@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CompeTIDOR</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="auth-loading">
+    <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
+      <div class="login-brand">
+        <img class="login-logo" src="/competidor-login.png" alt="CompeTIDOR" />
+      </div>
+      <form id="login-form" class="login-card">
+        <label>E-mail <input name="email" type="text" inputmode="email" autocomplete="username" placeholder="seu@email.com" required /></label>
+        <label>Senha <input name="password" type="password" autocomplete="current-password" placeholder="Sua senha" required /></label>
+        <button class="primary" type="submit">Entrar</button>
+        <div id="login-feedback" class="login-feedback"></div>
+      </form>
+      <form id="setup-form" class="login-card setup-card">
+        <label>Nome <input name="name" type="text" autocomplete="name" placeholder="Seu nome" required /></label>
+        <label>E-mail <input name="email" type="email" autocomplete="username" placeholder="seu@email.com" required /></label>
+        <label>Senha master <input name="password" type="password" autocomplete="new-password" minlength="8" placeholder="Mínimo 8 caracteres" required /></label>
+        <button class="primary" type="submit">Criar usuário master</button>
+        <div id="setup-feedback" class="login-feedback"></div>
+      </form>
+    </section>
+
+    <aside class="sidebar">
+      <div class="brand">
+        <img class="menu-logo" src="/competidor-menu.png" alt="CompeTIDOR" />
+      </div>
+      <nav aria-label="Menu principal">
+        <a class="active" href="#/dashboard" data-route="dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/></svg></span><strong>Dashboard</strong></a>
+        <a href="#/contas" data-route="contas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8-6h5v2h-5V5Zm0 4h5v2h-5V9ZM3 21v-2a5 5 0 0 1 10 0v2H3Zm12-6h6v2h-6v-2Zm0 4h6v2h-6v-2Z"/></svg></span><strong>Contas</strong></a>
+        <a href="#/catalogo" data-route="catalogo"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8ZM7.5 8.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/></svg></span><strong>Catálogo</strong></a>
+        <a href="#/anuncios" data-route="anuncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16v4H4V5Zm0 6h16v8H4v-8Zm3 2v2h7v-2H7Zm0 3v1h10v-1H7Z"/></svg></span><strong>Anúncios</strong></a>
+        <a href="#/copiar" data-route="copiar"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 8h11v13H8V8Zm-3 8H3V3h13v2H5v11Z"/></svg></span><strong>Copiar anúncios</strong></a>
+        <a href="#/concorrentes" data-route="concorrentes"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 5c5.5 0 9 5.2 9 7s-3.5 7-9 7-9-5.2-9-7 3.5-7 9-7Zm0 10.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/></svg></span><strong>Concorrentes</strong></a>
+        <a href="#/scan" data-route="scan"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2Zm1 1v10l7.1 7.1 1.4-1.4-6.5-6.5V3h-2Zm-1 5a4 4 0 1 0 4 4h-2a2 2 0 1 1-2-2V8Z"/></svg></span><strong>Scan</strong></a>
+        <a href="#/alertas" data-route="alertas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22a2.5 2.5 0 0 0 2.4-2h-4.8A2.5 2.5 0 0 0 12 22Zm7-5-2-2V9a5 5 0 0 0-4-4.9V2h-2v2.1A5 5 0 0 0 7 9v6l-2 2v1h14v-1Z"/></svg></span><strong>Alertas</strong></a>
+        <a href="#/usuarios" data-route="usuarios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M9 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8.5 1a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7ZM2 21v-2.2A5.8 5.8 0 0 1 7.8 13h2.4a5.8 5.8 0 0 1 5.8 5.8V21H2Zm14.8 0v-2.2a7.7 7.7 0 0 0-1.1-4h1.8a4.5 4.5 0 0 1 4.5 4.5V21h-5.2Z"/></svg></span><strong>Usuários</strong></a>
+      </nav>
+      <button id="theme-toggle" class="theme-button" type="button" aria-label="Alternar tema"><span id="theme-icon"></span></button>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="page-eyebrow">Painel unificado</p>
+          <h1 id="page-title">Dashboard</h1>
+        </div>
+        <div class="topbar-actions">
+          <span class="api-pill" id="api-pill">OAuth verificando</span>
+          <span class="tenant-pill" id="tenant-pill">0 contas</span>
+          <div class="user-menu" id="current-user">
+            <span id="current-user-avatar">A</span>
+            <strong id="current-user-name">Administrador</strong>
+            <a id="logout" class="logout-link" href="/api/auth/logout">Sair</a>
+          </div>
+        </div>
+      </header>
+
+      <section class="page active" id="page-dashboard">
+        <div class="summary-grid">
+          <article class="summary-card success">
+            <span>Produtos ganhando</span>
+            <strong id="winning-count">0</strong>
+            <small>Disputas sob controle</small>
+          </article>
+          <article class="summary-card danger">
+            <span>Perdendo catálogo</span>
+            <strong id="losing-count">0</strong>
+            <small>Ação comercial necessária</small>
+          </article>
+          <article class="summary-card warn">
+            <span>Alertas críticos</span>
+            <strong id="critical-count">0</strong>
+            <small>Estoque, envios e reputação</small>
+          </article>
+          <article class="summary-card">
+            <span>Contas oficiais</span>
+            <strong id="official-count">0</strong>
+            <small>Conectadas por OAuth</small>
+          </article>
+        </div>
+        <section class="dashboard-sections">
+          <div class="panel wide-panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Faturamento mensal</p>
+                <h2>Total e contas conectadas</h2>
+              </div>
+            </div>
+            <div id="dashboard-revenue" class="revenue-grid"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Atenção estoque</p>
+                <h2>Produtos sem estoque</h2>
+              </div>
+            </div>
+            <div class="mini-filter-bar" id="stock-period-filter">
+              <button class="active" data-stock-period="today">Hoje</button>
+              <button data-stock-period="yesterday">Ontem</button>
+              <button data-stock-period="week">Semana</button>
+              <label>Data <input id="stock-custom-date" type="date" /></label>
+            </div>
+            <div id="dashboard-stock" class="ops-list"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Atenção catálogo</p>
+                <h2>Produtos perdendo catálogo</h2>
+              </div>
+            </div>
+            <div id="dashboard-catalog-loss" class="ops-list"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Reclamações</p>
+                <h2>Abertas e em mediação</h2>
+              </div>
+            </div>
+            <div id="dashboard-claims" class="ops-list"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Envios pendentes</p>
+                <h2>Prazo limite de despacho</h2>
+              </div>
+            </div>
+            <div id="dashboard-shipments" class="ops-list"></div>
+          </div>
+          <div class="panel wide-panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Últimas vendas</p>
+                <h2>Vendas recentes das contas conectadas</h2>
+              </div>
+            </div>
+            <div id="dashboard-sales" class="sales-list"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Saúde das contas</p>
+                <h2>Reputação e envios</h2>
+              </div>
+            </div>
+            <div id="dashboard-metrics" class="metrics-list"></div>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-contas">
+        <div class="accounts-hero">
+          <article class="connection-card primary-card">
+            <span>Login oficial Mercado Livre</span>
+            <strong>Conectar outra conta</strong>
+            <p>Cada vendedor autoriza a própria conta, com token e permissões separados.</p>
+            <a class="primary button-link" href="/api/oauth/start?switch_account=1">Conectar outra conta</a>
+          </article>
+          <article class="connection-card">
+            <span>Multi-conta</span>
+            <strong id="official-accounts-label">0 oficiais</strong>
+            <p>Pronto para várias contas Mercado Livre dentro do mesmo workspace.</p>
+          </article>
+          <article class="connection-card">
+            <span>Permissões</span>
+            <strong>OAuth oficial</strong>
+            <p>Anúncios, catálogo, envios e métricas dependem das permissões aceitas por cada vendedor.</p>
+          </article>
+        </div>
+        <div class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">OAuth oficial Mercado Livre</p>
+              <h2>Contas conectadas</h2>
+            </div>
+            <a id="connect-account-secondary" class="primary button-link" href="/api/oauth/start?switch_account=1">Conectar outra conta</a>
+          </div>
+          <form id="meli-config-form" class="settings-form meli-config-form" data-master-only>
+            <div class="form-grid">
+              <label>
+                Client ID
+                <input name="client_id" placeholder="App ID do Mercado Livre" autocomplete="off" />
+              </label>
+              <label>
+                Client Secret
+                <input name="client_secret" placeholder="********" autocomplete="off" />
+              </label>
+              <label class="span-2">
+                Redirect URI
+                <input name="redirect_uri" placeholder="http://127.0.0.1:8772/api/oauth/callback" />
+              </label>
+            </div>
+            <div class="form-actions">
+              <button class="primary" type="submit">Salvar credenciais</button>
+              <button class="ghost" type="button" id="use-current-redirect">Usar callback atual</button>
+            </div>
+          </form>
+          <div class="notice" data-master-only>
+            Use uma aplicação criada no painel de desenvolvedores do Mercado Livre. O Redirect URI salvo aqui precisa
+            ser exatamente igual ao cadastrado no Mercado Livre. Cada autorização salva uma conta oficial separada.
+            Para adicionar outra loja, entre no Mercado Livre com o usuário dessa loja e clique novamente no botão de conexão.
+          </div>
+          <div id="account-feedback"></div>
+          <div id="accounts-list" class="accounts-list"></div>
+        </div>
+      </section>
+
+      <section class="page" id="page-catalogo">
+        <div class="panel catalog-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Buy box / catálogo</p>
+              <h2>Produtos disputando catálogo</h2>
+            </div>
+            <div class="segmented" role="tablist" aria-label="Filtro de catálogo">
+              <button class="active" data-filter="all">Todos</button>
+              <button data-filter="winning">Ganhando</button>
+              <button data-filter="losing">Perdendo</button>
+              <button data-filter="sharing">Compartilhando</button>
+              <button data-filter="paused">Pausados</button>
+            </div>
+          </div>
+          <div class="filter-bar">
+            <label>Conta <select id="catalog-account-filter"></select></label>
+            <label>Busca <input id="catalog-search" placeholder="Produto, SKU ou MLB..." /></label>
+            <label>Status ML <select id="catalog-ml-status-filter"></select></label>
+            <label>Estoque <select id="catalog-stock-filter"><option value="all">Todos</option><option value="zero">Sem estoque</option><option value="available">Com estoque</option></select></label>
+          </div>
+          <div id="catalog-list" class="catalog-list"></div>
+        </div>
+      </section>
+
+      <section class="page" id="page-anuncios">
+        <div class="panel catalog-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Anúncios</p>
+              <h2>Todos os anúncios conectados</h2>
+            </div>
+          </div>
+          <div class="filter-bar">
+            <label>Conta <select id="ads-account-filter"></select></label>
+            <label>Produto <input id="ads-product-filter" placeholder="Nome do produto" /></label>
+            <label>SKU <input id="ads-sku-filter" placeholder="SKU" /></label>
+            <label>Código ML <input id="ads-code-filter" placeholder="MLB..." /></label>
+            <label>Status <select id="ads-status-filter"></select></label>
+          </div>
+          <div id="ads-list" class="ads-list"></div>
+        </div>
+      </section>
+
+      <section class="page" id="page-usuarios">
+        <div class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">SaaS e equipe</p>
+              <h2>Usuários do workspace</h2>
+            </div>
+          </div>
+          <div class="users-layout">
+            <form id="users-form" class="user-form" data-users-admin-only>
+              <label>Nome <input name="name" placeholder="Nome do usuário" required /></label>
+              <label>E-mail <input name="email" type="email" placeholder="usuario@empresa.com" required /></label>
+              <label>Papel
+                <select name="role">
+                  <option value="master" data-master-role-option>Master</option>
+                  <option value="admin">Administrador</option>
+                  <option value="manager">Gestor</option>
+                  <option value="operator">Operador</option>
+                  <option value="viewer">Leitura</option>
+                </select>
+              </label>
+              <label>Senha <input name="password" type="password" minlength="6" autocomplete="new-password" placeholder="Mínimo 6 caracteres" required /></label>
+              <button class="primary" type="submit">Criar usuário</button>
+            </form>
+            <div>
+              <div class="notice" data-master-only>Estrutura SaaS ativa: usuários ficam vinculados ao workspace atual. Master gerencia credenciais OAuth; administradores operam contas, usuários e rotinas sem alterar Client ID, Secret ou Redirect URI.</div>
+              <div class="notice" data-non-master-only>Estrutura SaaS ativa: usuários ficam vinculados ao workspace atual com permissões por função.</div>
+              <div id="users-list" class="users-list"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="page-copiar">
+        <div class="panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Multiplicar anúncios</p>
+              <h2>Selecione anúncios específicos</h2>
+            </div>
+          </div>
+          <form id="clone-form" class="clone-form">
+            <label>
+              Conta origem
+              <select name="source"></select>
+            </label>
+            <label>
+              Conta destino
+              <select name="target"></select>
+            </label>
+            <div class="item-picker">
+              <div class="item-picker-head">
+                <strong>Anúncios da origem</strong>
+                <small>Marque exatamente o que deseja copiar.</small>
+              </div>
+              <div id="copy-items-list" class="copy-items-list"></div>
+            </div>
+            <div class="clone-edit-grid">
+              <label>Título padrão <input name="title_override" placeholder="Opcional: novo título" /></label>
+              <label>SKU sufixo <input name="sku_suffix" placeholder="Ex: -SP ou -COPIA" /></label>
+              <label>Preço <input name="price_override" type="number" step="0.01" placeholder="Opcional" /></label>
+              <label>Estoque <input name="stock_override" type="number" step="1" placeholder="Opcional" /></label>
+              <label class="span-2">Descrição <input name="description_override" placeholder="Opcional: descrição para preparar a publicação" /></label>
+            </div>
+            <button class="primary" type="submit">Gerar preview dos selecionados</button>
+          </form>
+          <div id="clone-jobs" class="clone-jobs"></div>
+        </div>
+      </section>
+
+      <section class="page" id="page-concorrentes">
+        <div class="panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Monitoramento</p>
+              <h2>Concorrentes acompanhados</h2>
+            </div>
+          </div>
+          <form id="competitor-form" class="competitor-form">
+            <label>ID do vendedor <input name="seller_id" placeholder="Ex.: 123456789" required /></label>
+            <label>Anúncios para analisar <input name="limit" type="number" min="1" max="500" value="100" /></label>
+            <button class="primary" type="submit">Analisar concorrente</button>
+          </form>
+          <div class="notice">Para descobrir o ID: abra um anúncio do concorrente, copie o link do vendedor ou o nome da loja e use o Scan/catálogo para identificar o vendedor da oferta. Quando o Mercado Livre expõe o seller, o ID aparece como Seller ID. Se a API bloquear a listagem direta de anúncios desse vendedor, acompanhe por produto/catálogo no Scan.</div>
+          <div class="notice">A API oficial permite consultar dados públicos do vendedor e anúncios públicos. Vendas detalhadas, faturamento real por período e pedidos de concorrentes não são expostos sem autorização OAuth da própria conta.</div>
+          <div id="competitors-list" class="competitors-list"></div>
+        </div>
+      </section>
+
+      <section class="page" id="page-scan">
+        <div class="panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Scan</p>
+              <h2>Acompanhar preço de anúncios específicos</h2>
+            </div>
+          </div>
+          <form id="scan-form" class="scan-form">
+            <label>Produto padrão <input name="name" placeholder="Ex.: Duonn Atrium 20" required /></label>
+            <label>Link ou código MLB <input name="url" placeholder="https://produto.mercadolivre.com.br/... ou MLB123" required /></label>
+            <label class="scan-price-label">Preço mínimo para alerta <span class="money-field"><input name="minimum_price" type="number" min="0" step="0.01" placeholder="2500.00" /></span></label>
+            <button class="primary" type="submit">Criar scan</button>
+          </form>
+          <div class="notice">Scan automático ativo no servidor a cada 5 minutos. O botão manual continua disponível para conferir imediatamente.</div>
+          <div id="scan-list" class="scan-list"></div>
+        </div>
+      </section>
+
+      <section class="page" id="page-alertas">
+        <div class="workspace">
+          <div class="panel alerts-panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Alertas</p>
+                <h2>Prioridades e histórico</h2>
+              </div>
+            </div>
+            <div class="mini-filter-bar alert-filter-bar" id="alert-type-filter">
+              <button class="active" data-alert-type="all">Todos</button>
+              <button data-alert-type="claims">Reclamações</button>
+              <button data-alert-type="shipping">Atrasos</button>
+              <button data-alert-type="stock">Sem estoque</button>
+              <button data-alert-type="catalog">Catálogo</button>
+              <button data-alert-type="scan">Scan</button>
+            </div>
+            <div class="mini-filter-bar" id="alert-period-filter">
+              <button class="active" data-alert-period="today">Hoje</button>
+              <button data-alert-period="yesterday">Ontem</button>
+              <button data-alert-period="week">Semana</button>
+              <label>Data <input id="alert-custom-date" type="date" /></label>
+            </div>
+            <div id="alerts-list" class="alerts-list"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Canal oficial</p>
+                <h2>Telegram via BotFather</h2>
+              </div>
+            </div>
+            <div class="tutorial-card">
+              <strong>Mini tutorial</strong>
+              <ol>
+                <li>Abra o Telegram e procure por <code>@BotFather</code>.</li>
+                <li>Envie <code>/newbot</code>, escolha nome e usuário do bot.</li>
+                <li>Copie o token gerado pelo BotFather e cole abaixo. Essa configuração vale apenas para o usuário logado.</li>
+                <li>Abra o bot criado no Telegram e envie uma mensagem qualquer para ele. Pode ser <code>/start</code>.</li>
+                <li>Clique em <strong>Detectar Chat ID</strong> abaixo e selecione/copiei o <code>chat.id</code> retornado. Não use o ID do próprio bot.</li>
+                <li>Escolha quais tipos de alerta este usuário deve receber.</li>
+              </ol>
+            </div>
+            <form id="notifications-form" class="settings-form">
+              <label class="check-row">
+                <input type="checkbox" name="telegram_enabled" />
+                Ativar alertas pelo Telegram
+              </label>
+              <label>
+                Token do bot
+                <input name="telegram_bot_token" placeholder="123456:ABC..." autocomplete="off" />
+              </label>
+              <label>
+                Chat ID
+                <input name="telegram_chat_id" placeholder="Ex: 123456789 ou -100..." />
+              </label>
+              <button class="ghost" type="button" id="detect-telegram-chat">Detectar Chat ID</button>
+              <div id="telegram-chat-list" class="notice"></div>
+              <fieldset class="alert-type-grid">
+                <legend>Enviar pelo bot quando ocorrer:</legend>
+                <label class="check-row">
+                  <input type="checkbox" name="alert_types" value="stock" />
+                  Produto sem estoque ou pausado
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" name="alert_types" value="catalog" />
+                  Produto perdendo catálogo
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" name="alert_types" value="shipping" />
+                  Envios com atraso, agência ou Flex
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" name="alert_types" value="reputation" />
+                  Reclamações, mediações e cancelamentos
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" name="alert_types" value="competitor" />
+                  Movimentos relevantes de concorrentes
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" name="alert_types" value="scan" />
+                  Scan abaixo do preço mínimo
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" name="alert_types" value="claims" />
+                  Reclamações abertas ou em mediação
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" name="alert_types" value="pending_shipments" />
+                  Vendas pendentes de envio e prazo limite
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" name="alert_types" value="revenue" />
+                  Variações relevantes de faturamento
+                </label>
+              </fieldset>
+              <button class="primary" type="submit">Salvar Telegram</button>
+              <button class="ghost" type="button" id="test-notifications">Enviar teste</button>
+            </form>
+            <div id="notification-status" class="notice"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

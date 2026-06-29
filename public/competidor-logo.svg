@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 360" role="img" aria-label="CompeTIDOR">
+  <defs>
+    <linearGradient id="gold" x1="0" x2="1" y1="0" y2="1">
+      <stop stop-color="#FFE600"/>
+      <stop offset="1" stop-color="#FFB800"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feColorMatrix in="blur" values="1 0 0 0 1 0 0.82 0 0 0.78 0 0 0 0 0 0 0 0 0.7 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect width="360" height="360" rx="58" fill="#070B10"/>
+  <g filter="url(#glow)">
+    <path d="M92 137h38c13 0 24 8 29 20l34 83h70c14 0 26-9 30-23l22-78" fill="none" stroke="#F8FAFC" stroke-width="21" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M161 243c44-2 96-27 139-88l-5 51 43-81-89 35 42 10c-37 43-80 61-130 73Z" fill="url(#gold)"/>
+    <path d="M170 108h91v28c0 37-21 60-45 66 2 14-2 26-13 36 3-15 0-27-10-36-19-8-31-29-31-58v-36h8Z" fill="url(#gold)"/>
+    <path d="M160 119h-35c0 33 17 55 43 63M262 119h35c0 33-17 55-43 63" fill="none" stroke="url(#gold)" stroke-width="13" stroke-linecap="round"/>
+    <path d="m216 135 9 19 21 3-15 15 4 21-19-10-19 10 4-21-15-15 21-3 9-19Z" fill="#070B10"/>
+    <rect x="180" y="191" width="22" height="45" rx="4" fill="#070B10"/>
+    <rect x="214" y="175" width="22" height="61" rx="4" fill="#070B10"/>
+    <rect x="248" y="154" width="22" height="82" rx="4" fill="#070B10"/>
+    <circle cx="159" cy="276" r="20" fill="#F8FAFC"/>
+    <circle cx="159" cy="276" r="8" fill="#070B10"/>
+    <circle cx="265" cy="276" r="20" fill="#F8FAFC"/>
+    <circle cx="265" cy="276" r="8" fill="#070B10"/>
+  </g>
+  <text x="180" y="324" text-anchor="middle" font-family="Arial Black, Arial, sans-serif" font-size="35" font-weight="900" fill="#F8FAFC">Compe<tspan fill="#FFE600">TIDOR</tspan></text>
+</svg>
