@@ -1438,14 +1438,23 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
 document.querySelector("#clone-jobs").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-execute-clone]");
   if (!button) return;
-  const result = await api("/api/clone/execute", {
-    method: "POST",
-    body: JSON.stringify({ job_id: button.dataset.executeClone }),
-  });
-  state.data.catalog.push(...result.copied);
-  state.data.clone_jobs = state.data.clone_jobs.map((job) => (job.id === result.job.id ? result.job : job));
-  showToast("Anúncios copiados com sucesso.");
-  render();
+  button.disabled = true;
+  button.textContent = "Copiando...";
+  try {
+    const result = await api("/api/clone/execute", {
+      method: "POST",
+      body: JSON.stringify({ job_id: button.dataset.executeClone }),
+    });
+    state.data.catalog.push(...(result.copied || []));
+    state.data.clone_jobs = state.data.clone_jobs.map((job) => (job.id === result.job.id ? result.job : job));
+    showToast("Anúncios copiados com sucesso.");
+    render();
+  } catch (error) {
+    showToast(error.message || "Não foi possível copiar os anúncios.", "error");
+    alert(error.message || "Não foi possível copiar os anúncios.");
+    button.disabled = false;
+    button.textContent = "Copiar agora";
+  }
 });
 
 document.querySelector("#scan-form").addEventListener("submit", async (event) => {
