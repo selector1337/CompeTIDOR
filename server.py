@@ -2677,30 +2677,48 @@ class App(BaseHTTPRequestHandler):
             edits = request.get("edits") or {}
             if isinstance(item_ids, str):
                 item_ids = [item.strip() for item in item_ids.split(",") if item.strip()]
-            if request.get("source") == request.get("target"):
+            source = request.get("source")
+            target = request.get("target")
+            if source == target:
                 self.send_json({"error": "A conta destino precisa ser diferente da origem."}, status=400)
                 return
             if not item_ids:
                 self.send_json({"error": "Selecione ao menos um anúncio específico."}, status=400)
                 return
+            source_items = [
+                item
+                for item in payload.get("catalog", [])
+                if item.get("account") == source and item.get("id") in item_ids
+            ]
+            found_ids = {item.get("id") for item in source_items}
+            missing_ids = [item_id for item_id in item_ids if item_id not in found_ids]
+            if missing_ids:
+                self.send_json(
+                    {
+                        "error": "Alguns anúncios selecionados não foram encontrados na conta origem.",
+                        "missing": missing_ids,
+                    },
+                    status=400,
+                )
+                return
             job = {
                 "id": f"clone-{uuid.uuid4().hex[:8]}",
-                "source": request.get("source"),
-                "target": request.get("target"),
+                "source": source,
+                "target": target,
                 "item_ids": item_ids,
                 "items": len(item_ids),
                 "status": "preview_ready",
                 "edits": edits,
                 "note": "Preview criado para anúncios específicos. Na execução oficial, validaremos atributos obrigatórios, fotos, variações, estoque e políticas por conta.",
             }
-            payload["clone_jobs"].insert(0, job)
+            payload.setdefault("clone_jobs", []).insert(0, job)
             write_payload(payload)
             self.send_json(job, status=201)
             return
 
         if parsed.path == "/api/clone/execute":
             job_id = request.get("job_id")
-            job = next((item for item in payload["clone_jobs"] if item["id"] == job_id), None)
+            job = next((item for item in payload.setdefault("clone_jobs", []) if item["id"] == job_id), None)
             if not job:
                 self.send_json({"error": "Preview não encontrado."}, status=404)
                 return

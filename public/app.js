@@ -17,10 +17,20 @@
   alertType: "all",
   alertPeriod: "today",
   alertCustomDate: "",
+  catalogPage: 1,
+  adsPage: 1,
+  copyPage: 1,
+  copySearch: "",
+  copySku: "",
+  cloneSelectedIds: new Set(),
+  alertsPage: 1,
+  scanPage: 1,
+  competitorsPage: 1,
   theme: localStorage.getItem("competidor-theme") || "dark",
   currentUser: null,
 };
 
+const PAGE_SIZE = 100;
 const renderTimers = {};
 
 const pageTitles = {
@@ -157,6 +167,43 @@ function showSetup() {
 function showApp() {
   document.body.classList.remove("needs-auth", "needs-setup", "auth-loading");
   document.body.classList.add("is-authenticated");
+}
+
+function paginate(items, page) {
+  const total = items.length;
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const current = Math.min(Math.max(1, Number(page) || 1), pages);
+  const start = (current - 1) * PAGE_SIZE;
+  return {
+    items: items.slice(start, start + PAGE_SIZE),
+    current,
+    pages,
+    total,
+    start,
+  };
+}
+
+function paginationHtml(key, pageInfo) {
+  if (!pageInfo || pageInfo.total <= PAGE_SIZE) {
+    return pageInfo?.total ? `<div class="pagination-info">${pageInfo.total} resultado(s)</div>` : "";
+  }
+  const buttons = [];
+  const add = (page, label = page) => {
+    buttons.push(`<button class="${page === pageInfo.current ? "active" : ""}" type="button" data-page-key="${key}" data-page="${page}">${label}</button>`);
+  };
+  add(Math.max(1, pageInfo.current - 1), "Anterior");
+  const from = Math.max(1, pageInfo.current - 2);
+  const to = Math.min(pageInfo.pages, pageInfo.current + 2);
+  if (from > 1) add(1);
+  for (let page = from; page <= to; page += 1) add(page);
+  if (to < pageInfo.pages) add(pageInfo.pages);
+  add(Math.min(pageInfo.pages, pageInfo.current + 1), "Próxima");
+  return `
+    <div class="pagination">
+      <span>${pageInfo.total} resultado(s) · página ${pageInfo.current} de ${pageInfo.pages}</span>
+      <div>${buttons.join("")}</div>
+    </div>
+  `;
 }
 
 function renderCurrentUser() {
@@ -403,7 +450,7 @@ function renderCatalog() {
   const list = document.querySelector("#catalog-list");
   renderFilterOptions();
   const term = state.catalogSearch.toLowerCase();
-  const items = state.data.catalog.filter((item) => {
+  const filtered = state.data.catalog.filter((item) => {
     const text = `${item.title} ${item.sku} ${item.id}`.toLowerCase();
     return isCatalogListing(item)
       && (state.filter === "all" || item.status === state.filter)
@@ -412,7 +459,9 @@ function renderCatalog() {
       && (state.catalogStock === "all" || (state.catalogStock === "zero" ? Number(item.stock) === 0 : Number(item.stock) > 0))
       && (!term || text.includes(term));
   });
-  list.innerHTML = items
+  const pageInfo = paginate(filtered, state.catalogPage);
+  state.catalogPage = pageInfo.current;
+  list.innerHTML = filtered.length ? paginationHtml("catalogPage", pageInfo) + pageInfo.items
     .map(
       (item) => `
         <article class="catalog-item ${item.status}">
@@ -462,7 +511,7 @@ function renderCatalog() {
         </article>
       `
     )
-    .join("");
+    .join("") + paginationHtml("catalogPage", pageInfo) : `<div class="notice">Nenhum anúncio de catálogo encontrado.</div>`;
 }
 
 function catalogWinnerName(item) {
@@ -522,7 +571,7 @@ function renderAds() {
   const productTerm = state.adsProduct.toLowerCase();
   const skuTerm = state.adsSku.toLowerCase();
   const codeTerm = state.adsCode.toLowerCase();
-  const items = state.data.catalog.filter((item) => {
+  const filtered = state.data.catalog.filter((item) => {
     const title = `${item.title || ""}`.toLowerCase();
     const sku = `${item.sku || ""}`.toLowerCase();
     const code = `${item.id || ""}`.toLowerCase();
@@ -532,7 +581,9 @@ function renderAds() {
       && (!skuTerm || sku.includes(skuTerm))
       && (!codeTerm || code.includes(codeTerm));
   });
-  list.innerHTML = items.map((item) => `
+  const pageInfo = paginate(filtered, state.adsPage);
+  state.adsPage = pageInfo.current;
+  list.innerHTML = filtered.length ? paginationHtml("adsPage", pageInfo) + pageInfo.items.map((item) => `
     <article class="ad-item">
       <a class="product-media" href="${item.permalink || "#"}" target="_blank" rel="noreferrer">
         ${item.thumbnail ? `<img src="${item.thumbnail}" alt="${item.title}" loading="lazy" />` : `<span>${(item.title || item.id).slice(0, 2).toUpperCase()}</span>`}
@@ -568,7 +619,7 @@ function renderAds() {
         ${renderItemLog(item)}
       </div>
     </article>
-  `).join("") || `<div class="notice">Nenhum anúncio encontrado.</div>`;
+  `).join("") + paginationHtml("adsPage", pageInfo) : `<div class="notice">Nenhum anúncio encontrado.</div>`;
 }
 
 function isCatalogListing(item) {
@@ -607,7 +658,9 @@ function formatLogChanges(log) {
 function renderAlerts() {
   const list = document.querySelector("#alerts-list");
   const alerts = filterAlerts(state.data.alerts || []);
-  list.innerHTML = alerts
+  const pageInfo = paginate(alerts, state.alertsPage);
+  state.alertsPage = pageInfo.current;
+  list.innerHTML = alerts.length ? paginationHtml("alertsPage", pageInfo) + pageInfo.items
     .map(
       (alert) => `
         <article class="alert-item ${alert.severity} ${alert.read ? "read" : ""}">
@@ -626,7 +679,7 @@ function renderAlerts() {
         </article>
       `
     )
-    .join("") || `<div class="notice">Nenhum alerta encontrado neste filtro.</div>`;
+    .join("") + paginationHtml("alertsPage", pageInfo) : `<div class="notice">Nenhum alerta encontrado neste filtro.</div>`;
 }
 
 function filterAlerts(alerts) {
@@ -713,7 +766,10 @@ function metricLine(label, value, max, inverse) {
 
 function renderCompetitors() {
   const list = document.querySelector("#competitors-list");
-  list.innerHTML = state.data.competitors
+  const competitors = state.data.competitors || [];
+  const pageInfo = paginate(competitors, state.competitorsPage);
+  state.competitorsPage = pageInfo.current;
+  list.innerHTML = competitors.length ? paginationHtml("competitorsPage", pageInfo) + pageInfo.items
     .map(
       (competitor) => `
         <article class="competitor-item">
@@ -754,14 +810,16 @@ function renderCompetitors() {
         </article>
       `
     )
-    .join("");
+    .join("") + paginationHtml("competitorsPage", pageInfo) : `<div class="notice">Nenhum concorrente acompanhado ainda.</div>`;
 }
 
 function renderScan() {
   const list = document.querySelector("#scan-list");
   if (!list || !state.data) return;
   const scans = state.data.scan_items || [];
-  list.innerHTML = scans.map((scan) => {
+  const pageInfo = paginate(scans, state.scanPage);
+  state.scanPage = pageInfo.current;
+  list.innerHTML = scans.length ? paginationHtml("scanPage", pageInfo) + pageInfo.items.map((scan) => {
     const history = scan.history || [];
     const minimum = Number(scan.minimum_price || 0);
     const belowOffers = scan.below_minimum_offers || [];
@@ -815,7 +873,7 @@ function renderScan() {
         </div>
       </article>
     `;
-  }).join("") || `<div class="notice">Nenhum produto em Scan ainda. Cadastre um produto padrão e cole o link do anúncio para começar.</div>`;
+  }).join("") + paginationHtml("scanPage", pageInfo) : `<div class="notice">Nenhum produto em Scan ainda. Cadastre um produto padrão e cole o link do anúncio para começar.</div>`;
 }
 
 function renderClone() {
@@ -834,6 +892,10 @@ function renderClone() {
   if ((!hadTarget || target.value === source.value) && target.options.length > 1) {
     target.selectedIndex = target.options[0].value === source.value ? 1 : 0;
   }
+  const copyProduct = document.querySelector("#copy-product-filter");
+  const copySku = document.querySelector("#copy-sku-filter");
+  if (copyProduct && copyProduct.value !== state.copySearch) copyProduct.value = state.copySearch;
+  if (copySku && copySku.value !== state.copySku) copySku.value = state.copySku;
   renderCopyItems();
 
   document.querySelector("#clone-jobs").innerHTML = state.data.clone_jobs
@@ -901,13 +963,27 @@ function renderUsers() {
 function renderCopyItems() {
   const source = document.querySelector('select[name="source"]').value;
   const list = document.querySelector("#copy-items-list");
-  const items = state.data.catalog.filter((item) => item.account === source);
-  list.innerHTML = items.length
-    ? items
+  const productTerm = state.copySearch.toLowerCase();
+  const skuTerm = state.copySku.toLowerCase();
+  const filtered = state.data.catalog.filter((item) => {
+    const title = `${item.title || ""}`.toLowerCase();
+    const sku = `${item.sku || ""}`.toLowerCase();
+    const code = `${item.id || ""}`.toLowerCase();
+    return item.account === source
+      && (!productTerm || title.includes(productTerm))
+      && (!skuTerm || sku.includes(skuTerm) || code.includes(skuTerm));
+  });
+  const pageInfo = paginate(filtered, state.copyPage);
+  state.copyPage = pageInfo.current;
+  const selectedCount = state.cloneSelectedIds.size;
+  list.innerHTML = filtered.length
+    ? `<div class="pagination-info">${selectedCount} selecionado(s)</div>`
+        + paginationHtml("copyPage", pageInfo)
+        + pageInfo.items
         .map(
           (item) => `
             <label class="copy-item">
-              <input type="checkbox" name="item_ids" value="${item.id}" />
+              <input type="checkbox" name="item_ids" value="${item.id}" ${state.cloneSelectedIds.has(item.id) ? "checked" : ""} />
               <span>
                 <strong>${item.title}</strong>
                 <small>${item.id} - SKU ${item.sku} - ${money.format(item.price)} - estoque ${item.stock}</small>
@@ -916,6 +992,7 @@ function renderCopyItems() {
           `
         )
         .join("")
+        + paginationHtml("copyPage", pageInfo)
     : `<div class="notice">Nenhum anúncio carregado para esta origem. Em conta oficial, a sincronização vem de /users/{seller_id}/items/search.</div>`;
 }
 
@@ -1024,6 +1101,7 @@ document.querySelector(".segmented").addEventListener("click", (event) => {
   document.querySelectorAll(".segmented button").forEach((button) => button.classList.remove("active"));
   event.target.classList.add("active");
   state.filter = event.target.dataset.filter;
+  state.catalogPage = 1;
   renderCatalog();
 });
 
@@ -1051,6 +1129,7 @@ document.querySelector("#alert-type-filter").addEventListener("click", (event) =
   document.querySelectorAll("[data-alert-type]").forEach((item) => item.classList.remove("active"));
   button.classList.add("active");
   state.alertType = button.dataset.alertType;
+  state.alertsPage = 1;
   renderAlerts();
 });
 
@@ -1061,6 +1140,7 @@ document.querySelector("#alert-period-filter").addEventListener("click", (event)
   button.classList.add("active");
   state.alertPeriod = button.dataset.alertPeriod;
   state.alertCustomDate = "";
+  state.alertsPage = 1;
   document.querySelector("#alert-custom-date").value = "";
   renderAlerts();
 });
@@ -1068,6 +1148,7 @@ document.querySelector("#alert-period-filter").addEventListener("click", (event)
 document.querySelector("#alert-custom-date").addEventListener("change", (event) => {
   state.alertPeriod = "custom";
   state.alertCustomDate = event.target.value;
+  state.alertsPage = 1;
   document.querySelectorAll("[data-alert-period]").forEach((item) => item.classList.remove("active"));
   renderAlerts();
 });
@@ -1086,6 +1167,21 @@ document.addEventListener("click", async (event) => {
   }
 });
 
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-page-key][data-page]");
+  if (!button) return;
+  const key = button.dataset.pageKey;
+  const page = Number(button.dataset.page || 1);
+  if (!(key in state)) return;
+  state[key] = page;
+  if (key === "catalogPage") renderCatalog();
+  if (key === "adsPage") renderAds();
+  if (key === "copyPage") renderCopyItems();
+  if (key === "alertsPage") renderAlerts();
+  if (key === "scanPage") renderScan();
+  if (key === "competitorsPage") renderCompetitors();
+});
+
 [
   ["#catalog-account-filter", "catalogAccount"],
   ["#catalog-search", "catalogSearch"],
@@ -1096,18 +1192,40 @@ document.addEventListener("click", async (event) => {
   ["#ads-sku-filter", "adsSku"],
   ["#ads-code-filter", "adsCode"],
   ["#ads-status-filter", "adsStatus"],
+  ["#copy-product-filter", "copySearch"],
+  ["#copy-sku-filter", "copySku"],
 ].forEach(([selector, key]) => {
   document.addEventListener("input", (event) => {
     if (!event.target.matches(selector)) return;
     state[key] = event.target.value;
-    if (key.startsWith("catalog")) scheduleRender("catalog", renderCatalog);
-    if (key.startsWith("ads")) scheduleRender("ads", renderAds);
+    if (key.startsWith("catalog")) {
+      state.catalogPage = 1;
+      scheduleRender("catalog", renderCatalog);
+    }
+    if (key.startsWith("ads")) {
+      state.adsPage = 1;
+      scheduleRender("ads", renderAds);
+    }
+    if (key.startsWith("copy")) {
+      state.copyPage = 1;
+      scheduleRender("copy", renderCopyItems);
+    }
   });
   document.addEventListener("change", (event) => {
     if (!event.target.matches(selector)) return;
     state[key] = event.target.value;
-    if (key.startsWith("catalog")) renderCatalog();
-    if (key.startsWith("ads")) renderAds();
+    if (key.startsWith("catalog")) {
+      state.catalogPage = 1;
+      renderCatalog();
+    }
+    if (key.startsWith("ads")) {
+      state.adsPage = 1;
+      renderAds();
+    }
+    if (key.startsWith("copy")) {
+      state.copyPage = 1;
+      renderCopyItems();
+    }
   });
 });
 
@@ -1264,12 +1382,25 @@ document.querySelector("#accounts-list").addEventListener("click", async (event)
   }
 });
 
-document.querySelector('select[name="source"]').addEventListener("change", renderCopyItems);
+document.querySelector('select[name="source"]').addEventListener("change", () => {
+  state.cloneSelectedIds.clear();
+  state.copyPage = 1;
+  renderCopyItems();
+});
+
+document.querySelector("#copy-items-list").addEventListener("change", (event) => {
+  const input = event.target.closest('input[name="item_ids"]');
+  if (!input) return;
+  if (input.checked) state.cloneSelectedIds.add(input.value);
+  else state.cloneSelectedIds.delete(input.value);
+  renderCopyItems();
+});
 
 document.querySelector("#clone-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
-  const itemIds = form.getAll("item_ids");
+  form.getAll("item_ids").forEach((itemId) => state.cloneSelectedIds.add(itemId));
+  const itemIds = [...state.cloneSelectedIds];
   if (!itemIds.length) {
     alert("Selecione pelo menos um anúncio específico para copiar.");
     return;
@@ -1278,24 +1409,30 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
     alert("Escolha uma conta destino diferente da origem.");
     return;
   }
-  const job = await api("/api/clone/preview", {
-    method: "POST",
-    body: JSON.stringify({
-      source: form.get("source"),
-      target: form.get("target"),
-      item_ids: itemIds,
-      edits: {
-        title: form.get("title_override"),
-        sku_suffix: form.get("sku_suffix"),
-        price: form.get("price_override"),
-        stock: form.get("stock_override"),
-        description: form.get("description_override"),
-      },
-    }),
-  });
-  state.data.clone_jobs.unshift(job);
-  showToast("Preview de cópia criado com sucesso.");
-  renderClone();
+  try {
+    const job = await api("/api/clone/preview", {
+      method: "POST",
+      body: JSON.stringify({
+        source: form.get("source"),
+        target: form.get("target"),
+        item_ids: itemIds,
+        edits: {
+          title: form.get("title_override"),
+          sku_suffix: form.get("sku_suffix"),
+          price: form.get("price_override"),
+          stock: form.get("stock_override"),
+          description: form.get("description_override"),
+        },
+      }),
+    });
+    state.data.clone_jobs.unshift(job);
+    state.cloneSelectedIds.clear();
+    showToast("Preview de cópia criado com sucesso.");
+    renderClone();
+  } catch (error) {
+    showToast(error.message || "Não foi possível gerar o preview.", "error");
+    alert(error.message || "Não foi possível gerar o preview.");
+  }
 });
 
 document.querySelector("#clone-jobs").addEventListener("click", async (event) => {

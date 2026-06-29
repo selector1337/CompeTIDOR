@@ -565,6 +565,49 @@ h2 {
   gap: 12px;
 }
 
+.copy-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.pagination,
+.pagination-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 900;
+}
+
+.pagination > div {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.pagination button {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(255, 230, 0, 0.04);
+  color: var(--ink);
+  padding: 0 10px;
+  box-shadow: var(--neon);
+  font-size: 0.8rem;
+  font-weight: 900;
+}
+
+.pagination button.active {
+  background: var(--brand);
+  color: var(--brand-ink);
+}
+
 .catalog-item,
 .alert-item,
 .account-item,
