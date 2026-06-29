@@ -1162,6 +1162,11 @@ def normalize_competition(client, account, item):
         "winner_seller_id": "",
         "winner_name": "Indisponível",
         "winner_price": None,
+        "winner_confirmed": False,
+        "winner_source": "",
+        "catalog_reference_seller_id": "",
+        "catalog_reference_name": "",
+        "catalog_reference_price": None,
         "price_to_win": None,
         "current_price": None,
         "visit_share": None,
@@ -1185,6 +1190,8 @@ def normalize_competition(client, account, item):
             data["winner_seller_id"] = account.get("seller_id", "")
             data["winner_name"] = account.get("nickname", "Sua conta")
             data["winner_price"] = price.get("current_price")
+            data["winner_confirmed"] = True
+            data["winner_source"] = "price_to_win"
     except Exception as exc:
         data["competition_reason"] = str(exc)
 
@@ -1199,35 +1206,47 @@ def normalize_competition(client, account, item):
                 live_candidates = live_catalog_offers({"accounts": [account]}, candidates, sort_by_price=False)
                 if live_candidates:
                     candidates = live_candidates
-                winner = candidates[0] if candidates else {"raw": rows[0], "price": None, "item_id": "", "seller_id": ""}
-                raw_winner = winner.get("raw") or rows[0]
-                seller_id = str(winner.get("seller_id") or first_present(raw_winner, ["seller_id", "seller.id", "seller.id_seller"], ""))
-                winner_item_id = winner.get("item_id") or first_present(raw_winner, ["item_id", "id", "item.id"], "")
-                if winner_item_id:
+                reference = candidates[0] if candidates else {"raw": rows[0], "price": None, "item_id": "", "seller_id": ""}
+                raw_reference = reference.get("raw") or rows[0]
+                reference_seller_id = str(reference.get("seller_id") or first_present(raw_reference, ["seller_id", "seller.id", "seller.id_seller"], ""))
+                reference_item_id = reference.get("item_id") or first_present(raw_reference, ["item_id", "id", "item.id"], "")
+                reference_price = reference.get("price") or first_present(raw_reference, ["price", "sale_price.amount", "current_price"], None)
+                if reference_item_id:
                     try:
-                        winner_item = client.item(winner_item_id)
-                        if winner_item.get("status") in {"active", "under_review", None, ""}:
-                            seller_id = seller_id or str(winner_item.get("seller_id") or "")
-                            data["winner_price"] = winner_item.get("price") or data["winner_price"]
+                        reference_item = client.item(reference_item_id)
+                        if reference_item.get("status") in {"active", "under_review", None, ""}:
+                            reference_seller_id = reference_seller_id or str(reference_item.get("seller_id") or "")
+                            reference_price = reference_item.get("price") or reference_price
                     except Exception:
                         pass
-                data["winner_seller_id"] = seller_id
-                data["winner_price"] = data["winner_price"] or winner.get("price") or first_present(raw_winner, ["price", "sale_price.amount", "current_price"], None)
                 data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "listed"
-                if seller_id and seller_id == str(account.get("seller_id")):
-                    data["winner_name"] = account.get("nickname", "Sua conta")
-                elif seller_id:
+                data["catalog_reference_seller_id"] = reference_seller_id
+                data["catalog_reference_price"] = reference_price
+                if reference_seller_id:
                     try:
-                        seller = client.user(seller_id)
-                        data["winner_name"] = seller.get("nickname") or f"Seller {seller_id}"
+                        seller = client.user(reference_seller_id)
+                        data["catalog_reference_name"] = seller.get("nickname") or f"Seller {reference_seller_id}"
                     except Exception:
-                        data["winner_name"] = f"Seller {seller_id}"
-                else:
-                    data["winner_name"] = first_present(raw_winner, ["seller.nickname", "nickname"], "Vendedor do catálogo")
+                        data["catalog_reference_name"] = f"Seller {reference_seller_id}"
+                if reference.get("is_winner") and not data.get("winner_confirmed"):
+                    data["winner_seller_id"] = reference_seller_id
+                    data["winner_price"] = reference_price
+                    data["winner_confirmed"] = True
+                    data["winner_source"] = "products_items_winner_marker"
+                    if reference_seller_id and reference_seller_id == str(account.get("seller_id")):
+                        data["winner_name"] = account.get("nickname", "Sua conta")
+                    else:
+                        data["winner_name"] = data.get("catalog_reference_name") or first_present(raw_reference, ["seller.nickname", "nickname"], "Vendedor do catálogo")
+                elif not data.get("winner_confirmed") and not data.get("competition_reason"):
+                    data["competition_reason"] = "A API oficial não confirmou o vencedor da buy box; lista de ofertas do catálogo não será usada como vencedor."
         except Exception as exc:
             if not data["competition_reason"]:
                 data["competition_reason"] = str(exc)
 
+    if not data.get("winner_confirmed"):
+        data["winner_seller_id"] = ""
+        data["winner_name"] = "Não confirmado pela API"
+        data["winner_price"] = None
     if data["competition_status"] == "not_listed" and not data.get("winner_seller_id"):
         data["winner_name"] = "Sem vencedor disponível"
     return data

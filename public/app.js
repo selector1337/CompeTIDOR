@@ -434,8 +434,9 @@ function renderCatalog() {
               ${fact("Estoque", item.stock)}
               ${fact("Preço", money.format(item.price))}
               ${item.meli_status ? fact("Status ML", item.meli_status === "paused" ? "Pausado" : item.meli_status) : ""}
-              ${fact("Vencedor", item.winner_name || "Indisponível")}
-              ${fact("Preço vencedor", item.winner_price ? money.format(item.winner_price) : "-")}
+              ${fact("Vencedor", catalogWinnerName(item))}
+              ${fact("Preço vencedor", catalogWinnerPrice(item))}
+              ${!item.winner_confirmed && item.catalog_reference_price ? fact("Oferta da lista", money.format(item.catalog_reference_price)) : ""}
               ${fact("Preço p/ ganhar", item.price_to_win ? money.format(item.price_to_win) : "Sem sugestão ML")}
             </div>
             <div class="progress"><span style="width:${item.share}%; background:${colors[item.status]}; color:${colors[item.status]}"></span></div>
@@ -456,12 +457,20 @@ function renderCatalog() {
           <div class="score">
             <small>Participação estimada</small>
             <strong>${item.share}%</strong>
-            <small>${item.winner_name ? `Vencedor: ${item.winner_name}` : `Concorrente: ${item.competitor}`}</small>
+            <small>${item.winner_confirmed ? `Vencedor: ${item.winner_name}` : "Buy box não confirmada pela API"}</small>
           </div>
         </article>
       `
     )
     .join("");
+}
+
+function catalogWinnerName(item) {
+  return item.winner_confirmed ? (item.winner_name || "Indisponível") : "Não confirmado pela API";
+}
+
+function catalogWinnerPrice(item) {
+  return item.winner_confirmed && item.winner_price ? money.format(item.winner_price) : "-";
 }
 
 function renderFilterOptions() {
