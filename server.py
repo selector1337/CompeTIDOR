@@ -1406,9 +1406,20 @@ def normalize_competition(client, account, item):
         except Exception as exc:
             data["public_buybox_error"] = str(exc)
 
+    if not data.get("winner_confirmed") and (data.get("catalog_reference_price") or data.get("catalog_reference_name") or data.get("catalog_reference_seller_id")):
+        data["winner_seller_id"] = data.get("catalog_reference_seller_id") or ""
+        data["winner_name"] = data.get("catalog_reference_name") or (
+            f"Seller {data.get('catalog_reference_seller_id')}" if data.get("catalog_reference_seller_id") else "Vendedor da buybox"
+        )
+        data["winner_price"] = data.get("catalog_reference_price")
+        data["winner_confirmed"] = True
+        data["winner_source"] = "catalog_reference"
+        data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "catalog_reference"
+        data["competition_reason"] = "Buybox operacional baseada na primeira oferta elegível retornada pelo catálogo Mercado Livre."
+
     if not data.get("winner_confirmed"):
         data["winner_seller_id"] = ""
-        data["winner_name"] = "Não confirmado pela API"
+        data["winner_name"] = "Aguardando atualização"
         data["winner_price"] = None
     if data["competition_status"] == "not_listed" and not data.get("winner_seller_id"):
         data["winner_name"] = "Sem vencedor disponível"

@@ -436,8 +436,7 @@ function renderCatalog() {
               ${item.meli_status ? fact("Status ML", item.meli_status === "paused" ? "Pausado" : item.meli_status) : ""}
               ${fact("Vencedor", catalogWinnerName(item))}
               ${fact("Preço vencedor", catalogWinnerPrice(item))}
-              ${item.winner_confirmed ? fact("Fonte vencedor", catalogWinnerSource(item.winner_source)) : ""}
-              ${!item.winner_confirmed && item.catalog_reference_price ? fact("Oferta da lista", money.format(item.catalog_reference_price)) : ""}
+              ${catalogWinnerSourceValue(item) ? fact("Fonte vencedor", catalogWinnerSourceValue(item)) : ""}
               ${fact("Preço p/ ganhar", item.price_to_win ? money.format(item.price_to_win) : "Sem sugestão ML")}
             </div>
             <div class="progress"><span style="width:${item.share}%; background:${colors[item.status]}; color:${colors[item.status]}"></span></div>
@@ -458,7 +457,7 @@ function renderCatalog() {
           <div class="score">
             <small>Participação estimada</small>
             <strong>${item.share}%</strong>
-            <small>${item.winner_confirmed ? `Vencedor: ${item.winner_name}` : "Buy box não confirmada pela API"}</small>
+            <small>Vencedor: ${catalogWinnerName(item)}</small>
           </div>
         </article>
       `
@@ -467,11 +466,22 @@ function renderCatalog() {
 }
 
 function catalogWinnerName(item) {
-  return item.winner_confirmed ? (item.winner_name || "Indisponível") : "Não confirmado pela API";
+  if (item.winner_confirmed && item.winner_name) return item.winner_name;
+  if (item.catalog_reference_name) return item.catalog_reference_name;
+  if (item.catalog_reference_seller_id) return `Seller ${item.catalog_reference_seller_id}`;
+  if (item.catalog_reference_price) return "Vendedor da buybox";
+  return item.winner_name && !/não confirmado/i.test(item.winner_name) ? item.winner_name : "Aguardando atualização";
 }
 
 function catalogWinnerPrice(item) {
-  return item.winner_confirmed && item.winner_price ? money.format(item.winner_price) : "-";
+  const value = item.winner_price || item.catalog_reference_price;
+  return value ? money.format(value) : "-";
+}
+
+function catalogWinnerSourceValue(item) {
+  if (item.winner_confirmed && item.winner_source) return catalogWinnerSource(item.winner_source);
+  if (item.catalog_reference_price || item.catalog_reference_name || item.catalog_reference_seller_id) return "Catálogo ML";
+  return "";
 }
 
 function catalogWinnerSource(source) {
@@ -479,6 +489,7 @@ function catalogWinnerSource(source) {
     price_to_win: "API oficial",
     products_items_winner_marker: "API catálogo",
     public_product_page: "Página pública ML",
+    catalog_reference: "Catálogo ML",
   };
   return sources[source] || "Mercado Livre";
 }
