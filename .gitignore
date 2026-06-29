@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.log
+
+# Dados locais e produção: podem conter tokens OAuth, sessões, Telegram e credenciais.
+data/*.json
+data/certs/
+
+# Binários/atalhos locais de teste.
+cloudflared.exe
