@@ -3,6 +3,7 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import parse_qs, urlencode, urlparse
 import json
+import html
 import hashlib
 import hmac
 import os
@@ -591,6 +592,9 @@ class MercadoLivreClient:
     def item(self, item_id):
         return self.get(f"/items/{item_id}")
 
+    def product(self, catalog_product_id):
+        return self.get(f"/products/{catalog_product_id}")
+
     def price_to_win(self, item_id):
         return self.get(f"/items/{item_id}/price_to_win?version=v2")
 
@@ -1154,6 +1158,101 @@ def auto_scan_loop():
         time.sleep(interval)
 
 
+def parse_brl_price(text):
+    match = re.search(r"R\$\s*([\d\.]+)(?:,(\d{2}))?", text or "")
+    if not match:
+        return None
+    whole = match.group(1).replace(".", "")
+    cents = match.group(2) or "00"
+    try:
+        return float(f"{whole}.{cents}")
+    except ValueError:
+        return None
+
+
+def visible_page_lines(html_text):
+    text = re.sub(r"(?is)<(script|style|noscript).*?</\1>", "\n", html_text or "")
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|section|article|li|h[1-6]|span|a)>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if re.sub(r"\s+", " ", line).strip()]
+
+
+def product_public_url(client, catalog_product_id):
+    try:
+        product = client.product(catalog_product_id)
+        permalink = product.get("permalink") or product.get("url")
+        if permalink:
+            return permalink, product.get("name") or product.get("title") or ""
+    except Exception:
+        pass
+    return f"https://www.mercadolivre.com.br/p/{catalog_product_id}", ""
+
+
+def fetch_public_buybox(client, catalog_product_id):
+    url, product_title = product_public_url(client, catalog_product_id)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as response:
+        html_text = response.read().decode("utf-8", errors="replace")
+        final_url = response.geturl() or url
+    lines = visible_page_lines(html_text)
+    seller_name = ""
+    price = None
+    for index, line in enumerate(lines):
+        if "Vendido por" in line:
+            tail = line.split("Vendido por", 1)[1].strip(" :·-")
+            if tail:
+                seller_name = tail
+            for candidate in lines[index + 1 : index + 5]:
+                if candidate and not re.search(r"mercadolíder|mercado líder|vendas|devolução|garantia|compra garantida", candidate, re.I):
+                    seller_name = seller_name or candidate
+                    break
+            break
+    anchors = []
+    if product_title:
+        anchors.append(product_title)
+    anchors.extend(["Novo |", "Adicionar aos favoritos", "Compartilhar"])
+    search_text = "\n".join(lines)
+    start = 0
+    for anchor in anchors:
+        pos = search_text.lower().find(anchor.lower())
+        if pos >= 0:
+            start = pos
+            break
+    end = len(search_text)
+    for anchor in ["Opções de compra", "Ir para a compra", "O que você precisa saber", "Características"]:
+        pos = search_text.find(anchor, start)
+        if pos > start:
+            end = min(end, pos)
+    main_area = search_text[start:end]
+    price_matches = [match.group(0) for match in re.finditer(r"R\$\s*[\d\.]+(?:,\d{2})?", main_area)]
+    for raw_price in price_matches:
+        if re.search(r"x\s*" + re.escape(raw_price), main_area):
+            continue
+        price = parse_brl_price(raw_price)
+        if price:
+            break
+    if not price:
+        price = parse_brl_price(search_text)
+    if not seller_name and "Vendido por" in search_text:
+        seller_name = "Vendedor informado na página pública"
+    if not price and not seller_name:
+        raise RuntimeError("Não foi possível extrair buybox da página pública do Mercado Livre.")
+    return {
+        "seller_name": seller_name or "Vendedor da buybox",
+        "price": price,
+        "url": final_url,
+    }
+
+
 def normalize_competition(client, account, item):
     item_id = item.get("id")
     catalog_product_id = item.get("catalog_product_id")
@@ -1242,6 +1341,18 @@ def normalize_competition(client, account, item):
         except Exception as exc:
             if not data["competition_reason"]:
                 data["competition_reason"] = str(exc)
+
+    if catalog_product_id and not data.get("winner_confirmed"):
+        try:
+            public_buybox = fetch_public_buybox(client, catalog_product_id)
+            data["winner_name"] = public_buybox.get("seller_name") or "Vendedor da buybox"
+            data["winner_price"] = public_buybox.get("price")
+            data["winner_confirmed"] = True
+            data["winner_source"] = "public_product_page"
+            data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "public_buybox"
+            data["competition_reason"] = "Buybox verificada na página pública do Mercado Livre."
+        except Exception as exc:
+            data["public_buybox_error"] = str(exc)
 
     if not data.get("winner_confirmed"):
         data["winner_seller_id"] = ""

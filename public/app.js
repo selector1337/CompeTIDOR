@@ -436,6 +436,7 @@ function renderCatalog() {
               ${item.meli_status ? fact("Status ML", item.meli_status === "paused" ? "Pausado" : item.meli_status) : ""}
               ${fact("Vencedor", catalogWinnerName(item))}
               ${fact("Preço vencedor", catalogWinnerPrice(item))}
+              ${item.winner_confirmed ? fact("Fonte vencedor", catalogWinnerSource(item.winner_source)) : ""}
               ${!item.winner_confirmed && item.catalog_reference_price ? fact("Oferta da lista", money.format(item.catalog_reference_price)) : ""}
               ${fact("Preço p/ ganhar", item.price_to_win ? money.format(item.price_to_win) : "Sem sugestão ML")}
             </div>
@@ -471,6 +472,15 @@ function catalogWinnerName(item) {
 
 function catalogWinnerPrice(item) {
   return item.winner_confirmed && item.winner_price ? money.format(item.winner_price) : "-";
+}
+
+function catalogWinnerSource(source) {
+  const sources = {
+    price_to_win: "API oficial",
+    products_items_winner_marker: "API catálogo",
+    public_product_page: "Página pública ML",
+  };
+  return sources[source] || "Mercado Livre";
 }
 
 function renderFilterOptions() {
