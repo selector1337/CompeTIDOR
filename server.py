@@ -837,9 +837,9 @@ def offer_value(row, keys, default=""):
     return first_present(row, keys, default)
 
 
-def catalog_offer_candidates(rows):
+def catalog_offer_candidates(rows, sort_by_price=True):
     candidates = []
-    for row in rows or []:
+    for position, row in enumerate(rows or []):
         price = offer_value(row, ["price", "sale_price.amount", "current_price", "amount"], 0) or 0
         try:
             price = float(price)
@@ -848,6 +848,17 @@ def catalog_offer_candidates(rows):
         item_id = offer_value(row, ["item_id", "id", "item.id"], "")
         seller_id = offer_value(row, ["seller_id", "seller.id", "seller.id_seller"], "")
         permalink = offer_value(row, ["permalink", "item.permalink"], "")
+        tags = row.get("tags") if isinstance(row, dict) else []
+        tags = tags if isinstance(tags, list) else []
+        winner_markers = [
+            row.get("winner") if isinstance(row, dict) else None,
+            row.get("winning") if isinstance(row, dict) else None,
+            row.get("is_winner") if isinstance(row, dict) else None,
+            first_present(row, ["metadata.winner", "catalog_position.winner"], None) if isinstance(row, dict) else None,
+        ]
+        is_winner = any(str(marker).lower() == "true" for marker in winner_markers) or any(
+            str(tag).lower() in {"winner", "catalog_winner", "best_seller"} for tag in tags
+        )
         if price:
             candidates.append(
                 {
@@ -855,13 +866,17 @@ def catalog_offer_candidates(rows):
                     "item_id": item_id,
                     "seller_id": str(seller_id) if seller_id else "",
                     "permalink": permalink,
+                    "position": position,
+                    "is_winner": is_winner,
                     "raw": row,
                 }
             )
-    return sorted(candidates, key=lambda item: item["price"])
+    if sort_by_price:
+        return sorted(candidates, key=lambda item: item["price"])
+    return sorted(candidates, key=lambda item: (0 if item.get("is_winner") else 1, item.get("position", 999999)))
 
 
-def live_catalog_offers(payload, candidates):
+def live_catalog_offers(payload, candidates, sort_by_price=True):
     live = []
     max_offers = max(1, int(os.getenv("SCAN_VALIDATE_OFFERS_LIMIT", "150")))
     for candidate in candidates[:max_offers]:
@@ -892,7 +907,9 @@ def live_catalog_offers(payload, candidates):
                 "title": item.get("title") or "",
             }
         )
-    return sorted(live, key=lambda item: item["price"])
+    if sort_by_price:
+        return sorted(live, key=lambda item: item["price"])
+    return sorted(live, key=lambda item: (0 if item.get("is_winner") else 1, item.get("position", 999999)))
 
 
 def scan_meli_item(payload, scan_id):
@@ -1178,20 +1195,24 @@ def normalize_competition(client, account, item):
             if isinstance(rows, dict):
                 rows = rows.get("results") or rows.get("items") or []
             if rows:
-                candidates = catalog_offer_candidates(rows)
+                candidates = catalog_offer_candidates(rows, sort_by_price=False)
+                live_candidates = live_catalog_offers({"accounts": [account]}, candidates, sort_by_price=False)
+                if live_candidates:
+                    candidates = live_candidates
                 winner = candidates[0] if candidates else {"raw": rows[0], "price": None, "item_id": "", "seller_id": ""}
                 raw_winner = winner.get("raw") or rows[0]
                 seller_id = str(winner.get("seller_id") or first_present(raw_winner, ["seller_id", "seller.id", "seller.id_seller"], ""))
                 winner_item_id = winner.get("item_id") or first_present(raw_winner, ["item_id", "id", "item.id"], "")
-                if winner_item_id and not seller_id:
+                if winner_item_id:
                     try:
                         winner_item = client.item(winner_item_id)
-                        seller_id = str(winner_item.get("seller_id") or "")
-                        data["winner_price"] = data["winner_price"] or winner_item.get("price")
+                        if winner_item.get("status") in {"active", "under_review", None, ""}:
+                            seller_id = seller_id or str(winner_item.get("seller_id") or "")
+                            data["winner_price"] = winner_item.get("price") or data["winner_price"]
                     except Exception:
                         pass
                 data["winner_seller_id"] = seller_id
-                data["winner_price"] = winner.get("price") or first_present(raw_winner, ["price", "sale_price.amount", "current_price"], data["winner_price"])
+                data["winner_price"] = data["winner_price"] or winner.get("price") or first_present(raw_winner, ["price", "sale_price.amount", "current_price"], None)
                 data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "listed"
                 if seller_id and seller_id == str(account.get("seller_id")):
                     data["winner_name"] = account.get("nickname", "Sua conta")
