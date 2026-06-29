@@ -1158,6 +1158,38 @@ def auto_scan_loop():
         time.sleep(interval)
 
 
+def auto_official_sync_loop():
+    interval = max(300, int(os.getenv("AUTO_SYNC_INTERVAL_SECONDS", "900")))
+    startup_delay = max(20, int(os.getenv("AUTO_SYNC_STARTUP_DELAY_SECONDS", "45")))
+    time.sleep(startup_delay)
+    while True:
+        try:
+            payload = read_payload()
+            accounts = [
+                account
+                for account in payload.get("accounts", [])
+                if account.get("official") and account.get("access_token") and account.get("status") == "connected"
+            ]
+            changed = False
+            for account in accounts:
+                try:
+                    result = sync_official_account(payload, account.get("id"), "all")
+                    account["auto_sync_status"] = f"Sincronização automática OK: {result.get('items', 0)} anúncios"
+                    account["auto_sync_error"] = ""
+                    account["last_auto_sync_at"] = now_label()
+                    changed = True
+                except Exception as exc:
+                    account["auto_sync_status"] = "Sincronização automática com erro"
+                    account["auto_sync_error"] = str(exc)
+                    account["last_auto_sync_at"] = now_label()
+                    changed = True
+            if changed:
+                write_payload(payload)
+        except Exception:
+            pass
+        time.sleep(interval)
+
+
 def parse_brl_price(text):
     match = re.search(r"R\$\s*([\d\.]+)(?:,(\d{2}))?", text or "")
     if not match:
@@ -1179,19 +1211,39 @@ def visible_page_lines(html_text):
     return [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if re.sub(r"\s+", " ", line).strip()]
 
 
-def product_public_url(client, catalog_product_id):
+def product_public_urls(client, catalog_product_id, item=None):
+    urls = []
+    item_permalink = (item or {}).get("permalink") or ""
+    if item_permalink:
+        urls.append(item_permalink)
     try:
         product = client.product(catalog_product_id)
         permalink = product.get("permalink") or product.get("url")
         if permalink:
-            return permalink, product.get("name") or product.get("title") or ""
+            urls.append(permalink)
+        product_title = product.get("name") or product.get("title") or ""
     except Exception:
-        pass
-    return f"https://www.mercadolivre.com.br/p/{catalog_product_id}", ""
+        product_title = ""
+    urls.append(f"https://www.mercadolivre.com.br/p/{catalog_product_id}")
+    deduped = []
+    for url in urls:
+        if url and url not in deduped:
+            deduped.append(url)
+    return deduped, product_title
 
 
-def fetch_public_buybox(client, catalog_product_id):
-    url, product_title = product_public_url(client, catalog_product_id)
+def fetch_public_buybox(client, catalog_product_id, item=None):
+    urls, product_title = product_public_urls(client, catalog_product_id, item)
+    last_error = None
+    for url in urls:
+        try:
+            return fetch_public_buybox_url(url, product_title)
+        except Exception as exc:
+            last_error = exc
+    raise last_error or RuntimeError("Não foi possível consultar a página pública do Mercado Livre.")
+
+
+def fetch_public_buybox_url(url, product_title=""):
     req = urllib.request.Request(
         url,
         headers={
@@ -1344,7 +1396,7 @@ def normalize_competition(client, account, item):
 
     if catalog_product_id and not data.get("winner_confirmed"):
         try:
-            public_buybox = fetch_public_buybox(client, catalog_product_id)
+            public_buybox = fetch_public_buybox(client, catalog_product_id, item)
             data["winner_name"] = public_buybox.get("seller_name") or "Vendedor da buybox"
             data["winner_price"] = public_buybox.get("price")
             data["winner_confirmed"] = True
@@ -2689,6 +2741,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=https_server.serve_forever, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
+    threading.Thread(target=auto_official_sync_loop, daemon=True).start()
     print(f"CompeTIDOR rodando em http://127.0.0.1:{port}")
     print(f"Callback HTTPS em https://127.0.0.1:{https_port()}/api/oauth/callback")
     http_server.serve_forever()
