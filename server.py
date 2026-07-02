@@ -2058,6 +2058,33 @@ def clone_shipping_payload(item):
     return payload
 
 
+def clone_extra_required_fields(item):
+    fields = {}
+    body_fields = (
+        "family_name",
+        "catalog_product_id",
+        "domain_id",
+        "official_store_id",
+    )
+    for field in body_fields:
+        if item.get(field) not in (None, "", [], {}):
+            fields[field] = item.get(field)
+    attribute_to_body = {
+        "FAMILY_NAME": "family_name",
+        "MODEL": "family_name",
+    }
+    for attribute in item.get("attributes") or []:
+        attr_id = str(attribute.get("id") or "").upper()
+        field = attribute_to_body.get(attr_id)
+        if field and not fields.get(field):
+            value = attribute.get("value_name")
+            if not value and attribute.get("values"):
+                value = (attribute.get("values") or [{}])[0].get("name")
+            if value:
+                fields[field] = value
+    return fields
+
+
 def build_clone_item_payload(source_item, edits):
     source_sku = source_item.get("seller_custom_field") or item_sku(source_item) or source_item.get("id") or "SEM-SKU"
     sku_suffix = edits.get("sku_suffix") or "-COPIA"
@@ -2075,12 +2102,49 @@ def build_clone_item_payload(source_item, edits):
         "attributes": clone_attributes_payload(source_item, new_sku),
         "sale_terms": clone_sale_terms_payload(source_item),
     }
+    payload.update(clone_extra_required_fields(source_item))
     shipping = clone_shipping_payload(source_item)
     if shipping:
         payload["shipping"] = shipping
     if source_item.get("seller_custom_field"):
         payload["seller_custom_field"] = new_sku
     return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
+
+
+def required_fields_from_error(exc):
+    text = str(exc)
+    match = re.search(r"properties \[([^\]]+)\]", text)
+    if not match:
+        return []
+    return [field.strip().strip("'\"") for field in match.group(1).split(",") if field.strip()]
+
+
+def source_attribute_value(source_item, ids):
+    wanted = {item.upper() for item in ids}
+    for attribute in source_item.get("attributes") or []:
+        if str(attribute.get("id") or "").upper() not in wanted:
+            continue
+        value = attribute.get("value_name")
+        if not value and attribute.get("values"):
+            value = (attribute.get("values") or [{}])[0].get("name")
+        if value:
+            return value
+    return ""
+
+
+def fill_missing_clone_fields(create_payload, source_item, fields):
+    for field in fields:
+        if create_payload.get(field):
+            continue
+        if field == "family_name":
+            create_payload[field] = (
+                source_item.get("family_name")
+                or source_attribute_value(source_item, ["FAMILY_NAME", "MODEL", "LINE", "BRAND"])
+                or (source_item.get("title") or "")[:60]
+            )
+        elif field in source_item and source_item.get(field) not in (None, "", [], {}):
+            create_payload[field] = source_item.get(field)
+    return create_payload
 
 
 def create_official_clone(payload, job, source_item_id, edits):
@@ -2094,7 +2158,14 @@ def create_official_clone(payload, job, source_item_id, edits):
     target_client = account_client(target_account)
     source_item = source_client.item(source_item_id)
     create_payload = build_clone_item_payload(source_item, edits)
-    created = target_client.create_item(create_payload)
+    try:
+        created = target_client.create_item(create_payload)
+    except Exception as exc:
+        missing_fields = required_fields_from_error(exc)
+        if not missing_fields:
+            raise
+        create_payload = fill_missing_clone_fields(create_payload, source_item, missing_fields)
+        created = target_client.create_item(create_payload)
     description_text = (edits.get("description") or "").strip()
     if not description_text:
         try:
