@@ -50,6 +50,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/users/[^/]+/items/search(\?|$)"),
     re.compile(r"^/items[^/]*(\?|$)"),
     re.compile(r"^/items/[^/]+(\?|$)"),
+    re.compile(r"^/items/[^/]+/description(\?|$)"),
     re.compile(r"^/items/[^/]+/price_to_win(\?|$)"),
     re.compile(r"^/products/[^/]+(\?|$)"),
     re.compile(r"^/products/[^/]+/items(\?|$)"),
@@ -637,6 +638,9 @@ class MercadoLivreClient:
     def item(self, item_id):
         return self.get(f"/items/{item_id}")
 
+    def item_description(self, item_id):
+        return self.get(f"/items/{item_id}/description")
+
     def product(self, catalog_product_id):
         return self.get(f"/products/{catalog_product_id}")
 
@@ -648,6 +652,9 @@ class MercadoLivreClient:
 
     def create_item(self, payload):
         return self.post("/items", payload)
+
+    def create_item_description(self, item_id, plain_text):
+        return self.post(f"/items/{item_id}/description", {"plain_text": plain_text})
 
     def update_item(self, item_id, payload):
         return self.put(f"/items/{item_id}", payload)
@@ -1973,6 +1980,136 @@ def unlink_official_account(payload, account_id):
     return public_account(account)
 
 
+def official_account_by_name(payload, name):
+    return next(
+        (
+            account
+            for account in payload.get("accounts", [])
+            if account.get("nickname") == name or account.get("id") == name or str(account.get("seller_id")) == str(name)
+        ),
+        None,
+    )
+
+
+def clone_picture_payload(item):
+    pictures = item.get("pictures") or []
+    rows = []
+    for picture in pictures:
+        url = picture.get("secure_url") or picture.get("url")
+        if url:
+            rows.append({"source": url})
+    return rows
+
+
+def clone_attributes_payload(item, source_sku):
+    attributes = []
+    for attribute in item.get("attributes") or []:
+        attr_id = attribute.get("id")
+        if not attr_id:
+            continue
+        row = {"id": attr_id}
+        if attribute.get("value_id"):
+            row["value_id"] = attribute.get("value_id")
+        elif attribute.get("value_name"):
+            row["value_name"] = attribute.get("value_name")
+        elif attribute.get("values"):
+            values = []
+            for value in attribute.get("values") or []:
+                if value.get("id"):
+                    values.append({"id": value.get("id")})
+                elif value.get("name"):
+                    values.append({"name": value.get("name")})
+            if values:
+                row["values"] = values
+        if len(row) > 1:
+            attributes.append(row)
+    if source_sku:
+        existing = next((attr for attr in attributes if attr.get("id") in {"SELLER_SKU", "SKU"}), None)
+        if existing:
+            existing.pop("value_id", None)
+            existing["value_name"] = source_sku
+        else:
+            attributes.append({"id": "SELLER_SKU", "value_name": source_sku})
+    return attributes
+
+
+def clone_sale_terms_payload(item):
+    terms = []
+    for term in item.get("sale_terms") or []:
+        term_id = term.get("id")
+        if not term_id:
+            continue
+        row = {"id": term_id}
+        if term.get("value_id"):
+            row["value_id"] = term.get("value_id")
+        elif term.get("value_name"):
+            row["value_name"] = term.get("value_name")
+        if len(row) > 1:
+            terms.append(row)
+    return terms
+
+
+def clone_shipping_payload(item):
+    shipping = item.get("shipping") or {}
+    allowed_keys = ("mode", "local_pick_up", "free_shipping", "logistic_type", "store_pick_up")
+    payload = {key: shipping.get(key) for key in allowed_keys if key in shipping and shipping.get(key) is not None}
+    if payload.get("logistic_type") in {"fulfillment", "xd_drop_off"}:
+        payload.pop("logistic_type", None)
+    return payload
+
+
+def build_clone_item_payload(source_item, edits):
+    source_sku = source_item.get("seller_custom_field") or item_sku(source_item) or source_item.get("id") or "SEM-SKU"
+    sku_suffix = edits.get("sku_suffix") or "-COPIA"
+    new_sku = f"{source_sku}{sku_suffix}"
+    payload = {
+        "title": (edits.get("title") or source_item.get("title") or "").strip(),
+        "category_id": source_item.get("category_id"),
+        "price": float(edits.get("price") or source_item.get("price") or 0),
+        "currency_id": source_item.get("currency_id") or "BRL",
+        "available_quantity": int(float(edits.get("stock") or source_item.get("available_quantity") or 1)),
+        "buying_mode": source_item.get("buying_mode") or "buy_it_now",
+        "listing_type_id": source_item.get("listing_type_id") or "gold_special",
+        "condition": source_item.get("condition") or "new",
+        "pictures": clone_picture_payload(source_item),
+        "attributes": clone_attributes_payload(source_item, new_sku),
+        "sale_terms": clone_sale_terms_payload(source_item),
+    }
+    shipping = clone_shipping_payload(source_item)
+    if shipping:
+        payload["shipping"] = shipping
+    if source_item.get("seller_custom_field"):
+        payload["seller_custom_field"] = new_sku
+    return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
+
+
+def create_official_clone(payload, job, source_item_id, edits):
+    source_account = official_account_by_name(payload, job.get("source"))
+    target_account = official_account_by_name(payload, job.get("target"))
+    if not source_account or not source_account.get("official"):
+        raise RuntimeError("Conta origem oficial não encontrada para clonar via Mercado Livre.")
+    if not target_account or not target_account.get("official"):
+        raise RuntimeError("Conta destino oficial não encontrada para clonar via Mercado Livre.")
+    source_client = account_client(source_account)
+    target_client = account_client(target_account)
+    source_item = source_client.item(source_item_id)
+    create_payload = build_clone_item_payload(source_item, edits)
+    created = target_client.create_item(create_payload)
+    description_text = (edits.get("description") or "").strip()
+    if not description_text:
+        try:
+            description = source_client.item_description(source_item_id)
+            description_text = description.get("plain_text") or description.get("text") or ""
+        except Exception:
+            description_text = ""
+    if description_text and created.get("id"):
+        try:
+            target_client.create_item_description(created["id"], description_text)
+        except Exception:
+            pass
+    return created, source_item
+
+
 class App(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
@@ -2853,34 +2990,47 @@ class App(BaseHTTPRequestHandler):
                 catalog = payload.setdefault("catalog", [])
                 existing_ids = {item.get("id") for item in catalog if item.get("id")}
                 copied = []
+                errors = []
                 edits = job.get("edits") or {}
                 for item_id in job.get("item_ids", []):
                     source_item = next((item for item in catalog if item.get("id") == item_id), None)
                     if not source_item:
                         continue
-                    new_id = f"COPY-{uuid.uuid4().hex[:6].upper()}"
-                    while new_id in existing_ids:
-                        new_id = f"COPY-{uuid.uuid4().hex[:6].upper()}"
+                    try:
+                        created, official_source = create_official_clone(payload, job, item_id, edits)
+                    except Exception as exc:
+                        errors.append({"item_id": item_id, "error": str(exc)})
+                        continue
+                    new_id = created.get("id") or f"COPY-{uuid.uuid4().hex[:6].upper()}"
+                    if new_id in existing_ids:
+                        continue
                     existing_ids.add(new_id)
-                    source_sku = source_item.get("sku") or source_item.get("seller_sku") or source_item.get("id") or "SEM-SKU"
-                    new_item = {
-                        **source_item,
-                        "id": new_id,
-                        "account": job.get("target"),
-                        "title": edits.get("title") or source_item.get("title") or source_item.get("id") or new_id,
-                        "sku": f"{source_sku}{edits.get('sku_suffix') or '-COPIA'}",
-                        "price": float(edits.get("price") or source_item.get("price") or 0),
-                        "stock": int(float(edits.get("stock") or source_item.get("stock") or 0)),
-                        "status": "sharing",
-                        "share": 0,
-                        "description_override": edits.get("description", ""),
-                        "action": f"Anúncio copiado de {source_item.get('id')} para {job.get('target')}. Revise estoque, preço e políticas antes de publicar oficialmente.",
-                    }
+                    target_account = official_account_by_name(payload, job.get("target")) or {}
+                    source_sku = source_item.get("sku") or item_sku(official_source) or source_item.get("id") or "SEM-SKU"
+                    new_item = synced_catalog_item(target_account, {**official_source, **created})
+                    new_item.update(
+                        {
+                            "id": new_id,
+                            "account": job.get("target"),
+                            "account_id": target_account.get("id"),
+                            "sku": f"{source_sku}{edits.get('sku_suffix') or '-COPIA'}",
+                            "price": created.get("price") or float(edits.get("price") or source_item.get("price") or 0),
+                            "stock": created.get("available_quantity") or int(float(edits.get("stock") or source_item.get("stock") or 0)),
+                            "status": "sharing",
+                            "share": 0,
+                            "clone_source_item_id": item_id,
+                            "description_override": edits.get("description", ""),
+                            "action": f"Anúncio criado oficialmente no Mercado Livre a partir de {source_item.get('id')}.",
+                        }
+                    )
                     catalog.append(new_item)
                     copied.append(new_item)
-                job["status"] = "copied"
+                job["status"] = "copied" if copied and not errors else "partial_error" if copied else "error"
                 job["copied_items"] = [item.get("id") for item in copied]
-                job["note"] = f"{len(copied)} anúncios copiados para {job.get('target')} no ambiente do CompeTIDOR."
+                job["errors"] = errors
+                job["note"] = f"{len(copied)} anúncio(s) criados oficialmente no Mercado Livre para {job.get('target')}."
+                if errors:
+                    job["note"] += f" {len(errors)} anúncio(s) falharam; veja erros no job."
                 write_payload(payload)
                 self.send_json({"ok": True, "job": job, "copied": copied})
             except Exception as exc:

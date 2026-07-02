@@ -904,6 +904,7 @@ function renderClone() {
             <strong>${job.source} -> ${job.target}</strong>
             <div class="meta-row"><span>${job.items} anúncios</span><span>${(job.item_ids || []).join(", ")}</span></div>
             <p>${job.note}</p>
+            ${job.errors?.length ? `<div class="notice danger-notice">${job.errors.map((row) => `${escapeText(row.item_id)}: ${escapeText(row.error)}`).join("<br>")}</div>` : ""}
             ${job.status === "preview_ready" ? `<button class="mini-button" data-execute-clone="${job.id}">Copiar agora</button>` : ""}
           </div>
           <span class="badge winning">${job.status}</span>
