@@ -889,9 +889,7 @@ function renderClone() {
   target.innerHTML = options;
   if ([...source.options].some((option) => option.value === currentSource)) source.value = currentSource;
   if ([...target.options].some((option) => option.value === currentTarget)) target.value = currentTarget;
-  if ((!hadTarget || target.value === source.value) && target.options.length > 1) {
-    target.selectedIndex = target.options[0].value === source.value ? 1 : 0;
-  }
+  if (!hadTarget && target.options.length) target.selectedIndex = 0;
   const copyProduct = document.querySelector("#copy-product-filter");
   const copySku = document.querySelector("#copy-sku-filter");
   if (copyProduct && copyProduct.value !== state.copySearch) copyProduct.value = state.copySearch;
@@ -1365,13 +1363,13 @@ document.querySelector("#accounts-list").addEventListener("click", async (event)
   button.disabled = true;
   button.textContent = "Sincronizando...";
   try {
-    await api("/api/meli/sync", {
+    const result = await api("/api/meli/sync", {
       method: "POST",
       body: JSON.stringify({ account_id: button.dataset.syncAccount, limit: "all" }),
     });
     await load();
-    showToast("Anúncios sincronizados com sucesso.");
-    location.hash = "#/catalogo";
+    showToast(result.queued ? "Sincronização iniciada em segundo plano." : "Anúncios sincronizados com sucesso.");
+    if (!result.queued) location.hash = "#/catalogo";
   } catch (error) {
     showToast(error.message || "Não foi possível sincronizar a conta.", "error");
     if (feedback) {
@@ -1403,10 +1401,6 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
   const itemIds = [...state.cloneSelectedIds];
   if (!itemIds.length) {
     alert("Selecione pelo menos um anúncio específico para copiar.");
-    return;
-  }
-  if (form.get("source") === form.get("target")) {
-    alert("Escolha uma conta destino diferente da origem.");
     return;
   }
   try {

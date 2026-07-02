@@ -24,6 +24,8 @@ DATA.mkdir(exist_ok=True)
 CERTS = DATA / "certs"
 CERTS.mkdir(exist_ok=True)
 APP_DATA_FILE = "app.json"
+SYNC_LOCK = threading.Lock()
+ACTIVE_SYNC_ACCOUNTS = set()
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -575,11 +577,54 @@ class MercadoLivreClient:
     def seller_items(self, seller_id, limit=50, offset=0):
         return self.get(f"/users/{seller_id}/items/search?limit={limit}&offset={offset}")
 
-    def seller_all_items(self, seller_id, max_items=1000):
+    def seller_items_scan(self, seller_id, limit=100, scroll_id="", status=""):
+        params = {"search_type": "scan", "limit": min(int(limit or 100), 100)}
+        if scroll_id:
+            params["scroll_id"] = scroll_id
+        if status:
+            params["status"] = status
+        return self.get(f"/users/{seller_id}/items/search?{urlencode(params)}")
+
+    def seller_all_items(self, seller_id, max_items=None):
+        max_items = None if max_items in (None, "all", 0, "0") else int(max_items)
+        statuses = [
+            status.strip()
+            for status in os.getenv("MELI_SYNC_STATUSES", "active,paused,under_review").split(",")
+            if status.strip()
+        ]
+        results = []
+        seen = set()
+        for status in statuses:
+            scroll_id = ""
+            empty_pages = 0
+            max_pages = max(1, int(os.getenv("MELI_SCAN_MAX_PAGES", "1000")))
+            for _ in range(max_pages):
+                page = self.seller_items_scan(seller_id, limit=100, scroll_id=scroll_id, status=status)
+                batch = page.get("results", []) or []
+                added = 0
+                for item_id in batch:
+                    if item_id and item_id not in seen:
+                        seen.add(item_id)
+                        results.append(item_id)
+                        added += 1
+                        if max_items and len(results) >= max_items:
+                            return results[:max_items]
+                scroll_id = page.get("scroll_id") or scroll_id
+                if not batch or added == 0:
+                    empty_pages += 1
+                if not scroll_id or empty_pages >= 2:
+                    break
+            if max_items and len(results) >= max_items:
+                break
+        if results:
+            return results[:max_items] if max_items else results
+
+        # Fallback para contas/permissões em que search_type=scan não esteja disponível.
+        fallback_limit = max_items or int(os.getenv("MELI_OFFSET_FALLBACK_LIMIT", "1000"))
         results = []
         offset = 0
         page_size = 50
-        while len(results) < max_items:
+        while len(results) < fallback_limit:
             page = self.seller_items(seller_id, page_size, offset)
             batch = page.get("results", [])
             results.extend(batch)
@@ -587,7 +632,7 @@ class MercadoLivreClient:
             if not batch or len(results) >= total:
                 break
             offset += page_size
-        return results[:max_items]
+        return results[:fallback_limit]
 
     def item(self, item_id):
         return self.get(f"/items/{item_id}")
@@ -1810,7 +1855,7 @@ def sync_official_account(payload, account_id, limit=None):
 
     client = account_client(account)
     user_profile = client.user(account["seller_id"])
-    item_ids = client.seller_all_items(account["seller_id"], max_items=1000 if limit in (None, "all") else int(limit))
+    item_ids = client.seller_all_items(account["seller_id"], max_items=None if limit in (None, "all") else int(limit))
     imported = []
     for item_id in item_ids:
         try:
@@ -1828,10 +1873,75 @@ def sync_official_account(payload, account_id, limit=None):
     payload["catalog"].extend(imported)
     account["last_sync"] = now_label()
     account["sync_status"] = f"{len(imported)} anúncios importados da API oficial"
+    account["sync_total_item_ids"] = len(item_ids)
     upsert_metric(payload, account, user_profile)
     add_stock_alerts(payload, account, imported)
     sync_recent_sales(payload, account, client)
     return {"account": public_account(account), "items": len(imported), "catalog": imported}
+
+
+def enqueue_official_sync(account_id, limit=None, reason="manual"):
+    account_id = str(account_id or "")
+    with SYNC_LOCK:
+        if account_id in ACTIVE_SYNC_ACCOUNTS:
+            return {"queued": False, "status": "running", "message": "Sincronização desta conta já está em andamento."}
+        ACTIVE_SYNC_ACCOUNTS.add(account_id)
+    payload = read_payload()
+    account = next(
+        (
+            item
+            for item in payload.get("accounts", [])
+            if item.get("id") == account_id or str(item.get("seller_id")) == account_id or item.get("nickname") == account_id
+        ),
+        None,
+    )
+    if not account:
+        with SYNC_LOCK:
+            ACTIVE_SYNC_ACCOUNTS.discard(account_id)
+        raise RuntimeError("Conta não encontrada.")
+    account["sync_status"] = "Sincronização em andamento no servidor"
+    account["sync_requested_at"] = now_label()
+    account["sync_reason"] = reason
+    write_payload(payload)
+
+    def worker():
+        try:
+            payload_inner = read_payload()
+            result = sync_official_account(payload_inner, account_id, limit)
+            refreshed = next(
+                (
+                    item
+                    for item in payload_inner.get("accounts", [])
+                    if item.get("id") == account_id or str(item.get("seller_id")) == account_id
+                ),
+                None,
+            )
+            if refreshed:
+                refreshed["sync_status"] = f"Sincronização concluída: {result.get('items', 0)} anúncios importados"
+                refreshed["sync_finished_at"] = now_label()
+                refreshed["sync_error"] = ""
+            write_payload(payload_inner)
+        except Exception as exc:
+            payload_inner = read_payload()
+            failed = next(
+                (
+                    item
+                    for item in payload_inner.get("accounts", [])
+                    if item.get("id") == account_id or str(item.get("seller_id")) == account_id
+                ),
+                None,
+            )
+            if failed:
+                failed["sync_status"] = "Sincronização com erro"
+                failed["sync_error"] = str(exc)
+                failed["sync_finished_at"] = now_label()
+            write_payload(payload_inner)
+        finally:
+            with SYNC_LOCK:
+                ACTIVE_SYNC_ACCOUNTS.discard(account_id)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"queued": True, "status": "queued", "message": "Sincronização iniciada em segundo plano."}
 
 
 def unlink_official_account(payload, account_id):
@@ -2510,10 +2620,14 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/meli/sync":
             try:
                 raw_limit = request.get("limit", "all")
-                limit = None if raw_limit in ("all", "", None) else max(1, min(int(raw_limit), 1000))
-                result = sync_official_account(payload, request.get("account_id", ""), limit)
-                write_payload(payload)
-                self.send_json({"ok": True, **result})
+                limit = None if raw_limit in ("all", "", None) else max(1, int(raw_limit))
+                if limit is None or limit > int(os.getenv("MELI_SYNC_INLINE_LIMIT", "200")):
+                    result = enqueue_official_sync(request.get("account_id", ""), limit, "manual")
+                    self.send_json({"ok": True, **result}, status=202)
+                else:
+                    result = sync_official_account(payload, request.get("account_id", ""), limit)
+                    write_payload(payload)
+                    self.send_json({"ok": True, **result})
             except Exception as exc:
                 message = str(exc)
                 if "PA_UNAUTHORIZED_RESULT_FROM_POLICIES" in message or "HTTP 403" in message:
@@ -2684,9 +2798,6 @@ class App(BaseHTTPRequestHandler):
                 if not source or not target:
                     self.send_json({"error": "Informe conta origem e conta destino."}, status=400)
                     return
-                if source == target:
-                    self.send_json({"error": "A conta destino precisa ser diferente da origem."}, status=400)
-                    return
                 if not item_ids:
                     self.send_json({"error": "Selecione ao menos um anúncio específico."}, status=400)
                     return
@@ -2715,7 +2826,7 @@ class App(BaseHTTPRequestHandler):
                     "items": len(item_ids),
                     "status": "preview_ready",
                     "edits": edits,
-                    "note": "Preview criado para anúncios específicos. Na execução oficial, validaremos atributos obrigatórios, fotos, variações, estoque e políticas por conta.",
+                "note": "Preview criado para anúncios específicos. A cópia pode ser feita para outra conta ou para a mesma conta, usando novo ID interno e SKU com sufixo para evitar conflito.",
                 }
                 jobs = payload.get("clone_jobs")
                 if not isinstance(jobs, list):

@@ -33,6 +33,9 @@ MELI_REDIRECT_URI=https://competidor.umsoftware.com.br/api/oauth/callback
 SCAN_INTERVAL_SECONDS=300
 AUTO_SYNC_INTERVAL_SECONDS=900
 AUTO_SYNC_STARTUP_DELAY_SECONDS=45
+MELI_SYNC_STATUSES=active,paused,under_review
+MELI_SCAN_MAX_PAGES=1000
+MELI_SYNC_INLINE_LIMIT=200
 ```
 
 No painel de desenvolvedores do Mercado Livre, cadastre exatamente:
@@ -111,6 +114,9 @@ MELI_REDIRECT_URI=https://competidor.umsoftware.com.br/api/oauth/callback
 SCAN_INTERVAL_SECONDS=300
 AUTO_SYNC_INTERVAL_SECONDS=900
 AUTO_SYNC_STARTUP_DELAY_SECONDS=45
+MELI_SYNC_STATUSES=active,paused,under_review
+MELI_SCAN_MAX_PAGES=1000
+MELI_SYNC_INLINE_LIMIT=200
 ```
 
 6. Crie o serviço:
