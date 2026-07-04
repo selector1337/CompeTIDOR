@@ -922,6 +922,40 @@ h2 {
   align-items: center;
 }
 
+.clone-error-block {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.clone-error-block p {
+  margin: 0;
+}
+
+.clone-pending-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.clone-pending-grid label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.clone-pending-grid input {
+  border: 1px solid rgba(255, 230, 0, 0.55);
+  background: rgba(5, 9, 14, 0.8);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 10px 12px;
+  outline: none;
+}
+
 .mini-button {
   min-height: 32px;
   border-radius: 8px;

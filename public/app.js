@@ -899,19 +899,46 @@ function renderClone() {
   document.querySelector("#clone-jobs").innerHTML = state.data.clone_jobs
     .map(
       (job) => `
-        <article class="clone-job">
+        <article class="clone-job" data-clone-job-card="${job.id}">
           <div>
             <strong>${job.source} -> ${job.target}</strong>
             <div class="meta-row"><span>${job.items} anúncios</span><span>${(job.item_ids || []).join(", ")}</span></div>
             <p>${job.note}</p>
-            ${job.errors?.length ? `<div class="notice danger-notice">${job.errors.map((row) => `${escapeText(row.item_id)}: ${escapeText(row.error)}`).join("<br>")}</div>` : ""}
-            ${job.status === "preview_ready" ? `<button class="mini-button" data-execute-clone="${job.id}">Copiar agora</button>` : ""}
+            ${job.errors?.length ? cloneErrorsHtml(job.errors) : ""}
+            ${["preview_ready", "review_required", "partial_error", "error"].includes(job.status) ? `<button class="mini-button" data-execute-clone="${job.id}">${job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button>` : ""}
           </div>
           <span class="badge winning">${job.status}</span>
         </article>
       `
     )
     .join("");
+}
+
+function cloneErrorsHtml(errors) {
+  return `
+    <div class="notice danger-notice">
+      ${errors.map((row) => `
+        <div class="clone-error-block">
+          <strong>${escapeText(row.item_id)}</strong>
+          <p>${escapeText(row.error)}</p>
+          ${row.pending_fields?.length ? `
+            <div class="clone-pending-grid">
+              ${row.pending_fields.map((field) => `
+                <label>
+                  ${escapeText(field.label || field.id)}
+                  <input
+                    data-clone-answer-item="${escapeAttr(row.item_id)}"
+                    data-clone-answer-field="${escapeAttr(field.id)}"
+                    placeholder="${escapeAttr(field.message || "Informe o valor exigido pelo Mercado Livre")}"
+                  />
+                </label>
+              `).join("")}
+            </div>
+          ` : ""}
+        </div>
+      `).join("")}
+    </div>
+  `;
 }
 
 function renderUsers() {
@@ -1434,12 +1461,20 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
 document.querySelector("#clone-jobs").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-execute-clone]");
   if (!button) return;
+  const card = button.closest("[data-clone-job-card]");
+  const fieldAnswers = {};
+  card?.querySelectorAll("[data-clone-answer-item][data-clone-answer-field]").forEach((input) => {
+    if (!input.value.trim()) return;
+    const itemId = input.dataset.cloneAnswerItem;
+    fieldAnswers[itemId] ||= {};
+    fieldAnswers[itemId][input.dataset.cloneAnswerField] = input.value.trim();
+  });
   button.disabled = true;
   button.textContent = "Copiando...";
   try {
     const result = await api("/api/clone/execute", {
       method: "POST",
-      body: JSON.stringify({ job_id: button.dataset.executeClone }),
+      body: JSON.stringify({ job_id: button.dataset.executeClone, field_answers: fieldAnswers }),
     });
     state.data.catalog.push(...(result.copied || []));
     state.data.clone_jobs = state.data.clone_jobs.map((job) => (job.id === result.job.id ? result.job : job));
