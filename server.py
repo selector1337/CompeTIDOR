@@ -968,6 +968,22 @@ def live_catalog_offers(payload, candidates, sort_by_price=True):
     return sorted(live, key=lambda item: (0 if item.get("is_winner") else 1, item.get("position", 999999)))
 
 
+def seller_name(payload, seller_id, client=None):
+    seller_id = str(seller_id or "")
+    if not seller_id:
+        return ""
+    for account in payload.get("accounts", []):
+        if str(account.get("seller_id")) == seller_id:
+            return account.get("nickname") or f"Seller {seller_id}"
+    if client:
+        try:
+            seller = client.user(seller_id)
+            return seller.get("nickname") or f"Seller {seller_id}"
+        except Exception:
+            pass
+    return f"Seller {seller_id}"
+
+
 def scan_meli_item(payload, scan_id):
     scans = payload.setdefault("scan_items", [])
     scan = next((item for item in scans if item.get("id") == scan_id), None)
@@ -1310,6 +1326,33 @@ def fetch_public_buybox_url(url, product_title=""):
     lines = visible_page_lines(html_text)
     seller_name = ""
     price = None
+    json_seller_patterns = [
+        r'"seller_name"\s*:\s*"([^"]+)"',
+        r'"sellerName"\s*:\s*"([^"]+)"',
+        r'"seller"\s*:\s*\{[^{}]{0,800}?"nickname"\s*:\s*"([^"]+)"',
+        r'"official_store_name"\s*:\s*"([^"]+)"',
+    ]
+    for pattern in json_seller_patterns:
+        match = re.search(pattern, html_text, flags=re.I)
+        if match:
+            seller_name = html.unescape(match.group(1)).strip()
+            break
+    price_patterns = [
+        r'"price"\s*:\s*"?(\d+(?:\.\d+)?)"?',
+        r'"amount"\s*:\s*(\d+(?:\.\d+)?)',
+        r'itemprop="price"\s+content="(\d+(?:\.\d+)?)"',
+        r'content="(\d+(?:\.\d+)?)"\s+itemprop="price"',
+    ]
+    for pattern in price_patterns:
+        match = re.search(pattern, html_text, flags=re.I)
+        if match:
+            try:
+                parsed_price = float(match.group(1))
+                if parsed_price:
+                    price = parsed_price
+                    break
+            except (TypeError, ValueError):
+                pass
     for index, line in enumerate(lines):
         if "Vendido por" in line:
             tail = line.split("Vendido por", 1)[1].strip(" :·-")
@@ -1337,13 +1380,14 @@ def fetch_public_buybox_url(url, product_title=""):
         if pos > start:
             end = min(end, pos)
     main_area = search_text[start:end]
-    price_matches = [match.group(0) for match in re.finditer(r"R\$\s*[\d\.]+(?:,\d{2})?", main_area)]
-    for raw_price in price_matches:
-        if re.search(r"x\s*" + re.escape(raw_price), main_area):
-            continue
-        price = parse_brl_price(raw_price)
-        if price:
-            break
+    if not price:
+        price_matches = [match.group(0) for match in re.finditer(r"R\$\s*[\d\.]+(?:,\d{2})?", main_area)]
+        for raw_price in price_matches:
+            if re.search(r"x\s*" + re.escape(raw_price), main_area):
+                continue
+            price = parse_brl_price(raw_price)
+            if price:
+                break
     if not price:
         price = parse_brl_price(search_text)
     if not seller_name and "Vendido por" in search_text:
@@ -1400,6 +1444,18 @@ def normalize_competition(client, account, item):
 
     if catalog_product_id:
         try:
+            public_buybox = fetch_public_buybox(client, catalog_product_id, item)
+            data["winner_name"] = public_buybox.get("seller_name") or "Vendedor da buybox"
+            data["winner_price"] = public_buybox.get("price")
+            data["winner_confirmed"] = True
+            data["winner_source"] = "public_product_page"
+            data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "public_buybox"
+            data["competition_reason"] = "Buybox verificada na página pública do Mercado Livre."
+        except Exception as exc:
+            data["public_buybox_error"] = str(exc)
+
+    if catalog_product_id:
+        try:
             winners = client.product_winners(catalog_product_id)
             rows = winners.get("results") if isinstance(winners, dict) else winners
             if isinstance(rows, dict):
@@ -1409,7 +1465,8 @@ def normalize_competition(client, account, item):
                 live_candidates = live_catalog_offers({"accounts": [account]}, candidates, sort_by_price=False)
                 if live_candidates:
                     candidates = live_candidates
-                reference = candidates[0] if candidates else {"raw": rows[0], "price": None, "item_id": "", "seller_id": ""}
+                explicit_winner = next((candidate for candidate in candidates if candidate.get("is_winner")), None)
+                reference = explicit_winner or (candidates[0] if candidates else {"raw": rows[0], "price": None, "item_id": "", "seller_id": ""})
                 raw_reference = reference.get("raw") or rows[0]
                 reference_seller_id = str(reference.get("seller_id") or first_present(raw_reference, ["seller_id", "seller.id", "seller.id_seller"], ""))
                 reference_item_id = reference.get("item_id") or first_present(raw_reference, ["item_id", "id", "item.id"], "")
@@ -1431,7 +1488,7 @@ def normalize_competition(client, account, item):
                         data["catalog_reference_name"] = seller.get("nickname") or f"Seller {reference_seller_id}"
                     except Exception:
                         data["catalog_reference_name"] = f"Seller {reference_seller_id}"
-                if reference.get("is_winner") and not data.get("winner_confirmed"):
+                if explicit_winner and not data.get("winner_confirmed"):
                     data["winner_seller_id"] = reference_seller_id
                     data["winner_price"] = reference_price
                     data["winner_confirmed"] = True
@@ -1446,29 +1503,6 @@ def normalize_competition(client, account, item):
             if not data["competition_reason"]:
                 data["competition_reason"] = str(exc)
 
-    if catalog_product_id and not data.get("winner_confirmed"):
-        try:
-            public_buybox = fetch_public_buybox(client, catalog_product_id, item)
-            data["winner_name"] = public_buybox.get("seller_name") or "Vendedor da buybox"
-            data["winner_price"] = public_buybox.get("price")
-            data["winner_confirmed"] = True
-            data["winner_source"] = "public_product_page"
-            data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "public_buybox"
-            data["competition_reason"] = "Buybox verificada na página pública do Mercado Livre."
-        except Exception as exc:
-            data["public_buybox_error"] = str(exc)
-
-    if not data.get("winner_confirmed") and (data.get("catalog_reference_price") or data.get("catalog_reference_name") or data.get("catalog_reference_seller_id")):
-        data["winner_seller_id"] = data.get("catalog_reference_seller_id") or ""
-        data["winner_name"] = data.get("catalog_reference_name") or (
-            f"Seller {data.get('catalog_reference_seller_id')}" if data.get("catalog_reference_seller_id") else "Vendedor da buybox"
-        )
-        data["winner_price"] = data.get("catalog_reference_price")
-        data["winner_confirmed"] = True
-        data["winner_source"] = "catalog_reference"
-        data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "catalog_reference"
-        data["competition_reason"] = "Buybox operacional baseada na primeira oferta elegível retornada pelo catálogo Mercado Livre."
-
     if not data.get("winner_confirmed"):
         data["winner_seller_id"] = ""
         data["winner_name"] = "Aguardando atualização"
@@ -1476,6 +1510,45 @@ def normalize_competition(client, account, item):
     if data["competition_status"] == "not_listed" and not data.get("winner_seller_id"):
         data["winner_name"] = "Sem vencedor disponível"
     return data
+
+
+def classified_catalog_status(account, item, stock, is_catalog, competition):
+    if item.get("status") == "paused":
+        return "paused", "Anúncio pausado no Mercado Livre. Ative o anúncio e revise estoque, preço e políticas antes de disputar catálogo."
+    if stock == 0:
+        return "paused", "Anúncio importado sem estoque disponível. Pode estar pausado ou em risco de pausa por estoque zerado."
+    if not is_catalog:
+        return "winning", "Anúncio importado da API oficial. Sem vínculo de catálogo identificado neste retorno."
+
+    own_seller_id = str(account.get("seller_id") or "")
+    winner_seller_id = str(competition.get("winner_seller_id") or "")
+    winner_name = str(competition.get("winner_name") or "")
+    own_name = str(account.get("nickname") or "")
+    status_text = str(competition.get("competition_status") or "").lower()
+    try:
+        own_price = float(item.get("price") or competition.get("current_price") or 0)
+    except (TypeError, ValueError):
+        own_price = 0
+    try:
+        winner_price = float(competition.get("winner_price") or 0)
+    except (TypeError, ValueError):
+        winner_price = 0
+
+    if winner_seller_id and own_seller_id and winner_seller_id == own_seller_id:
+        return "winning", "Sua conta está vencendo a buybox deste catálogo."
+    if winner_name and own_name and winner_name.strip().lower() == own_name.strip().lower():
+        return "winning", "Sua conta está vencendo a buybox deste catálogo."
+    if "sharing" in status_text or "shared" in status_text or competition.get("competitors_sharing_first_place"):
+        return "sharing", "Sua conta está compartilhando a primeira posição do catálogo."
+    if competition.get("price_to_win") or status_text in {"competing", "losing", "not_winning"}:
+        return "losing", "Sua conta não está vencendo este catálogo. Revise preço, reputação e condições comerciais."
+    if competition.get("winner_confirmed") and winner_price and own_price:
+        if own_price > winner_price:
+            return "losing", "Sua conta está acima do preço vencedor informado para a buybox."
+        if abs(own_price - winner_price) < 0.01:
+            return "sharing", "Sua conta está no mesmo preço da oferta vencedora; pode estar compartilhando a disputa."
+        return "winning", "Sua conta está com preço abaixo da oferta vencedora informada; confirme reputação e frete."
+    return "sharing", "Anúncio de catálogo importado da API oficial. Aguardando confirmação completa da buybox."
 
 
 def synced_catalog_item(account, item, competition=None):
@@ -1486,18 +1559,7 @@ def synced_catalog_item(account, item, competition=None):
     shipping_mode = first_present(item, ["shipping.mode"], "")
     is_catalog = bool(item.get("catalog_listing") or item.get("catalog_product_id"))
     competition = competition or {}
-    if item.get("status") == "paused":
-        status = "paused"
-        action = "Anúncio pausado no Mercado Livre. Ative o anúncio e revise estoque, preço e políticas antes de disputar catálogo."
-    elif stock == 0:
-        status = "paused"
-        action = "Anúncio importado sem estoque disponível. Pode estar pausado ou em risco de pausa por estoque zerado."
-    elif is_catalog:
-        status = "sharing"
-        action = "Anúncio de catálogo importado da API oficial. A etapa seguinte é consultar concorrência e posição no catálogo."
-    else:
-        status = "winning"
-        action = "Anúncio importado da API oficial. Sem vínculo de catálogo identificado neste retorno."
+    status, action = classified_catalog_status(account, item, stock, is_catalog, competition)
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
@@ -2087,8 +2149,10 @@ def clone_extra_required_fields(item):
 
 def build_clone_item_payload(source_item, edits):
     source_sku = source_item.get("seller_custom_field") or item_sku(source_item) or source_item.get("id") or "SEM-SKU"
-    sku_suffix = edits.get("sku_suffix") or "-COPIA"
+    sku_suffix = edits.get("sku_suffix") or ""
     new_sku = f"{source_sku}{sku_suffix}"
+    requested_listing_type = edits.get("listing_type_id") or ""
+    listing_type_id = requested_listing_type if requested_listing_type in {"gold_special", "gold_pro"} else source_item.get("listing_type_id") or "gold_special"
     payload = {
         "title": (edits.get("title") or source_item.get("title") or "").strip(),
         "category_id": source_item.get("category_id"),
@@ -2096,7 +2160,7 @@ def build_clone_item_payload(source_item, edits):
         "currency_id": source_item.get("currency_id") or "BRL",
         "available_quantity": int(float(edits.get("stock") or source_item.get("available_quantity") or 1)),
         "buying_mode": source_item.get("buying_mode") or "buy_it_now",
-        "listing_type_id": source_item.get("listing_type_id") or "gold_special",
+        "listing_type_id": listing_type_id,
         "condition": source_item.get("condition") or "new",
         "pictures": clone_picture_payload(source_item),
         "attributes": clone_attributes_payload(source_item, new_sku),
@@ -2117,6 +2181,33 @@ def required_fields_from_error(exc):
     if not match:
         return []
     return [field.strip().strip("'\"") for field in match.group(1).split(",") if field.strip()]
+
+
+def invalid_fields_from_error(exc):
+    text = str(exc)
+    fields = []
+    match = re.search(r"fields \[([^\]]+)\] are invalid", text, flags=re.IGNORECASE)
+    if match:
+        fields.extend(field.strip().strip("'\"") for field in match.group(1).split(",") if field.strip())
+    try:
+        _, raw_json = text.split(": ", 1)
+        detail = json.loads(raw_json)
+    except Exception:
+        detail = {}
+    if isinstance(detail, dict):
+        for cause in detail.get("cause") or []:
+            code = str(cause.get("code") or cause.get("cause_id") or "")
+            if "invalid_fields" not in code:
+                continue
+            for reference in cause.get("references") or []:
+                field = str(reference or "").replace("body.", "").strip()
+                if field and field != "body":
+                    fields.append(field)
+        error_text = " ".join(str(detail.get(key) or "") for key in ("message", "error"))
+        match = re.search(r"fields \[([^\]]+)\] are invalid", error_text, flags=re.IGNORECASE)
+        if match:
+            fields.extend(field.strip().strip("'\"") for field in match.group(1).split(",") if field.strip())
+    return list(dict.fromkeys(fields))
 
 
 def source_attribute_value(source_item, ids):
@@ -2147,6 +2238,39 @@ def fill_missing_clone_fields(create_payload, source_item, fields):
     return create_payload
 
 
+def create_item_with_clone_retries(target_client, create_payload, source_item):
+    payload = dict(create_payload)
+    adjustments = []
+    last_error = None
+    for _ in range(5):
+        try:
+            created = target_client.create_item(payload)
+            if adjustments and isinstance(created, dict):
+                created["_clone_adjustments"] = adjustments
+            return created
+        except Exception as exc:
+            last_error = exc
+            changed = False
+            missing_fields = required_fields_from_error(exc)
+            if missing_fields:
+                before = dict(payload)
+                payload = fill_missing_clone_fields(payload, source_item, missing_fields)
+                changed = changed or payload != before
+                adjustments.append({"tipo": "campos_obrigatorios_preenchidos", "campos": missing_fields})
+            invalid_fields = invalid_fields_from_error(exc)
+            removed_fields = []
+            for field in invalid_fields:
+                if field in payload:
+                    payload.pop(field, None)
+                    removed_fields.append(field)
+                    changed = True
+            if removed_fields:
+                adjustments.append({"tipo": "campos_invalidos_removidos", "campos": removed_fields})
+            if not changed:
+                raise
+    raise last_error
+
+
 def create_official_clone(payload, job, source_item_id, edits):
     source_account = official_account_by_name(payload, job.get("source"))
     target_account = official_account_by_name(payload, job.get("target"))
@@ -2158,14 +2282,7 @@ def create_official_clone(payload, job, source_item_id, edits):
     target_client = account_client(target_account)
     source_item = source_client.item(source_item_id)
     create_payload = build_clone_item_payload(source_item, edits)
-    try:
-        created = target_client.create_item(create_payload)
-    except Exception as exc:
-        missing_fields = required_fields_from_error(exc)
-        if not missing_fields:
-            raise
-        create_payload = fill_missing_clone_fields(create_payload, source_item, missing_fields)
-        created = target_client.create_item(create_payload)
+    created = create_item_with_clone_retries(target_client, create_payload, source_item)
     description_text = (edits.get("description") or "").strip()
     if not description_text:
         try:
@@ -3034,7 +3151,7 @@ class App(BaseHTTPRequestHandler):
                     "items": len(item_ids),
                     "status": "preview_ready",
                     "edits": edits,
-                "note": "Preview criado para anúncios específicos. A cópia pode ser feita para outra conta ou para a mesma conta, usando novo ID interno e SKU com sufixo para evitar conflito.",
+                    "note": "Preview criado para anúncios específicos. Campos opcionais em branco mantêm as informações originais; o tipo pode ser mantido, Clássico ou Premium.",
                 }
                 jobs = payload.get("clone_jobs")
                 if not isinstance(jobs, list):
@@ -3079,12 +3196,13 @@ class App(BaseHTTPRequestHandler):
                     target_account = official_account_by_name(payload, job.get("target")) or {}
                     source_sku = source_item.get("sku") or item_sku(official_source) or source_item.get("id") or "SEM-SKU"
                     new_item = synced_catalog_item(target_account, {**official_source, **created})
+                    display_sku = item_sku(created) or f"{source_sku}{edits.get('sku_suffix') or ''}"
                     new_item.update(
                         {
                             "id": new_id,
                             "account": job.get("target"),
                             "account_id": target_account.get("id"),
-                            "sku": f"{source_sku}{edits.get('sku_suffix') or '-COPIA'}",
+                            "sku": display_sku,
                             "price": created.get("price") or float(edits.get("price") or source_item.get("price") or 0),
                             "stock": created.get("available_quantity") or int(float(edits.get("stock") or source_item.get("stock") or 0)),
                             "status": "sharing",

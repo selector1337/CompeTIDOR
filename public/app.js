@@ -1414,6 +1414,7 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
         edits: {
           title: form.get("title_override"),
           sku_suffix: form.get("sku_suffix"),
+          listing_type_id: form.get("listing_type_override"),
           price: form.get("price_override"),
           stock: form.get("stock_override"),
           description: form.get("description_override"),
