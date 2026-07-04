@@ -12,6 +12,7 @@ import secrets
 import ssl
 import time
 import threading
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -737,10 +738,40 @@ def account_client(account):
 def item_sku(item):
     if item.get("seller_custom_field"):
         return item["seller_custom_field"]
+    for key in ("seller_sku", "seller_custom_field", "sku"):
+        if item.get(key):
+            return item[key]
     for attribute in item.get("attributes", []) or []:
-        if attribute.get("id") in {"SELLER_SKU", "SKU", "MODEL"} and attribute.get("value_name"):
+        if attribute.get("id") in {"SELLER_SKU", "SKU"} and attribute.get("value_name"):
             return attribute["value_name"]
+    for variation in item.get("variations", []) or []:
+        if variation.get("seller_custom_field"):
+            return variation["seller_custom_field"]
+        for attribute in variation.get("attributes", []) or []:
+            if attribute.get("id") in {"SELLER_SKU", "SKU"} and attribute.get("value_name"):
+                return attribute["value_name"]
     return "-"
+
+
+def item_available_quantity(item):
+    quantity = item.get("available_quantity")
+    if quantity not in (None, ""):
+        try:
+            return int(float(quantity or 0))
+        except (TypeError, ValueError):
+            pass
+    total = 0
+    for variation in item.get("variations", []) or []:
+        try:
+            total += int(float(variation.get("available_quantity") or 0))
+        except (TypeError, ValueError):
+            pass
+    if total:
+        return total
+    try:
+        return int(float(item.get("initial_quantity") or item.get("stock") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def item_thumbnail(item):
@@ -1156,7 +1187,7 @@ def scan_competitor_profile(payload, seller_id, limit=50):
                     "title": item.get("title") or item.get("id"),
                     "price": price,
                     "sold_quantity": sold,
-                    "available_quantity": item.get("available_quantity") or 0,
+                    "available_quantity": item_available_quantity(item),
                     "status": item.get("status") or "-",
                     "listing_type_id": item.get("listing_type_id") or "",
                     "thumbnail": item_thumbnail(item),
@@ -1563,7 +1594,7 @@ def classified_catalog_status(account, item, stock, is_catalog, competition):
 
 
 def synced_catalog_item(account, item, competition=None):
-    stock = item.get("available_quantity") or 0
+    stock = item_available_quantity(item)
     catalog_product_id = item.get("catalog_product_id") or "-"
     listing_type_id = item.get("listing_type_id") or first_present(item, ["listing_type.id", "listing_type"], "")
     shipping_logistic_type = first_present(item, ["shipping.logistic_type"], "")
@@ -2246,12 +2277,13 @@ def build_clone_item_payload(source_item, edits):
     new_sku = f"{source_sku}{sku_suffix}"
     requested_listing_type = edits.get("listing_type_id") or ""
     listing_type_id = requested_listing_type if requested_listing_type in {"gold_special", "gold_pro"} else source_item.get("listing_type_id") or "gold_special"
+    source_quantity = item_available_quantity(source_item) or 1
     payload = {
         "title": (edits.get("title") or source_item.get("title") or "").strip(),
         "category_id": source_item.get("category_id"),
         "price": float(edits.get("price") or source_item.get("price") or 0),
         "currency_id": source_item.get("currency_id") or "BRL",
-        "available_quantity": int(float(edits.get("stock") or source_item.get("available_quantity") or 1)),
+        "available_quantity": max(1, int(float(edits.get("stock") or source_quantity or 1))),
         "buying_mode": source_item.get("buying_mode") or "buy_it_now",
         "listing_type_id": listing_type_id,
         "condition": source_item.get("condition") or "new",
@@ -2295,6 +2327,17 @@ def meli_error_causes(exc):
     return causes if isinstance(causes, list) else []
 
 
+def meli_error_text(exc):
+    detail = meli_error_detail(exc)
+    parts = [str(exc)]
+    if isinstance(detail, dict):
+        parts.extend(str(detail.get(key) or "") for key in ("message", "error"))
+        for cause in detail.get("cause") or []:
+            parts.append(str(cause.get("message") or ""))
+            parts.append(str(cause.get("code") or ""))
+    return " ".join(part for part in parts if part)
+
+
 def invalid_fields_from_error(exc):
     text = str(exc)
     fields = []
@@ -2330,6 +2373,31 @@ def attribute_ids_from_error_text(text):
     return list(dict.fromkeys(ids))
 
 
+def human_attribute_names_from_error_text(text):
+    names = []
+    for pattern in (
+        r'em "([^"]+)"',
+        r"em '([^']+)'",
+        r'Attribute ([A-Z0-9_]+) with value null was omitted',
+    ):
+        for match in re.finditer(pattern, text or "", flags=re.I):
+            value = match.group(1).strip()
+            if value:
+                names.append(value)
+    return list(dict.fromkeys(names))
+
+
+ATTRIBUTE_NAME_TO_ID = {
+    "quantidade de pares": "UNITS_PER_PACKAGE",
+    "comprimento do cabo": "CABLE_LENGTH",
+}
+
+
+def attribute_id_from_human_name(name):
+    normalized = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode("ascii").lower().strip()
+    return ATTRIBUTE_NAME_TO_ID.get(normalized) or re.sub(r"[^A-Z0-9]+", "_", (name or "").upper()).strip("_")
+
+
 def remove_clone_attributes(create_payload, attr_ids):
     wanted = {str(attr_id).upper() for attr_id in attr_ids if attr_id}
     if not wanted:
@@ -2355,6 +2423,7 @@ def add_or_update_clone_attribute(create_payload, attr_id, value):
     if existing:
         existing.pop("value_id", None)
         existing.pop("values", None)
+        existing.pop("value_struct", None)
         existing["value_name"] = value
     else:
         attributes.append({"id": attr_id, "value_name": value})
@@ -2369,6 +2438,17 @@ def clone_pending_field(field_id, label, kind="text", message="", item_id=""):
         "message": message,
         "item_id": item_id,
     }
+
+
+def dedupe_pending_fields(fields):
+    deduped = {}
+    for field in fields:
+        field_id = field.get("id")
+        if not field_id:
+            continue
+        if field_id not in deduped:
+            deduped[field_id] = field
+    return list(deduped.values())
 
 
 def normalize_family_name(value):
@@ -2421,6 +2501,7 @@ def clone_payload_from_answers(create_payload, answers):
 def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending_fields, item_id=""):
     changed = False
     adjustments = []
+    error_text = meli_error_text(exc)
     missing_fields = required_fields_from_error(exc)
     if missing_fields:
         before = json.dumps(create_payload, sort_keys=True, ensure_ascii=False)
@@ -2455,6 +2536,7 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
             attrs_to_remove.extend(PRODUCT_IDENTIFIER_ATTRS)
         if code == "item.attribute.invalid":
             attr_ids = attribute_ids_from_error_text(message)
+            attr_ids.extend(attribute_id_from_human_name(name) for name in human_attribute_names_from_error_text(message))
             attrs_to_remove.extend(attr_ids)
             for attr_id in attr_ids:
                 pending_fields.append(
@@ -2463,6 +2545,25 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
                         attr_id.replace("_", " ").title(),
                         "text",
                         "O Mercado Livre exigiu um valor válido para este atributo.",
+                        item_id,
+                    )
+                )
+        if "está incorreto" in message or "esta incorreto" in message or "value null was omitted" in message or "Struct or text must be present" in message:
+            human_names = human_attribute_names_from_error_text(message)
+            attr_ids = [attribute_id_from_human_name(name) for name in human_names]
+            attr_ids.extend(attribute_ids_from_error_text(message))
+            removed_attrs = remove_clone_attributes(create_payload, attr_ids)
+            if removed_attrs:
+                changed = True
+                adjustments.append({"tipo": "atributos_com_valor_invalido_removidos", "campos": removed_attrs})
+            for name in human_names:
+                attr_id = attribute_id_from_human_name(name)
+                pending_fields.append(
+                    clone_pending_field(
+                        f"attribute:{attr_id}",
+                        name,
+                        "text",
+                        "Informe exatamente no formato aceito pelo Mercado Livre. Ex: 1 ou 1.7 m.",
                         item_id,
                     )
                 )
@@ -2477,6 +2578,26 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
                 adjustments.append({"tipo": "frete_removido_para_padrao_da_conta", "campos": ["shipping"]})
         if cause_type == "warning" and code == "item.attributes.ignored":
             attrs_to_remove.extend(attribute_ids_from_error_text(message))
+
+    if "Struct or text must be present" in error_text or "value null was omitted" in error_text or "está incorreto" in error_text or "esta incorreto" in error_text:
+        human_names = human_attribute_names_from_error_text(error_text)
+        attr_ids = [attribute_id_from_human_name(name) for name in human_names]
+        attr_ids.extend(attribute_ids_from_error_text(error_text))
+        removed_attrs = remove_clone_attributes(create_payload, attr_ids)
+        if removed_attrs:
+            changed = True
+            adjustments.append({"tipo": "atributos_com_valor_invalido_removidos", "campos": removed_attrs})
+        for name in human_names:
+            attr_id = attribute_id_from_human_name(name)
+            pending_fields.append(
+                clone_pending_field(
+                    f"attribute:{attr_id}",
+                    name,
+                    "text",
+                    "Informe exatamente no formato aceito pelo Mercado Livre. Ex: 1 ou 1.7 m.",
+                    item_id,
+                )
+            )
 
     removed_attrs = remove_clone_attributes(create_payload, attrs_to_remove)
     if removed_attrs:
@@ -2532,11 +2653,13 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
             last_error = exc
             payload, changed, new_adjustments = clone_retry_adjustments_from_error(exc, payload, source_item, pending_fields, item_id)
             adjustments.extend(new_adjustments)
+            if pending_fields:
+                break
             if not changed:
                 break
     if pending_fields:
         error = RuntimeError("Revise campos obrigatórios antes de copiar este anúncio.")
-        error.pending_fields = list({field["id"]: field for field in pending_fields}.values())
+        error.pending_fields = dedupe_pending_fields(pending_fields)
         error.original_error = str(last_error)
         raise error
     raise last_error
@@ -3546,7 +3669,8 @@ class App(BaseHTTPRequestHandler):
                         continue
                     existing_ids.add(new_id)
                     target_account = official_account_by_name(payload, job.get("target")) or {}
-                    source_sku = source_item.get("sku") or item_sku(official_source) or source_item.get("id") or "SEM-SKU"
+                    official_sku = item_sku(official_source)
+                    source_sku = official_sku if official_sku and official_sku != "-" else source_item.get("sku") or source_item.get("id") or "SEM-SKU"
                     official_created_item = {**official_source, **created, **verified_item}
                     new_item = synced_catalog_item(target_account, official_created_item)
                     display_sku = item_sku(official_created_item) or f"{source_sku}{edits.get('sku_suffix') or ''}"
@@ -3557,7 +3681,7 @@ class App(BaseHTTPRequestHandler):
                             "account_id": target_account.get("id"),
                             "sku": display_sku,
                             "price": official_created_item.get("price") or float(edits.get("price") or source_item.get("price") or 0),
-                            "stock": official_created_item.get("available_quantity") or int(float(edits.get("stock") or source_item.get("stock") or 0)),
+                            "stock": item_available_quantity(official_created_item) or int(float(edits.get("stock") or item_available_quantity(official_source) or source_item.get("stock") or 0)),
                             "status": "sharing",
                             "share": 0,
                             "clone_source_item_id": item_id,
