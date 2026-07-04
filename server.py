@@ -1231,8 +1231,10 @@ def auto_scan_loop():
 
 
 def auto_official_sync_loop():
-    interval = max(300, int(os.getenv("AUTO_SYNC_INTERVAL_SECONDS", "900")))
+    interval = max(120, int(os.getenv("AUTO_SYNC_INTERVAL_SECONDS", "300")))
     startup_delay = max(20, int(os.getenv("AUTO_SYNC_STARTUP_DELAY_SECONDS", "45")))
+    full_every = max(1, int(os.getenv("AUTO_FULL_SYNC_EVERY_N_RUNS", "72")))
+    run_count = 0
     time.sleep(startup_delay)
     while True:
         try:
@@ -1243,10 +1245,15 @@ def auto_official_sync_loop():
                 if account.get("official") and account.get("access_token") and account.get("status") == "connected"
             ]
             changed = False
+            run_count += 1
             for account in accounts:
                 try:
-                    result = sync_official_account(payload, account.get("id"), "all")
-                    account["auto_sync_status"] = f"Sincronização automática OK: {result.get('items', 0)} anúncios"
+                    if run_count % full_every == 0:
+                        result = sync_official_account(payload, account.get("id"), "all")
+                        account["auto_sync_status"] = f"Sincronização completa automática OK: {result.get('items', 0)} anúncios"
+                    else:
+                        result = refresh_official_account_items(payload, account)
+                        account["auto_sync_status"] = account.get("auto_refresh_status") or f"Atualização automática OK: {result.get('items', 0)} anúncios"
                     account["auto_sync_error"] = ""
                     account["last_auto_sync_at"] = now_label()
                     changed = True
@@ -1953,6 +1960,66 @@ def sync_official_account(payload, account_id, limit=None):
     return {"account": public_account(account), "items": len(imported), "catalog": imported}
 
 
+def refresh_official_account_items(payload, account, batch_size=None):
+    batch_size = max(1, int(batch_size or os.getenv("AUTO_REFRESH_BATCH_SIZE", "120")))
+    rows = [
+        item
+        for item in payload.get("catalog", [])
+        if item.get("official_source") and item.get("account_id") == account.get("id") and item.get("id")
+    ]
+    if not rows:
+        return {"items": 0, "alerts": 0}
+    cursor_key = f"auto_refresh_cursor_{account.get('id')}"
+    cursor = int(account.get(cursor_key) or 0)
+    selected = rows[cursor : cursor + batch_size]
+    if len(selected) < batch_size:
+        selected.extend(rows[: max(0, batch_size - len(selected))])
+    selected = selected[:batch_size]
+    account[cursor_key] = 0 if cursor + batch_size >= len(rows) else cursor + batch_size
+
+    client = account_client(account)
+    refreshed = 0
+    prior_by_id = {item.get("id"): dict(item) for item in selected}
+    for current in selected:
+        try:
+            official = client.item(current.get("id"))
+            competition = normalize_competition(client, account, official)
+            updated = synced_catalog_item(account, official, competition)
+            current.update(updated)
+            current["updated_at"] = now_label()
+            refreshed += 1
+        except Exception as exc:
+            current["auto_refresh_error"] = str(exc)
+            current["auto_refresh_at"] = now_label()
+
+    alerts_created = ensure_stock_alerts(payload, notify=True)
+    for item in selected:
+        before = prior_by_id.get(item.get("id")) or {}
+        if before and before.get("status") != item.get("status") and item.get("status") == "losing":
+            alert_id = f"catalog-{account.get('id')}-{item.get('id')}-{now_label()[:10]}"
+            existing_ids = {alert.get("id") for alert in payload.get("alerts", [])}
+            if alert_id not in existing_ids:
+                alert = {
+                    "id": alert_id,
+                    "type": "catalog",
+                    "severity": "danger",
+                    "title": "Produto começou a perder catálogo",
+                    "message": f"{item.get('title')} perdeu a buybox. Vencedor: {item.get('winner_name') or '-'} por {item.get('winner_price') or '-'}.",
+                    "account": item.get("account"),
+                    "item_id": item.get("id"),
+                    "sku": item.get("sku"),
+                    "product": item.get("title"),
+                    "created_at": now_label(),
+                }
+                payload.setdefault("alerts", []).insert(0, alert)
+                notify_alert(payload, alert)
+                alerts_created += 1
+
+    account["auto_refresh_status"] = f"Atualização automática OK: {refreshed}/{len(rows)} anúncios revisados em lote"
+    account["last_auto_refresh_at"] = now_label()
+    return {"items": refreshed, "total": len(rows), "alerts": alerts_created}
+
+
 def enqueue_official_sync(account_id, limit=None, reason="manual"):
     account_id = str(account_id or "")
     with SYNC_LOCK:
@@ -2488,6 +2555,12 @@ def create_official_clone(payload, job, source_item_id, edits):
     create_payload = build_clone_item_payload(source_item, edits)
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
     created = create_item_with_clone_retries(target_client, create_payload, source_item, answers, source_item_id)
+    verified_item = {}
+    if created.get("id"):
+        try:
+            verified_item = target_client.item(created["id"])
+        except Exception as exc:
+            created["_verification_warning"] = f"Anúncio criado, mas ainda não apareceu na leitura imediata da API: {exc}"
     description_text = (edits.get("description") or "").strip()
     if not description_text:
         try:
@@ -2500,7 +2573,7 @@ def create_official_clone(payload, job, source_item_id, edits):
             target_client.create_item_description(created["id"], description_text)
         except Exception:
             pass
-    return created, source_item
+    return created, source_item, verified_item
 
 
 def clone_payload_has_attribute(create_payload, attr_id):
@@ -3446,13 +3519,14 @@ class App(BaseHTTPRequestHandler):
                 existing_ids = {item.get("id") for item in catalog if item.get("id")}
                 copied = []
                 errors = []
+                created_details = []
                 edits = job.get("edits") or {}
                 for item_id in job.get("item_ids", []):
                     source_item = next((item for item in catalog if item.get("id") == item_id), None)
                     if not source_item:
                         continue
                     try:
-                        created, official_source = create_official_clone(payload, job, item_id, edits)
+                        created, official_source, verified_item = create_official_clone(payload, job, item_id, edits)
                     except Exception as exc:
                         pending_fields = getattr(exc, "pending_fields", [])
                         if pending_fields:
@@ -3473,30 +3547,49 @@ class App(BaseHTTPRequestHandler):
                     existing_ids.add(new_id)
                     target_account = official_account_by_name(payload, job.get("target")) or {}
                     source_sku = source_item.get("sku") or item_sku(official_source) or source_item.get("id") or "SEM-SKU"
-                    new_item = synced_catalog_item(target_account, {**official_source, **created})
-                    display_sku = item_sku(created) or f"{source_sku}{edits.get('sku_suffix') or ''}"
+                    official_created_item = {**official_source, **created, **verified_item}
+                    new_item = synced_catalog_item(target_account, official_created_item)
+                    display_sku = item_sku(official_created_item) or f"{source_sku}{edits.get('sku_suffix') or ''}"
                     new_item.update(
                         {
                             "id": new_id,
                             "account": job.get("target"),
                             "account_id": target_account.get("id"),
                             "sku": display_sku,
-                            "price": created.get("price") or float(edits.get("price") or source_item.get("price") or 0),
-                            "stock": created.get("available_quantity") or int(float(edits.get("stock") or source_item.get("stock") or 0)),
+                            "price": official_created_item.get("price") or float(edits.get("price") or source_item.get("price") or 0),
+                            "stock": official_created_item.get("available_quantity") or int(float(edits.get("stock") or source_item.get("stock") or 0)),
                             "status": "sharing",
                             "share": 0,
                             "clone_source_item_id": item_id,
                             "description_override": edits.get("description", ""),
-                            "action": f"Anúncio criado oficialmente no Mercado Livre a partir de {source_item.get('id')}.",
+                            "permalink": official_created_item.get("permalink") or created.get("permalink") or "",
+                            "meli_status": official_created_item.get("status") or created.get("status") or new_item.get("meli_status"),
+                            "verification_warning": created.get("_verification_warning", ""),
+                            "action": f"Anúncio criado oficialmente no Mercado Livre a partir de {source_item.get('id')}. Novo código: {new_id}.",
                         }
                     )
                     catalog.append(new_item)
                     copied.append(new_item)
+                    created_details.append(
+                        {
+                            "source_item_id": item_id,
+                            "item_id": new_id,
+                            "title": new_item.get("title"),
+                            "sku": new_item.get("sku"),
+                            "status": new_item.get("meli_status") or "-",
+                            "permalink": new_item.get("permalink") or "",
+                            "verification_warning": new_item.get("verification_warning") or "",
+                        }
+                    )
                 has_pending = any(row.get("pending_fields") for row in errors)
                 job["status"] = "copied" if copied and not errors else "review_required" if has_pending else "partial_error" if copied else "error"
                 job["copied_items"] = [item.get("id") for item in copied]
+                job["created_details"] = created_details
                 job["errors"] = errors
+                created_codes = ", ".join(item.get("item_id") for item in created_details if item.get("item_id"))
                 job["note"] = f"{len(copied)} anúncio(s) criados oficialmente no Mercado Livre para {job.get('target')}."
+                if created_codes:
+                    job["note"] += f" Códigos criados: {created_codes}."
                 if errors:
                     job["note"] += f" {len(errors)} anúncio(s) falharam; veja erros no job."
                 write_payload(payload)

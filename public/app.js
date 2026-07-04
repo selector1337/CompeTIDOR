@@ -904,6 +904,7 @@ function renderClone() {
             <strong>${job.source} -> ${job.target}</strong>
             <div class="meta-row"><span>${job.items} anúncios</span><span>${(job.item_ids || []).join(", ")}</span></div>
             <p>${job.note}</p>
+            ${job.created_details?.length ? cloneCreatedHtml(job.created_details) : ""}
             ${job.errors?.length ? cloneErrorsHtml(job.errors) : ""}
             ${["preview_ready", "review_required", "partial_error", "error"].includes(job.status) ? `<button class="mini-button" data-execute-clone="${job.id}">${job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button>` : ""}
           </div>
@@ -912,6 +913,21 @@ function renderClone() {
       `
     )
     .join("");
+}
+
+function cloneCreatedHtml(items) {
+  return `
+    <div class="clone-created-grid">
+      ${items.map((item) => `
+        <a class="copy-chip clone-created-chip" href="${item.permalink || "#"}" target="_blank" rel="noreferrer">
+          <small>Criado ${escapeText(item.status || "-")}</small>
+          <strong>${escapeText(item.item_id || "-")}</strong>
+          <span>${escapeText(item.sku || "")}</span>
+          ${item.verification_warning ? `<em>${escapeText(item.verification_warning)}</em>` : ""}
+        </a>
+      `).join("")}
+    </div>
+  `;
 }
 
 function cloneErrorsHtml(errors) {

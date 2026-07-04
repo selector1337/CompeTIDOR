@@ -956,6 +956,28 @@ h2 {
   outline: none;
 }
 
+.clone-created-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.clone-created-chip {
+  text-decoration: none;
+  border-color: rgba(0, 214, 143, 0.7);
+  box-shadow: 0 0 18px rgba(0, 214, 143, 0.18);
+}
+
+.clone-created-chip span,
+.clone-created-chip em {
+  display: block;
+  color: var(--muted);
+  font-style: normal;
+  font-size: 11px;
+  margin-top: 3px;
+}
+
 .mini-button {
   min-height: 32px;
   border-radius: 8px;
