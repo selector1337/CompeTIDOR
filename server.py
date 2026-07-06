@@ -285,6 +285,11 @@ def public_payload(payload, actor=None):
     clean = json.loads(json.dumps(payload))
     clean.setdefault("scan_items", [])
     clean.setdefault("recent_sales", [])
+    clean["clone_jobs"] = clean.get("clone_jobs", [])[:50]
+    for job in clean["clone_jobs"]:
+        if job.get("errors"):
+            job["errors"] = job["errors"][:10]
+    clean["item_logs"] = clean.get("item_logs", [])[:500]
     clean["accounts"] = [public_account(account) for account in clean.get("accounts", [])]
     clean["notifications"] = public_notifications(user_notifications(payload, actor, create=False))
     clean["operations"] = build_operations(clean)
@@ -772,6 +777,19 @@ def item_available_quantity(item):
         return int(float(item.get("initial_quantity") or item.get("stock") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def item_flex_logistic_type(item):
+    shipping = item.get("shipping") or {}
+    logistic_type = shipping.get("logistic_type") or ""
+    mode = shipping.get("mode") or ""
+    tags = shipping.get("tags") or item.get("shipping_tags") or item.get("tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    tag_text = " ".join(str(tag).lower() for tag in tags)
+    if logistic_type == "self_service" or "self_service" in tag_text or "mercado_envios_flex" in tag_text or "flex" in tag_text:
+        return "self_service"
+    return logistic_type or mode
 
 
 def item_thumbnail(item):
@@ -1321,20 +1339,28 @@ def visible_page_lines(html_text):
     return [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if re.sub(r"\s+", " ", line).strip()]
 
 
+def canonical_product_url(catalog_product_id, url=""):
+    if catalog_product_id:
+        return f"https://www.mercadolivre.com.br/p/{catalog_product_id}"
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.scheme and parsed.netloc else url.split("?", 1)[0].split("#", 1)[0]
+
+
 def product_public_urls(client, catalog_product_id, item=None):
-    urls = []
-    item_permalink = (item or {}).get("permalink") or ""
-    if item_permalink:
-        urls.append(item_permalink)
+    urls = [canonical_product_url(catalog_product_id)]
     try:
         product = client.product(catalog_product_id)
         permalink = product.get("permalink") or product.get("url")
         if permalink:
-            urls.append(permalink)
+            urls.append(canonical_product_url(catalog_product_id, permalink))
         product_title = product.get("name") or product.get("title") or ""
     except Exception:
         product_title = ""
-    urls.append(f"https://www.mercadolivre.com.br/p/{catalog_product_id}")
+    item_permalink = (item or {}).get("permalink") or ""
+    if item_permalink:
+        urls.append(canonical_product_url(catalog_product_id, item_permalink))
     deduped = []
     for url in urls:
         if url and url not in deduped:
@@ -1597,7 +1623,7 @@ def synced_catalog_item(account, item, competition=None):
     stock = item_available_quantity(item)
     catalog_product_id = item.get("catalog_product_id") or "-"
     listing_type_id = item.get("listing_type_id") or first_present(item, ["listing_type.id", "listing_type"], "")
-    shipping_logistic_type = first_present(item, ["shipping.logistic_type"], "")
+    shipping_logistic_type = item_flex_logistic_type(item)
     shipping_mode = first_present(item, ["shipping.mode"], "")
     is_catalog = bool(item.get("catalog_listing") or item.get("catalog_product_id"))
     competition = competition or {}
@@ -1916,6 +1942,29 @@ def sync_recent_sales(payload, account, client):
     return rows
 
 
+COMPETITION_FIELDS = (
+    "competition_status",
+    "winner_seller_id",
+    "winner_name",
+    "winner_price",
+    "winner_confirmed",
+    "winner_source",
+    "catalog_reference_seller_id",
+    "catalog_reference_name",
+    "catalog_reference_price",
+    "price_to_win",
+    "current_price",
+    "visit_share",
+    "competition_reason",
+    "competitors_sharing_first_place",
+    "public_buybox_error",
+)
+
+
+def competition_snapshot(item):
+    return {field: item.get(field) for field in COMPETITION_FIELDS if field in item}
+
+
 def upsert_monthly_revenue(payload, account, amount, orders_count, period, status):
     monthly = payload.setdefault("monthly_revenue", {"period": period, "accounts": {}})
     if monthly.get("period") != period:
@@ -1968,10 +2017,20 @@ def sync_official_account(payload, account_id, limit=None):
     user_profile = client.user(account["seller_id"])
     item_ids = client.seller_all_items(account["seller_id"], max_items=None if limit in (None, "all") else int(limit))
     imported = []
-    for item_id in item_ids:
+    existing_by_id = {
+        item.get("id"): item
+        for item in payload.get("catalog", [])
+        if item.get("official_source") and item.get("account_id") == account.get("id") and item.get("id")
+    }
+    competition_inline_limit = max(0, int(os.getenv("MELI_SYNC_COMPETITION_INLINE_LIMIT", "150")))
+    for index, item_id in enumerate(item_ids):
         try:
             item = client.item(item_id)
-            competition = normalize_competition(client, account, item)
+            is_catalog = bool(item.get("catalog_listing") or item.get("catalog_product_id"))
+            if is_catalog and index < competition_inline_limit:
+                competition = normalize_competition(client, account, item)
+            else:
+                competition = competition_snapshot(existing_by_id.get(item_id, {}))
             imported.append(synced_catalog_item(account, item, competition))
         except Exception:
             continue
@@ -3444,6 +3503,18 @@ class App(BaseHTTPRequestHandler):
                     update["status"] = "paused"
                 if request.get("status_action") == "activate":
                     update["status"] = "active"
+                dimension_attrs = []
+                dimension_map = {
+                    "package_weight": "PACKAGE_WEIGHT",
+                    "package_height": "PACKAGE_HEIGHT",
+                    "package_width": "PACKAGE_WIDTH",
+                    "package_length": "PACKAGE_LENGTH",
+                }
+                for request_key, attr_id in dimension_map.items():
+                    if clean_attribute_value(request.get(request_key)):
+                        dimension_attrs.append({"id": attr_id, "value_name": clean_attribute_value(request.get(request_key))})
+                if dimension_attrs:
+                    update["attributes"] = dimension_attrs
                 if not update:
                     raise RuntimeError("Nenhum campo informado para atualizar.")
                 client = account_client(account)

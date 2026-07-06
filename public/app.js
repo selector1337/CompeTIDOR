@@ -20,6 +20,7 @@
   catalogPage: 1,
   adsPage: 1,
   copyPage: 1,
+  copyPageSize: Number(localStorage.getItem("competidor-copy-page-size") || 20),
   copySearch: "",
   copySku: "",
   cloneSelectedIds: new Set(),
@@ -169,22 +170,24 @@ function showApp() {
   document.body.classList.add("is-authenticated");
 }
 
-function paginate(items, page) {
+function paginate(items, page, pageSize = PAGE_SIZE) {
   const total = items.length;
-  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const pages = Math.max(1, Math.ceil(total / pageSize));
   const current = Math.min(Math.max(1, Number(page) || 1), pages);
-  const start = (current - 1) * PAGE_SIZE;
+  const start = (current - 1) * pageSize;
   return {
-    items: items.slice(start, start + PAGE_SIZE),
+    items: items.slice(start, start + pageSize),
     current,
     pages,
     total,
     start,
+    pageSize,
   };
 }
 
 function paginationHtml(key, pageInfo) {
-  if (!pageInfo || pageInfo.total <= PAGE_SIZE) {
+  const pageSize = pageInfo?.pageSize || PAGE_SIZE;
+  if (!pageInfo || pageInfo.total <= pageSize) {
     return pageInfo?.total ? `<div class="pagination-info">${pageInfo.total} resultado(s)</div>` : "";
   }
   const buttons = [];
@@ -604,6 +607,10 @@ function renderAds() {
         <div class="inline-edit">
           <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
           <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
+          <label>Peso <input type="text" placeholder="Ex: 500 g" data-weight-input="${item.id}" /></label>
+          <label>Altura <input type="text" placeholder="Ex: 10 cm" data-height-input="${item.id}" /></label>
+          <label>Largura <input type="text" placeholder="Ex: 20 cm" data-width-input="${item.id}" /></label>
+          <label>Comprimento <input type="text" placeholder="Ex: 30 cm" data-length-input="${item.id}" /></label>
           <div class="ad-actions">
             <button class="mini-button" data-save-ad="${item.id}">Salvar</button>
             ${item.meli_status === "paused" || item.status === "paused"
@@ -892,8 +899,10 @@ function renderClone() {
   if (!hadTarget && target.options.length) target.selectedIndex = 0;
   const copyProduct = document.querySelector("#copy-product-filter");
   const copySku = document.querySelector("#copy-sku-filter");
+  const copyPageSize = document.querySelector("#copy-page-size");
   if (copyProduct && copyProduct.value !== state.copySearch) copyProduct.value = state.copySearch;
   if (copySku && copySku.value !== state.copySku) copySku.value = state.copySku;
+  if (copyPageSize && Number(copyPageSize.value) !== state.copyPageSize) copyPageSize.value = String(state.copyPageSize);
   renderCopyItems();
 
   document.querySelector("#clone-jobs").innerHTML = state.data.clone_jobs
@@ -1015,7 +1024,7 @@ function renderCopyItems() {
       && (!productTerm || title.includes(productTerm))
       && (!skuTerm || sku.includes(skuTerm) || code.includes(skuTerm));
   });
-  const pageInfo = paginate(filtered, state.copyPage);
+  const pageInfo = paginate(filtered, state.copyPage, state.copyPageSize);
   state.copyPage = pageInfo.current;
   const selectedCount = state.cloneSelectedIds.size;
   list.innerHTML = filtered.length
@@ -1028,7 +1037,7 @@ function renderCopyItems() {
               <input type="checkbox" name="item_ids" value="${item.id}" ${state.cloneSelectedIds.has(item.id) ? "checked" : ""} />
               <span>
                 <strong>${item.title}</strong>
-                <small>${item.id} - SKU ${item.sku} - ${money.format(item.price)} - estoque ${item.stock}</small>
+                <small>${item.id} - SKU ${item.sku} - ${listingTypeLabel(item.listing_type_id)} - ${money.format(item.price)} - estoque ${item.stock}</small>
               </span>
             </label>
           `
@@ -1236,10 +1245,12 @@ document.addEventListener("click", (event) => {
   ["#ads-status-filter", "adsStatus"],
   ["#copy-product-filter", "copySearch"],
   ["#copy-sku-filter", "copySku"],
+  ["#copy-page-size", "copyPageSize"],
 ].forEach(([selector, key]) => {
   document.addEventListener("input", (event) => {
     if (!event.target.matches(selector)) return;
-    state[key] = event.target.value;
+    state[key] = key === "copyPageSize" ? Number(event.target.value || 20) : event.target.value;
+    if (key === "copyPageSize") localStorage.setItem("competidor-copy-page-size", String(state.copyPageSize));
     if (key.startsWith("catalog")) {
       state.catalogPage = 1;
       scheduleRender("catalog", renderCatalog);
@@ -1255,7 +1266,8 @@ document.addEventListener("click", (event) => {
   });
   document.addEventListener("change", (event) => {
     if (!event.target.matches(selector)) return;
-    state[key] = event.target.value;
+    state[key] = key === "copyPageSize" ? Number(event.target.value || 20) : event.target.value;
+    if (key === "copyPageSize") localStorage.setItem("competidor-copy-page-size", String(state.copyPageSize));
     if (key.startsWith("catalog")) {
       state.catalogPage = 1;
       renderCatalog();
@@ -1338,6 +1350,10 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   if (button.dataset.saveAd) {
     payload.price = Number(document.querySelector(`[data-price-input="${id}"]`).value);
     payload.available_quantity = Number(document.querySelector(`[data-stock-input="${id}"]`).value);
+    payload.package_weight = document.querySelector(`[data-weight-input="${id}"]`).value;
+    payload.package_height = document.querySelector(`[data-height-input="${id}"]`).value;
+    payload.package_width = document.querySelector(`[data-width-input="${id}"]`).value;
+    payload.package_length = document.querySelector(`[data-length-input="${id}"]`).value;
   }
   if (button.dataset.pauseAd) payload.status_action = "pause";
   if (button.dataset.activateAd) payload.status_action = "activate";
@@ -1435,8 +1451,20 @@ document.querySelector("#copy-items-list").addEventListener("change", (event) =>
   if (!input) return;
   if (input.checked) state.cloneSelectedIds.add(input.value);
   else state.cloneSelectedIds.delete(input.value);
+  if (input.checked && state.cloneSelectedIds.size === 1) fillCloneFieldsFromItem(input.value);
   renderCopyItems();
 });
+
+function fillCloneFieldsFromItem(itemId) {
+  const item = state.data.catalog.find((row) => row.id === itemId);
+  if (!item) return;
+  const form = document.querySelector("#clone-form");
+  form.elements.title_override.value = item.title || "";
+  form.elements.price_override.value = item.price || "";
+  form.elements.stock_override.value = item.stock || "";
+  form.elements.listing_type_override.value = item.listing_type_id || "";
+  form.elements.sku_suffix.value = "";
+}
 
 document.querySelector("#clone-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1767,8 +1795,37 @@ window.addEventListener("hashchange", () => {
   if (state.data) render();
 });
 
+function fixStaticCopyLabels() {
+  const fieldLabels = {
+    title_override: "Título padrão ",
+    sku_suffix: "SKU sufixo ",
+    price_override: "Preço ",
+    stock_override: "Estoque ",
+    description_override: "Descrição ",
+  };
+  Object.entries(fieldLabels).forEach(([name, text]) => {
+    const input = document.querySelector(`[name="${name}"]`);
+    const label = input?.closest("label");
+    if (label?.firstChild) label.firstChild.textContent = text;
+  });
+  const listingType = document.querySelector('select[name="listing_type_override"]');
+  if (listingType) {
+    const labels = {
+      "": "Mesmo tipo do anúncio",
+      gold_special: "Clássico",
+      gold_pro: "Premium",
+    };
+    [...listingType.options].forEach((option) => {
+      option.textContent = labels[option.value] || option.textContent;
+    });
+    const label = listingType.closest("label");
+    if (label?.firstChild) label.firstChild.textContent = "Tipo de anúncio ";
+  }
+}
+
 if (!location.hash) location.hash = "#/dashboard";
 applyTheme();
+fixStaticCopyLabels();
 checkSession().catch((error) => {
   document.body.innerHTML = `<main class="error"><h1>CompeTIDOR</h1><p>${error.message}</p></main>`;
 });
