@@ -285,8 +285,13 @@ def telegram_type_enabled(config, alert_type):
     return not types or alert_type in types
 
 
-def public_payload(payload, actor=None):
-    clean = json.loads(json.dumps(payload))
+def public_payload(payload, actor=None, include_catalog=True):
+    if include_catalog:
+        clean = json.loads(json.dumps(payload))
+    else:
+        clean = json.loads(json.dumps({key: value for key, value in payload.items() if key not in {"catalog", "item_logs"}}))
+        clean["catalog"] = []
+        clean["item_logs"] = []
     clean.setdefault("scan_items", [])
     clean.setdefault("recent_sales", [])
     clean["clone_jobs"] = clean.get("clone_jobs", [])[:50]
@@ -294,6 +299,14 @@ def public_payload(payload, actor=None):
         if job.get("errors"):
             job["errors"] = job["errors"][:10]
     clean["item_logs"] = clean.get("item_logs", [])[:500]
+    catalog = clean.get("catalog", [])
+    clean["catalog_counts"] = {
+        "total": len(catalog),
+        "winning": len([item for item in catalog if item.get("status") == "winning"]),
+        "losing": len([item for item in catalog if item.get("status") == "losing"]),
+        "sharing": len([item for item in catalog if item.get("status") == "sharing"]),
+        "paused": len([item for item in catalog if item.get("status") == "paused" or item.get("meli_status") == "paused"]),
+    }
     clean["accounts"] = [public_account(account) for account in clean.get("accounts", [])]
     clean["notifications"] = public_notifications(user_notifications(payload, actor, create=False))
     clean["operations"] = build_operations(clean)
@@ -648,6 +661,16 @@ class MercadoLivreClient:
 
     def item(self, item_id):
         return self.get(f"/items/{item_id}")
+
+    def items_bulk(self, item_ids):
+        ids = ",".join(item_ids)
+        rows = self.get(f"/items?ids={ids}")
+        items = []
+        for row in rows if isinstance(rows, list) else []:
+            body = row.get("body") if isinstance(row, dict) else None
+            if body:
+                items.append(body)
+        return items
 
     def item_description(self, item_id):
         return self.get(f"/items/{item_id}/description")
@@ -2110,6 +2133,8 @@ def sync_official_account(payload, account_id, limit=None):
 
     client = account_client(account)
     user_profile = client.user(account["seller_id"])
+    sync_recent_sales(payload, account, client)
+    sync_claims(payload, account, client)
     item_ids = client.seller_all_items(account["seller_id"], max_items=None if limit in (None, "all") else int(limit))
     imported = []
     existing_by_id = {
@@ -2118,9 +2143,23 @@ def sync_official_account(payload, account_id, limit=None):
         if item.get("official_source") and item.get("account_id") == account.get("id") and item.get("id")
     }
     competition_inline_limit = max(0, int(os.getenv("MELI_SYNC_COMPETITION_INLINE_LIMIT", "150")))
-    for index, item_id in enumerate(item_ids):
+    batch_size = max(1, min(20, int(os.getenv("MELI_ITEM_BULK_SIZE", "20"))))
+    for batch_start in range(0, len(item_ids), batch_size):
+        batch_ids = item_ids[batch_start : batch_start + batch_size]
         try:
-            item = client.item(item_id)
+            batch_items = client.items_bulk(batch_ids)
+        except Exception:
+            batch_items = []
+            for item_id in batch_ids:
+                try:
+                    batch_items.append(client.item(item_id))
+                except Exception:
+                    pass
+        for batch_offset, item in enumerate(batch_items):
+            item_id = item.get("id")
+            index = batch_start + batch_offset
+            if not item_id:
+                continue
             is_catalog = bool(item.get("catalog_listing") or item.get("catalog_product_id"))
             if is_catalog and index < competition_inline_limit:
                 competition = normalize_competition(client, account, item)
@@ -2130,8 +2169,6 @@ def sync_official_account(payload, account_id, limit=None):
             previous = existing_by_id.get(item_id, {})
             row["first_seen_at"] = previous.get("first_seen_at") or now_label()
             imported.append(row)
-        except Exception:
-            continue
 
     payload["catalog"] = [
         item
@@ -2144,8 +2181,6 @@ def sync_official_account(payload, account_id, limit=None):
     account["sync_total_item_ids"] = len(item_ids)
     upsert_metric(payload, account, user_profile)
     # Estoque zerado antigo não gera alerta na sincronização completa; alertas vêm de transição no refresh automático.
-    sync_recent_sales(payload, account, client)
-    sync_claims(payload, account, client)
     return {"account": public_account(account), "items": len(imported), "catalog": imported}
 
 
@@ -3093,11 +3128,26 @@ class App(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/dashboard":
             notifications_migrated = migrate_legacy_notifications(payload)
-            stock_created = ensure_stock_alerts(payload, notify=False)
             alerts_enriched = enrich_product_alerts(payload)
-            if notifications_migrated or stock_created or alerts_enriched:
+            if notifications_migrated or alerts_enriched:
                 write_payload(payload)
-            self.send_json(public_payload(payload, self.current_user(payload)))
+            self.send_json(public_payload(payload, self.current_user(payload), include_catalog=False))
+            return
+        if parsed.path == "/api/catalog":
+            catalog = payload.get("catalog", [])
+            self.send_json(
+                {
+                    "catalog": catalog,
+                    "item_logs": payload.get("item_logs", [])[:500],
+                    "catalog_counts": {
+                        "total": len(catalog),
+                        "winning": len([item for item in catalog if item.get("status") == "winning"]),
+                        "losing": len([item for item in catalog if item.get("status") == "losing"]),
+                        "sharing": len([item for item in catalog if item.get("status") == "sharing"]),
+                        "paused": len([item for item in catalog if item.get("status") == "paused" or item.get("meli_status") == "paused"]),
+                    },
+                }
+            )
             return
         if parsed.path == "/api/accounts":
             self.send_json([public_account(account) for account in payload["accounts"]])

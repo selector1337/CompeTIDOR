@@ -1638,6 +1638,7 @@ main {
 .filter-bar input,
 .filter-bar select,
 .clone-edit-grid input,
+.clone-edit-grid textarea,
 .inline-edit input,
 .price-tools input,
 .user-form input,
@@ -1650,6 +1651,13 @@ main {
   background: var(--panel);
   color: var(--ink);
   padding: 0 10px;
+}
+
+.clone-edit-grid textarea {
+  min-height: 130px;
+  resize: vertical;
+  padding: 12px;
+  line-height: 1.45;
 }
 
 .inline-edit {

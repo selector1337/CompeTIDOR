@@ -29,6 +29,8 @@
   competitorsPage: 1,
   theme: localStorage.getItem("competidor-theme") || "dark",
   currentUser: null,
+  catalogLoaded: false,
+  catalogLoading: null,
 };
 
 const PAGE_SIZE = 100;
@@ -130,6 +132,7 @@ async function load() {
   state.meta = meta;
   state.meliConfig = meliConfig;
   state.data = dashboard;
+  state.catalogLoaded = Boolean((dashboard.catalog || []).length);
   const apiStatus = document.querySelector("#api-status");
   const redirectUri = document.querySelector("#redirect-uri");
   if (apiStatus) apiStatus.textContent = meta.meli.client_configured ? "OAuth pronto" : "Credenciais pendentes";
@@ -138,6 +141,25 @@ async function load() {
   document.querySelector("#tenant-pill").textContent = tenantLabel(meta, dashboard);
   renderCurrentUser();
   render();
+  loadCatalogInBackground();
+}
+
+async function loadCatalogInBackground(force = false) {
+  if (!state.data || (state.catalogLoaded && !force)) return;
+  if (state.catalogLoading) return state.catalogLoading;
+  state.catalogLoading = api("/api/catalog")
+    .then((result) => {
+      state.data.catalog = result.catalog || [];
+      state.data.item_logs = result.item_logs || [];
+      state.data.catalog_counts = result.catalog_counts || state.data.catalog_counts || {};
+      state.catalogLoaded = true;
+      render();
+    })
+    .catch((error) => showToast(error.message || "Não foi possível carregar os anúncios.", "error"))
+    .finally(() => {
+      state.catalogLoading = null;
+    });
+  return state.catalogLoading;
 }
 
 async function checkSession() {
@@ -309,8 +331,9 @@ function connectedAccounts() {
 
 function renderSummary() {
   const { catalog, alerts, accounts } = state.data;
-  document.querySelector("#winning-count").textContent = catalog.filter((item) => item.status === "winning").length;
-  document.querySelector("#losing-count").textContent = catalog.filter((item) => item.status === "losing").length;
+  const counts = state.data.catalog_counts || {};
+  document.querySelector("#winning-count").textContent = counts.winning ?? catalog.filter((item) => item.status === "winning").length;
+  document.querySelector("#losing-count").textContent = counts.losing ?? catalog.filter((item) => item.status === "losing").length;
   document.querySelector("#critical-count").textContent = alerts.filter((alert) => !alert.read && alert.severity === "critical").length;
   document.querySelector("#official-count").textContent = accounts.filter((account) => account.official).length;
   const officialLabel = document.querySelector("#official-accounts-label");
@@ -451,6 +474,11 @@ function opsRows(rows, empty, tone = "") {
 
 function renderCatalog() {
   const list = document.querySelector("#catalog-list");
+  if (!state.catalogLoaded) {
+    list.innerHTML = `<div class="notice">Carregando anúncios e disputa de catálogo em segundo plano...</div>`;
+    loadCatalogInBackground();
+    return;
+  }
   renderFilterOptions();
   const term = state.catalogSearch.toLowerCase();
   const filtered = state.data.catalog.filter((item) => {
@@ -569,6 +597,11 @@ function setOptions(selector, values, current, allLabel, formatter = (value) => 
 
 function renderAds() {
   const list = document.querySelector("#ads-list");
+  if (!state.catalogLoaded) {
+    list.innerHTML = `<div class="notice">Carregando anúncios em segundo plano...</div>`;
+    loadCatalogInBackground();
+    return;
+  }
   if (!list || !state.data) return;
   renderFilterOptions();
   const productTerm = state.adsProduct.toLowerCase();
@@ -1014,6 +1047,11 @@ function renderUsers() {
 function renderCopyItems() {
   const source = document.querySelector('select[name="source"]').value;
   const list = document.querySelector("#copy-items-list");
+  if (!state.catalogLoaded) {
+    list.innerHTML = `<div class="notice">Carregando anúncios da origem em segundo plano...</div>`;
+    loadCatalogInBackground();
+    return;
+  }
   const productTerm = state.copySearch.toLowerCase();
   const skuTerm = state.copySku.toLowerCase();
   const filtered = state.data.catalog.filter((item) => {
@@ -1059,8 +1097,20 @@ function fact(label, value) {
 function formatDateBR(value) {
   if (!value || value === "Pendente" || value === "-") return value || "-";
   const text = String(value);
+  const isoLike = text.match(/^\d{4}-\d{2}-\d{2}T/);
+  if (isoLike) {
+    const date = new Date(text);
+    if (!Number.isNaN(date.getTime())) {
+      const day = String(date.getDate()).padStart(2, "0");
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const year = date.getFullYear();
+      const hour = String(date.getHours()).padStart(2, "0");
+      const minute = String(date.getMinutes()).padStart(2, "0");
+      return `${day}-${month}-${year} ${hour}:${minute}`;
+    }
+  }
   const match = text.match(/^(\d{4})-(\d{2})-(\d{2})(.*)$/);
-  if (match) return `${match[3]}-${match[2]}-${match[1]}${match[4] || ""}`;
+  if (match) return `${match[3]}-${match[2]}-${match[1]}${(match[4] || "").replace("T", " ").slice(0, 6)}`;
   return text;
 }
 
@@ -1806,6 +1856,15 @@ window.addEventListener("hashchange", () => {
 });
 
 function fixStaticCopyLabels() {
+  const descriptionInput = document.querySelector('input[name="description_override"]');
+  if (descriptionInput) {
+    const textarea = document.createElement("textarea");
+    textarea.name = descriptionInput.name;
+    textarea.placeholder = descriptionInput.placeholder;
+    textarea.value = descriptionInput.value || "";
+    textarea.rows = 7;
+    descriptionInput.replaceWith(textarea);
+  }
   const fieldLabels = {
     title_override: "Título padrão ",
     sku_suffix: "SKU ",
