@@ -631,10 +631,15 @@ h2 {
 .copy-thumb {
   width: 56px;
   height: 56px;
+  display: block;
   object-fit: contain;
   background: #fff;
   border-radius: 8px;
   border: 1px solid rgba(255, 230, 0, 0.45);
+}
+
+.copy-thumb-empty {
+  background: linear-gradient(135deg, rgba(255, 230, 0, 0.18), rgba(255, 255, 255, 0.92));
 }
 
 .copy-item span {
@@ -644,6 +649,23 @@ h2 {
 .copy-item strong,
 .copy-item small {
   display: block;
+  overflow-wrap: anywhere;
+}
+
+.metric-item {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: stretch;
+  cursor: default;
+}
+
+.metric-item .metric-header {
+  width: 100%;
+}
+
+.metric-item .metric-header strong {
+  min-width: 0;
+  max-width: 45%;
   overflow-wrap: anywhere;
 }
 
@@ -1085,14 +1107,21 @@ h2 {
   display: grid;
   gap: 8px;
   margin-top: 12px;
+  width: 100%;
 }
 
 .metric-line {
   display: grid;
-  grid-template-columns: 132px 1fr 54px;
+  grid-template-columns: minmax(130px, 180px) minmax(140px, 1fr) 70px;
   align-items: center;
   gap: 8px;
   font-size: 0.88rem;
+  min-width: 0;
+}
+
+.metric-line > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .metric-line .progress {

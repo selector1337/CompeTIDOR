@@ -286,6 +286,7 @@ def telegram_type_enabled(config, alert_type):
 
 
 def public_payload(payload, actor=None, include_catalog=True):
+    enrich_recent_sale_thumbnails(payload)
     if include_catalog:
         clean = json.loads(json.dumps(payload))
     else:
@@ -312,6 +313,24 @@ def public_payload(payload, actor=None, include_catalog=True):
     clean["operations"] = build_operations(payload if not include_catalog else clean)
     clean["users"] = visible_users_for(actor, ensure_users(clean))
     return clean
+
+
+def enrich_recent_sale_thumbnails(payload):
+    catalog_by_id = {
+        item.get("id"): item
+        for item in payload.get("catalog", [])
+        if item.get("id") and item.get("thumbnail")
+    }
+    changed = False
+    for sale in payload.get("recent_sales", []):
+        if sale.get("thumbnail"):
+            continue
+        catalog_item = catalog_by_id.get(sale.get("item_id")) or {}
+        thumbnail = catalog_item.get("thumbnail") or ""
+        if thumbnail:
+            sale["thumbnail"] = thumbnail
+            changed = True
+    return changed
 
 
 def percent_rate(value):
@@ -1657,7 +1676,7 @@ def normalize_competition(client, account, item):
             data["winner_name"] = public_buybox.get("seller_name") or "Vendedor da buybox"
             data["winner_price"] = public_buybox.get("price")
             data["winner_confirmed"] = True
-            data["winner_source"] = "public_product_page"
+            data["winner_source"] = public_buybox.get("source") or "public_product_page"
             data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "public_buybox"
             data["competition_reason"] = "Buybox verificada na página pública do Mercado Livre."
         except Exception as exc:
@@ -1670,12 +1689,13 @@ def normalize_competition(client, account, item):
             if isinstance(rows, dict):
                 rows = rows.get("results") or rows.get("items") or []
             if rows:
-                candidates = catalog_offer_candidates(rows, sort_by_price=False)
-                live_candidates = live_catalog_offers({"accounts": [account]}, candidates, sort_by_price=False)
+                candidates = catalog_offer_candidates(rows, sort_by_price=True)
+                live_candidates = live_catalog_offers({"accounts": [account]}, candidates, sort_by_price=True)
                 if live_candidates:
                     candidates = live_candidates
                 explicit_winner = next((candidate for candidate in candidates if candidate.get("is_winner")), None)
-                reference = explicit_winner or (candidates[0] if candidates else {"raw": rows[0], "price": None, "item_id": "", "seller_id": ""})
+                lowest_active = candidates[0] if candidates else None
+                reference = explicit_winner or lowest_active or {"raw": rows[0], "price": None, "item_id": "", "seller_id": ""}
                 raw_reference = reference.get("raw") or rows[0]
                 reference_seller_id = str(reference.get("seller_id") or first_present(raw_reference, ["seller_id", "seller.id", "seller.id_seller"], ""))
                 reference_item_id = reference.get("item_id") or first_present(raw_reference, ["item_id", "id", "item.id"], "")
@@ -1697,8 +1717,16 @@ def normalize_competition(client, account, item):
                         data["catalog_reference_name"] = seller.get("nickname") or f"Seller {reference_seller_id}"
                     except Exception:
                         data["catalog_reference_name"] = f"Seller {reference_seller_id}"
-                if not data.get("winner_confirmed") and not data.get("competition_reason"):
-                    data["competition_reason"] = "A API oficial não confirmou o vencedor da buy box; lista de ofertas do catálogo não será usada como vencedor."
+                if not data.get("winner_confirmed") and lowest_active:
+                    data["winner_seller_id"] = reference_seller_id
+                    data["winner_name"] = data.get("catalog_reference_name") or (f"Seller {reference_seller_id}" if reference_seller_id else "Menor oferta ativa")
+                    data["winner_price"] = reference_price
+                    data["winner_confirmed"] = True
+                    data["winner_source"] = "catalog_lowest_active_offer"
+                    data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "listed"
+                    data["competition_reason"] = (
+                        "Página pública da buybox não confirmou o vendedor; exibindo a menor oferta ativa validada pela API oficial do catálogo."
+                    )
         except Exception as exc:
             if not data["competition_reason"]:
                 data["competition_reason"] = str(exc)
@@ -1733,7 +1761,13 @@ def classified_catalog_status(account, item, stock, is_catalog, competition):
         winner_price = float(competition.get("winner_price") or 0)
     except (TypeError, ValueError):
         winner_price = 0
+    try:
+        price_to_win = float(competition.get("price_to_win") or 0)
+    except (TypeError, ValueError):
+        price_to_win = 0
 
+    if price_to_win and own_price and own_price > price_to_win:
+        return "losing", "Sua conta não está vencendo este catálogo. Revise preço, reputação e condições comerciais."
     if winner_seller_id and own_seller_id and winner_seller_id == own_seller_id:
         return "winning", "Sua conta está vencendo a buybox deste catálogo."
     if winner_name and own_name and winner_name.strip().lower() == own_name.strip().lower():
@@ -2088,6 +2122,11 @@ def sync_claims(payload, account, client):
         rows = data.get("results") or data.get("claims") or []
     except Exception as exc:
         account["claims_sync_status"] = policy_error_message(exc, "a leitura das reclamações")
+        if "404" in str(exc) or "resource not found" in str(exc).lower():
+            account["claims_sync_status"] = (
+                "Reclamações não retornadas pela API oficial nesta credencial. "
+                "Verifique no painel do Mercado Livre se a aplicação tem permissão de pós-venda/reclamações."
+            )
         return []
     details = []
     open_count = 0
@@ -2120,14 +2159,19 @@ def sync_claims(payload, account, client):
 def sync_pending_shipments_from_orders(payload, account, orders):
     pending = []
     pending_statuses = {"paid", "confirmed", "payment_required", "partially_paid"}
+    final_statuses = {"cancelled", "canceled", "invalid"}
+    final_shipping_statuses = {"delivered", "cancelled", "canceled", "not_delivered"}
     for order in orders:
         status = str(order.get("status") or "").lower()
-        fulfilled = any(str(tag).lower() in {"delivered", "not_delivered", "cancelled"} for tag in order.get("tags", []) or [])
-        if status not in pending_statuses or fulfilled:
-            continue
+        tags = [str(tag).lower() for tag in order.get("tags", []) or []]
         shipping = order.get("shipping") or {}
+        shipping_status = str(shipping.get("status") or first_present(shipping, ["status_history.status"], "") or "").lower()
+        fulfilled = any(tag in {"delivered", "cancelled", "canceled"} for tag in tags) or shipping_status in final_shipping_statuses
+        if status in final_statuses or status not in pending_statuses or fulfilled:
+            continue
         deadline = (
-            shipping.get("estimated_handling_limit")
+            first_present(shipping, ["estimated_handling_limit.date", "estimated_handling_limit", "shipping_option.estimated_handling_limit"])
+            or first_present(shipping, ["estimated_delivery_time.date", "shipping_option.estimated_delivery_time.date"])
             or shipping.get("date_first_printed")
             or order.get("expiration_date")
             or order.get("date_closed")

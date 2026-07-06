@@ -142,7 +142,6 @@ async function load() {
   document.querySelector("#tenant-pill").textContent = tenantLabel(meta, dashboard);
   renderCurrentUser();
   render();
-  loadCatalogInBackground();
 }
 
 async function loadCatalogInBackground(force = false) {
@@ -301,6 +300,9 @@ function render() {
 
 function renderRoute() {
   if (!state.data) return;
+  if (["catalogo", "anuncios", "copiar"].includes(state.route) && !state.catalogLoaded) {
+    loadCatalogInBackground();
+  }
   const routeRenderers = {
     dashboard: renderDashboard,
     contas: () => {
@@ -554,9 +556,8 @@ function renderCatalog() {
 }
 
 function catalogWinnerName(item) {
-  if (!item.winner_confirmed || ["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "Aguardando atualização";
   if (item.winner_confirmed && item.winner_name) return item.winner_name;
-  return item.winner_name && !/não confirmado/i.test(item.winner_name) ? item.winner_name : "Aguardando atualização";
+  return item.winner_name && !/não confirmado|aguardando/i.test(item.winner_name) ? item.winner_name : "Não confirmado";
 }
 
 function catalogPublicUrl(item) {
@@ -566,13 +567,11 @@ function catalogPublicUrl(item) {
 }
 
 function catalogWinnerPrice(item) {
-  if (!item.winner_confirmed || ["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "-";
   const value = item.winner_price;
   return value ? money.format(value) : "-";
 }
 
 function catalogWinnerSourceValue(item) {
-  if (!item.winner_confirmed || ["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "Aguardando página pública";
   if (item.winner_confirmed && item.winner_source) return catalogWinnerSource(item.winner_source);
   return "";
 }
@@ -583,6 +582,8 @@ function catalogWinnerSource(source) {
     products_items_winner_marker: "API catálogo",
     public_product_page: "Página pública ML",
     catalog_reference: "Catálogo ML",
+    catalog_lowest_active_offer: "Menor oferta ativa ML",
+    public_purchase_options: "Página pública ML",
   };
   return sources[source] || "Mercado Livre";
 }
@@ -1087,7 +1088,9 @@ function renderCopyItems() {
           (item) => `
             <label class="copy-item">
               <input type="checkbox" name="item_ids" value="${item.id}" ${state.cloneSelectedIds.has(item.id) ? "checked" : ""} />
-              ${item.thumbnail ? `<img class="copy-thumb" src="${item.thumbnail}" alt="${escapeAttr(item.title || item.id)}" loading="lazy" />` : ""}
+              ${item.thumbnail
+                ? `<img class="copy-thumb" src="${item.thumbnail}" alt="${escapeAttr(item.title || item.id)}" loading="lazy" />`
+                : `<span class="copy-thumb copy-thumb-empty"></span>`}
               <span>
                 <strong>${item.title}</strong>
                 <small>${item.id} - SKU ${item.sku} - ${listingTypeLabel(item.listing_type_id)} - ${money.format(item.price)} - estoque ${item.stock}</small>
