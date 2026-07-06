@@ -309,7 +309,7 @@ def public_payload(payload, actor=None, include_catalog=True):
     }
     clean["accounts"] = [public_account(account) for account in clean.get("accounts", [])]
     clean["notifications"] = public_notifications(user_notifications(payload, actor, create=False))
-    clean["operations"] = build_operations(clean)
+    clean["operations"] = build_operations(payload if not include_catalog else clean)
     clean["users"] = visible_users_for(actor, ensure_users(clean))
     return clean
 
@@ -431,6 +431,7 @@ def build_operations(payload):
             "sku": item.get("sku"),
             "stock": item.get("stock"),
             "price": item.get("price"),
+            "thumbnail": item.get("thumbnail"),
             "occurred_at": item.get("updated_at") or fallback_time(index + 1),
         }
         if item.get("stock") == 0:
@@ -833,11 +834,32 @@ def item_attribute_value(item, attr_ids):
             continue
         value = clean_attribute_value(attribute.get("value_name"))
         if value:
-            return value
+            return normalize_package_value(value, attr_ids)
         struct = attribute.get("value_struct") or {}
         if struct.get("number") and struct.get("unit"):
-            return f"{struct.get('number')} {struct.get('unit')}"
+            return normalize_package_value(f"{struct.get('number')} {struct.get('unit')}", attr_ids)
     return ""
+
+
+def normalize_package_value(value, attr_ids):
+    text = clean_attribute_value(value)
+    match = re.search(r"([\d.,]+)\s*([a-zA-Z]+)", text)
+    if not match:
+        return text
+    number = float(match.group(1).replace(".", "").replace(",", "."))
+    unit = match.group(2).lower()
+    attr_text = " ".join(str(attr).upper() for attr in attr_ids)
+    if "WEIGHT" in attr_text:
+        if unit in {"kg", "kgs"} and number > 50:
+            return f"{number:g} g"
+        if unit in {"mg"}:
+            return f"{number / 1000:g} g"
+        return f"{number:g} {unit}"
+    if unit == "mm":
+        return f"{number / 10:g} cm"
+    if unit in {"m", "metro", "metros"}:
+        return f"{number * 100:g} cm"
+    return f"{number:g} {unit}"
 
 
 def item_thumbnail(item):
@@ -1440,6 +1462,9 @@ def fetch_public_buybox_url(url, product_title=""):
         html_text = response.read().decode("utf-8", errors="replace")
         final_url = response.geturl() or url
     lines = visible_page_lines(html_text)
+    options_buybox = public_purchase_options_winner(lines)
+    if options_buybox.get("price") or options_buybox.get("seller_name"):
+        return {**options_buybox, "url": final_url}
     seller_name = ""
     price = None
     json_seller_patterns = [
@@ -1514,6 +1539,46 @@ def fetch_public_buybox_url(url, product_title=""):
         "seller_name": seller_name or "Vendedor da buybox",
         "price": price,
         "url": final_url,
+    }
+
+
+def public_purchase_options_winner(lines):
+    best_index = next((i for i, line in enumerate(lines) if "Melhor preço" in line), -1)
+    if best_index < 0:
+        options_index = next((i for i, line in enumerate(lines) if "Outras opções de compra" in line or "Opções de compra" in line), -1)
+        if options_index >= 0:
+            best_index = options_index + 1
+    if best_index < 0:
+        return {}
+
+    window_start = max(0, best_index - 8)
+    window_end = min(len(lines), best_index + 18)
+    window = lines[window_start:window_end]
+    price = None
+    seller_name = ""
+    price_candidates = []
+    for line in window:
+        if re.search(r"R\$\s*[\d\.]+(?:,\d{2})?", line):
+            parsed = parse_brl_price(line)
+            if parsed:
+                price_candidates.append(parsed)
+    if price_candidates:
+        price = min(price_candidates)
+    for index, line in enumerate(window):
+        match = re.search(r"Loja oficial\s+(.+)", line, flags=re.I)
+        if match:
+            seller_name = re.split(r"\s{2,}|\s\+\d|NF-e|verificada", match.group(1).strip())[0].strip()
+            break
+        if "Vendido por" in line:
+            seller_name = line.split("Vendido por", 1)[1].strip(" :·-")
+            break
+        if re.search(r"Loja\s+oficial", line, flags=re.I) and index + 1 < len(window):
+            seller_name = window[index + 1].strip()
+            break
+    return {
+        "seller_name": seller_name or "",
+        "price": price,
+        "source": "public_purchase_options",
     }
 
 
@@ -1604,16 +1669,7 @@ def normalize_competition(client, account, item):
                         data["catalog_reference_name"] = seller.get("nickname") or f"Seller {reference_seller_id}"
                     except Exception:
                         data["catalog_reference_name"] = f"Seller {reference_seller_id}"
-                if explicit_winner and not data.get("winner_confirmed"):
-                    data["winner_seller_id"] = reference_seller_id
-                    data["winner_price"] = reference_price
-                    data["winner_confirmed"] = True
-                    data["winner_source"] = "products_items_winner_marker"
-                    if reference_seller_id and reference_seller_id == str(account.get("seller_id")):
-                        data["winner_name"] = account.get("nickname", "Sua conta")
-                    else:
-                        data["winner_name"] = data.get("catalog_reference_name") or first_present(raw_reference, ["seller.nickname", "nickname"], "Vendedor do catálogo")
-                elif not data.get("winner_confirmed") and not data.get("competition_reason"):
+                if not data.get("winner_confirmed") and not data.get("competition_reason"):
                     data["competition_reason"] = "A API oficial não confirmou o vencedor da buy box; lista de ofertas do catálogo não será usada como vencedor."
         except Exception as exc:
             if not data["competition_reason"]:

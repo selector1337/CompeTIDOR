@@ -623,6 +623,30 @@ h2 {
   background: var(--panel-2);
 }
 
+.copy-thumb {
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+  background: #fff;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 230, 0, 0.45);
+}
+
+.ops-media-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ops-media-row img {
+  width: 54px;
+  height: 54px;
+  object-fit: contain;
+  background: #fff;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 230, 0, 0.5);
+}
+
 .sale-item {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 170px;

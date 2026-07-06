@@ -12,6 +12,7 @@
   adsSku: "",
   adsCode: "",
   adsStatus: "all",
+  adsFlex: "all",
   stockPeriod: "today",
   stockCustomDate: "",
   alertType: "all",
@@ -460,12 +461,17 @@ function opsRows(rows, empty, tone = "") {
   return rows
     .map((item) => `
       <article class="ops-item ${tone}">
-        <strong>${item.title}</strong>
-        <div class="chip-row">
-          ${copyChip("Loja", item.account)}
-          ${copyChip("MLB", item.id)}
-          ${copyChip("SKU", item.sku || "-")}
-          ${copyChip("Data", formatDateBR(item.occurred_at))}
+        <div class="ops-media-row">
+          ${item.thumbnail ? `<img src="${item.thumbnail}" alt="${escapeAttr(item.title || item.id)}" loading="lazy" />` : ""}
+          <div>
+            <strong>${item.title}</strong>
+            <div class="chip-row">
+              ${copyChip("Loja", item.account)}
+              ${copyChip("MLB", item.id)}
+              ${copyChip("SKU", item.sku || "-")}
+              ${copyChip("Data", formatDateBR(item.occurred_at))}
+            </div>
+          </div>
         </div>
       </article>
     `)
@@ -496,7 +502,7 @@ function renderCatalog() {
     .map(
       (item) => `
         <article class="catalog-item ${item.status}">
-          <a class="product-media" href="${item.permalink || "#"}" target="_blank" rel="noreferrer" aria-label="Abrir anúncio ${item.id}">
+          <a class="product-media" href="${catalogPublicUrl(item)}" target="_blank" rel="noreferrer" aria-label="Abrir catálogo ${item.catalog_product_id || item.id}">
             ${item.thumbnail ? `<img src="${item.thumbnail}" alt="${item.title}" loading="lazy" />` : `<span>${(item.title || item.id).slice(0, 2).toUpperCase()}</span>`}
           </a>
           <div>
@@ -546,6 +552,7 @@ function renderCatalog() {
 }
 
 function catalogWinnerName(item) {
+  if (["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "Aguardando atualização";
   if (item.winner_confirmed && item.winner_name) return item.winner_name;
   if (item.catalog_reference_name) return item.catalog_reference_name;
   if (item.catalog_reference_seller_id) return `Seller ${item.catalog_reference_seller_id}`;
@@ -553,12 +560,20 @@ function catalogWinnerName(item) {
   return item.winner_name && !/não confirmado/i.test(item.winner_name) ? item.winner_name : "Aguardando atualização";
 }
 
+function catalogPublicUrl(item) {
+  return item.catalog_product_id && item.catalog_product_id !== "-"
+    ? `https://www.mercadolivre.com.br/p/${item.catalog_product_id}`
+    : item.permalink || "#";
+}
+
 function catalogWinnerPrice(item) {
+  if (["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "-";
   const value = item.winner_price || item.catalog_reference_price;
   return value ? money.format(value) : "-";
 }
 
 function catalogWinnerSourceValue(item) {
+  if (["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "Aguardando página pública";
   if (item.winner_confirmed && item.winner_source) return catalogWinnerSource(item.winner_source);
   if (item.catalog_reference_price || item.catalog_reference_name || item.catalog_reference_seller_id) return "Catálogo ML";
   return "";
@@ -613,6 +628,7 @@ function renderAds() {
     const code = `${item.id || ""}`.toLowerCase();
     return (state.adsAccount === "all" || item.account === state.adsAccount)
       && (state.adsStatus === "all" || item.meli_status === state.adsStatus)
+      && (state.adsFlex === "all" || (state.adsFlex === "active" ? item.shipping_logistic_type === "self_service" : item.shipping_logistic_type !== "self_service"))
       && (!productTerm || title.includes(productTerm))
       && (!skuTerm || sku.includes(skuTerm))
       && (!codeTerm || code.includes(codeTerm));
@@ -1073,6 +1089,7 @@ function renderCopyItems() {
           (item) => `
             <label class="copy-item">
               <input type="checkbox" name="item_ids" value="${item.id}" ${state.cloneSelectedIds.has(item.id) ? "checked" : ""} />
+              ${item.thumbnail ? `<img class="copy-thumb" src="${item.thumbnail}" alt="${escapeAttr(item.title || item.id)}" loading="lazy" />` : ""}
               <span>
                 <strong>${item.title}</strong>
                 <small>${item.id} - SKU ${item.sku} - ${listingTypeLabel(item.listing_type_id)} - ${money.format(item.price)} - estoque ${item.stock}</small>
@@ -1293,6 +1310,7 @@ document.addEventListener("click", (event) => {
   ["#ads-sku-filter", "adsSku"],
   ["#ads-code-filter", "adsCode"],
   ["#ads-status-filter", "adsStatus"],
+  ["#ads-flex-filter", "adsFlex"],
   ["#copy-product-filter", "copySearch"],
   ["#copy-sku-filter", "copySku"],
   ["#copy-page-size", "copyPageSize"],
