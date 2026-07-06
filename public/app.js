@@ -376,7 +376,7 @@ function renderDashboard() {
             <p>${claim.description || claim.reason || "Detalhe ainda não sincronizado pela API."}</p>
             <div class="chip-row">${copyChip("ID", claim.id || "-")}${copyChip("Status", claim.status || "-")}${copyChip("Data", formatDateBR(claim.created_at || item.updated_at))}</div>
           </article>
-        `).join("") : `<div class="notice">Nenhuma reclamação detalhada sincronizada para esta conta.</div>`}
+        `).join("") : `<div class="notice">${escapeText(item.sync_status || "Nenhuma reclamação detalhada sincronizada para esta conta.")}</div>`}
       </div>
     </details>
   `).join("") || `<div class="notice">Nenhuma reclamação ativa sincronizada.</div>`;
@@ -385,11 +385,13 @@ function renderDashboard() {
       <strong>${item.account}</strong>
       <p>Pedido ${item.order_id} · ${item.buyer}</p>
       <div class="chip-row">${copyChip("Conta", item.account)}${copyChip("Limite", item.deadline)}${copyChip("Falta", item.time_left)}</div>
+      ${item.sync_status ? `<small>${escapeText(item.sync_status)}</small>` : ""}
     </article>
   `).join("") || `<div class="notice">Nenhum envio pendente sincronizado.</div>`;
 
   document.querySelector("#dashboard-sales").innerHTML = (state.data.recent_sales || []).slice(0, 12).map((sale) => `
     <article class="sale-item">
+      ${sale.thumbnail ? `<img class="sale-thumb" src="${sale.thumbnail}" alt="${escapeAttr(sale.product || sale.item_id)}" loading="lazy" />` : `<span class="sale-thumb sale-thumb-empty"></span>`}
       <div>
         <strong>${escapeText(sale.product || "Produto vendido")}</strong>
         <div class="chip-row">
@@ -552,11 +554,8 @@ function renderCatalog() {
 }
 
 function catalogWinnerName(item) {
-  if (["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "Aguardando atualização";
+  if (!item.winner_confirmed || ["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "Aguardando atualização";
   if (item.winner_confirmed && item.winner_name) return item.winner_name;
-  if (item.catalog_reference_name) return item.catalog_reference_name;
-  if (item.catalog_reference_seller_id) return `Seller ${item.catalog_reference_seller_id}`;
-  if (item.catalog_reference_price) return "Vendedor da buybox";
   return item.winner_name && !/não confirmado/i.test(item.winner_name) ? item.winner_name : "Aguardando atualização";
 }
 
@@ -567,15 +566,14 @@ function catalogPublicUrl(item) {
 }
 
 function catalogWinnerPrice(item) {
-  if (["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "-";
-  const value = item.winner_price || item.catalog_reference_price;
+  if (!item.winner_confirmed || ["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "-";
+  const value = item.winner_price;
   return value ? money.format(value) : "-";
 }
 
 function catalogWinnerSourceValue(item) {
-  if (["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "Aguardando página pública";
+  if (!item.winner_confirmed || ["catalog_reference", "products_items_winner_marker"].includes(item.winner_source)) return "Aguardando página pública";
   if (item.winner_confirmed && item.winner_source) return catalogWinnerSource(item.winner_source);
-  if (item.catalog_reference_price || item.catalog_reference_name || item.catalog_reference_seller_id) return "Catálogo ML";
   return "";
 }
 

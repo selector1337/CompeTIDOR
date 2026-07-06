@@ -446,12 +446,21 @@ def build_operations(payload):
     for detail in payload.get("claim_details", []):
         details_by_account.setdefault(detail.get("account"), []).append(detail)
     claims = payload.get("claims") or [
-        {"account": account.get("nickname"), "open": 0, "mediations": 0, "updated_at": now_label(), "details": details_by_account.get(account.get("nickname"), [])}
+        {
+            "account": account.get("nickname"),
+            "open": 0,
+            "mediations": 0,
+            "updated_at": now_label(),
+            "details": details_by_account.get(account.get("nickname"), []),
+            "sync_status": account.get("claims_sync_status") or "Aguardando sincronização de reclamações",
+        }
         for account in accounts
         if account.get("official")
     ]
     for claim in claims:
         claim["details"] = claim.get("details") or details_by_account.get(claim.get("account"), [])
+        account = next((account for account in accounts if account.get("nickname") == claim.get("account")), {})
+        claim["sync_status"] = claim.get("sync_status") or account.get("claims_sync_status") or ""
     shipments = payload.get("pending_shipments") or [
         {
             "account": account.get("nickname"),
@@ -459,6 +468,7 @@ def build_operations(payload):
             "buyer": "A sincronizar",
             "deadline": "Aguardando pedidos oficiais",
             "time_left": "-",
+            "sync_status": account.get("sales_sync_status") or "Aguardando sincronização de pedidos",
         }
         for account in accounts
         if account.get("official")
@@ -841,6 +851,22 @@ def item_attribute_value(item, attr_ids):
     return ""
 
 
+def package_dimensions_from_shipping(item):
+    dimensions = first_present(item, ["shipping.dimensions"], "")
+    if not dimensions:
+        return {}
+    match = re.match(r"\s*([\d.,]+)x([\d.,]+)x([\d.,]+)\s*,\s*([\d.,]+)", str(dimensions), flags=re.I)
+    if not match:
+        return {}
+    width, height, length, weight = [float(part.replace(".", "").replace(",", ".")) for part in match.groups()]
+    return {
+        "package_width": f"{width:g} cm",
+        "package_height": f"{height:g} cm",
+        "package_length": f"{length:g} cm",
+        "package_weight": f"{weight / 1000:g} kg",
+    }
+
+
 def normalize_package_value(value, attr_ids):
     text = clean_attribute_value(value)
     match = re.search(r"([\d.,]+)\s*([a-zA-Z]+)", text)
@@ -850,8 +876,10 @@ def normalize_package_value(value, attr_ids):
     unit = match.group(2).lower()
     attr_text = " ".join(str(attr).upper() for attr in attr_ids)
     if "WEIGHT" in attr_text:
-        if unit in {"kg", "kgs"} and number > 50:
-            return f"{number:g} g"
+        if unit in {"g", "gr", "gramas"}:
+            return f"{number / 1000:g} kg" if number >= 1000 else f"{number:g} g"
+        if unit in {"kg", "kgs"} and number > 80:
+            return f"{number / 1000:g} kg"
         if unit in {"mg"}:
             return f"{number / 1000:g} g"
         return f"{number:g} {unit}"
@@ -1732,6 +1760,7 @@ def synced_catalog_item(account, item, competition=None):
     is_catalog = bool(item.get("catalog_listing") or item.get("catalog_product_id"))
     competition = competition or {}
     status, action = classified_catalog_status(account, item, stock, is_catalog, competition)
+    shipping_dimensions = package_dimensions_from_shipping(item)
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
@@ -1745,10 +1774,10 @@ def synced_catalog_item(account, item, competition=None):
         "listing_type_id": listing_type_id,
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
-        "package_weight": item_attribute_value(item, ["PACKAGE_WEIGHT", "WEIGHT"]),
-        "package_height": item_attribute_value(item, ["PACKAGE_HEIGHT", "HEIGHT"]),
-        "package_width": item_attribute_value(item, ["PACKAGE_WIDTH", "WIDTH"]),
-        "package_length": item_attribute_value(item, ["PACKAGE_LENGTH", "LENGTH"]),
+        "package_weight": shipping_dimensions.get("package_weight") or item_attribute_value(item, ["PACKAGE_WEIGHT", "WEIGHT"]),
+        "package_height": shipping_dimensions.get("package_height") or item_attribute_value(item, ["PACKAGE_HEIGHT", "HEIGHT"]),
+        "package_width": shipping_dimensions.get("package_width") or item_attribute_value(item, ["PACKAGE_WIDTH", "WIDTH"]),
+        "package_length": shipping_dimensions.get("package_length") or item_attribute_value(item, ["PACKAGE_LENGTH", "LENGTH"]),
         "status": status,
         "share": 0 if is_catalog else 100,
         "price": item.get("price") or 0,
@@ -2011,6 +2040,7 @@ def sync_recent_sales(payload, account, client):
     revenue_total = 0.0
     revenue_orders = 0
     ignored_statuses = {"cancelled", "canceled", "invalid"}
+    catalog_by_id = {item.get("id"): item for item in payload.get("catalog", []) if item.get("id")}
     for order in orders:
         status = str(order.get("status") or "").lower()
         order_total = float(order.get("total_amount") or order.get("paid_amount") or 0)
@@ -2029,6 +2059,7 @@ def sync_recent_sales(payload, account, client):
                 "account": account.get("nickname"),
                 "product": item.get("title") or "Produto sem título",
                 "item_id": item.get("id") or "",
+                "thumbnail": item.get("thumbnail") or item.get("secure_thumbnail") or (catalog_by_id.get(item.get("id")) or {}).get("thumbnail") or "",
                 "sku": item.get("seller_sku") or item.get("seller_custom_field") or "-",
                 "quantity": quantity,
                 "unit_price": unit_price,

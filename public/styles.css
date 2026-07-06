@@ -617,19 +617,34 @@ h2 {
 .clone-job,
 .priority-item,
 .copy-item {
+  display: grid;
+  grid-template-columns: 20px 56px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
   border: 1px solid var(--line);
   border-radius: 16px;
   padding: 16px;
   background: var(--panel-2);
+  cursor: pointer;
 }
 
 .copy-thumb {
-  width: 44px;
-  height: 44px;
+  width: 56px;
+  height: 56px;
   object-fit: contain;
   background: #fff;
   border-radius: 8px;
   border: 1px solid rgba(255, 230, 0, 0.45);
+}
+
+.copy-item span {
+  min-width: 0;
+}
+
+.copy-item strong,
+.copy-item small {
+  display: block;
+  overflow-wrap: anywhere;
 }
 
 .ops-media-row {
@@ -649,7 +664,7 @@ h2 {
 
 .sale-item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 170px;
+  grid-template-columns: 58px minmax(0, 1fr) 170px;
   gap: 14px;
   align-items: center;
   border: 1px solid var(--line);
@@ -657,6 +672,15 @@ h2 {
   padding: 14px;
   background: var(--panel-2);
   box-shadow: inset 0 0 12px rgba(255, 230, 0, 0.04);
+}
+
+.sale-thumb {
+  width: 58px;
+  height: 58px;
+  object-fit: contain;
+  background: #fff;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 230, 0, 0.5);
 }
 
 .sale-item > div:first-child {
@@ -1120,12 +1144,6 @@ h2 {
   justify-content: space-between;
   gap: 14px;
   margin-bottom: 12px;
-}
-
-.copy-item {
-  grid-template-columns: 20px 1fr;
-  align-items: center;
-  cursor: pointer;
 }
 
 .copy-item input {
