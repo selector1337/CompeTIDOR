@@ -1,6 +1,7 @@
 ﻿from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlencode, urlparse
 import json
 import html
@@ -32,6 +33,7 @@ MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 MELI_API_URL = "https://api.mercadolibre.com"
 TELEGRAM_API_URL = "https://api.telegram.org"
+APP_TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "America/Sao_Paulo"))
 SESSION_SECONDS = 60 * 60 * 12
 SENSITIVE_MELI_PATH_TERMS = (
     "mercadopago",
@@ -57,6 +59,8 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/products/[^/]+(\?|$)"),
     re.compile(r"^/products/[^/]+/items(\?|$)"),
     re.compile(r"^/orders/search(\?|$)"),
+    re.compile(r"^/claims/search(\?|$)"),
+    re.compile(r"^/post-purchase/v1/claims/search(\?|$)"),
 )
 
 
@@ -80,7 +84,7 @@ def write_payload(payload):
 
 
 def now_label():
-    return time.strftime("%Y-%m-%d %H:%M")
+    return datetime.now(APP_TZ).strftime("%Y-%m-%d %H:%M")
 
 
 def https_port():
@@ -361,17 +365,17 @@ def fallback_time(index):
 
 
 def current_month_period():
-    now = datetime.now()
+    now = datetime.now(APP_TZ)
     return f"{now.year:04d}-{now.month:02d}"
 
 
 def current_month_window():
-    now = datetime.now()
-    start = datetime(now.year, now.month, 1)
+    now = datetime.now(APP_TZ)
+    start = datetime(now.year, now.month, 1, tzinfo=APP_TZ)
     if now.month == 12:
-        end = datetime(now.year + 1, 1, 1)
+        end = datetime(now.year + 1, 1, 1, tzinfo=APP_TZ)
     else:
-        end = datetime(now.year, now.month + 1, 1)
+        end = datetime(now.year, now.month + 1, 1, tzinfo=APP_TZ)
     return (
         current_month_period(),
         start.strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
@@ -682,6 +686,13 @@ class MercadoLivreClient:
             params["order.date_created.to"] = date_to
         return self.get(f"/orders/search?{urlencode(params)}")
 
+    def seller_claims(self, seller_id, limit=50, offset=0):
+        params = {"seller_id": seller_id, "limit": min(int(limit or 50), 50), "offset": max(int(offset or 0), 0)}
+        try:
+            return self.get(f"/post-purchase/v1/claims/search?{urlencode(params)}")
+        except Exception:
+            return self.get(f"/claims/search?{urlencode(params)}")
+
 
 class Notifier:
     def __init__(self, config):
@@ -783,13 +794,27 @@ def item_flex_logistic_type(item):
     shipping = item.get("shipping") or {}
     logistic_type = shipping.get("logistic_type") or ""
     mode = shipping.get("mode") or ""
-    tags = shipping.get("tags") or item.get("shipping_tags") or item.get("tags") or []
+    tags = shipping.get("tags") or item.get("shipping_tags") or item.get("tags") or item.get("sub_status") or []
     if isinstance(tags, str):
         tags = [tags]
     tag_text = " ".join(str(tag).lower() for tag in tags)
-    if logistic_type == "self_service" or "self_service" in tag_text or "mercado_envios_flex" in tag_text or "flex" in tag_text:
+    if logistic_type == "self_service" or mode == "self_service" or "self_service" in tag_text or "mercado_envios_flex" in tag_text or "flex" in tag_text:
         return "self_service"
     return logistic_type or mode
+
+
+def item_attribute_value(item, attr_ids):
+    wanted = {str(attr_id).upper() for attr_id in attr_ids}
+    for attribute in item.get("attributes", []) or []:
+        if str(attribute.get("id") or "").upper() not in wanted:
+            continue
+        value = clean_attribute_value(attribute.get("value_name"))
+        if value:
+            return value
+        struct = attribute.get("value_struct") or {}
+        if struct.get("number") and struct.get("unit"):
+            return f"{struct.get('number')} {struct.get('unit')}"
+    return ""
 
 
 def item_thumbnail(item):
@@ -1641,6 +1666,10 @@ def synced_catalog_item(account, item, competition=None):
         "listing_type_id": listing_type_id,
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
+        "package_weight": item_attribute_value(item, ["PACKAGE_WEIGHT", "WEIGHT"]),
+        "package_height": item_attribute_value(item, ["PACKAGE_HEIGHT", "HEIGHT"]),
+        "package_width": item_attribute_value(item, ["PACKAGE_WIDTH", "WIDTH"]),
+        "package_length": item_attribute_value(item, ["PACKAGE_LENGTH", "LENGTH"]),
         "status": status,
         "share": 0 if is_catalog else 100,
         "price": item.get("price") or 0,
@@ -1939,7 +1968,73 @@ def sync_recent_sales(payload, account, client):
     payload["recent_sales"] = sorted([*rows, *existing], key=lambda item: item.get("date") or "", reverse=True)[:80]
     account["sales_sync_status"] = f"{revenue_orders} pedidos reais sincronizados no mês"
     upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"])
+    sync_pending_shipments_from_orders(payload, account, orders)
     return rows
+
+
+def sync_claims(payload, account, client):
+    try:
+        data = client.seller_claims(account.get("seller_id"), 50, 0)
+        rows = data.get("results") or data.get("claims") or []
+    except Exception as exc:
+        account["claims_sync_status"] = policy_error_message(exc, "a leitura das reclamações")
+        return []
+    details = []
+    open_count = 0
+    mediation_count = 0
+    for claim in rows:
+        status = str(claim.get("status") or claim.get("stage") or "").lower()
+        if "medi" in status:
+            mediation_count += 1
+        elif status not in {"closed", "resolved", "cancelled", "canceled"}:
+            open_count += 1
+        details.append(
+            {
+                "id": claim.get("id") or claim.get("claim_id") or "-",
+                "account": account.get("nickname"),
+                "status": claim.get("status") or claim.get("stage") or "-",
+                "subject": claim.get("type") or claim.get("reason") or "Reclamação Mercado Livre",
+                "description": claim.get("description") or claim.get("detail") or claim.get("reason") or "",
+                "created_at": claim.get("date_created") or claim.get("created_at") or now_label(),
+            }
+        )
+    payload["claim_details"] = [item for item in payload.get("claim_details", []) if item.get("account") != account.get("nickname")]
+    payload["claim_details"].extend(details[:50])
+    claims = [item for item in payload.get("claims", []) if item.get("account") != account.get("nickname")]
+    claims.append({"account": account.get("nickname"), "open": open_count, "mediations": mediation_count, "updated_at": now_label(), "details": details[:20]})
+    payload["claims"] = claims
+    account["claims_sync_status"] = f"{len(details)} reclamações sincronizadas"
+    return details
+
+
+def sync_pending_shipments_from_orders(payload, account, orders):
+    pending = []
+    pending_statuses = {"paid", "confirmed", "payment_required", "partially_paid"}
+    for order in orders:
+        status = str(order.get("status") or "").lower()
+        fulfilled = any(str(tag).lower() in {"delivered", "not_delivered", "cancelled"} for tag in order.get("tags", []) or [])
+        if status not in pending_statuses or fulfilled:
+            continue
+        shipping = order.get("shipping") or {}
+        deadline = (
+            shipping.get("estimated_handling_limit")
+            or shipping.get("date_first_printed")
+            or order.get("expiration_date")
+            or order.get("date_closed")
+            or "Aguardando prazo oficial"
+        )
+        pending.append(
+            {
+                "account": account.get("nickname"),
+                "order_id": order.get("id") or "-",
+                "buyer": first_present(order, ["buyer.nickname", "buyer.first_name"], "Comprador Mercado Livre"),
+                "deadline": deadline,
+                "time_left": "-",
+            }
+        )
+    payload["pending_shipments"] = [item for item in payload.get("pending_shipments", []) if item.get("account") != account.get("nickname")]
+    payload["pending_shipments"].extend(pending[:30])
+    return pending
 
 
 COMPETITION_FIELDS = (
@@ -2031,7 +2126,10 @@ def sync_official_account(payload, account_id, limit=None):
                 competition = normalize_competition(client, account, item)
             else:
                 competition = competition_snapshot(existing_by_id.get(item_id, {}))
-            imported.append(synced_catalog_item(account, item, competition))
+            row = synced_catalog_item(account, item, competition)
+            previous = existing_by_id.get(item_id, {})
+            row["first_seen_at"] = previous.get("first_seen_at") or now_label()
+            imported.append(row)
         except Exception:
             continue
 
@@ -2045,8 +2143,9 @@ def sync_official_account(payload, account_id, limit=None):
     account["sync_status"] = f"{len(imported)} anúncios importados da API oficial"
     account["sync_total_item_ids"] = len(item_ids)
     upsert_metric(payload, account, user_profile)
-    add_stock_alerts(payload, account, imported)
+    # Estoque zerado antigo não gera alerta na sincronização completa; alertas vêm de transição no refresh automático.
     sync_recent_sales(payload, account, client)
+    sync_claims(payload, account, client)
     return {"account": public_account(account), "items": len(imported), "catalog": imported}
 
 
@@ -2082,7 +2181,18 @@ def refresh_official_account_items(payload, account, batch_size=None):
             current["auto_refresh_error"] = str(exc)
             current["auto_refresh_at"] = now_label()
 
-    alerts_created = ensure_stock_alerts(payload, notify=True)
+    alerts_created = 0
+    existing_alert_ids = {alert.get("id") for alert in payload.get("alerts", [])}
+    for item in selected:
+        before = prior_by_id.get(item.get("id")) or {}
+        if int(before.get("stock") or 0) > 0 and int(item.get("stock") or 0) == 0:
+            alert_id = f"stock-{account.get('id')}-{item.get('id')}-{now_label()[:10]}"
+            if alert_id not in existing_alert_ids:
+                alert = stock_alert(alert_id, account, item)
+                payload.setdefault("alerts", []).insert(0, alert)
+                notify_alert(payload, alert)
+                alerts_created += 1
+                existing_alert_ids.add(alert_id)
     for item in selected:
         before = prior_by_id.get(item.get("id")) or {}
         if before and before.get("status") != item.get("status") and item.get("status") == "losing":
@@ -2332,8 +2442,7 @@ def clone_extra_required_fields(item):
 
 def build_clone_item_payload(source_item, edits):
     source_sku = source_item.get("seller_custom_field") or item_sku(source_item) or source_item.get("id") or "SEM-SKU"
-    sku_suffix = edits.get("sku_suffix") or ""
-    new_sku = f"{source_sku}{sku_suffix}"
+    new_sku = clean_attribute_value(edits.get("sku") or edits.get("sku_suffix")) or source_sku
     requested_listing_type = edits.get("listing_type_id") or ""
     listing_type_id = requested_listing_type if requested_listing_type in {"gold_special", "gold_pro"} else source_item.get("listing_type_id") or "gold_special"
     source_quantity = item_available_quantity(source_item) or 1
@@ -3544,6 +3653,20 @@ class App(BaseHTTPRequestHandler):
                 ensure_stock_alerts(payload, notify=True)
                 write_payload(payload)
                 self.send_json({"ok": True, "official": official, "catalog": public_payload(payload, user)["catalog"]})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/item/description":
+            try:
+                item_id = request.get("item_id", "")
+                account_id = request.get("account_id", "")
+                account = next((item for item in payload.get("accounts", []) if item.get("id") == account_id or item.get("nickname") == request.get("account")), None)
+                if not account or not account.get("official"):
+                    raise RuntimeError("Conta oficial não encontrada para ler a descrição.")
+                description = account_client(account).item_description(item_id)
+                text = description.get("plain_text") or description.get("text") or ""
+                self.send_json({"ok": True, "description": text})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return

@@ -607,10 +607,10 @@ function renderAds() {
         <div class="inline-edit">
           <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
           <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
-          <label>Peso <input type="text" placeholder="Ex: 500 g" data-weight-input="${item.id}" /></label>
-          <label>Altura <input type="text" placeholder="Ex: 10 cm" data-height-input="${item.id}" /></label>
-          <label>Largura <input type="text" placeholder="Ex: 20 cm" data-width-input="${item.id}" /></label>
-          <label>Comprimento <input type="text" placeholder="Ex: 30 cm" data-length-input="${item.id}" /></label>
+          <label>Peso <input type="text" value="${escapeAttr(item.package_weight || "")}" placeholder="Ex: 500 g" data-weight-input="${item.id}" /></label>
+          <label>Altura <input type="text" value="${escapeAttr(item.package_height || "")}" placeholder="Ex: 10 cm" data-height-input="${item.id}" /></label>
+          <label>Largura <input type="text" value="${escapeAttr(item.package_width || "")}" placeholder="Ex: 20 cm" data-width-input="${item.id}" /></label>
+          <label>Comprimento <input type="text" value="${escapeAttr(item.package_length || "")}" placeholder="Ex: 30 cm" data-length-input="${item.id}" /></label>
           <div class="ad-actions">
             <button class="mini-button" data-save-ad="${item.id}">Salvar</button>
             ${item.meli_status === "paused" || item.status === "paused"
@@ -1455,7 +1455,7 @@ document.querySelector("#copy-items-list").addEventListener("change", (event) =>
   renderCopyItems();
 });
 
-function fillCloneFieldsFromItem(itemId) {
+async function fillCloneFieldsFromItem(itemId) {
   const item = state.data.catalog.find((row) => row.id === itemId);
   if (!item) return;
   const form = document.querySelector("#clone-form");
@@ -1463,7 +1463,17 @@ function fillCloneFieldsFromItem(itemId) {
   form.elements.price_override.value = item.price || "";
   form.elements.stock_override.value = item.stock || "";
   form.elements.listing_type_override.value = item.listing_type_id || "";
-  form.elements.sku_suffix.value = "";
+  form.elements.sku_suffix.value = item.sku && item.sku !== "-" ? item.sku : "";
+  form.elements.description_override.value = "Carregando descrição...";
+  try {
+    const result = await api("/api/meli/item/description", {
+      method: "POST",
+      body: JSON.stringify({ item_id: item.id, account_id: item.account_id }),
+    });
+    form.elements.description_override.value = result.description || "";
+  } catch (_) {
+    form.elements.description_override.value = "";
+  }
 }
 
 document.querySelector("#clone-form").addEventListener("submit", async (event) => {
@@ -1484,7 +1494,7 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
         item_ids: itemIds,
         edits: {
           title: form.get("title_override"),
-          sku_suffix: form.get("sku_suffix"),
+          sku: form.get("sku_suffix"),
           listing_type_id: form.get("listing_type_override"),
           price: form.get("price_override"),
           stock: form.get("stock_override"),
@@ -1798,7 +1808,7 @@ window.addEventListener("hashchange", () => {
 function fixStaticCopyLabels() {
   const fieldLabels = {
     title_override: "Título padrão ",
-    sku_suffix: "SKU sufixo ",
+    sku_suffix: "SKU ",
     price_override: "Preço ",
     stock_override: "Estoque ",
     description_override: "Descrição ",
