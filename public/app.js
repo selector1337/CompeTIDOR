@@ -978,8 +978,8 @@ function renderClone() {
             <div class="meta-row"><span>${job.items} anúncios</span><span>${(job.item_ids || []).join(", ")}</span></div>
             <p>${job.note}</p>
             ${job.created_details?.length ? cloneCreatedHtml(job.created_details) : ""}
-            ${job.errors?.length ? cloneErrorsHtml(job.errors) : ""}
-            ${["preview_ready", "review_required", "partial_error", "error"].includes(job.status) ? `<button class="mini-button" data-execute-clone="${job.id}">${job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button>` : ""}
+            ${job.errors?.length ? cloneErrorsHtml(job.errors, job.validation_version) : ""}
+            ${["preview_ready", "review_required", "partial_error", "error"].includes(job.status) ? `<button class="mini-button" data-execute-clone="${job.id}">${!job.validation_version ? "Revalidar e copiar" : job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button>` : ""}
           </div>
           <span class="badge winning">${job.status}</span>
         </article>
@@ -1033,7 +1033,15 @@ function clonePendingInputHtml(row, field) {
   `;
 }
 
-function cloneErrorsHtml(errors) {
+function cloneErrorsHtml(errors, validationVersion = 0) {
+  if (!validationVersion && errors.some((row) => row.pending_fields?.length)) {
+    return `
+      <div class="notice warning-notice">
+        <strong>Preview antigo</strong>
+        <p>Os campos abaixo foram gerados por regras anteriores. Clique em <b>Revalidar e copiar</b> para buscar novamente todas as informações do anúncio original.</p>
+      </div>
+    `;
+  }
   return `
     <div class="notice danger-notice">
       ${errors.map((row) => `

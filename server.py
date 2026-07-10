@@ -1095,10 +1095,10 @@ def seller_package_api_value(field, value):
 def package_values_from_item(item):
     shipping_dimensions = package_dimensions_from_shipping(item)
     return {
-        "package_weight": item_attribute_value(item, ["SELLER_PACKAGE_WEIGHT"]) or shipping_dimensions.get("package_weight") or "",
-        "package_height": item_attribute_value(item, ["SELLER_PACKAGE_HEIGHT"]) or shipping_dimensions.get("package_height") or "",
-        "package_width": item_attribute_value(item, ["SELLER_PACKAGE_WIDTH"]) or shipping_dimensions.get("package_width") or "",
-        "package_length": item_attribute_value(item, ["SELLER_PACKAGE_LENGTH"]) or shipping_dimensions.get("package_length") or "",
+        "package_weight": item_attribute_value(item, ["SELLER_PACKAGE_WEIGHT"]) or shipping_dimensions.get("package_weight") or item_attribute_value(item, ["PACKAGE_WEIGHT"]) or "",
+        "package_height": item_attribute_value(item, ["SELLER_PACKAGE_HEIGHT"]) or shipping_dimensions.get("package_height") or item_attribute_value(item, ["PACKAGE_HEIGHT"]) or "",
+        "package_width": item_attribute_value(item, ["SELLER_PACKAGE_WIDTH"]) or shipping_dimensions.get("package_width") or item_attribute_value(item, ["PACKAGE_WIDTH"]) or "",
+        "package_length": item_attribute_value(item, ["SELLER_PACKAGE_LENGTH"]) or shipping_dimensions.get("package_length") or item_attribute_value(item, ["PACKAGE_LENGTH"]) or "",
     }
 
 
@@ -2867,6 +2867,27 @@ PRODUCT_IDENTIFIER_ATTRS = {
     "UNIVERSAL_PRODUCT_CODE",
 }
 
+CLONE_ATTRIBUTE_ALIASES = {
+    "PACKAGE_HEIGHT": "SELLER_PACKAGE_HEIGHT",
+    "PACKAGE_LENGTH": "SELLER_PACKAGE_LENGTH",
+    "PACKAGE_WIDTH": "SELLER_PACKAGE_WIDTH",
+    "PACKAGE_WEIGHT": "SELLER_PACKAGE_WEIGHT",
+    "PACKAGE_TYPE": "SELLER_PACKAGE_TYPE",
+}
+CLONE_INTERNAL_READ_ONLY_ATTRIBUTES = {
+    "PACKAGE_DATA_SOURCE",
+    "SYI_PYMES_ID",
+}
+CLONE_ALWAYS_ALLOWED_ATTRIBUTES = {
+    "SELLER_SKU",
+    "SKU",
+    "SELLER_PACKAGE_HEIGHT",
+    "SELLER_PACKAGE_LENGTH",
+    "SELLER_PACKAGE_WIDTH",
+    "SELLER_PACKAGE_WEIGHT",
+    "SELLER_PACKAGE_TYPE",
+}
+
 
 def clean_attribute_value(text):
     if text in (None, "", [], {}):
@@ -2884,21 +2905,8 @@ def clone_attributes_payload(item, source_sku):
         attr_id_text = str(attr_id).upper()
         if attr_id_text in PRODUCT_IDENTIFIER_ATTRS:
             continue
-        row = {"id": attr_id}
-        if attribute.get("value_id"):
-            row["value_id"] = attribute.get("value_id")
-        elif clean_attribute_value(attribute.get("value_name")):
-            row["value_name"] = clean_attribute_value(attribute.get("value_name"))
-        elif attribute.get("values"):
-            values = []
-            for value in attribute.get("values") or []:
-                if value.get("id"):
-                    values.append({"id": value.get("id")})
-                elif clean_attribute_value(value.get("name")):
-                    values.append({"name": clean_attribute_value(value.get("name"))})
-            if values:
-                row["values"] = values
-        if len(row) > 1:
+        row = clone_attribute_row(attribute)
+        if row:
             attributes.append(row)
     if source_sku:
         existing = next((attr for attr in attributes if attr.get("id") in {"SELLER_SKU", "SKU"}), None)
@@ -2920,7 +2928,12 @@ def clone_attribute_row(attribute):
     elif clean_attribute_value(attribute.get("value_name")):
         row["value_name"] = clean_attribute_value(attribute.get("value_name"))
     elif isinstance(attribute.get("value_struct"), dict) and attribute.get("value_struct"):
-        row["value_struct"] = attribute.get("value_struct")
+        struct = attribute.get("value_struct")
+        if struct.get("number") is not None:
+            unit = clean_attribute_value(struct.get("unit"))
+            row["value_name"] = f"{struct.get('number')}{f' {unit}' if unit else ''}"
+        else:
+            row["value_struct"] = struct
     elif attribute.get("values"):
         values = []
         for value in attribute.get("values") or []:
@@ -2962,6 +2975,7 @@ def clone_source_catalog_product(client, source_item):
 def source_clone_attribute(source_item, catalog_product, attr_id):
     wanted = str(attr_id or "").upper()
     wanted_ids = {wanted}
+    wanted_ids.update(key for key, value in CLONE_ATTRIBUTE_ALIASES.items() if value == wanted)
     if wanted == "GTIN":
         wanted_ids.update({"EAN", "UPC", "JAN", "ISBN", "UNIVERSAL_PRODUCT_CODE"})
     for container in (source_item, catalog_product or {}):
@@ -2994,7 +3008,9 @@ def source_clone_attribute(source_item, catalog_product, attr_id):
 
 
 def clone_required_attribute_satisfied(create_payload, attr_id):
-    attr_id = str(attr_id or "").upper()
+    attr_id = canonical_clone_attribute_id(attr_id)
+    if not attr_id:
+        return True
     if clone_payload_has_attribute(create_payload, attr_id):
         return True
     if attr_id == "GTIN" and clone_payload_has_attribute(create_payload, "EMPTY_GTIN_REASON"):
@@ -3006,7 +3022,12 @@ def hydrate_required_clone_attributes(create_payload, source_item, category_attr
     copied = []
     for definition in category_attributes or []:
         attr_id = definition.get("id")
-        if not attr_id or not clone_attribute_is_required(definition) or clone_required_attribute_satisfied(create_payload, attr_id):
+        if (
+            not attr_id
+            or not clone_attribute_is_required(definition)
+            or not clone_attribute_user_editable(definition, attr_id)
+            or clone_required_attribute_satisfied(create_payload, attr_id)
+        ):
             continue
         row = source_clone_attribute(source_item, catalog_product or {}, attr_id)
         if not row:
@@ -3014,6 +3035,50 @@ def hydrate_required_clone_attributes(create_payload, source_item, category_attr
         create_payload.setdefault("attributes", []).append(row)
         copied.append(str(attr_id).upper())
     return copied
+
+
+def hydrate_clone_package_attributes(create_payload, source_item):
+    copied = []
+    field_map = {
+        "package_height": "SELLER_PACKAGE_HEIGHT",
+        "package_length": "SELLER_PACKAGE_LENGTH",
+        "package_width": "SELLER_PACKAGE_WIDTH",
+        "package_weight": "SELLER_PACKAGE_WEIGHT",
+    }
+    values = package_values_from_item(source_item)
+    for field, attr_id in field_map.items():
+        if clone_payload_has_attribute(create_payload, attr_id) or not values.get(field):
+            continue
+        try:
+            value = seller_package_api_value(field, values[field])
+        except Exception:
+            continue
+        create_payload.setdefault("attributes", []).append({"id": attr_id, "value_name": value})
+        copied.append(attr_id)
+    if not clone_payload_has_attribute(create_payload, "SELLER_PACKAGE_TYPE"):
+        package_type = source_clone_attribute(source_item, {}, "SELLER_PACKAGE_TYPE")
+        if package_type:
+            create_payload.setdefault("attributes", []).append(package_type)
+            copied.append("SELLER_PACKAGE_TYPE")
+    return copied
+
+
+def restore_clone_attribute_from_source(create_payload, source_item, category_attributes, attr_id):
+    canonical_id = canonical_clone_attribute_id(attr_id)
+    if not canonical_id or clone_required_attribute_satisfied(create_payload, canonical_id):
+        return bool(canonical_id)
+    if canonical_id.startswith("SELLER_PACKAGE_"):
+        hydrate_clone_package_attributes(create_payload, source_item)
+        if clone_required_attribute_satisfied(create_payload, canonical_id):
+            return True
+    row = source_clone_attribute(source_item, {}, canonical_id)
+    if not row:
+        return False
+    definition = category_attribute_definition(category_attributes, canonical_id)
+    if definition and not clone_attribute_user_editable(definition, canonical_id):
+        return False
+    create_payload.setdefault("attributes", []).append(row)
+    return True
 
 
 def clone_sale_terms_payload(item):
@@ -3271,6 +3336,14 @@ ATTRIBUTE_LABELS_PT = {
     "SELLER_PACKAGE_HEIGHT": "Altura da embalagem",
     "SELLER_PACKAGE_WIDTH": "Largura da embalagem",
     "SELLER_PACKAGE_LENGTH": "Comprimento da embalagem",
+    "SELLER_PACKAGE_TYPE": "Tipo de embalagem",
+    "PACKAGE_HEIGHT": "Altura da embalagem",
+    "PACKAGE_WIDTH": "Largura da embalagem",
+    "PACKAGE_LENGTH": "Comprimento da embalagem",
+    "PACKAGE_WEIGHT": "Peso da embalagem",
+    "PACKAGE_DATA_SOURCE": "Origem dos dados da embalagem",
+    "GAUGES": "Calibres",
+    "RECOMMENDED_INSTRUMENT": "Instrumento recomendado",
     "OUTPUT_CONNECTORS": "Conectores de saída",
     "GTIN": "Código universal do produto (GTIN/EAN)",
     "EAN": "Código EAN",
@@ -3399,6 +3472,38 @@ def category_attribute_ids(category_attributes):
     }
 
 
+def canonical_clone_attribute_id(attr_id):
+    normalized = str(attr_id or "").replace("attribute:", "").upper()
+    if normalized in CLONE_INTERNAL_READ_ONLY_ATTRIBUTES:
+        return ""
+    return CLONE_ATTRIBUTE_ALIASES.get(normalized, normalized)
+
+
+def clone_attribute_user_editable(attribute, attr_id=""):
+    normalized = str(attr_id or attribute.get("id") or "").upper()
+    if normalized in CLONE_INTERNAL_READ_ONLY_ATTRIBUTES:
+        return False
+    if normalized in CLONE_ATTRIBUTE_ALIASES:
+        return False
+    tags = attribute.get("tags") or {}
+    return not (isinstance(tags, dict) and tags.get("read_only") is True)
+
+
+def source_attribute_label(source_item, attr_id):
+    wanted = str(attr_id or "").upper()
+    aliases = {wanted}
+    aliases.update(key for key, value in CLONE_ATTRIBUTE_ALIASES.items() if value == wanted)
+    for container in [source_item, *(source_item.get("variations") or [])]:
+        sections = [container.get("attributes") or []]
+        if container is not source_item:
+            sections.append(container.get("attribute_combinations") or [])
+        for section in sections:
+            for attribute in section:
+                if str(attribute.get("id") or "").upper() in aliases and attribute.get("name"):
+                    return str(attribute.get("name"))
+    return ""
+
+
 def sanitize_clone_answers(answers, category_attributes):
     if not category_attributes:
         return dict(answers or {})
@@ -3408,9 +3513,9 @@ def sanitize_clone_answers(answers, category_attributes):
         if not key.startswith("attribute:"):
             clean[key] = value
             continue
-        attr_id = key.split(":", 1)[1].upper()
-        if attr_id in allowed or attr_id in {"SELLER_SKU", "SKU"}:
-            clean[key] = value
+        attr_id = canonical_clone_attribute_id(key.split(":", 1)[1])
+        if attr_id and (attr_id in allowed or attr_id in CLONE_ALWAYS_ALLOWED_ATTRIBUTES):
+            clean[f"attribute:{attr_id}"] = value
     return clean
 
 
@@ -3421,11 +3526,14 @@ def sanitize_clone_payload_attributes(create_payload, category_attributes):
     removed = []
     kept = []
     for attribute in create_payload.get("attributes") or []:
-        attr_id = str(attribute.get("id") or "").upper()
-        if attr_id in allowed or attr_id in {"SELLER_SKU", "SKU"}:
+        original_id = str(attribute.get("id") or "").upper()
+        attr_id = canonical_clone_attribute_id(original_id)
+        if original_id in CLONE_ATTRIBUTE_ALIASES or not attr_id:
+            removed.append(original_id)
+        elif attr_id in allowed or attr_id in CLONE_ALWAYS_ALLOWED_ATTRIBUTES:
             kept.append(attribute)
-        elif attr_id:
-            removed.append(attr_id)
+        else:
+            removed.append(original_id)
     create_payload["attributes"] = kept
     return list(dict.fromkeys(removed))
 
@@ -3439,16 +3547,28 @@ def source_attribute_id_from_label(source_item, label):
 
 
 def pending_clone_attribute(attr_id, source_item, category_attributes, item_id="", fallback_label=""):
-    definition = category_attribute_definition(category_attributes, attr_id, fallback_label)
-    resolved_id = str(definition.get("id") or attr_id or "").replace("attribute:", "").upper()
-    label = clone_attribute_label(resolved_id, definition.get("name") or fallback_label)
+    original_id = str(attr_id or "").replace("attribute:", "").upper()
+    resolved_id = canonical_clone_attribute_id(original_id)
+    if not resolved_id:
+        return {}
+    definition = category_attribute_definition(category_attributes, resolved_id, fallback_label)
+    if definition and not clone_attribute_user_editable(definition, resolved_id):
+        return {}
+    source_label = source_attribute_label(source_item, resolved_id)
+    label = clone_attribute_label(resolved_id, source_label or definition.get("name") or fallback_label)
     options = []
     for value in definition.get("values") or []:
         name = clean_attribute_value(value.get("name"))
         if name and name not in options:
             options.append(name)
-    value_type = str(definition.get("value_type") or "string").lower()
+    if resolved_id == "SELLER_PACKAGE_TYPE" and not options:
+        options = ["Sem embalagem adicional", "Com embalagem adicional"]
+    value_type = str(definition.get("value_type") or ("number_unit" if resolved_id.startswith("SELLER_PACKAGE_") and resolved_id != "SELLER_PACKAGE_TYPE" else "string")).lower()
     units = clone_attribute_units(definition)
+    if not units and resolved_id in {"SELLER_PACKAGE_HEIGHT", "SELLER_PACKAGE_LENGTH", "SELLER_PACKAGE_WIDTH"}:
+        units = ["cm"]
+    elif not units and resolved_id == "SELLER_PACKAGE_WEIGHT":
+        units = ["g"]
     kind = "select" if options else "number" if value_type in {"number", "number_unit"} else "text"
     max_length = definition.get("value_max_length")
     message = "Selecione ou informe o valor obrigatório exigido pelo Mercado Livre."
@@ -3520,7 +3640,9 @@ def required_clone_attributes_from_error(exc, source_item, category_attributes):
         if not attr_id or attr_id in seen:
             continue
         seen.add(attr_id)
-        deduped.append(pending_clone_attribute(attr_id, source_item, category_attributes, fallback_label=label))
+        pending = pending_clone_attribute(attr_id, source_item, category_attributes, fallback_label=label)
+        if pending:
+            deduped.append(pending)
     return deduped
 
 
@@ -3583,13 +3705,27 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
         changed = True
         adjustments.append({"tipo": "atributos_inexistentes_removidos", "campos": removed_dropped_attrs})
     for field in required_clone_attributes_from_error(exc, source_item, category_attributes or []):
+        attr_id = str(field.get("id") or "").replace("attribute:", "")
+        if restore_clone_attribute_from_source(create_payload, source_item, category_attributes or [], attr_id):
+            changed = True
+            adjustments.append({"tipo": "atributo_recuperado_do_anuncio_original", "campos": [canonical_clone_attribute_id(attr_id)]})
+            continue
         field["item_id"] = item_id
         pending_fields.append(field)
     normalized_error = normalized_attribute_label(error_text)
     if "required" in normalized_error or "obrigatorio" in normalized_error:
         for attribute in category_attributes or []:
             attr_id = attribute.get("id")
-            if not attr_id or not clone_attribute_is_required(attribute) or clone_required_attribute_satisfied(create_payload, attr_id):
+            if (
+                not attr_id
+                or not clone_attribute_is_required(attribute)
+                or not clone_attribute_user_editable(attribute, attr_id)
+                or clone_required_attribute_satisfied(create_payload, attr_id)
+            ):
+                continue
+            if restore_clone_attribute_from_source(create_payload, source_item, category_attributes or [], attr_id):
+                changed = True
+                adjustments.append({"tipo": "atributo_recuperado_do_anuncio_original", "campos": [canonical_clone_attribute_id(attr_id)]})
                 continue
             pending_fields.append(
                 pending_clone_attribute(
@@ -3602,15 +3738,33 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
             )
     missing_fields = required_fields_from_error(exc)
     if missing_fields:
+        body_field_names = {
+            "family_name", "title", "category_id", "price", "currency_id", "available_quantity",
+            "buying_mode", "listing_type_id", "condition", "pictures", "domain_id", "catalog_product_id",
+        }
+        body_fields = [field for field in missing_fields if str(field).lower() in body_field_names]
         before = json.dumps(create_payload, sort_keys=True, ensure_ascii=False)
-        create_payload = fill_missing_clone_fields(create_payload, source_item, missing_fields)
+        create_payload = fill_missing_clone_fields(create_payload, source_item, body_fields)
         after = json.dumps(create_payload, sort_keys=True, ensure_ascii=False)
         if before != after:
             changed = True
-            adjustments.append({"tipo": "campos_obrigatorios_preenchidos", "campos": missing_fields})
-        for field in missing_fields:
+            adjustments.append({"tipo": "campos_obrigatorios_preenchidos", "campos": body_fields})
+        for field in body_fields:
             if not create_payload.get(field):
                 pending_fields.append(clone_pending_field(field, field.replace("_", " ").title(), "text", "Campo obrigatório exigido pelo Mercado Livre.", item_id))
+        for field in missing_fields:
+            if str(field).lower() in body_field_names or str(field).lower() == "official_store_id":
+                continue
+            canonical_id = canonical_clone_attribute_id(field)
+            if not canonical_id:
+                continue
+            if restore_clone_attribute_from_source(create_payload, source_item, category_attributes or [], canonical_id):
+                changed = True
+                adjustments.append({"tipo": "atributo_recuperado_do_anuncio_original", "campos": [canonical_id]})
+                continue
+            pending = pending_clone_attribute(canonical_id, source_item, category_attributes or [], item_id)
+            if pending:
+                pending_fields.append(pending)
 
     invalid_fields = invalid_fields_from_error(exc)
     removed_fields = []
@@ -3637,15 +3791,10 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
             attr_ids.extend(attribute_id_from_human_name(name) for name in human_attribute_names_from_error_text(message))
             attrs_to_remove.extend(attr_ids)
             for attr_id in attr_ids:
-                pending_fields.append(
-                    clone_pending_field(
-                        f"attribute:{attr_id}",
-                        attr_id.replace("_", " ").title(),
-                        "text",
-                        "O Mercado Livre exigiu um valor válido para este atributo.",
-                        item_id,
-                    )
-                )
+                pending = pending_clone_attribute(attr_id, source_item, category_attributes or [], item_id)
+                if pending:
+                    pending["message"] = "O Mercado Livre exigiu um valor válido para este atributo."
+                    pending_fields.append(pending)
         if "está incorreto" in message or "esta incorreto" in message or "value null was omitted" in message or "Struct or text must be present" in message:
             human_names = human_attribute_names_from_error_text(message)
             attr_ids = [attribute_id_from_human_name(name) for name in human_names]
@@ -3656,15 +3805,10 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
                 adjustments.append({"tipo": "atributos_com_valor_invalido_removidos", "campos": removed_attrs})
             for name in human_names:
                 attr_id = attribute_id_from_human_name(name)
-                pending_fields.append(
-                    clone_pending_field(
-                        f"attribute:{attr_id}",
-                        name,
-                        "text",
-                        "Informe exatamente no formato aceito pelo Mercado Livre. Ex: 1 ou 1.7 m.",
-                        item_id,
-                    )
-                )
+                pending = pending_clone_attribute(attr_id, source_item, category_attributes or [], item_id, name)
+                if pending:
+                    pending["message"] = "Informe exatamente no formato aceito pelo Mercado Livre."
+                    pending_fields.append(pending)
         if code == "item.family_name.length_invalid" or "Family Name length is over" in message:
             if create_payload.get("family_name"):
                 create_payload["family_name"] = normalize_family_name(create_payload.get("family_name"))
@@ -3687,27 +3831,17 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
             adjustments.append({"tipo": "atributos_com_valor_invalido_removidos", "campos": removed_attrs})
         for name in human_names:
             attr_id = attribute_id_from_human_name(name)
-            pending_fields.append(
-                clone_pending_field(
-                    f"attribute:{attr_id}",
-                    name,
-                    "text",
-                    "Informe exatamente no formato aceito pelo Mercado Livre. Ex: 1 ou 1.7 m.",
-                    item_id,
-                )
-            )
+            pending = pending_clone_attribute(attr_id, source_item, category_attributes or [], item_id, name)
+            if pending:
+                pending["message"] = "Informe exatamente no formato aceito pelo Mercado Livre."
+                pending_fields.append(pending)
 
     if "item.attribute.invalid" in error_text or "Value name of attribute" in error_text:
         for attr_id in attribute_ids_from_error_text(error_text):
-            pending_fields.append(
-                clone_pending_field(
-                    f"attribute:{attr_id}",
-                    clone_attribute_label(attr_id),
-                    "text",
-                    "Informe um valor válido para este campo obrigatório.",
-                    item_id,
-                )
-            )
+            pending = pending_clone_attribute(attr_id, source_item, category_attributes or [], item_id)
+            if pending:
+                pending["message"] = "Informe um valor válido para este campo obrigatório."
+                pending_fields.append(pending)
 
     removed_attrs = remove_clone_attributes(create_payload, attrs_to_remove)
     if removed_attrs:
@@ -3816,6 +3950,7 @@ def create_official_clone(payload, job, source_item_id, edits):
     except Exception:
         category_attributes = []
     catalog_product = clone_source_catalog_product(source_client, source_item)
+    hydrate_clone_package_attributes(create_payload, source_item)
     hydrate_required_clone_attributes(create_payload, source_item, category_attributes, catalog_product)
     create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
@@ -3875,6 +4010,7 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
             if category_id not in category_cache:
                 category_cache[category_id] = cached_category_attributes(client, category_id)
             catalog_product = clone_source_catalog_product(client, source_item)
+            hydrate_clone_package_attributes(create_payload, source_item)
             hydrate_required_clone_attributes(
                 create_payload,
                 source_item,
@@ -3884,7 +4020,7 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
             item_fields = []
             for attribute in category_cache.get(category_id) or []:
                 attr_id = attribute.get("id")
-                if not clone_attribute_is_required(attribute) or not attr_id:
+                if not clone_attribute_is_required(attribute) or not attr_id or not clone_attribute_user_editable(attribute, attr_id):
                     continue
                 if clone_required_attribute_satisfied(create_payload, attr_id):
                     continue
@@ -4861,6 +4997,7 @@ class App(BaseHTTPRequestHandler):
                 preflight_errors = clone_preflight_pending_fields(payload, source_account.get("id"), item_ids, edits)
                 job = {
                     "id": f"clone-{uuid.uuid4().hex[:8]}",
+                    "validation_version": 3,
                     "source": source_account.get("nickname"),
                     "target": target_account.get("nickname"),
                     "source_account_id": source_account.get("id"),
@@ -4968,6 +5105,7 @@ class App(BaseHTTPRequestHandler):
                         }
                     )
                 has_pending = any(row.get("pending_fields") for row in errors)
+                job["validation_version"] = 3
                 job["status"] = "copied" if copied and not errors else "review_required" if has_pending else "partial_error" if copied else "error"
                 job["copied_items"] = [item.get("id") for item in copied]
                 job["created_details"] = created_details
