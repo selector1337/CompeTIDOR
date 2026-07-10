@@ -33,6 +33,8 @@ SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
 ACTIVE_SYNC_ACCOUNTS = set()
 MELI_NOTIFICATION_QUEUE = queue.Queue(maxsize=5000)
+CATEGORY_ATTRIBUTES_LOCK = threading.RLock()
+CATEGORY_ATTRIBUTES_CACHE = {}
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -3128,6 +3130,11 @@ ATTRIBUTE_LABELS_PT = {
     "SELLER_PACKAGE_HEIGHT": "Altura da embalagem",
     "SELLER_PACKAGE_WIDTH": "Largura da embalagem",
     "SELLER_PACKAGE_LENGTH": "Comprimento da embalagem",
+    "OUTPUT_CONNECTORS": "Conectores de saída",
+    "GTIN": "Código universal do produto (GTIN/EAN)",
+    "EAN": "Código EAN",
+    "UPC": "Código UPC",
+    "EMPTY_GTIN_REASON": "Motivo para não informar o código universal",
 }
 
 
@@ -3136,14 +3143,17 @@ def clone_attribute_label(field_id, fallback=""):
     return ATTRIBUTE_LABELS_PT.get(normalized) or fallback or normalized.replace("_", " ").title()
 
 
-def clone_pending_field(field_id, label, kind="text", message="", item_id=""):
-    return {
+def clone_pending_field(field_id, label, kind="text", message="", item_id="", options=None, **metadata):
+    field = {
         "id": field_id,
         "label": clone_attribute_label(field_id, label),
         "kind": kind,
         "message": message,
         "item_id": item_id,
+        "options": options or [],
     }
+    field.update({key: value for key, value in metadata.items() if value not in (None, "", [], {})})
+    return field
 
 
 def dedupe_pending_fields(fields):
@@ -3175,6 +3185,217 @@ def source_attribute_value(source_item, ids):
     return ""
 
 
+def normalized_attribute_label(value):
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii").lower(),
+    ).strip()
+
+
+def cached_category_attributes(client, category_id):
+    category_id = str(category_id or "").strip()
+    if not category_id:
+        return []
+    ttl = max(300, int(os.getenv("CATEGORY_ATTRIBUTES_CACHE_SECONDS", "3600")))
+    now = time.monotonic()
+    with CATEGORY_ATTRIBUTES_LOCK:
+        cached = CATEGORY_ATTRIBUTES_CACHE.get(category_id)
+        if cached and now - cached["time"] < ttl:
+            return cached["attributes"]
+    attributes = client.category_attributes(category_id)
+    attributes = attributes if isinstance(attributes, list) else []
+    with CATEGORY_ATTRIBUTES_LOCK:
+        CATEGORY_ATTRIBUTES_CACHE[category_id] = {"time": now, "attributes": attributes}
+    return attributes
+
+
+def clone_attribute_is_required(attribute):
+    tags = attribute.get("tags") or {}
+    if not isinstance(tags, dict):
+        return False
+    for key, value in tags.items():
+        normalized = str(key or "").lower()
+        if "required" not in normalized or normalized.startswith(("not_", "non_", "optional_")):
+            continue
+        if value not in (False, None, "", 0, "0", "false", "False"):
+            return True
+    return False
+
+
+def clone_attribute_units(attribute):
+    units = []
+    default_unit = attribute.get("default_unit")
+    if isinstance(default_unit, dict):
+        default_unit = default_unit.get("name") or default_unit.get("id")
+    if clean_attribute_value(default_unit):
+        units.append(clean_attribute_value(default_unit))
+    for unit in attribute.get("allowed_units") or []:
+        if isinstance(unit, dict):
+            unit = unit.get("name") or unit.get("id")
+        unit = clean_attribute_value(unit)
+        if unit and unit not in units:
+            units.append(unit)
+    return units
+
+
+def category_attribute_definition(category_attributes, attr_id="", label=""):
+    wanted_id = str(attr_id or "").replace("attribute:", "").upper()
+    wanted_label = normalized_attribute_label(label)
+    for attribute in category_attributes or []:
+        current_id = str(attribute.get("id") or "").upper()
+        current_label = normalized_attribute_label(attribute.get("name") or "")
+        if (wanted_id and current_id == wanted_id) or (wanted_label and current_label == wanted_label):
+            return attribute
+    return {}
+
+
+def category_attribute_ids(category_attributes):
+    return {
+        str(attribute.get("id") or "").upper()
+        for attribute in category_attributes or []
+        if attribute.get("id")
+    }
+
+
+def sanitize_clone_answers(answers, category_attributes):
+    if not category_attributes:
+        return dict(answers or {})
+    allowed = category_attribute_ids(category_attributes)
+    clean = {}
+    for key, value in (answers or {}).items():
+        if not key.startswith("attribute:"):
+            clean[key] = value
+            continue
+        attr_id = key.split(":", 1)[1].upper()
+        if attr_id in allowed or attr_id in {"SELLER_SKU", "SKU"}:
+            clean[key] = value
+    return clean
+
+
+def sanitize_clone_payload_attributes(create_payload, category_attributes):
+    if not category_attributes:
+        return []
+    allowed = category_attribute_ids(category_attributes)
+    removed = []
+    kept = []
+    for attribute in create_payload.get("attributes") or []:
+        attr_id = str(attribute.get("id") or "").upper()
+        if attr_id in allowed or attr_id in {"SELLER_SKU", "SKU"}:
+            kept.append(attribute)
+        elif attr_id:
+            removed.append(attr_id)
+    create_payload["attributes"] = kept
+    return list(dict.fromkeys(removed))
+
+
+def source_attribute_id_from_label(source_item, label):
+    wanted = normalized_attribute_label(label)
+    for attribute in source_item.get("attributes") or []:
+        if normalized_attribute_label(attribute.get("name") or "") == wanted:
+            return str(attribute.get("id") or "").upper()
+    return ""
+
+
+def pending_clone_attribute(attr_id, source_item, category_attributes, item_id="", fallback_label=""):
+    definition = category_attribute_definition(category_attributes, attr_id, fallback_label)
+    resolved_id = str(definition.get("id") or attr_id or "").replace("attribute:", "").upper()
+    label = clone_attribute_label(resolved_id, definition.get("name") or fallback_label)
+    options = []
+    for value in definition.get("values") or []:
+        name = clean_attribute_value(value.get("name"))
+        if name and name not in options:
+            options.append(name)
+    value_type = str(definition.get("value_type") or "string").lower()
+    units = clone_attribute_units(definition)
+    kind = "select" if options else "number" if value_type in {"number", "number_unit"} else "text"
+    max_length = definition.get("value_max_length")
+    message = "Selecione ou informe o valor obrigatório exigido pelo Mercado Livre."
+    if units:
+        message = f"Informe o valor e use uma das unidades aceitas: {', '.join(units)}."
+    elif max_length:
+        message = f"Informe o valor obrigatório com no máximo {max_length} caracteres."
+    return clone_pending_field(
+        f"attribute:{resolved_id}",
+        label,
+        kind,
+        message,
+        item_id,
+        options,
+        units=units,
+        max_length=max_length,
+        value_type=value_type,
+    )
+
+
+def required_clone_attributes_from_error(exc, source_item, category_attributes):
+    text = meli_error_text(exc)
+    found = []
+
+    for match in re.finditer(
+        r"(?:attributes?|atributos?)\s*\[([^\]]+)\]\s*(?:are|is|são|sao)\s+required",
+        text,
+        flags=re.I,
+    ):
+        for raw_id in match.group(1).split(","):
+            attr_id = raw_id.strip().strip("'\"").upper()
+            if re.fullmatch(r"[A-Z0-9_]+", attr_id):
+                found.append((attr_id, ""))
+
+    human_patterns = (
+        r'(?:campo|atributo)\s+["\']([^"\']+)["\']\s+(?:é|e)\s+obrigat[oó]rio',
+        r'(?:field|attribute)\s+["\']([^"\']+)["\']\s+is\s+required',
+    )
+    for pattern in human_patterns:
+        for match in re.finditer(pattern, text, flags=re.I):
+            label = match.group(1).strip()
+            definition = category_attribute_definition(category_attributes, label=label)
+            attr_id = str(definition.get("id") or "").upper() or source_attribute_id_from_label(source_item, label)
+            if not attr_id:
+                attr_id = attribute_id_from_human_name(label)
+            found.append((attr_id, label))
+
+    for match in re.finditer(
+        r"(?:attribute|atributo)\s+([A-Z][A-Z0-9_]{2,})\s+(?:is\s+required|(?:é|e)\s+obrigat[oó]rio)",
+        text,
+        flags=re.I,
+    ):
+        found.append((match.group(1).upper(), ""))
+
+    for cause in meli_error_causes(exc):
+        code_message = f"{cause.get('code') or ''} {cause.get('message') or ''}".lower()
+        if "required" not in code_message and "obrig" not in normalized_attribute_label(code_message):
+            continue
+        for reference in cause.get("references") or []:
+            tokens = re.findall(r"[A-Z][A-Z0-9_]{2,}", str(reference or ""))
+            for attr_id in tokens:
+                if attr_id not in {"BODY", "ITEM", "ATTRIBUTES"}:
+                    found.append((attr_id, ""))
+
+    deduped = []
+    seen = set()
+    for attr_id, label in found:
+        attr_id = str(attr_id or "").upper()
+        if not attr_id or attr_id in seen:
+            continue
+        seen.add(attr_id)
+        deduped.append(pending_clone_attribute(attr_id, source_item, category_attributes, fallback_label=label))
+    return deduped
+
+
+def dropped_clone_attributes_from_error(exc):
+    text = meli_error_text(exc)
+    attr_ids = []
+    patterns = (
+        r"Attribute:\s*([A-Z0-9_]+)\s+was dropped",
+        r"Attribute\s+\[?([A-Z0-9_]+)\]?\s+(?:was dropped|does not exist|does not exists)",
+        r"Atributo\s+\[?([A-Z0-9_]+)\]?\s+(?:não existe|nao existe|foi removido)",
+    )
+    for pattern in patterns:
+        attr_ids.extend(match.group(1).upper() for match in re.finditer(pattern, text, flags=re.I))
+    return list(dict.fromkeys(attr_ids))
+
+
 def fill_missing_clone_fields(create_payload, source_item, fields):
     for field in fields:
         if create_payload.get(field):
@@ -3204,10 +3425,33 @@ def clone_payload_from_answers(create_payload, answers):
     return create_payload
 
 
-def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending_fields, item_id=""):
+def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending_fields, item_id="", category_attributes=None):
     changed = False
     adjustments = []
     error_text = meli_error_text(exc)
+    dropped_attrs = dropped_clone_attributes_from_error(exc)
+    removed_dropped_attrs = remove_clone_attributes(create_payload, dropped_attrs)
+    if removed_dropped_attrs:
+        changed = True
+        adjustments.append({"tipo": "atributos_inexistentes_removidos", "campos": removed_dropped_attrs})
+    for field in required_clone_attributes_from_error(exc, source_item, category_attributes or []):
+        field["item_id"] = item_id
+        pending_fields.append(field)
+    normalized_error = normalized_attribute_label(error_text)
+    if "required" in normalized_error or "obrigatorio" in normalized_error:
+        for attribute in category_attributes or []:
+            attr_id = attribute.get("id")
+            if not attr_id or not clone_attribute_is_required(attribute) or clone_payload_has_attribute(create_payload, attr_id):
+                continue
+            pending_fields.append(
+                pending_clone_attribute(
+                    attr_id,
+                    source_item,
+                    category_attributes or [],
+                    item_id,
+                    attribute.get("name") or "",
+                )
+            )
     missing_fields = required_fields_from_error(exc)
     if missing_fields:
         before = json.dumps(create_payload, sort_keys=True, ensure_ascii=False)
@@ -3355,10 +3599,13 @@ def friendly_clone_error(exc):
     return " ".join(dict.fromkeys(messages)) or str(exc)
 
 
-def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id=""):
-    payload = dict(create_payload)
-    payload = clone_payload_from_answers(payload, answers or {})
+def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id="", category_attributes=None):
+    payload = json.loads(json.dumps(create_payload, ensure_ascii=False))
+    sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [])
+    payload = clone_payload_from_answers(payload, sanitize_clone_answers(answers or {}, category_attributes or []))
     adjustments = []
+    if sanitized_attributes:
+        adjustments.append({"tipo": "atributos_fora_da_categoria_removidos", "campos": sanitized_attributes})
     last_error = None
     pending_fields = []
     for _ in range(5):
@@ -3369,7 +3616,14 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
             return created
         except Exception as exc:
             last_error = exc
-            payload, changed, new_adjustments = clone_retry_adjustments_from_error(exc, payload, source_item, pending_fields, item_id)
+            payload, changed, new_adjustments = clone_retry_adjustments_from_error(
+                exc,
+                payload,
+                source_item,
+                pending_fields,
+                item_id,
+                category_attributes or [],
+            )
             adjustments.extend(new_adjustments)
             if pending_fields:
                 break
@@ -3395,7 +3649,18 @@ def create_official_clone(payload, job, source_item_id, edits):
     source_item = source_client.item(source_item_id)
     create_payload = build_clone_item_payload(source_item, edits)
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
-    created = create_item_with_clone_retries(target_client, create_payload, source_item, answers, source_item_id)
+    try:
+        category_attributes = cached_category_attributes(source_client, source_item.get("category_id"))
+    except Exception:
+        category_attributes = []
+    created = create_item_with_clone_retries(
+        target_client,
+        create_payload,
+        source_item,
+        answers,
+        source_item_id,
+        category_attributes,
+    )
     verified_item = {}
     if created.get("id"):
         try:
@@ -3442,28 +3707,29 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
             if not category_id:
                 continue
             if category_id not in category_cache:
-                category_cache[category_id] = client.category_attributes(category_id)
+                category_cache[category_id] = cached_category_attributes(client, category_id)
+            item_fields = []
             for attribute in category_cache.get(category_id) or []:
                 attr_id = attribute.get("id")
-                tags = attribute.get("tags") or {}
-                is_required = bool(tags.get("required") or tags.get("catalog_required") or tags.get("required_for_catalog"))
-                if not is_required or not attr_id or str(attr_id).upper() in PRODUCT_IDENTIFIER_ATTRS:
+                if not clone_attribute_is_required(attribute) or not attr_id:
                     continue
                 if clone_payload_has_attribute(create_payload, attr_id):
                     continue
+                item_fields.append(
+                    pending_clone_attribute(
+                        attr_id,
+                        source_item,
+                        category_cache.get(category_id) or [],
+                        item_id,
+                        attribute.get("name") or "",
+                    )
+                )
+            if item_fields:
                 pending.append(
                     {
                         "item_id": item_id,
                         "error": "O Mercado Livre exige informações antes de criar este anúncio.",
-                        "pending_fields": [
-                            clone_pending_field(
-                                f"attribute:{attr_id}",
-                                clone_attribute_label(attr_id, attribute.get("name") or ""),
-                                "text",
-                                "Informe o valor obrigatório para esta categoria.",
-                                item_id,
-                            )
-                        ],
+                        "pending_fields": dedupe_pending_fields(item_fields),
                     }
                 )
         except Exception:

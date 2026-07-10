@@ -1017,13 +1017,50 @@ h2 {
   text-transform: uppercase;
 }
 
-.clone-pending-grid input {
+.clone-pending-grid input,
+.clone-pending-grid select {
   border: 1px solid rgba(255, 230, 0, 0.55);
   background: rgba(5, 9, 14, 0.8);
   color: var(--text);
   border-radius: 8px;
   padding: 10px 12px;
   outline: none;
+  min-width: 0;
+}
+
+.clone-pending-grid small {
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.35;
+  text-transform: none;
+}
+
+.clone-value-with-unit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.clone-value-with-unit > input {
+  border-radius: 8px 0 0 8px;
+}
+
+.clone-value-with-unit > select,
+.clone-fixed-unit {
+  min-width: 66px;
+  border: 1px solid rgba(255, 230, 0, 0.55);
+  border-left: 0;
+  border-radius: 0 8px 8px 0;
+  background: #18212c;
+  color: var(--brand);
+  padding: 10px;
+  font-weight: 900;
+}
+
+.clone-fixed-unit {
+  display: grid;
+  place-items: center;
 }
 
 .clone-created-grid {
@@ -2712,13 +2749,17 @@ body {
 
 .login-brand {
   margin: 0;
-  padding: 0 24px;
+  padding: 12px 18px;
+  border: 1px solid rgba(255, 230, 0, 0.42);
+  border-radius: 8px;
+  background: #f4f6f8;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.28), 0 0 24px rgba(255, 214, 0, 0.08);
 }
 
 .login-logo {
-  width: min(300px, 72vw);
-  max-height: 190px;
-  filter: drop-shadow(0 14px 30px rgba(255, 214, 0, 0.16));
+  width: min(280px, 68vw);
+  max-height: 176px;
+  filter: none;
 }
 
 .login-card {

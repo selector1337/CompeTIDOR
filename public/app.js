@@ -1003,6 +1003,36 @@ function cloneCreatedHtml(items) {
   `;
 }
 
+function clonePendingInputHtml(row, field) {
+  const common = `data-clone-answer-item="${escapeAttr(row.item_id)}" data-clone-answer-field="${escapeAttr(field.id)}"`;
+  if (field.options?.length) {
+    return `
+      <select ${common}>
+        <option value="">Selecione uma opção</option>
+        ${field.options.map((option) => `<option value="${escapeAttr(option)}">${escapeText(option)}</option>`).join("")}
+      </select>
+    `;
+  }
+  const input = `
+    <input
+      ${common}
+      type="text"
+      ${field.kind === "number" ? 'inputmode="decimal"' : ""}
+      ${field.max_length ? `maxlength="${escapeAttr(field.max_length)}"` : ""}
+      placeholder="${escapeAttr(field.message || "Informe o valor exigido pelo Mercado Livre")}"
+    />
+  `;
+  if (!field.units?.length) return input;
+  return `
+    <span class="clone-value-with-unit">
+      ${input}
+      ${field.units.length === 1
+        ? `<span class="clone-fixed-unit" data-clone-answer-unit="${escapeAttr(field.units[0])}">${escapeText(field.units[0])}</span>`
+        : `<select data-clone-answer-unit>${field.units.map((unit) => `<option value="${escapeAttr(unit)}">${escapeText(unit)}</option>`).join("")}</select>`}
+    </span>
+  `;
+}
+
 function cloneErrorsHtml(errors) {
   return `
     <div class="notice danger-notice">
@@ -1015,11 +1045,8 @@ function cloneErrorsHtml(errors) {
               ${row.pending_fields.map((field) => `
                 <label>
                   ${escapeText(field.label || field.id)}
-                  <input
-                    data-clone-answer-item="${escapeAttr(row.item_id)}"
-                    data-clone-answer-field="${escapeAttr(field.id)}"
-                    placeholder="${escapeAttr(field.message || "Informe o valor exigido pelo Mercado Livre")}"
-                  />
+                  ${clonePendingInputHtml(row, field)}
+                  ${field.message ? `<small>${escapeText(field.message)}</small>` : ""}
                 </label>
               `).join("")}
             </div>
@@ -1622,8 +1649,12 @@ document.querySelector("#clone-jobs").addEventListener("click", async (event) =>
   card?.querySelectorAll("[data-clone-answer-item][data-clone-answer-field]").forEach((input) => {
     if (!input.value.trim()) return;
     const itemId = input.dataset.cloneAnswerItem;
+    const unitControl = input.closest("label")?.querySelector("[data-clone-answer-unit]");
+    const unit = unitControl?.dataset.cloneAnswerUnit || unitControl?.value || "";
+    const rawValue = input.value.trim();
+    const value = unit && !/[a-zA-Z]/.test(rawValue) ? `${rawValue} ${unit}` : rawValue;
     fieldAnswers[itemId] ||= {};
-    fieldAnswers[itemId][input.dataset.cloneAnswerField] = input.value.trim();
+    fieldAnswers[itemId][input.dataset.cloneAnswerField] = value;
   });
   button.disabled = true;
   button.textContent = "Copiando...";
