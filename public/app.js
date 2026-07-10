@@ -12,6 +12,7 @@
   adsSku: "",
   adsCode: "",
   adsStatus: "all",
+  adsCatalog: "all",
   adsFlex: "all",
   stockPeriod: "today",
   stockCustomDate: "",
@@ -581,6 +582,7 @@ function catalogWinnerSourceValue(item) {
 function catalogWinnerSource(source) {
   const sources = {
     price_to_win: "API oficial",
+    price_to_win_winner: "API oficial · price_to_win v2",
     products_items_winner_marker: "API catálogo",
     public_product_page: "Página pública ML",
     catalog_reference: "Catálogo ML",
@@ -629,6 +631,7 @@ function renderAds() {
     const code = `${item.id || ""}`.toLowerCase();
     return (state.adsAccount === "all" || item.account === state.adsAccount)
       && (state.adsStatus === "all" || item.meli_status === state.adsStatus)
+      && (state.adsCatalog === "all" || (state.adsCatalog === "catalog" ? isCatalogItem(item) : !isCatalogItem(item)))
       && (state.adsFlex === "all" || (state.adsFlex === "active" ? item.shipping_logistic_type === "self_service" : item.shipping_logistic_type !== "self_service"))
       && (!productTerm || title.includes(productTerm))
       && (!skuTerm || sku.includes(skuTerm))
@@ -651,16 +654,17 @@ function renderAds() {
           ${fact("Código do anúncio", item.id)}
           ${fact("SKU", item.sku || "-")}
           ${fact("Tipo", listingTypeLabel(item.listing_type_id))}
+          ${fact("Modalidade", isCatalogItem(item) ? "Catálogo" : "Tradicional")}
           ${flexStatusBadge(item.shipping_logistic_type)}
           ${fact("Status do anúncio", statusLabel(item.meli_status || item.status))}
         </div>
         <div class="inline-edit">
           <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
           <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
-          <label>Peso <input type="text" value="${escapeAttr(item.package_weight || "")}" placeholder="Ex: 500 g" data-weight-input="${item.id}" /></label>
-          <label>Altura <input type="text" value="${escapeAttr(item.package_height || "")}" placeholder="Ex: 10 cm" data-height-input="${item.id}" /></label>
-          <label>Largura <input type="text" value="${escapeAttr(item.package_width || "")}" placeholder="Ex: 20 cm" data-width-input="${item.id}" /></label>
-          <label>Comprimento <input type="text" value="${escapeAttr(item.package_length || "")}" placeholder="Ex: 30 cm" data-length-input="${item.id}" /></label>
+          <label>Peso <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_weight))}" placeholder="0,6" data-weight-input="${item.id}" /><span>kg</span></span></label>
+          <label>Altura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_height))}" placeholder="13" data-height-input="${item.id}" /><span>cm</span></span></label>
+          <label>Largura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_width))}" placeholder="18" data-width-input="${item.id}" /><span>cm</span></span></label>
+          <label>Comprimento <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_length))}" placeholder="13" data-length-input="${item.id}" /><span>cm</span></span></label>
           <div class="ad-actions">
             <button class="mini-button" data-save-ad="${item.id}">Salvar</button>
             ${item.meli_status === "paused" || item.status === "paused"
@@ -681,6 +685,15 @@ function renderAds() {
 
 function isCatalogListing(item) {
   return item.catalog_listing === true;
+}
+
+function isCatalogItem(item) {
+  return item.catalog_listing === true || Boolean(item.catalog_product_id && item.catalog_product_id !== "-");
+}
+
+function measureInputValue(value) {
+  const match = String(value || "").match(/[\d.,]+/);
+  return match ? match[0] : "";
 }
 
 function renderItemLog(item) {
@@ -722,10 +735,10 @@ function renderAlerts() {
       (alert) => `
         <article class="alert-item ${alert.severity} ${alert.read ? "read" : ""}">
           <div class="alert-top">
-            <strong>${alert.title}</strong>
+            <strong>${escapeText(alert.title)}</strong>
             <button class="mini-button" data-alert="${alert.id}">${alert.read ? "Lido" : "Marcar lido"}</button>
           </div>
-          <p>${alert.message}</p>
+          <p>${escapeText(alert.message)}</p>
           <div class="chip-row alert-chips">
             ${copyChip("Conta", alert.account || "-")}
             ${alert.item_id ? copyChip("MLB", alert.item_id) : ""}
@@ -1085,13 +1098,13 @@ function renderCopyItems() {
   state.copyPage = pageInfo.current;
   const selectedCount = state.cloneSelectedIds.size;
   list.innerHTML = filtered.length
-    ? `<div class="pagination-info">${selectedCount} selecionado(s)</div>`
+    ? `<div class="pagination-info">${selectedCount ? "1 anúncio selecionado" : "Selecione um anúncio para copiar"}</div>`
         + paginationHtml("copyPage", pageInfo)
         + pageInfo.items
         .map(
           (item) => `
             <label class="copy-item">
-              <input type="checkbox" name="item_ids" value="${item.id}" ${state.cloneSelectedIds.has(item.id) ? "checked" : ""} />
+              <input type="radio" name="item_id" value="${item.id}" ${state.cloneSelectedIds.has(item.id) ? "checked" : ""} />
               ${item.thumbnail
                 ? `<img class="copy-thumb" src="${item.thumbnail}" alt="${escapeAttr(item.title || item.id)}" loading="lazy" />`
                 : `<span class="copy-thumb copy-thumb-empty"></span>`}
@@ -1315,6 +1328,7 @@ document.addEventListener("click", (event) => {
   ["#ads-sku-filter", "adsSku"],
   ["#ads-code-filter", "adsCode"],
   ["#ads-status-filter", "adsStatus"],
+  ["#ads-catalog-filter", "adsCatalog"],
   ["#ads-flex-filter", "adsFlex"],
   ["#copy-product-filter", "copySearch"],
   ["#copy-sku-filter", "copySku"],
@@ -1423,10 +1437,10 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   if (button.dataset.saveAd) {
     payload.price = Number(document.querySelector(`[data-price-input="${id}"]`).value);
     payload.available_quantity = Number(document.querySelector(`[data-stock-input="${id}"]`).value);
-    payload.package_weight = document.querySelector(`[data-weight-input="${id}"]`).value;
-    payload.package_height = document.querySelector(`[data-height-input="${id}"]`).value;
-    payload.package_width = document.querySelector(`[data-width-input="${id}"]`).value;
-    payload.package_length = document.querySelector(`[data-length-input="${id}"]`).value;
+    payload.package_weight = withUnit(document.querySelector(`[data-weight-input="${id}"]`).value, "kg");
+    payload.package_height = withUnit(document.querySelector(`[data-height-input="${id}"]`).value, "cm");
+    payload.package_width = withUnit(document.querySelector(`[data-width-input="${id}"]`).value, "cm");
+    payload.package_length = withUnit(document.querySelector(`[data-length-input="${id}"]`).value, "cm");
   }
   if (button.dataset.pauseAd) payload.status_action = "pause";
   if (button.dataset.activateAd) payload.status_action = "activate";
@@ -1441,6 +1455,11 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
     alert(error.message || "Não foi possível atualizar o anúncio.");
   }
 });
+
+function withUnit(value, unit) {
+  const normalized = String(value || "").trim();
+  return normalized ? `${normalized} ${unit}` : "";
+}
 
 document.querySelector("#alerts-list").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-alert]");
@@ -1520,11 +1539,11 @@ document.querySelector('select[name="source"]').addEventListener("change", () =>
 });
 
 document.querySelector("#copy-items-list").addEventListener("change", (event) => {
-  const input = event.target.closest('input[name="item_ids"]');
+  const input = event.target.closest('input[name="item_id"]');
   if (!input) return;
+  state.cloneSelectedIds.clear();
   if (input.checked) state.cloneSelectedIds.add(input.value);
-  else state.cloneSelectedIds.delete(input.value);
-  if (input.checked && state.cloneSelectedIds.size === 1) fillCloneFieldsFromItem(input.value);
+  if (input.checked) fillCloneFieldsFromItem(input.value);
   renderCopyItems();
 });
 
@@ -1563,7 +1582,6 @@ document.querySelector('[name="title_override"]')?.addEventListener("input", upd
 document.querySelector("#clone-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
-  form.getAll("item_ids").forEach((itemId) => state.cloneSelectedIds.add(itemId));
   const itemIds = [...state.cloneSelectedIds];
   if (!itemIds.length) {
     alert("Selecione pelo menos um anúncio específico para copiar.");

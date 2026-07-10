@@ -1087,6 +1087,56 @@ def seller_package_api_value(field, value):
     return f"{number:g} cm"
 
 
+def package_values_from_item(item):
+    shipping_dimensions = package_dimensions_from_shipping(item)
+    return {
+        "package_weight": item_attribute_value(item, ["SELLER_PACKAGE_WEIGHT"]) or shipping_dimensions.get("package_weight") or "",
+        "package_height": item_attribute_value(item, ["SELLER_PACKAGE_HEIGHT"]) or shipping_dimensions.get("package_height") or "",
+        "package_width": item_attribute_value(item, ["SELLER_PACKAGE_WIDTH"]) or shipping_dimensions.get("package_width") or "",
+        "package_length": item_attribute_value(item, ["SELLER_PACKAGE_LENGTH"]) or shipping_dimensions.get("package_length") or "",
+    }
+
+
+def package_value_number(field, value):
+    normalized = normalize_package_value(value, ["SELLER_PACKAGE_WEIGHT" if field == "package_weight" else "SELLER_PACKAGE_LENGTH"])
+    match = re.search(r"[\d.,]+", normalized or "")
+    return parse_decimal_number(match.group(0)) if match else None
+
+
+def verify_package_update(client, item_id, expected):
+    expected_numbers = {
+        field: package_value_number(field, value)
+        for field, value in expected.items()
+        if clean_attribute_value(value)
+    }
+    latest = {}
+    mismatches = []
+    for attempt in range(4):
+        latest = client.item(item_id)
+        actual = package_values_from_item(latest)
+        mismatches = []
+        for field, expected_number in expected_numbers.items():
+            actual_number = package_value_number(field, actual.get(field))
+            tolerance = 0.005 if field == "package_weight" else 0.05
+            if actual_number is None or expected_number is None or abs(actual_number - expected_number) > tolerance:
+                mismatches.append(field)
+        if not mismatches:
+            return latest
+        if attempt < 3:
+            time.sleep(0.5 * (attempt + 1))
+    labels = {
+        "package_weight": "peso",
+        "package_height": "altura",
+        "package_width": "largura",
+        "package_length": "comprimento",
+    }
+    names = ", ".join(labels.get(field, field) for field in mismatches)
+    raise RuntimeError(
+        f"O Mercado Livre recebeu a solicitação, mas não confirmou a alteração de {names}. "
+        "Em anúncios Full ou com dimensões gerenciadas pela logística, esses campos podem ser somente leitura."
+    )
+
+
 def item_thumbnail(item):
     thumbnail = item.get("secure_thumbnail") or item.get("thumbnail") or ""
     pictures = item.get("pictures") or []
@@ -1895,6 +1945,7 @@ def normalize_competition(client, account, item):
 
     try:
         price = client.price_to_win(item_id)
+        winner = price.get("winner") or {}
         data.update(
             {
                 "competition_status": price.get("status") or "unknown",
@@ -1905,7 +1956,27 @@ def normalize_competition(client, account, item):
                 "competition_reason": ", ".join(price.get("reason") or []),
             }
         )
-        if str(price.get("winner", "")).lower() == "true" or price.get("status") in {"winning", "winner"}:
+        if isinstance(winner, dict) and winner.get("item_id"):
+            winner_item_id = winner.get("item_id")
+            winner_seller_id = ""
+            winner_name = ""
+            try:
+                winner_item = client.item(winner_item_id)
+                winner_seller_id = str(winner_item.get("seller_id") or "")
+                if winner_seller_id:
+                    winner_profile = client.user(winner_seller_id)
+                    winner_name = winner_profile.get("nickname") or f"Seller {winner_seller_id}"
+            except Exception:
+                pass
+            if str(winner_item_id) == str(item_id):
+                winner_seller_id = str(account.get("seller_id") or winner_seller_id)
+                winner_name = account.get("nickname") or winner_name or "Sua conta"
+            data["winner_seller_id"] = winner_seller_id
+            data["winner_name"] = winner_name or f"Anúncio {winner_item_id}"
+            data["winner_price"] = winner.get("price") or price.get("price_to_win") or price.get("current_price")
+            data["winner_confirmed"] = True
+            data["winner_source"] = "price_to_win_winner"
+        elif price.get("status") in {"winning", "winner"}:
             data["winner_seller_id"] = account.get("seller_id", "")
             data["winner_name"] = account.get("nickname", "Sua conta")
             data["winner_price"] = price.get("current_price")
@@ -1914,7 +1985,7 @@ def normalize_competition(client, account, item):
     except Exception as exc:
         data["competition_reason"] = str(exc)
 
-    if catalog_product_id:
+    if catalog_product_id and not data.get("winner_confirmed"):
         try:
             public_buybox = fetch_public_buybox(client, catalog_product_id, item)
             data["winner_name"] = public_buybox.get("seller_name") or "Vendedor da buybox"
@@ -2030,11 +2101,7 @@ def synced_catalog_item(account, item, competition=None):
     is_catalog = bool(item.get("catalog_listing") or item.get("catalog_product_id"))
     competition = competition or {}
     status, action = classified_catalog_status(account, item, stock, is_catalog, competition)
-    shipping_dimensions = package_dimensions_from_shipping(item)
-    package_weight = item_attribute_value(item, ["SELLER_PACKAGE_WEIGHT"]) or shipping_dimensions.get("package_weight") or ""
-    package_height = item_attribute_value(item, ["SELLER_PACKAGE_HEIGHT"]) or shipping_dimensions.get("package_height") or ""
-    package_width = item_attribute_value(item, ["SELLER_PACKAGE_WIDTH"]) or shipping_dimensions.get("package_width") or ""
-    package_length = item_attribute_value(item, ["SELLER_PACKAGE_LENGTH"]) or shipping_dimensions.get("package_length") or ""
+    package_values = package_values_from_item(item)
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
@@ -2048,10 +2115,7 @@ def synced_catalog_item(account, item, competition=None):
         "listing_type_id": listing_type_id,
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
-        "package_weight": package_weight,
-        "package_height": package_height,
-        "package_width": package_width,
-        "package_length": package_length,
+        **package_values,
         "status": status,
         "share": 0 if is_catalog else 100,
         "price": item.get("price") or 0,
@@ -2465,6 +2529,10 @@ def competition_snapshot(item):
                 "winner_price": None,
                 "winner_confirmed": False,
                 "winner_source": "",
+                "competition_reason": (
+                    "A API oficial informa o status da disputa e o preço para ganhar, "
+                    "mas este registro antigo não possuía vencedor confirmado."
+                ),
             }
         )
     return snapshot
@@ -4139,6 +4207,7 @@ class App(BaseHTTPRequestHandler):
                 if request.get("status_action") == "activate":
                     update["status"] = "active"
                 dimension_attrs = []
+                expected_package_values = {}
                 dimension_map = {
                     "package_weight": "SELLER_PACKAGE_WEIGHT",
                     "package_height": "SELLER_PACKAGE_HEIGHT",
@@ -4147,13 +4216,17 @@ class App(BaseHTTPRequestHandler):
                 }
                 for request_key, attr_id in dimension_map.items():
                     if clean_attribute_value(request.get(request_key)):
-                        dimension_attrs.append({"id": attr_id, "value_name": seller_package_api_value(request_key, request.get(request_key))})
+                        api_value = seller_package_api_value(request_key, request.get(request_key))
+                        expected_package_values[request_key] = api_value
+                        dimension_attrs.append({"id": attr_id, "value_name": api_value})
                 if dimension_attrs:
                     update["attributes"] = dimension_attrs
                 if not update:
                     raise RuntimeError("Nenhum campo informado para atualizar.")
                 client = account_client(account)
                 official = client.update_item(item_id, update)
+                verified_item = verify_package_update(client, item_id, expected_package_values) if expected_package_values else {}
+                verified_package_values = package_values_from_item(verified_item) if verified_item else {}
                 stock_transition = None
                 for item in payload.get("catalog", []):
                     if item.get("id") == item_id:
@@ -4170,9 +4243,8 @@ class App(BaseHTTPRequestHandler):
                             item["title"] = update["title"]
                         for request_key in dimension_map:
                             if clean_attribute_value(request.get(request_key)):
-                                normalized_value = normalize_package_value(
-                                    seller_package_api_value(request_key, request.get(request_key)),
-                                    [dimension_map[request_key]],
+                                normalized_value = verified_package_values.get(request_key) or normalize_package_value(
+                                    expected_package_values[request_key], [dimension_map[request_key]]
                                 )
                                 changes[request_key] = {"from": item.get(request_key), "to": normalized_value}
                                 item[request_key] = normalized_value
@@ -4323,6 +4395,9 @@ class App(BaseHTTPRequestHandler):
                     return
                 if not item_ids:
                     self.send_json({"error": "Selecione ao menos um anúncio específico."}, status=400)
+                    return
+                if len(item_ids) > 1:
+                    self.send_json({"error": "A cópia permite apenas um anúncio por vez."}, status=400)
                     return
                 catalog = payload.setdefault("catalog", [])
                 source_items = [
