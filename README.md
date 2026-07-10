@@ -27,16 +27,29 @@ Use variáveis de ambiente no servidor. Não suba segredos para o GitHub.
 
 ```bash
 PORT=8765
+COMPETIDOR_DATA_DIR=/var/lib/competidor
 MELI_CLIENT_ID=seu_client_id
 MELI_CLIENT_SECRET=seu_client_secret
 MELI_REDIRECT_URI=https://competidor.umsoftware.com.br/api/oauth/callback
 SCAN_INTERVAL_SECONDS=300
 AUTO_SYNC_INTERVAL_SECONDS=900
 AUTO_SYNC_STARTUP_DELAY_SECONDS=45
+AUTO_REFRESH_BATCH_SIZE=400
+AUTO_COMPETITION_BATCH_SIZE=12
 MELI_SYNC_STATUSES=active,paused,under_review
 MELI_SCAN_MAX_PAGES=1000
 MELI_SYNC_INLINE_LIMIT=200
+MELI_SYNC_COMPETITION_INLINE_LIMIT=0
+MELI_PUBLIC_PAGE_TIMEOUT_SECONDS=4
 ```
+
+No painel da aplicação no Mercado Livre, configure a URL de notificações como:
+
+```text
+https://competidor.umsoftware.com.br/api/notifications/meli
+```
+
+Ative pelo menos os tópicos `Items` e `Orders v2`. O endpoint confirma o recebimento imediatamente e processa estoque, preço, status e vendas em uma fila interna.
 
 No painel de desenvolvedores do Mercado Livre, cadastre exatamente:
 
@@ -108,15 +121,20 @@ Conteúdo:
 
 ```bash
 PORT=8765
+COMPETIDOR_DATA_DIR=/var/lib/competidor
 MELI_CLIENT_ID=seu_client_id
 MELI_CLIENT_SECRET=seu_client_secret
 MELI_REDIRECT_URI=https://competidor.umsoftware.com.br/api/oauth/callback
 SCAN_INTERVAL_SECONDS=300
 AUTO_SYNC_INTERVAL_SECONDS=900
 AUTO_SYNC_STARTUP_DELAY_SECONDS=45
+AUTO_REFRESH_BATCH_SIZE=400
+AUTO_COMPETITION_BATCH_SIZE=12
 MELI_SYNC_STATUSES=active,paused,under_review
 MELI_SCAN_MAX_PAGES=1000
 MELI_SYNC_INLINE_LIMIT=200
+MELI_SYNC_COMPETITION_INLINE_LIMIT=0
+MELI_PUBLIC_PAGE_TIMEOUT_SECONDS=4
 ```
 
 6. Crie o serviço:
@@ -149,8 +167,9 @@ WantedBy=multi-user.target
 7. Permita escrita na pasta de dados:
 
 ```bash
-sudo mkdir -p /opt/competidor/data
-sudo chown -R www-data:www-data /opt/competidor/data
+sudo mkdir -p /var/lib/competidor
+sudo cp -an /opt/competidor/data/. /var/lib/competidor/
+sudo chown -R www-data:www-data /var/lib/competidor
 sudo chown -R www-data:www-data /opt/competidor
 ```
 

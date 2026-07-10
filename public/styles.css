@@ -1144,6 +1144,17 @@ h2 {
   font-weight: 900;
 }
 
+#clone-title-counter {
+  justify-self: end;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+#clone-title-counter.limit {
+  color: var(--amber);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--amber) 55%, transparent);
+}
+
 .clone-form input,
 .clone-form select,
 .settings-form input {

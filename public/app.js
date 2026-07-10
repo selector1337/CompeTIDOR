@@ -329,7 +329,9 @@ function scheduleRender(key, callback, delay = 120) {
 }
 
 function connectedAccounts() {
-  return state.data.accounts.filter((account) => account.status !== "needs_auth" && account.status !== "oauth_error");
+  return state.data.accounts.filter(
+    (account) => account.official && account.status === "connected" && account.id
+  );
 }
 
 function renderSummary() {
@@ -790,6 +792,7 @@ function renderAccounts() {
             ${account.official ? `<button class="mini-button" data-sync-account="${account.id}">Sincronizar anúncios</button>` : ""}
             ${account.official ? `<button class="mini-button danger-button" data-unlink-account="${account.id}" data-account-name="${account.nickname}">Desvincular</button>` : ""}
             ${account.sync_status ? `<small>${account.sync_status}</small>` : ""}
+            ${account.webhook_status ? `<small>${escapeText(account.webhook_status)} · ${formatDateBR(account.last_webhook_at)}</small>` : ""}
           </div>
         </article>
       `
@@ -938,7 +941,7 @@ function renderClone() {
   const currentTarget = target.value;
   const hadTarget = Boolean(currentTarget);
   const options = connectedAccounts()
-    .map((account) => `<option value="${account.nickname}">${account.nickname}</option>`)
+    .map((account) => `<option value="${escapeAttr(account.id || account.seller_id)}">${escapeText(account.nickname)} · Seller ${escapeText(account.seller_id || "-")}</option>`)
     .join("");
   source.innerHTML = options;
   target.innerHTML = options;
@@ -1061,6 +1064,7 @@ function renderUsers() {
 
 function renderCopyItems() {
   const source = document.querySelector('select[name="source"]').value;
+  const sourceAccount = connectedAccounts().find((account) => account.id === source || String(account.seller_id) === String(source));
   const list = document.querySelector("#copy-items-list");
   if (!state.catalogLoaded) {
     list.innerHTML = `<div class="notice">Carregando anúncios da origem em segundo plano...</div>`;
@@ -1073,7 +1077,7 @@ function renderCopyItems() {
     const title = `${item.title || ""}`.toLowerCase();
     const sku = `${item.sku || ""}`.toLowerCase();
     const code = `${item.id || ""}`.toLowerCase();
-    return item.account === source
+    return (item.account_id === source || item.account === sourceAccount?.nickname)
       && (!productTerm || title.includes(productTerm))
       && (!skuTerm || sku.includes(skuTerm) || code.includes(skuTerm));
   });
@@ -1093,7 +1097,7 @@ function renderCopyItems() {
                 : `<span class="copy-thumb copy-thumb-empty"></span>`}
               <span>
                 <strong>${item.title}</strong>
-                <small>${item.id} - SKU ${item.sku} - ${listingTypeLabel(item.listing_type_id)} - ${money.format(item.price)} - estoque ${item.stock}</small>
+                <small>${item.id} - SKU ${item.sku} - ${listingTypeLabel(item.listing_type_id)} - ${(item.catalog_listing || (item.catalog_product_id && item.catalog_product_id !== "-")) ? "Catálogo" : "Tradicional"} - ${money.format(item.price)} - estoque ${item.stock}</small>
               </span>
             </label>
           `
@@ -1528,7 +1532,8 @@ async function fillCloneFieldsFromItem(itemId) {
   const item = state.data.catalog.find((row) => row.id === itemId);
   if (!item) return;
   const form = document.querySelector("#clone-form");
-  form.elements.title_override.value = item.title || "";
+  form.elements.title_override.value = (item.title || "").slice(0, 60);
+  updateCloneTitleCounter();
   form.elements.price_override.value = item.price || "";
   form.elements.stock_override.value = item.stock || "";
   form.elements.listing_type_override.value = item.listing_type_id || "";
@@ -1544,6 +1549,16 @@ async function fillCloneFieldsFromItem(itemId) {
     form.elements.description_override.value = "";
   }
 }
+
+function updateCloneTitleCounter() {
+  const input = document.querySelector('[name="title_override"]');
+  const counter = document.querySelector("#clone-title-counter");
+  if (!input || !counter) return;
+  counter.textContent = `${input.value.length}/60`;
+  counter.classList.toggle("limit", input.value.length >= 55);
+}
+
+document.querySelector('[name="title_override"]')?.addEventListener("input", updateCloneTitleCounter);
 
 document.querySelector("#clone-form").addEventListener("submit", async (event) => {
   event.preventDefault();

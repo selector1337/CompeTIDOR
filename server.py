@@ -8,6 +8,8 @@ import html
 import hashlib
 import hmac
 import os
+import random
+import queue
 import re
 import secrets
 import ssl
@@ -21,13 +23,16 @@ import uuid
 
 ROOT = Path(__file__).parent
 PUBLIC = ROOT / "public"
-DATA = ROOT / "data"
-DATA.mkdir(exist_ok=True)
+DATA = Path(os.getenv("COMPETIDOR_DATA_DIR", str(ROOT / "data"))).expanduser().resolve()
+DATA.mkdir(parents=True, exist_ok=True)
 CERTS = DATA / "certs"
 CERTS.mkdir(exist_ok=True)
 APP_DATA_FILE = "app.json"
+CATALOG_DATA_FILE = "catalog.json"
 SYNC_LOCK = threading.Lock()
+DATA_LOCK = threading.RLock()
 ACTIVE_SYNC_ACCOUNTS = set()
+MELI_NOTIFICATION_QUEUE = queue.Queue(maxsize=5000)
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -65,22 +70,120 @@ ALLOWED_MELI_PATHS = (
 
 
 def read_json(name, fallback):
-    path = DATA / name
-    if not path.exists():
-        path.write_text(json.dumps(fallback, indent=2, ensure_ascii=False), encoding="utf-8")
-    return json.loads(path.read_text(encoding="utf-8"))
+    with DATA_LOCK:
+        path = DATA / name
+        if not path.exists():
+            write_json(name, fallback)
+        return json.loads(path.read_text(encoding="utf-8"))
 
 
 def write_json(name, payload):
-    (DATA / name).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    with DATA_LOCK:
+        path = DATA / name
+        temporary = DATA / f".{name}.{uuid.uuid4().hex}.tmp"
+        temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
 
 
-def read_payload():
-    return read_json(APP_DATA_FILE, empty_payload())
+def read_payload(include_catalog=True):
+    with DATA_LOCK:
+        payload = read_json(APP_DATA_FILE, empty_payload())
+        embedded_catalog = payload.pop("catalog", None)
+        catalog_path = DATA / CATALOG_DATA_FILE
+        if embedded_catalog is not None:
+            if embedded_catalog or not catalog_path.exists():
+                write_json(CATALOG_DATA_FILE, embedded_catalog)
+            migration_payload = {**payload, "catalog": embedded_catalog}
+            payload["catalog_counts_snapshot"] = catalog_counts(embedded_catalog)
+            payload["operations_snapshot"] = build_operations(migration_payload)
+            write_json(APP_DATA_FILE, payload)
+        payload["catalog"] = read_json(CATALOG_DATA_FILE, []) if include_catalog else []
+        if include_catalog:
+            for item in payload["catalog"]:
+                if item.get("winner_source") in {
+                    "catalog_lowest_active_offer",
+                    "catalog_reference",
+                    "products_items_winner_marker",
+                    "public_purchase_options",
+                }:
+                    item.update(competition_snapshot(item))
+        payload["_catalog_loaded"] = bool(include_catalog)
+        payload.setdefault("_revision", 0)
+        return payload
 
 
-def write_payload(payload):
-    write_json(APP_DATA_FILE, payload)
+def record_key(collection, record):
+    if collection == "users":
+        return str(record.get("id") or (record.get("email") or "").lower())
+    if collection == "accounts":
+        return str(record.get("seller_id") or record.get("id") or record.get("nickname") or "")
+    return str(record.get("id") or "")
+
+
+def merge_critical_records(collection, incoming, latest):
+    merged = []
+    incoming_by_key = {record_key(collection, row): row for row in incoming or [] if record_key(collection, row)}
+    latest_by_key = {record_key(collection, row): row for row in latest or [] if record_key(collection, row)}
+    for key in [*latest_by_key.keys(), *[key for key in incoming_by_key if key not in latest_by_key]]:
+        current = incoming_by_key.get(key)
+        saved = latest_by_key.get(key)
+        if current is None:
+            merged.append(saved)
+            continue
+        if saved is None:
+            merged.append(current)
+            continue
+        if collection == "accounts" and int(current.get("token_created_at") or 0) > int(saved.get("token_created_at") or 0):
+            merged.append({**saved, **current})
+        else:
+            merged.append({**current, **saved})
+    return merged
+
+
+def write_payload(payload, replace_collections=None):
+    replace_collections = set(replace_collections or [])
+    with DATA_LOCK:
+        path = DATA / APP_DATA_FILE
+        latest = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        latest.pop("catalog", None)
+        incoming_revision = int(payload.get("_revision") or 0)
+        latest_revision = int(latest.get("_revision") or 0)
+        if incoming_revision < latest_revision:
+            for collection in ("users", "accounts"):
+                if collection not in replace_collections:
+                    payload[collection] = merge_critical_records(
+                        collection,
+                        payload.get(collection, []),
+                        latest.get(collection, []),
+                    )
+            latest_notifications = latest.get("user_notifications") or {}
+            payload["user_notifications"] = {**(payload.get("user_notifications") or {}), **latest_notifications}
+        payload["_revision"] = latest_revision + 1
+        catalog_loaded = bool(payload.get("_catalog_loaded", True))
+        if catalog_loaded:
+            write_json(CATALOG_DATA_FILE, payload.get("catalog", []))
+            payload["catalog_counts_snapshot"] = catalog_counts(payload.get("catalog", []))
+            payload["operations_snapshot"] = build_operations(payload)
+        metadata = dict(payload)
+        metadata.pop("catalog", None)
+        metadata.pop("_catalog_loaded", None)
+        write_json(APP_DATA_FILE, metadata)
+
+
+def catalog_counts(catalog):
+    return {
+        "total": len(catalog or []),
+        "winning": len([item for item in catalog or [] if item.get("status") == "winning"]),
+        "losing": len([item for item in catalog or [] if item.get("status") == "losing"]),
+        "sharing": len([item for item in catalog or [] if item.get("status") == "sharing"]),
+        "paused": len(
+            [
+                item
+                for item in catalog or []
+                if item.get("status") == "paused" or item.get("meli_status") == "paused"
+            ]
+        ),
+    }
 
 
 def now_label():
@@ -286,7 +389,8 @@ def telegram_type_enabled(config, alert_type):
 
 
 def public_payload(payload, actor=None, include_catalog=True):
-    enrich_recent_sale_thumbnails(payload)
+    if payload.get("catalog"):
+        enrich_recent_sale_thumbnails(payload)
     if include_catalog:
         clean = json.loads(json.dumps(payload))
     else:
@@ -301,17 +405,19 @@ def public_payload(payload, actor=None, include_catalog=True):
             job["errors"] = job["errors"][:10]
     clean["item_logs"] = clean.get("item_logs", [])[:500]
     catalog = clean.get("catalog", [])
-    clean["catalog_counts"] = {
-        "total": len(catalog),
-        "winning": len([item for item in catalog if item.get("status") == "winning"]),
-        "losing": len([item for item in catalog if item.get("status") == "losing"]),
-        "sharing": len([item for item in catalog if item.get("status") == "sharing"]),
-        "paused": len([item for item in catalog if item.get("status") == "paused" or item.get("meli_status") == "paused"]),
-    }
+    clean["catalog_counts"] = catalog_counts(catalog) if include_catalog else clean.get("catalog_counts_snapshot") or catalog_counts([])
     clean["accounts"] = [public_account(account) for account in clean.get("accounts", [])]
     clean["notifications"] = public_notifications(user_notifications(payload, actor, create=False))
-    clean["operations"] = build_operations(payload if not include_catalog else clean)
+    clean["operations"] = (
+        build_operations(clean)
+        if include_catalog
+        else clean.get("operations_snapshot") or build_operations(clean)
+    )
     clean["users"] = visible_users_for(actor, ensure_users(clean))
+    clean.pop("_catalog_loaded", None)
+    clean.pop("_revision", None)
+    clean.pop("operations_snapshot", None)
+    clean.pop("catalog_counts_snapshot", None)
     return clean
 
 
@@ -442,6 +548,25 @@ def build_operations(payload):
 
     stock = []
     catalog_attention = []
+    catalog_by_id = {item.get("id"): item for item in catalog if item.get("id")}
+    seen_stock_items = set()
+    for alert in payload.get("alerts", []):
+        if alert.get("type") != "stock" or not alert.get("item_id"):
+            continue
+        item = catalog_by_id.get(alert.get("item_id")) or {}
+        stock.append(
+            {
+                "id": alert.get("item_id"),
+                "title": alert.get("product") or item.get("title") or alert.get("item_id"),
+                "account": alert.get("account") or item.get("account"),
+                "sku": alert.get("sku") or item.get("sku") or "-",
+                "stock": 0,
+                "price": item.get("price"),
+                "thumbnail": item.get("thumbnail"),
+                "occurred_at": alert.get("created_at") or "",
+            }
+        )
+        seen_stock_items.add(alert.get("item_id"))
     for index, item in enumerate(catalog):
         row = {
             "id": item.get("id"),
@@ -453,8 +578,6 @@ def build_operations(payload):
             "thumbnail": item.get("thumbnail"),
             "occurred_at": item.get("updated_at") or fallback_time(index + 1),
         }
-        if item.get("stock") == 0:
-            stock.append(row)
         if item.get("status") == "losing" or item.get("competition_status") in {"competing", "sharing"} and item.get("winner_name") not in ("", None, item.get("account")):
             catalog_attention.append({**row, "winner_name": item.get("winner_name"), "winner_price": item.get("winner_price")})
 
@@ -503,20 +626,39 @@ def build_operations(payload):
     }
 
 
-def request_json(url, method="GET", payload=None, headers=None):
+def request_json(url, method="GET", payload=None, headers=None, retries=None):
     body = None
     request_headers = headers or {}
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
         request_headers.setdefault("Content-Type", "application/json")
-    req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=20) as response:
-            text = response.read().decode("utf-8")
-            return json.loads(text) if text else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    method = method.upper()
+    attempts = int(retries if retries is not None else (4 if method in {"GET", "PUT"} else 1))
+    transient_statuses = {429, 500, 502, 503, 504}
+    last_error = None
+    for attempt in range(max(1, attempts)):
+        req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                text = response.read().decode("utf-8")
+                return json.loads(text) if text else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
+            if exc.code not in transient_statuses or attempt + 1 >= attempts:
+                raise last_error from exc
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                delay = float(retry_after) if retry_after else min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5)
+            except (TypeError, ValueError):
+                delay = min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5)
+            time.sleep(delay)
+        except urllib.error.URLError as exc:
+            last_error = RuntimeError(f"Falha temporária de conexão com a API: {exc.reason}")
+            if attempt + 1 >= attempts:
+                raise last_error from exc
+            time.sleep(min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5))
+    raise last_error or RuntimeError("Não foi possível concluir a chamada à API.")
 
 
 def validate_meli_path(path):
@@ -877,7 +1019,7 @@ def package_dimensions_from_shipping(item):
     match = re.match(r"\s*([\d.,]+)x([\d.,]+)x([\d.,]+)\s*,\s*([\d.,]+)", str(dimensions), flags=re.I)
     if not match:
         return {}
-    width, height, length, weight = [float(part.replace(".", "").replace(",", ".")) for part in match.groups()]
+    width, height, length, weight = [parse_decimal_number(part) for part in match.groups()]
     return {
         "package_width": f"{width:g} cm",
         "package_height": f"{height:g} cm",
@@ -891,22 +1033,58 @@ def normalize_package_value(value, attr_ids):
     match = re.search(r"([\d.,]+)\s*([a-zA-Z]+)", text)
     if not match:
         return text
-    number = float(match.group(1).replace(".", "").replace(",", "."))
+    number = parse_decimal_number(match.group(1))
     unit = match.group(2).lower()
     attr_text = " ".join(str(attr).upper() for attr in attr_ids)
     if "WEIGHT" in attr_text:
         if unit in {"g", "gr", "gramas"}:
-            return f"{number / 1000:g} kg" if number >= 1000 else f"{number:g} g"
-        if unit in {"kg", "kgs"} and number > 80:
             return f"{number / 1000:g} kg"
         if unit in {"mg"}:
-            return f"{number / 1000:g} g"
+            return f"{number / 1000000:g} kg"
+        if unit in {"kg", "kgs", "quilo", "quilos"}:
+            return f"{number:g} kg"
         return f"{number:g} {unit}"
     if unit == "mm":
         return f"{number / 10:g} cm"
     if unit in {"m", "metro", "metros"}:
         return f"{number * 100:g} cm"
     return f"{number:g} {unit}"
+
+
+def parse_decimal_number(value):
+    text = str(value or "").strip()
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+    return float(text)
+
+
+def seller_package_api_value(field, value):
+    text = clean_attribute_value(value)
+    match = re.search(r"([\d.,]+)\s*([a-zA-Z]*)", text)
+    if not match:
+        raise RuntimeError(f"Valor inválido para {field}.")
+    number = parse_decimal_number(match.group(1))
+    unit = (match.group(2) or "").lower()
+    if field == "package_weight":
+        if unit in {"kg", "kgs", "quilo", "quilos"} or not unit:
+            grams = round(number * 1000)
+        elif unit in {"g", "gr", "grama", "gramas"}:
+            grams = round(number)
+        else:
+            raise RuntimeError("Informe o peso em kg ou g. Exemplo: 1,16 kg.")
+        return f"{max(1, grams)} g"
+    if unit == "mm":
+        number /= 10
+    elif unit in {"m", "metro", "metros"}:
+        number *= 100
+    elif unit not in {"", "cm"}:
+        raise RuntimeError("Informe as dimensões em cm. Exemplo: 31 cm.")
+    return f"{number:g} cm"
 
 
 def item_thumbnail(item):
@@ -1366,6 +1544,94 @@ def scan_competitor_profile(payload, seller_id, limit=50):
     return competitor
 
 
+def process_meli_notification(event):
+    topic = str(event.get("topic") or "")
+    if topic not in {"items", "orders_v2"}:
+        return
+    seller_id = str(event.get("user_id") or "")
+    payload = read_payload()
+    account = next(
+        (
+            row
+            for row in payload.get("accounts", [])
+            if str(row.get("seller_id") or "") == seller_id and row.get("official")
+        ),
+        None,
+    )
+    if not account:
+        return
+    client = account_client(account)
+    if topic == "orders_v2":
+        sync_recent_sales(payload, account, client)
+        account["last_webhook_at"] = now_label()
+        write_payload(payload)
+        return
+
+    resource = str(event.get("resource") or "")
+    match = re.fullmatch(r"/items/(MLB\d+)", resource, flags=re.I)
+    if not match:
+        return
+    item_id = match.group(1).upper()
+    official = client.item(item_id)
+    existing = next(
+        (
+            row
+            for row in payload.get("catalog", [])
+            if row.get("id") == item_id and row.get("account_id") == account.get("id")
+        ),
+        None,
+    )
+    before = dict(existing) if existing else None
+    is_catalog = bool(official.get("catalog_listing") or official.get("catalog_product_id"))
+    competition = normalize_competition(client, account, official) if is_catalog else {}
+    updated = synced_catalog_item(account, official, competition)
+    updated["first_seen_at"] = (before or {}).get("first_seen_at") or now_label()
+    updated["updated_at"] = now_label()
+    updated["last_webhook_at"] = now_label()
+    if existing is None:
+        payload.setdefault("catalog", []).append(updated)
+    else:
+        existing.update(updated)
+
+    if before and int(before.get("stock") or 0) > 0 and int(updated.get("stock") or 0) == 0:
+        alert = stock_alert(f"stock-{account.get('id')}-{item_id}-{uuid.uuid4().hex[:8]}", account, updated)
+        payload.setdefault("alerts", []).insert(0, alert)
+        notify_alert(payload, alert)
+    if before and before.get("status") != "losing" and updated.get("status") == "losing":
+        alert = {
+            "id": f"catalog-{account.get('id')}-{item_id}-{uuid.uuid4().hex[:8]}",
+            "type": "catalog",
+            "severity": "danger",
+            "title": "Produto começou a perder catálogo",
+            "message": (
+                f"{updated.get('title')} deixou de vencer o catálogo. "
+                f"Preço para ganhar: {updated.get('price_to_win') or 'não informado pela API'}."
+            ),
+            "account": updated.get("account"),
+            "item_id": item_id,
+            "sku": updated.get("sku"),
+            "product": updated.get("title"),
+            "created_at": now_label(),
+            "read": False,
+        }
+        payload.setdefault("alerts", []).insert(0, alert)
+        notify_alert(payload, alert)
+    account["last_webhook_at"] = now_label()
+    account["webhook_status"] = f"Última notificação processada: {topic} {item_id}"
+    write_payload(payload)
+
+
+def meli_notification_loop():
+    while True:
+        event = MELI_NOTIFICATION_QUEUE.get()
+        try:
+            process_meli_notification(event)
+        except Exception:
+            pass
+        finally:
+            MELI_NOTIFICATION_QUEUE.task_done()
+
+
 def auto_scan_loop():
     interval = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "300")))
     time.sleep(8)
@@ -1505,52 +1771,27 @@ def fetch_public_buybox_url(url, product_title=""):
             "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
         },
     )
-    with urllib.request.urlopen(req, timeout=15) as response:
+    with urllib.request.urlopen(req, timeout=float(os.getenv("MELI_PUBLIC_PAGE_TIMEOUT_SECONDS", "4"))) as response:
         html_text = response.read().decode("utf-8", errors="replace")
         final_url = response.geturl() or url
     lines = visible_page_lines(html_text)
-    options_buybox = public_purchase_options_winner(lines)
-    if options_buybox.get("price") or options_buybox.get("seller_name"):
-        return {**options_buybox, "url": final_url}
     seller_name = ""
     price = None
-    json_seller_patterns = [
-        r'"seller_name"\s*:\s*"([^"]+)"',
-        r'"sellerName"\s*:\s*"([^"]+)"',
-        r'"seller"\s*:\s*\{[^{}]{0,800}?"nickname"\s*:\s*"([^"]+)"',
-        r'"official_store_name"\s*:\s*"([^"]+)"',
-    ]
-    for pattern in json_seller_patterns:
-        match = re.search(pattern, html_text, flags=re.I)
-        if match:
-            seller_name = html.unescape(match.group(1)).strip()
-            break
     price_patterns = [
-        r'"price"\s*:\s*"?(\d+(?:\.\d+)?)"?',
-        r'"amount"\s*:\s*(\d+(?:\.\d+)?)',
         r'itemprop="price"\s+content="(\d+(?:\.\d+)?)"',
         r'content="(\d+(?:\.\d+)?)"\s+itemprop="price"',
+        r'ui-pdp-price__second-line[\s\S]{0,1200}?andes-money-amount__fraction[^>]*>([\d\.]+)<',
     ]
-    for pattern in price_patterns:
+    for pattern_index, pattern in enumerate(price_patterns):
         match = re.search(pattern, html_text, flags=re.I)
         if match:
             try:
-                parsed_price = float(match.group(1))
+                parsed_price = float(match.group(1)) if pattern_index < 2 else parse_brl_price(f"R$ {match.group(1)}")
                 if parsed_price:
                     price = parsed_price
                     break
             except (TypeError, ValueError):
                 pass
-    for index, line in enumerate(lines):
-        if "Vendido por" in line:
-            tail = line.split("Vendido por", 1)[1].strip(" :·-")
-            if tail:
-                seller_name = tail
-            for candidate in lines[index + 1 : index + 5]:
-                if candidate and not re.search(r"mercadolíder|mercado líder|vendas|devolução|garantia|compra garantida", candidate, re.I):
-                    seller_name = seller_name or candidate
-                    break
-            break
     anchors = []
     if product_title:
         anchors.append(product_title)
@@ -1568,24 +1809,27 @@ def fetch_public_buybox_url(url, product_title=""):
         if pos > start:
             end = min(end, pos)
     main_area = search_text[start:end]
+    sold_match = re.search(r"Vendido por\s+([^\n]+)", main_area, flags=re.I)
+    if sold_match:
+        seller_name = re.split(r"\s{2,}|\+\d+\s+vendas|NF-e|verificada", sold_match.group(1).strip())[0].strip()
     if not price:
-        price_matches = [match.group(0) for match in re.finditer(r"R\$\s*[\d\.]+(?:,\d{2})?", main_area)]
-        for raw_price in price_matches:
-            if re.search(r"x\s*" + re.escape(raw_price), main_area):
+        price_candidates = []
+        for line in main_area.splitlines():
+            if re.search(r"\b\d+x\b|sem juros|meios de pagamento", line, flags=re.I):
                 continue
-            price = parse_brl_price(raw_price)
-            if price:
-                break
-    if not price:
-        price = parse_brl_price(search_text)
-    if not seller_name and "Vendido por" in search_text:
-        seller_name = "Vendedor informado na página pública"
-    if not price and not seller_name:
-        raise RuntimeError("Não foi possível extrair buybox da página pública do Mercado Livre.")
+            for match in re.finditer(r"R\$\s*[\d\.]+(?:,\d{2})?", line):
+                parsed = parse_brl_price(match.group(0))
+                if parsed:
+                    price_candidates.append(parsed)
+        if price_candidates:
+            price = min(price_candidates)
+    if not seller_name or not price:
+        raise RuntimeError("A página pública não confirmou simultaneamente vendedor e preço da buybox.")
     return {
-        "seller_name": seller_name or "Vendedor da buybox",
+        "seller_name": seller_name,
         "price": price,
         "url": final_url,
+        "source": "public_product_page",
     }
 
 
@@ -1690,9 +1934,6 @@ def normalize_competition(client, account, item):
                 rows = rows.get("results") or rows.get("items") or []
             if rows:
                 candidates = catalog_offer_candidates(rows, sort_by_price=True)
-                live_candidates = live_catalog_offers({"accounts": [account]}, candidates, sort_by_price=True)
-                if live_candidates:
-                    candidates = live_candidates
                 explicit_winner = next((candidate for candidate in candidates if candidate.get("is_winner")), None)
                 lowest_active = candidates[0] if candidates else None
                 reference = explicit_winner or lowest_active or {"raw": rows[0], "price": None, "item_id": "", "seller_id": ""}
@@ -1718,14 +1959,9 @@ def normalize_competition(client, account, item):
                     except Exception:
                         data["catalog_reference_name"] = f"Seller {reference_seller_id}"
                 if not data.get("winner_confirmed") and lowest_active:
-                    data["winner_seller_id"] = reference_seller_id
-                    data["winner_name"] = data.get("catalog_reference_name") or (f"Seller {reference_seller_id}" if reference_seller_id else "Menor oferta ativa")
-                    data["winner_price"] = reference_price
-                    data["winner_confirmed"] = True
-                    data["winner_source"] = "catalog_lowest_active_offer"
-                    data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "listed"
                     data["competition_reason"] = (
-                        "Página pública da buybox não confirmou o vendedor; exibindo a menor oferta ativa validada pela API oficial do catálogo."
+                        "A API oficial confirmou a disputa e o preço para ganhar, mas não expõe o vendedor da buybox. "
+                        "A menor oferta ativa não será tratada como vencedora."
                     )
         except Exception as exc:
             if not data["competition_reason"]:
@@ -1733,7 +1969,7 @@ def normalize_competition(client, account, item):
 
     if not data.get("winner_confirmed"):
         data["winner_seller_id"] = ""
-        data["winner_name"] = "Aguardando atualização"
+        data["winner_name"] = "Não exposto pela API oficial"
         data["winner_price"] = None
     if data["competition_status"] == "not_listed" and not data.get("winner_seller_id"):
         data["winner_name"] = "Sem vencedor disponível"
@@ -1795,6 +2031,10 @@ def synced_catalog_item(account, item, competition=None):
     competition = competition or {}
     status, action = classified_catalog_status(account, item, stock, is_catalog, competition)
     shipping_dimensions = package_dimensions_from_shipping(item)
+    package_weight = item_attribute_value(item, ["SELLER_PACKAGE_WEIGHT"]) or shipping_dimensions.get("package_weight") or ""
+    package_height = item_attribute_value(item, ["SELLER_PACKAGE_HEIGHT"]) or shipping_dimensions.get("package_height") or ""
+    package_width = item_attribute_value(item, ["SELLER_PACKAGE_WIDTH"]) or shipping_dimensions.get("package_width") or ""
+    package_length = item_attribute_value(item, ["SELLER_PACKAGE_LENGTH"]) or shipping_dimensions.get("package_length") or ""
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
@@ -1808,10 +2048,10 @@ def synced_catalog_item(account, item, competition=None):
         "listing_type_id": listing_type_id,
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
-        "package_weight": shipping_dimensions.get("package_weight") or item_attribute_value(item, ["PACKAGE_WEIGHT", "WEIGHT"]),
-        "package_height": shipping_dimensions.get("package_height") or item_attribute_value(item, ["PACKAGE_HEIGHT", "HEIGHT"]),
-        "package_width": shipping_dimensions.get("package_width") or item_attribute_value(item, ["PACKAGE_WIDTH", "WIDTH"]),
-        "package_length": shipping_dimensions.get("package_length") or item_attribute_value(item, ["PACKAGE_LENGTH", "LENGTH"]),
+        "package_weight": package_weight,
+        "package_height": package_height,
+        "package_width": package_width,
+        "package_length": package_length,
         "status": status,
         "share": 0 if is_catalog else 100,
         "price": item.get("price") or 0,
@@ -2211,7 +2451,23 @@ COMPETITION_FIELDS = (
 
 
 def competition_snapshot(item):
-    return {field: item.get(field) for field in COMPETITION_FIELDS if field in item}
+    snapshot = {field: item.get(field) for field in COMPETITION_FIELDS if field in item}
+    if snapshot.get("winner_source") in {
+        "catalog_lowest_active_offer",
+        "catalog_reference",
+        "products_items_winner_marker",
+        "public_purchase_options",
+    }:
+        snapshot.update(
+            {
+                "winner_seller_id": "",
+                "winner_name": "Não exposto pela API oficial",
+                "winner_price": None,
+                "winner_confirmed": False,
+                "winner_source": "",
+            }
+        )
+    return snapshot
 
 
 def upsert_monthly_revenue(payload, account, amount, orders_count, period, status):
@@ -2273,7 +2529,7 @@ def sync_official_account(payload, account_id, limit=None):
         for item in payload.get("catalog", [])
         if item.get("official_source") and item.get("account_id") == account.get("id") and item.get("id")
     }
-    competition_inline_limit = max(0, int(os.getenv("MELI_SYNC_COMPETITION_INLINE_LIMIT", "150")))
+    competition_inline_limit = max(0, int(os.getenv("MELI_SYNC_COMPETITION_INLINE_LIMIT", "0")))
     batch_size = max(1, min(20, int(os.getenv("MELI_ITEM_BULK_SIZE", "20"))))
     for batch_start in range(0, len(item_ids), batch_size):
         batch_ids = item_ids[batch_start : batch_start + batch_size]
@@ -2316,7 +2572,7 @@ def sync_official_account(payload, account_id, limit=None):
 
 
 def refresh_official_account_items(payload, account, batch_size=None):
-    batch_size = max(1, int(batch_size or os.getenv("AUTO_REFRESH_BATCH_SIZE", "120")))
+    batch_size = max(1, int(batch_size or os.getenv("AUTO_REFRESH_BATCH_SIZE", "400")))
     rows = [
         item
         for item in payload.get("catalog", [])
@@ -2335,10 +2591,34 @@ def refresh_official_account_items(payload, account, batch_size=None):
     client = account_client(account)
     refreshed = 0
     prior_by_id = {item.get("id"): dict(item) for item in selected}
+    official_by_id = {}
+    bulk_size = max(1, min(20, int(os.getenv("MELI_ITEM_BULK_SIZE", "20"))))
+    selected_ids = [item.get("id") for item in selected if item.get("id")]
+    for start in range(0, len(selected_ids), bulk_size):
+        batch_ids = selected_ids[start : start + bulk_size]
+        try:
+            for official in client.items_bulk(batch_ids):
+                if official.get("id"):
+                    official_by_id[official["id"]] = official
+        except Exception:
+            for item_id in batch_ids:
+                try:
+                    official_by_id[item_id] = client.item(item_id)
+                except Exception:
+                    pass
+    competition_limit = max(0, int(os.getenv("AUTO_COMPETITION_BATCH_SIZE", "12")))
+    competition_checked = 0
     for current in selected:
         try:
-            official = client.item(current.get("id"))
-            competition = normalize_competition(client, account, official)
+            official = official_by_id.get(current.get("id"))
+            if not official:
+                raise RuntimeError("Anúncio não retornado pelo lote oficial nesta rodada.")
+            is_catalog = bool(official.get("catalog_listing") or official.get("catalog_product_id"))
+            if is_catalog and competition_checked < competition_limit:
+                competition = normalize_competition(client, account, official)
+                competition_checked += 1
+            else:
+                competition = competition_snapshot(current)
             updated = synced_catalog_item(account, official, competition)
             current.update(updated)
             current["updated_at"] = now_label()
@@ -2381,7 +2661,10 @@ def refresh_official_account_items(payload, account, batch_size=None):
                 notify_alert(payload, alert)
                 alerts_created += 1
 
-    account["auto_refresh_status"] = f"Atualização automática OK: {refreshed}/{len(rows)} anúncios revisados em lote"
+    account["auto_refresh_status"] = (
+        f"Atualização automática OK: {refreshed}/{len(rows)} anúncios revisados; "
+        f"{competition_checked} disputas de catálogo recalculadas"
+    )
     account["last_auto_refresh_at"] = now_label()
     return {"items": refreshed, "total": len(rows), "alerts": alerts_created}
 
@@ -2613,7 +2896,7 @@ def build_clone_item_payload(source_item, edits):
     listing_type_id = requested_listing_type if requested_listing_type in {"gold_special", "gold_pro"} else source_item.get("listing_type_id") or "gold_special"
     source_quantity = item_available_quantity(source_item) or 1
     payload = {
-        "title": (edits.get("title") or source_item.get("title") or "").strip(),
+        "title": (edits.get("title") or source_item.get("title") or "").strip()[:60],
         "category_id": source_item.get("category_id"),
         "price": float(edits.get("price") or source_item.get("price") or 0),
         "currency_id": source_item.get("currency_id") or "BRL",
@@ -2764,10 +3047,31 @@ def add_or_update_clone_attribute(create_payload, attr_id, value):
     return True
 
 
+ATTRIBUTE_LABELS_PT = {
+    "ALPHANUMERIC_MODEL": "Modelo alfanumérico",
+    "DETAILED_MODEL": "Modelo detalhado",
+    "MODEL": "Modelo",
+    "LINE": "Linha",
+    "BRAND": "Marca",
+    "FAMILY_NAME": "Nome da família do produto",
+    "UNITS_PER_PACKAGE": "Quantidade de unidades por embalagem",
+    "CABLE_LENGTH": "Comprimento do cabo",
+    "SELLER_PACKAGE_WEIGHT": "Peso da embalagem",
+    "SELLER_PACKAGE_HEIGHT": "Altura da embalagem",
+    "SELLER_PACKAGE_WIDTH": "Largura da embalagem",
+    "SELLER_PACKAGE_LENGTH": "Comprimento da embalagem",
+}
+
+
+def clone_attribute_label(field_id, fallback=""):
+    normalized = str(field_id or "").replace("attribute:", "").upper()
+    return ATTRIBUTE_LABELS_PT.get(normalized) or fallback or normalized.replace("_", " ").title()
+
+
 def clone_pending_field(field_id, label, kind="text", message="", item_id=""):
     return {
         "id": field_id,
-        "label": label,
+        "label": clone_attribute_label(field_id, label),
         "kind": kind,
         "message": message,
         "item_id": item_id,
@@ -2933,6 +3237,18 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
                 )
             )
 
+    if "item.attribute.invalid" in error_text or "Value name of attribute" in error_text:
+        for attr_id in attribute_ids_from_error_text(error_text):
+            pending_fields.append(
+                clone_pending_field(
+                    f"attribute:{attr_id}",
+                    clone_attribute_label(attr_id),
+                    "text",
+                    "Informe um valor válido para este campo obrigatório.",
+                    item_id,
+                )
+            )
+
     removed_attrs = remove_clone_attributes(create_payload, attrs_to_remove)
     if removed_attrs:
         changed = True
@@ -3000,8 +3316,8 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
 
 
 def create_official_clone(payload, job, source_item_id, edits):
-    source_account = official_account_by_name(payload, job.get("source"))
-    target_account = official_account_by_name(payload, job.get("target"))
+    source_account = official_account_by_name(payload, job.get("source_account_id") or job.get("source"))
+    target_account = official_account_by_name(payload, job.get("target_account_id") or job.get("target"))
     if not source_account or not source_account.get("official"):
         raise RuntimeError("Conta origem oficial não encontrada para clonar via Mercado Livre.")
     if not target_account or not target_account.get("official"):
@@ -3074,7 +3390,7 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
                         "pending_fields": [
                             clone_pending_field(
                                 f"attribute:{attr_id}",
-                                attribute.get("name") or str(attr_id).replace("_", " ").title(),
+                                clone_attribute_label(attr_id, attribute.get("name") or ""),
                                 "text",
                                 "Informe o valor obrigatório para esta categoria.",
                                 item_id,
@@ -3157,16 +3473,18 @@ class App(BaseHTTPRequestHandler):
     def create_session(self, user):
         token = secrets.token_urlsafe(32)
         now = int(time.time())
-        sessions = [item for item in read_json("sessions.json", []) if item.get("expires_at", 0) > now]
-        sessions.append({"token": token, "user_id": user["id"], "created_at": now, "expires_at": now + SESSION_SECONDS})
-        write_json("sessions.json", sessions[-50:])
+        with DATA_LOCK:
+            sessions = [item for item in read_json("sessions.json", []) if item.get("expires_at", 0) > now]
+            sessions.append({"token": token, "user_id": user["id"], "created_at": now, "expires_at": now + SESSION_SECONDS})
+            write_json("sessions.json", sessions[-50:])
         return token
 
     def clear_session(self):
         token = self.cookie_value("competidor_session")
         if token:
-            sessions = [item for item in read_json("sessions.json", []) if item.get("token") != token]
-            write_json("sessions.json", sessions)
+            with DATA_LOCK:
+                sessions = [item for item in read_json("sessions.json", []) if item.get("token") != token]
+                write_json("sessions.json", sessions)
 
     def require_auth(self, payload=None):
         user = self.current_user(payload)
@@ -3213,7 +3531,7 @@ class App(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        payload = read_payload()
+        payload = read_payload(include_catalog=parsed.path == "/api/catalog")
 
         if parsed.path == "/api/auth/me":
             user = self.current_user(payload)
@@ -3418,12 +3736,39 @@ class App(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/notifications/meli":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                event = json.loads(body or "{}")
+                configured_app_id = str(meli_config().get("client_id") or "")
+                event_app_id = str(event.get("application_id") or "")
+                if configured_app_id and event_app_id and configured_app_id != event_app_id:
+                    self.send_json({"ok": False, "error": "Aplicação de origem inválida."}, status=403)
+                    return
+                MELI_NOTIFICATION_QUEUE.put_nowait(event)
+                self.send_json({"ok": True}, status=200)
+            except queue.Full:
+                self.send_json({"ok": False, "error": "Fila temporariamente cheia."}, status=503)
+            except Exception:
+                self.send_json({"ok": True}, status=200)
+            return
         if not self.validate_same_origin():
             return
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8") if length else "{}"
         request = json.loads(body or "{}")
-        payload = read_payload()
+        lightweight_paths = {
+            "/api/auth/setup-master",
+            "/api/auth/login",
+            "/api/auth/logout",
+            "/api/users",
+            "/api/users/update",
+            "/api/meli/config",
+            "/api/notifications/config",
+            "/api/notifications/test",
+        }
+        payload = read_payload(include_catalog=parsed.path not in lightweight_paths)
 
         if parsed.path == "/api/auth/setup-master":
             users = ensure_users(payload)
@@ -3771,7 +4116,7 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/meli/unlink":
             try:
                 account = unlink_official_account(payload, request.get("account_id", ""))
-                write_payload(payload)
+                write_payload(payload, replace_collections={"accounts"})
                 self.send_json({"ok": True, "account": account})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
@@ -3795,20 +4140,21 @@ class App(BaseHTTPRequestHandler):
                     update["status"] = "active"
                 dimension_attrs = []
                 dimension_map = {
-                    "package_weight": "PACKAGE_WEIGHT",
-                    "package_height": "PACKAGE_HEIGHT",
-                    "package_width": "PACKAGE_WIDTH",
-                    "package_length": "PACKAGE_LENGTH",
+                    "package_weight": "SELLER_PACKAGE_WEIGHT",
+                    "package_height": "SELLER_PACKAGE_HEIGHT",
+                    "package_width": "SELLER_PACKAGE_WIDTH",
+                    "package_length": "SELLER_PACKAGE_LENGTH",
                 }
                 for request_key, attr_id in dimension_map.items():
                     if clean_attribute_value(request.get(request_key)):
-                        dimension_attrs.append({"id": attr_id, "value_name": clean_attribute_value(request.get(request_key))})
+                        dimension_attrs.append({"id": attr_id, "value_name": seller_package_api_value(request_key, request.get(request_key))})
                 if dimension_attrs:
                     update["attributes"] = dimension_attrs
                 if not update:
                     raise RuntimeError("Nenhum campo informado para atualizar.")
                 client = account_client(account)
                 official = client.update_item(item_id, update)
+                stock_transition = None
                 for item in payload.get("catalog", []):
                     if item.get("id") == item_id:
                         changes = {}
@@ -3817,10 +4163,19 @@ class App(BaseHTTPRequestHandler):
                             item["price"] = update["price"]
                         if "available_quantity" in update:
                             changes["stock"] = {"from": item.get("stock"), "to": update["available_quantity"]}
+                            stock_transition = (int(item.get("stock") or 0), int(update["available_quantity"] or 0), item)
                             item["stock"] = update["available_quantity"]
                         if "title" in update:
                             changes["title"] = {"from": item.get("title"), "to": update["title"]}
                             item["title"] = update["title"]
+                        for request_key in dimension_map:
+                            if clean_attribute_value(request.get(request_key)):
+                                normalized_value = normalize_package_value(
+                                    seller_package_api_value(request_key, request.get(request_key)),
+                                    [dimension_map[request_key]],
+                                )
+                                changes[request_key] = {"from": item.get(request_key), "to": normalized_value}
+                                item[request_key] = normalized_value
                         if update.get("status") == "paused":
                             changes["status"] = {"from": item.get("meli_status"), "to": "paused"}
                             item["status"] = "paused"
@@ -3831,7 +4186,12 @@ class App(BaseHTTPRequestHandler):
                             item["meli_status"] = "active"
                         item["updated_at"] = now_label()
                         append_item_log(payload, item, user, "Atualização manual", changes)
-                ensure_stock_alerts(payload, notify=True)
+                if stock_transition and stock_transition[0] > 0 and stock_transition[1] == 0:
+                    old_stock, new_stock, changed_item = stock_transition
+                    alert_id = f"stock-{account.get('id')}-{item_id}-{uuid.uuid4().hex[:8]}"
+                    alert = stock_alert(alert_id, account, changed_item)
+                    payload.setdefault("alerts", []).insert(0, alert)
+                    notify_alert(payload, alert)
                 write_payload(payload)
                 self.send_json({"ok": True, "official": official, "catalog": public_payload(payload, user)["catalog"]})
             except Exception as exc:
@@ -3953,6 +4313,14 @@ class App(BaseHTTPRequestHandler):
                 if not source or not target:
                     self.send_json({"error": "Informe conta origem e conta destino."}, status=400)
                     return
+                source_account = official_account_by_name(payload, source)
+                target_account = official_account_by_name(payload, target)
+                if not source_account or not source_account.get("official") or not source_account.get("access_token"):
+                    self.send_json({"error": "A conta origem não está conectada oficialmente. Reautentique a conta e tente novamente."}, status=400)
+                    return
+                if not target_account or not target_account.get("official") or not target_account.get("access_token"):
+                    self.send_json({"error": "A conta destino não está conectada oficialmente. Reautentique a conta e tente novamente."}, status=400)
+                    return
                 if not item_ids:
                     self.send_json({"error": "Selecione ao menos um anúncio específico."}, status=400)
                     return
@@ -3960,7 +4328,10 @@ class App(BaseHTTPRequestHandler):
                 source_items = [
                     item
                     for item in catalog
-                    if item.get("account") == source and item.get("id") in item_ids
+                    if (
+                        item.get("account_id") == source_account.get("id")
+                        or item.get("account") == source_account.get("nickname")
+                    ) and item.get("id") in item_ids
                 ]
                 found_ids = {item.get("id") for item in source_items}
                 missing_ids = [item_id for item_id in item_ids if item_id not in found_ids]
@@ -3973,11 +4344,13 @@ class App(BaseHTTPRequestHandler):
                         status=400,
                     )
                     return
-                preflight_errors = clone_preflight_pending_fields(payload, source, item_ids, edits)
+                preflight_errors = clone_preflight_pending_fields(payload, source_account.get("id"), item_ids, edits)
                 job = {
                     "id": f"clone-{uuid.uuid4().hex[:8]}",
-                    "source": source,
-                    "target": target,
+                    "source": source_account.get("nickname"),
+                    "target": target_account.get("nickname"),
+                    "source_account_id": source_account.get("id"),
+                    "target_account_id": target_account.get("id"),
                     "item_ids": item_ids,
                     "items": len(item_ids),
                     "status": "review_required" if preflight_errors else "preview_ready",
@@ -4043,7 +4416,7 @@ class App(BaseHTTPRequestHandler):
                     if new_id in existing_ids:
                         continue
                     existing_ids.add(new_id)
-                    target_account = official_account_by_name(payload, job.get("target")) or {}
+                    target_account = official_account_by_name(payload, job.get("target_account_id") or job.get("target")) or {}
                     official_sku = item_sku(official_source)
                     source_sku = official_sku if official_sku and official_sku != "-" else source_item.get("sku") or source_item.get("id") or "SEM-SKU"
                     official_created_item = {**official_source, **created, **verified_item}
@@ -4111,6 +4484,7 @@ if __name__ == "__main__":
     https_server.socket = tls_context.wrap_socket(https_server.socket, server_side=True)
 
     threading.Thread(target=https_server.serve_forever, daemon=True).start()
+    threading.Thread(target=meli_notification_loop, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
     threading.Thread(target=auto_official_sync_loop, daemon=True).start()
     print(f"CompeTIDOR rodando em http://127.0.0.1:{port}")
