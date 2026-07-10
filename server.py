@@ -2936,7 +2936,6 @@ def clone_extra_required_fields(item):
         "family_name",
         "catalog_product_id",
         "domain_id",
-        "official_store_id",
     )
     for field in body_fields:
         if item.get(field) not in (None, "", [], {}):
@@ -2987,6 +2986,17 @@ def build_clone_item_payload(source_item, edits):
     return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
 
 
+def apply_target_account_clone_rules(create_payload, source_item, source_account, target_account):
+    source_seller_id = str(source_account.get("seller_id") or "")
+    target_seller_id = str(target_account.get("seller_id") or "")
+    same_seller = bool(source_seller_id and target_seller_id and source_seller_id == target_seller_id)
+    if same_seller and source_item.get("official_store_id") not in (None, "", [], {}):
+        create_payload["official_store_id"] = source_item.get("official_store_id")
+    else:
+        create_payload.pop("official_store_id", None)
+    return create_payload
+
+
 def required_fields_from_error(exc):
     text = str(exc)
     match = re.search(r"properties \[([^\]]+)\]", text)
@@ -3023,6 +3033,28 @@ def meli_error_text(exc):
             parts.append(str(cause.get("message") or ""))
             parts.append(str(cause.get("code") or ""))
     return " ".join(part for part in parts if part)
+
+
+def meli_error_status(exc):
+    detail = meli_error_detail(exc)
+    if isinstance(detail, dict):
+        try:
+            return int(detail.get("status"))
+        except (TypeError, ValueError):
+            pass
+    match = re.search(r"HTTP\s+(\d{3})", str(exc), flags=re.I)
+    return int(match.group(1)) if match else 0
+
+
+def meli_rate_limited_error(exc):
+    text = meli_error_text(exc).lower()
+    return meli_error_status(exc) == 429 or "local_rate_limited" in text or "rate limit" in text
+
+
+def clone_rate_limit_delay(attempt):
+    base = max(0.1, float(os.getenv("MELI_CLONE_RATE_LIMIT_BASE_SECONDS", "1.5")))
+    maximum = max(base, float(os.getenv("MELI_CLONE_RATE_LIMIT_MAX_SECONDS", "8")))
+    return min(maximum, base * (2**attempt)) + random.uniform(0.05, 0.25)
 
 
 def invalid_fields_from_error(exc):
@@ -3429,6 +3461,13 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
     changed = False
     adjustments = []
     error_text = meli_error_text(exc)
+    lowered_error = error_text.lower()
+    if "official_store_id" in lowered_error and (
+        "not allowed" in lowered_error or "invalid_official_store_id" in lowered_error or "invalid official" in lowered_error
+    ):
+        if create_payload.pop("official_store_id", None) is not None:
+            changed = True
+            adjustments.append({"tipo": "loja_oficial_incompativel_removida", "campos": ["official_store_id"]})
     dropped_attrs = dropped_clone_attributes_from_error(exc)
     removed_dropped_attrs = remove_clone_attributes(create_payload, dropped_attrs)
     if removed_dropped_attrs:
@@ -3575,6 +3614,11 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
 
 
 def friendly_clone_error(exc):
+    if meli_rate_limited_error(exc):
+        return "O Mercado Livre limitou temporariamente as criações. A aplicação tentou novamente com espera progressiva; aguarde alguns instantes e repita se necessário."
+    error_text = meli_error_text(exc).lower()
+    if "official_store_id" in error_text:
+        return "O vínculo de loja oficial pertence à conta de origem e não pode ser usado pela conta destino. A aplicação removerá esse vínculo automaticamente na próxima tentativa."
     causes = meli_error_causes(exc)
     if not causes:
         return str(exc)
@@ -3608,7 +3652,10 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
         adjustments.append({"tipo": "atributos_fora_da_categoria_removidos", "campos": sanitized_attributes})
     last_error = None
     pending_fields = []
-    for _ in range(5):
+    validation_attempts = 0
+    rate_limit_attempts = 0
+    max_rate_limit_attempts = max(0, int(os.getenv("MELI_CLONE_RATE_LIMIT_RETRIES", "3")))
+    while validation_attempts < 5:
         try:
             created = target_client.create_item(payload)
             if adjustments and isinstance(created, dict):
@@ -3616,6 +3663,13 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
             return created
         except Exception as exc:
             last_error = exc
+            if meli_rate_limited_error(exc) and rate_limit_attempts < max_rate_limit_attempts:
+                delay = clone_rate_limit_delay(rate_limit_attempts)
+                adjustments.append({"tipo": "limite_temporario_aguardado", "tentativa": rate_limit_attempts + 1, "espera_segundos": round(delay, 2)})
+                rate_limit_attempts += 1
+                time.sleep(delay)
+                continue
+            validation_attempts += 1
             payload, changed, new_adjustments = clone_retry_adjustments_from_error(
                 exc,
                 payload,
@@ -3648,6 +3702,7 @@ def create_official_clone(payload, job, source_item_id, edits):
     target_client = account_client(target_account)
     source_item = source_client.item(source_item_id)
     create_payload = build_clone_item_payload(source_item, edits)
+    create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
     try:
         category_attributes = cached_category_attributes(source_client, source_item.get("category_id"))
