@@ -836,6 +836,9 @@ class MercadoLivreClient:
     def item(self, item_id):
         return self.get(f"/items/{item_id}")
 
+    def item_for_clone(self, item_id):
+        return self.get(f"/items/{item_id}?include_attributes=all")
+
     def items_bulk(self, item_ids):
         ids = ",".join(item_ids)
         rows = self.get(f"/items?ids={ids}")
@@ -2907,6 +2910,112 @@ def clone_attributes_payload(item, source_sku):
     return attributes
 
 
+def clone_attribute_row(attribute):
+    attr_id = attribute.get("id")
+    if not attr_id:
+        return {}
+    row = {"id": attr_id}
+    if attribute.get("value_id") not in (None, ""):
+        row["value_id"] = attribute.get("value_id")
+    elif clean_attribute_value(attribute.get("value_name")):
+        row["value_name"] = clean_attribute_value(attribute.get("value_name"))
+    elif isinstance(attribute.get("value_struct"), dict) and attribute.get("value_struct"):
+        row["value_struct"] = attribute.get("value_struct")
+    elif attribute.get("values"):
+        values = []
+        for value in attribute.get("values") or []:
+            clean = {}
+            if value.get("id") not in (None, ""):
+                clean["id"] = value.get("id")
+            if clean_attribute_value(value.get("name")):
+                clean["name"] = clean_attribute_value(value.get("name"))
+            if isinstance(value.get("struct"), dict) and value.get("struct"):
+                clean["struct"] = value.get("struct")
+            if clean:
+                values.append(clean)
+        if values:
+            row["values"] = values
+    return row if len(row) > 1 else {}
+
+
+def clone_source_item(client, item_id):
+    method = getattr(client, "item_for_clone", None)
+    if callable(method):
+        try:
+            return method(item_id)
+        except Exception:
+            pass
+    return client.item(item_id)
+
+
+def clone_source_catalog_product(client, source_item):
+    product_id = source_item.get("catalog_product_id")
+    if not product_id:
+        return {}
+    try:
+        product = client.product(product_id)
+        return product if isinstance(product, dict) else {}
+    except Exception:
+        return {}
+
+
+def source_clone_attribute(source_item, catalog_product, attr_id):
+    wanted = str(attr_id or "").upper()
+    wanted_ids = {wanted}
+    if wanted == "GTIN":
+        wanted_ids.update({"EAN", "UPC", "JAN", "ISBN", "UNIVERSAL_PRODUCT_CODE"})
+    for container in (source_item, catalog_product or {}):
+        for attribute in container.get("attributes") or []:
+            if str(attribute.get("id") or "").upper() in wanted_ids:
+                row = clone_attribute_row(attribute)
+                if row:
+                    row["id"] = wanted
+                    return row
+
+    variations = source_item.get("variations") or []
+    variation_rows = []
+    for variation in variations:
+        row = {}
+        for section in (variation.get("attributes") or [], variation.get("attribute_combinations") or []):
+            attribute = next((item for item in section if str(item.get("id") or "").upper() in wanted_ids), None)
+            if attribute:
+                row = clone_attribute_row(attribute)
+                if row:
+                    row["id"] = wanted
+                break
+        if not row:
+            return {}
+        variation_rows.append(row)
+    if variation_rows:
+        signatures = {json.dumps(row, sort_keys=True, ensure_ascii=False) for row in variation_rows}
+        if len(signatures) == 1:
+            return variation_rows[0]
+    return {}
+
+
+def clone_required_attribute_satisfied(create_payload, attr_id):
+    attr_id = str(attr_id or "").upper()
+    if clone_payload_has_attribute(create_payload, attr_id):
+        return True
+    if attr_id == "GTIN" and clone_payload_has_attribute(create_payload, "EMPTY_GTIN_REASON"):
+        return True
+    return False
+
+
+def hydrate_required_clone_attributes(create_payload, source_item, category_attributes, catalog_product=None):
+    copied = []
+    for definition in category_attributes or []:
+        attr_id = definition.get("id")
+        if not attr_id or not clone_attribute_is_required(definition) or clone_required_attribute_satisfied(create_payload, attr_id):
+            continue
+        row = source_clone_attribute(source_item, catalog_product or {}, attr_id)
+        if not row:
+            continue
+        create_payload.setdefault("attributes", []).append(row)
+        copied.append(str(attr_id).upper())
+    return copied
+
+
 def clone_sale_terms_payload(item):
     terms = []
     for term in item.get("sale_terms") or []:
@@ -3480,7 +3589,7 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
     if "required" in normalized_error or "obrigatorio" in normalized_error:
         for attribute in category_attributes or []:
             attr_id = attribute.get("id")
-            if not attr_id or not clone_attribute_is_required(attribute) or clone_payload_has_attribute(create_payload, attr_id):
+            if not attr_id or not clone_attribute_is_required(attribute) or clone_required_attribute_satisfied(create_payload, attr_id):
                 continue
             pending_fields.append(
                 pending_clone_attribute(
@@ -3700,14 +3809,16 @@ def create_official_clone(payload, job, source_item_id, edits):
         raise RuntimeError("Conta destino oficial não encontrada para clonar via Mercado Livre.")
     source_client = account_client(source_account)
     target_client = account_client(target_account)
-    source_item = source_client.item(source_item_id)
+    source_item = clone_source_item(source_client, source_item_id)
     create_payload = build_clone_item_payload(source_item, edits)
-    create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
-    answers = (job.get("field_answers") or {}).get(source_item_id) or {}
     try:
         category_attributes = cached_category_attributes(source_client, source_item.get("category_id"))
     except Exception:
         category_attributes = []
+    catalog_product = clone_source_catalog_product(source_client, source_item)
+    hydrate_required_clone_attributes(create_payload, source_item, category_attributes, catalog_product)
+    create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
+    answers = (job.get("field_answers") or {}).get(source_item_id) or {}
     created = create_item_with_clone_retries(
         target_client,
         create_payload,
@@ -3756,19 +3867,26 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
     category_cache = {}
     for item_id in item_ids:
         try:
-            source_item = client.item(item_id)
+            source_item = clone_source_item(client, item_id)
             create_payload = build_clone_item_payload(source_item, edits)
             category_id = create_payload.get("category_id")
             if not category_id:
                 continue
             if category_id not in category_cache:
                 category_cache[category_id] = cached_category_attributes(client, category_id)
+            catalog_product = clone_source_catalog_product(client, source_item)
+            hydrate_required_clone_attributes(
+                create_payload,
+                source_item,
+                category_cache.get(category_id) or [],
+                catalog_product,
+            )
             item_fields = []
             for attribute in category_cache.get(category_id) or []:
                 attr_id = attribute.get("id")
                 if not clone_attribute_is_required(attribute) or not attr_id:
                     continue
-                if clone_payload_has_attribute(create_payload, attr_id):
+                if clone_required_attribute_satisfied(create_payload, attr_id):
                     continue
                 item_fields.append(
                     pending_clone_attribute(
