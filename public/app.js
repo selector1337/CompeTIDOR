@@ -25,6 +25,7 @@
   copyPageSize: Number(localStorage.getItem("competidor-copy-page-size") || 20),
   copySearch: "",
   copySku: "",
+  copyCatalog: "all",
   cloneSelectedIds: new Set(),
   alertsPage: 1,
   scanPage: 1,
@@ -33,6 +34,12 @@
   currentUser: null,
   catalogLoaded: false,
   catalogLoading: null,
+  statistics: null,
+  statisticsLoading: false,
+  statisticsAttempted: false,
+  statisticsError: "",
+  statisticsPage: 1,
+  statisticsPageSize: 50,
 };
 
 const PAGE_SIZE = 100;
@@ -40,6 +47,7 @@ const renderTimers = {};
 
 const pageTitles = {
   dashboard: ["Painel unificado", "Dashboard"],
+  estatisticas: ["Vendas oficiais", "Estatísticas por SKU"],
   contas: ["OAuth oficial", "Contas Mercado Livre"],
   catalogo: ["Catálogo Mercado Livre", "Disputa de catálogo"],
   anuncios: ["Gestão operacional", "Anúncios"],
@@ -306,6 +314,7 @@ function renderRoute() {
   }
   const routeRenderers = {
     dashboard: renderDashboard,
+    estatisticas: renderStatistics,
     contas: () => {
       renderAccounts();
       renderMeliConfig();
@@ -529,8 +538,10 @@ function renderCatalog() {
               ${item.meli_status ? fact("Status ML", item.meli_status === "paused" ? "Pausado" : item.meli_status) : ""}
               ${fact("Vencedor", catalogWinnerName(item))}
               ${fact("Preço vencedor", catalogWinnerPrice(item))}
+              ${item.winner_confirmed && item.winner_item_id ? fact("Anúncio vencedor", item.winner_item_id) : ""}
               ${catalogWinnerSourceValue(item) ? fact("Fonte vencedor", catalogWinnerSourceValue(item)) : ""}
               ${fact("Preço p/ ganhar", item.price_to_win ? money.format(item.price_to_win) : "Sem sugestão ML")}
+              ${item.competition_checked_at ? fact("Verificado em", formatDateBR(item.competition_checked_at)) : ""}
             </div>
             <div class="progress"><span style="width:${item.share}%; background:${colors[item.status]}; color:${colors[item.status]}"></span></div>
             <p class="catalog-action">${item.action}</p>
@@ -560,7 +571,7 @@ function renderCatalog() {
 
 function catalogWinnerName(item) {
   if (item.winner_confirmed && item.winner_name) return item.winner_name;
-  return item.winner_name && !/não confirmado|aguardando/i.test(item.winner_name) ? item.winner_name : "Não confirmado";
+  return "Aguardando API oficial";
 }
 
 function catalogPublicUrl(item) {
@@ -583,6 +594,7 @@ function catalogWinnerSource(source) {
   const sources = {
     price_to_win: "API oficial",
     price_to_win_winner: "API oficial · price_to_win v2",
+    product_buy_box_winner: "API oficial · produto",
     products_items_winner_marker: "API catálogo",
     public_product_page: "Página pública ML",
     catalog_reference: "Catálogo ML",
@@ -688,7 +700,7 @@ function isCatalogListing(item) {
 }
 
 function isCatalogItem(item) {
-  return item.catalog_listing === true || Boolean(item.catalog_product_id && item.catalog_product_id !== "-");
+  return isCatalogListing(item);
 }
 
 function measureInputValue(value) {
@@ -947,6 +959,170 @@ function renderScan() {
   }).join("") + paginationHtml("scanPage", pageInfo) : `<div class="notice">Nenhum produto em Scan ainda. Cadastre um produto padrão e cole o link do anúncio para começar.</div>`;
 }
 
+function localDateValue(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function statisticsDateRange(form) {
+  const period = form.elements.period.value;
+  const today = new Date();
+  let start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  let end = new Date(start);
+  if (period === "yesterday") {
+    start.setDate(start.getDate() - 1);
+    end = new Date(start);
+  } else if (period === "week") {
+    start.setDate(start.getDate() - 6);
+  } else if (period === "fortnight") {
+    start.setDate(start.getDate() - 14);
+  } else if (period === "month") {
+    start = new Date(today.getFullYear(), today.getMonth(), 1);
+  } else if (period === "year") {
+    start = new Date(today.getFullYear(), 0, 1);
+  } else if (period === "specific_date") {
+    const selected = form.elements.specific_date.value || localDateValue(today);
+    return { date_from: selected, date_to: selected };
+  } else if (period === "specific_month") {
+    const selected = form.elements.specific_month.value || `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
+    const [year, month] = selected.split("-").map(Number);
+    start = new Date(year, month - 1, 1);
+    end = new Date(year, month, 0);
+  } else if (period === "custom") {
+    const dateFrom = form.elements.date_from.value;
+    const dateTo = form.elements.date_to.value;
+    if (!dateFrom || !dateTo) throw new Error("Informe as datas inicial e final do período personalizado.");
+    return { date_from: dateFrom, date_to: dateTo };
+  }
+  return { date_from: localDateValue(start), date_to: localDateValue(end) };
+}
+
+function updateStatisticsPeriodFields() {
+  const form = document.querySelector("#statistics-form");
+  if (!form) return;
+  const period = form.elements.period.value;
+  form.querySelectorAll("[data-statistics-date]").forEach((node) => { node.hidden = period !== "specific_date"; });
+  form.querySelectorAll("[data-statistics-month]").forEach((node) => { node.hidden = period !== "specific_month"; });
+  form.querySelectorAll("[data-statistics-custom]").forEach((node) => { node.hidden = period !== "custom"; });
+}
+
+function renderStatistics() {
+  const form = document.querySelector("#statistics-form");
+  const feedback = document.querySelector("#statistics-feedback");
+  const summary = document.querySelector("#statistics-summary");
+  const results = document.querySelector("#statistics-results");
+  if (!form || !feedback || !summary || !results) return;
+  const accounts = connectedAccounts();
+  const currentAccount = form.elements.account.value || "all";
+  form.elements.account.innerHTML = `<option value="all">Todas as contas</option>${accounts
+    .map((account) => `<option value="${escapeAttr(account.id || account.seller_id)}">${escapeText(account.nickname)}</option>`)
+    .join("")}`;
+  if ([...form.elements.account.options].some((option) => option.value === currentAccount)) {
+    form.elements.account.value = currentAccount;
+  }
+  const today = new Date();
+  if (!form.elements.specific_date.value) form.elements.specific_date.value = localDateValue(today);
+  if (!form.elements.specific_month.value) form.elements.specific_month.value = localDateValue(today).slice(0, 7);
+  if (!form.elements.date_from.value) form.elements.date_from.value = localDateValue(new Date(today.getFullYear(), today.getMonth(), 1));
+  if (!form.elements.date_to.value) form.elements.date_to.value = localDateValue(today);
+  updateStatisticsPeriodFields();
+
+  if (!accounts.length) {
+    feedback.innerHTML = `<div class="notice">Conecte uma conta oficial do Mercado Livre para consultar as vendas.</div>`;
+    summary.innerHTML = "";
+    results.innerHTML = "";
+    return;
+  }
+  if (state.statisticsLoading) {
+    feedback.innerHTML = `<div class="statistics-loading"><span></span><strong>Consultando pedidos oficiais...</strong></div>`;
+  } else if (state.statisticsError) {
+    feedback.innerHTML = `<div class="notice danger-notice">${escapeText(state.statisticsError)}</div>`;
+  } else {
+    feedback.innerHTML = "";
+  }
+  if (!state.statistics && !state.statisticsLoading && !state.statisticsAttempted) {
+    state.statisticsLoading = true;
+    window.setTimeout(loadStatistics, 0);
+    return;
+  }
+  if (!state.statistics) return;
+
+  const data = state.statistics;
+  const updated = document.querySelector("#statistics-updated");
+  if (updated) updated.textContent = `${formatDateBR(data.date_from)} a ${formatDateBR(data.date_to)}`;
+  const summaryData = data.summary || {};
+  summary.innerHTML = `
+    <article><small>Unidades vendidas</small><strong>${Number(summaryData.units || 0).toLocaleString("pt-BR")}</strong></article>
+    <article><small>SKUs vendidos</small><strong>${Number(summaryData.skus || 0).toLocaleString("pt-BR")}</strong></article>
+    <article><small>Pedidos</small><strong>${Number(summaryData.orders || 0).toLocaleString("pt-BR")}</strong></article>
+    <article class="flex-stat"><small>Unidades via Flex</small><strong>${Number(summaryData.flex_units || 0).toLocaleString("pt-BR")}</strong></article>
+    <article><small>Valor dos itens</small><strong>${money.format(summaryData.revenue || 0)}</strong></article>
+  `;
+  const pageInfo = paginate(data.rows || [], state.statisticsPage, state.statisticsPageSize);
+  state.statisticsPage = pageInfo.current;
+  const warning = data.truncated
+    ? `<div class="notice danger-notice">A consulta atingiu o limite configurado de pedidos. Reduza o período ou aumente MELI_STATISTICS_ORDERS_LIMIT no servidor.</div>`
+    : "";
+  const messages = (data.warnings || []).map((message) => `<div class="notice warning-notice">${escapeText(message)}</div>`).join("");
+  results.innerHTML = `${warning}${messages}${paginationHtml("statisticsPage", pageInfo)}${pageInfo.items.length ? `
+    <div class="statistics-table" role="table" aria-label="SKUs vendidos">
+      <div class="statistics-table-head" role="row">
+        <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Unidades</span><span>Pedidos</span><span>Flex</span><span>Valor</span>
+      </div>
+      ${pageInfo.items.map((row, index) => `
+        <article class="statistics-row" role="row">
+          <strong class="statistics-rank">${pageInfo.start + index + 1}</strong>
+          <div class="statistics-product">
+            ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="${escapeAttr(row.product)}" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
+            <span><strong>${escapeText(row.product)}</strong><small>SKU ${escapeText(row.sku)}</small></span>
+          </div>
+          <span class="statistics-accounts">${(row.accounts || []).map((account) => `<em>${escapeText(account)}</em>`).join("")}</span>
+          <strong class="statistics-units">${Number(row.units || 0).toLocaleString("pt-BR")}</strong>
+          <span>${Number(row.orders || 0).toLocaleString("pt-BR")}</span>
+          <span class="statistics-flex">${Number(row.flex_units || 0).toLocaleString("pt-BR")}</span>
+          <strong>${money.format(row.revenue || 0)}</strong>
+        </article>
+      `).join("")}
+    </div>
+  ` : `<div class="notice">Nenhum SKU vendido corresponde aos filtros selecionados.</div>`}${paginationHtml("statisticsPage", pageInfo)}`;
+}
+
+async function loadStatistics() {
+  const form = document.querySelector("#statistics-form");
+  if (!form || !connectedAccounts().length) {
+    state.statisticsLoading = false;
+    return;
+  }
+  state.statisticsLoading = true;
+  state.statisticsAttempted = true;
+  renderStatistics();
+  try {
+    const range = statisticsDateRange(form);
+    const data = await api("/api/statistics/query", {
+      method: "POST",
+      body: JSON.stringify({
+        account: form.elements.account.value,
+        sku: form.elements.sku.value,
+        flex: form.elements.flex.value,
+        ...range,
+      }),
+    });
+    state.statistics = data;
+    state.statisticsError = "";
+    state.statisticsPage = 1;
+  } catch (error) {
+    state.statistics = null;
+    state.statisticsError = error.message || "Não foi possível consultar as estatísticas.";
+    showToast(error.message || "Não foi possível consultar as estatísticas.", "error");
+  } finally {
+    state.statisticsLoading = false;
+    renderStatistics();
+  }
+}
+
 function renderClone() {
   const source = document.querySelector('select[name="source"]');
   const target = document.querySelector('select[name="target"]');
@@ -963,9 +1139,11 @@ function renderClone() {
   if (!hadTarget && target.options.length) target.selectedIndex = 0;
   const copyProduct = document.querySelector("#copy-product-filter");
   const copySku = document.querySelector("#copy-sku-filter");
+  const copyCatalog = document.querySelector("#copy-catalog-filter");
   const copyPageSize = document.querySelector("#copy-page-size");
   if (copyProduct && copyProduct.value !== state.copySearch) copyProduct.value = state.copySearch;
   if (copySku && copySku.value !== state.copySku) copySku.value = state.copySku;
+  if (copyCatalog && copyCatalog.value !== state.copyCatalog) copyCatalog.value = state.copyCatalog;
   if (copyPageSize && Number(copyPageSize.value) !== state.copyPageSize) copyPageSize.value = String(state.copyPageSize);
   renderCopyItems();
 
@@ -1125,9 +1303,13 @@ function renderCopyItems() {
     const title = `${item.title || ""}`.toLowerCase();
     const sku = `${item.sku || ""}`.toLowerCase();
     const code = `${item.id || ""}`.toLowerCase();
+    const catalogOk = state.copyCatalog === "all"
+      || (state.copyCatalog === "catalog" && isCatalogListing(item))
+      || (state.copyCatalog === "traditional" && !isCatalogListing(item));
     return (item.account_id === source || item.account === sourceAccount?.nickname)
       && (!productTerm || title.includes(productTerm))
-      && (!skuTerm || sku.includes(skuTerm) || code.includes(skuTerm));
+      && (!skuTerm || sku.includes(skuTerm) || code.includes(skuTerm))
+      && catalogOk;
   });
   const pageInfo = paginate(filtered, state.copyPage, state.copyPageSize);
   state.copyPage = pageInfo.current;
@@ -1143,9 +1325,18 @@ function renderCopyItems() {
               ${item.thumbnail
                 ? `<img class="copy-thumb" src="${item.thumbnail}" alt="${escapeAttr(item.title || item.id)}" loading="lazy" />`
                 : `<span class="copy-thumb copy-thumb-empty"></span>`}
-              <span>
-                <strong>${item.title}</strong>
-                <small>${item.id} - SKU ${item.sku} - ${listingTypeLabel(item.listing_type_id)} - ${(item.catalog_listing || (item.catalog_product_id && item.catalog_product_id !== "-")) ? "Catálogo" : "Tradicional"} - ${money.format(item.price)} - estoque ${item.stock}</small>
+              <span class="copy-item-content">
+                <span class="copy-item-heading">
+                  <strong>${escapeText(item.title)}</strong>
+                  <span class="listing-mode ${isCatalogListing(item) ? "catalog" : "traditional"}">${isCatalogListing(item) ? "Catálogo" : "Tradicional"}</span>
+                </span>
+                <span class="copy-item-meta">
+                  <span>${escapeText(item.id)}</span>
+                  <span>SKU ${escapeText(item.sku || "-")}</span>
+                  <span>${listingTypeLabel(item.listing_type_id)}</span>
+                  <span>${money.format(item.price || 0)}</span>
+                  <span>Estoque ${Number(item.stock || 0)}</span>
+                </span>
               </span>
             </label>
           `
@@ -1351,6 +1542,22 @@ document.addEventListener("click", (event) => {
   if (key === "alertsPage") renderAlerts();
   if (key === "scanPage") renderScan();
   if (key === "competitorsPage") renderCompetitors();
+  if (key === "statisticsPage") renderStatistics();
+});
+
+document.querySelector("#statistics-form")?.addEventListener("change", (event) => {
+  if (event.target.name === "period") updateStatisticsPeriodFields();
+  if (event.target.name === "page_size") {
+    state.statisticsPageSize = Number(event.target.value || 50);
+    state.statisticsPage = 1;
+    renderStatistics();
+  }
+});
+
+document.querySelector("#statistics-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  state.statisticsPage = 1;
+  await loadStatistics();
 });
 
 [
@@ -1367,6 +1574,7 @@ document.addEventListener("click", (event) => {
   ["#ads-flex-filter", "adsFlex"],
   ["#copy-product-filter", "copySearch"],
   ["#copy-sku-filter", "copySku"],
+  ["#copy-catalog-filter", "copyCatalog"],
   ["#copy-page-size", "copyPageSize"],
 ].forEach(([selector, key]) => {
   document.addEventListener("input", (event) => {
@@ -1592,13 +1800,29 @@ async function fillCloneFieldsFromItem(itemId) {
   form.elements.stock_override.value = item.stock || "";
   form.elements.listing_type_override.value = item.listing_type_id || "";
   form.elements.sku_suffix.value = item.sku && item.sku !== "-" ? item.sku : "";
+  form.elements.gtin_override.value = "";
   form.elements.description_override.value = "Carregando descrição...";
   try {
-    const result = await api("/api/meli/item/description", {
+    const result = await api("/api/meli/item/clone-source", {
       method: "POST",
       body: JSON.stringify({ item_id: item.id, account_id: item.account_id }),
     });
+    form.elements.title_override.value = (result.title || item.title || "").slice(0, 60);
+    form.elements.price_override.value = result.price ?? item.price ?? "";
+    form.elements.stock_override.value = result.stock ?? item.stock ?? "";
+    form.elements.listing_type_override.value = result.listing_type_id || item.listing_type_id || "";
+    form.elements.sku_suffix.value = result.sku || (item.sku !== "-" ? item.sku : "") || "";
+    form.elements.gtin_override.value = result.gtin || "";
     form.elements.description_override.value = result.description || "";
+    const gtinHint = document.querySelector("#clone-gtin-hint");
+    if (gtinHint) {
+      gtinHint.textContent = result.variation_count > 1
+        ? `Este anúncio possui ${result.variation_count} variações. Use um código por variação separado por vírgula.`
+        : result.gtin
+          ? "Código carregado do anúncio oficial de origem."
+          : "O anúncio de origem não retornou código universal; informe se a categoria exigir.";
+    }
+    updateCloneTitleCounter();
   } catch (_) {
     form.elements.description_override.value = "";
   }
@@ -1632,6 +1856,7 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
         edits: {
           title: form.get("title_override"),
           sku: form.get("sku_suffix"),
+          gtin: form.get("gtin_override"),
           listing_type_id: form.get("listing_type_override"),
           price: form.get("price_override"),
           stock: form.get("stock_override"),

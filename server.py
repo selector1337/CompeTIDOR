@@ -1,6 +1,6 @@
 ﻿from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime, time as datetime_time, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlencode, urlparse
 import json
@@ -35,6 +35,10 @@ ACTIVE_SYNC_ACCOUNTS = set()
 MELI_NOTIFICATION_QUEUE = queue.Queue(maxsize=5000)
 CATEGORY_ATTRIBUTES_LOCK = threading.RLock()
 CATEGORY_ATTRIBUTES_CACHE = {}
+SELLER_PROFILE_LOCK = threading.RLock()
+SELLER_PROFILE_CACHE = {}
+STATISTICS_CACHE_LOCK = threading.RLock()
+STATISTICS_CACHE = {}
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -65,10 +69,23 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/categories/[^/]+/attributes(\?|$)"),
     re.compile(r"^/products/[^/]+(\?|$)"),
     re.compile(r"^/products/[^/]+/items(\?|$)"),
+    re.compile(r"^/user-products/[^/]+(\?|$)"),
     re.compile(r"^/orders/search(\?|$)"),
+    re.compile(r"^/shipments/[^/]+(\?|$)"),
     re.compile(r"^/claims/search(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/search(\?|$)"),
 )
+
+
+def meli_flag(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() == "true"
+
+
+def is_catalog_listing(item):
+    """Only catalog_listing identifies an offer that actually competes in catalog."""
+    return meli_flag((item or {}).get("catalog_listing"))
 
 
 def read_json(name, fallback):
@@ -83,7 +100,16 @@ def write_json(name, payload):
     with DATA_LOCK:
         path = DATA / name
         temporary = DATA / f".{name}.{uuid.uuid4().hex}.tmp"
-        temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        compact = name == CATALOG_DATA_FILE
+        temporary.write_text(
+            json.dumps(
+                payload,
+                indent=None if compact else 2,
+                separators=(",", ":") if compact else None,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         os.replace(temporary, path)
 
 
@@ -107,6 +133,7 @@ def read_payload(include_catalog=True):
                     "catalog_reference",
                     "products_items_winner_marker",
                     "public_purchase_options",
+                    "public_product_page",
                 }:
                     item.update(competition_snapshot(item))
         payload["_catalog_loaded"] = bool(include_catalog)
@@ -855,6 +882,9 @@ class MercadoLivreClient:
     def product(self, catalog_product_id):
         return self.get(f"/products/{catalog_product_id}")
 
+    def user_product(self, user_product_id):
+        return self.get(f"/user-products/{user_product_id}")
+
     def price_to_win(self, item_id):
         return self.get(f"/items/{item_id}/price_to_win?version=v2")
 
@@ -885,6 +915,9 @@ class MercadoLivreClient:
         if date_to:
             params["order.date_created.to"] = date_to
         return self.get(f"/orders/search?{urlencode(params)}")
+
+    def shipment(self, shipment_id):
+        return self.get(f"/shipments/{shipment_id}")
 
     def seller_claims(self, seller_id, limit=50, offset=0):
         params = {"seller_id": seller_id, "limit": min(int(limit or 50), 50), "offset": max(int(offset or 0), 0)}
@@ -1601,7 +1634,7 @@ def scan_competitor_profile(payload, seller_id, limit=50):
 
 def process_meli_notification(event):
     topic = str(event.get("topic") or "")
-    if topic not in {"items", "orders_v2"}:
+    if topic not in {"items", "orders_v2", "catalog_item_competition_status"}:
         return
     seller_id = str(event.get("user_id") or "")
     payload = read_payload()
@@ -1623,7 +1656,7 @@ def process_meli_notification(event):
         return
 
     resource = str(event.get("resource") or "")
-    match = re.fullmatch(r"/items/(MLB\d+)", resource, flags=re.I)
+    match = re.fullmatch(r"/items/(MLB\d+)(?:/price_to_win)?", resource, flags=re.I)
     if not match:
         return
     item_id = match.group(1).upper()
@@ -1637,7 +1670,7 @@ def process_meli_notification(event):
         None,
     )
     before = dict(existing) if existing else None
-    is_catalog = bool(official.get("catalog_listing") or official.get("catalog_product_id"))
+    is_catalog = is_catalog_listing(official)
     competition = normalize_competition(client, account, official) if is_catalog else {}
     updated = synced_catalog_item(account, official, competition)
     updated["first_seen_at"] = (before or {}).get("first_seen_at") or now_label()
@@ -1928,11 +1961,31 @@ def public_purchase_options_winner(lines):
     }
 
 
+def seller_nickname(client, seller_id):
+    seller_id = str(seller_id or "").strip()
+    if not seller_id:
+        return ""
+    ttl = max(300, int(os.getenv("SELLER_PROFILE_CACHE_SECONDS", "21600")))
+    now = time.monotonic()
+    with SELLER_PROFILE_LOCK:
+        cached = SELLER_PROFILE_CACHE.get(seller_id)
+        if cached and now - cached["time"] < ttl:
+            return cached["nickname"]
+    profile = client.user(seller_id)
+    nickname = str((profile or {}).get("nickname") or f"Seller {seller_id}")
+    with SELLER_PROFILE_LOCK:
+        SELLER_PROFILE_CACHE[seller_id] = {"time": now, "nickname": nickname}
+    return nickname
+
+
 def normalize_competition(client, account, item):
     item_id = item.get("id")
     catalog_product_id = item.get("catalog_product_id")
     data = {
         "competition_status": "not_checked",
+        "competition_consistent": None,
+        "competition_checked_at": now_label(),
+        "winner_item_id": "",
         "winner_seller_id": "",
         "winner_name": "Indisponível",
         "winner_price": None,
@@ -1954,6 +2007,7 @@ def normalize_competition(client, account, item):
         data.update(
             {
                 "competition_status": price.get("status") or "unknown",
+                "competition_consistent": price.get("consistent"),
                 "price_to_win": price.get("price_to_win"),
                 "current_price": price.get("current_price"),
                 "visit_share": price.get("visit_share"),
@@ -1962,90 +2016,74 @@ def normalize_competition(client, account, item):
             }
         )
         if isinstance(winner, dict) and winner.get("item_id"):
-            winner_item_id = winner.get("item_id")
-            winner_seller_id = ""
+            winner_item_id = str(winner.get("item_id") or "")
+            winner_seller_id = str(winner.get("seller_id") or "")
             winner_name = ""
             try:
                 winner_item = client.item(winner_item_id)
-                winner_seller_id = str(winner_item.get("seller_id") or "")
+                winner_seller_id = winner_seller_id or str(winner_item.get("seller_id") or "")
                 if winner_seller_id:
-                    winner_profile = client.user(winner_seller_id)
-                    winner_name = winner_profile.get("nickname") or f"Seller {winner_seller_id}"
+                    winner_name = seller_nickname(client, winner_seller_id)
             except Exception:
-                pass
+                if winner_seller_id:
+                    try:
+                        winner_name = seller_nickname(client, winner_seller_id)
+                    except Exception:
+                        winner_name = f"Seller {winner_seller_id}"
             if str(winner_item_id) == str(item_id):
                 winner_seller_id = str(account.get("seller_id") or winner_seller_id)
                 winner_name = account.get("nickname") or winner_name or "Sua conta"
+            winner_price = winner.get("price")
+            data["winner_item_id"] = winner_item_id
             data["winner_seller_id"] = winner_seller_id
             data["winner_name"] = winner_name or f"Anúncio {winner_item_id}"
-            data["winner_price"] = winner.get("price") or price.get("price_to_win") or price.get("current_price")
-            data["winner_confirmed"] = True
+            data["winner_price"] = winner_price
+            data["winner_confirmed"] = winner_price not in (None, "")
             data["winner_source"] = "price_to_win_winner"
         elif price.get("status") in {"winning", "winner"}:
+            data["winner_item_id"] = str(item_id or "")
             data["winner_seller_id"] = account.get("seller_id", "")
             data["winner_name"] = account.get("nickname", "Sua conta")
             data["winner_price"] = price.get("current_price")
-            data["winner_confirmed"] = True
+            data["winner_confirmed"] = price.get("current_price") not in (None, "")
             data["winner_source"] = "price_to_win"
     except Exception as exc:
         data["competition_reason"] = str(exc)
 
+    # Compatibility fallback for accounts where the product resource still exposes
+    # buy_box_winner. It remains an official API source and is never inferred from
+    # the lowest offer or from unrelated text on the public product page.
     if catalog_product_id and not data.get("winner_confirmed"):
         try:
-            public_buybox = fetch_public_buybox(client, catalog_product_id, item)
-            data["winner_name"] = public_buybox.get("seller_name") or "Vendedor da buybox"
-            data["winner_price"] = public_buybox.get("price")
-            data["winner_confirmed"] = True
-            data["winner_source"] = public_buybox.get("source") or "public_product_page"
-            data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "public_buybox"
-            data["competition_reason"] = "Buybox verificada na página pública do Mercado Livre."
-        except Exception as exc:
-            data["public_buybox_error"] = str(exc)
-
-    if catalog_product_id:
-        try:
-            winners = client.product_winners(catalog_product_id)
-            rows = winners.get("results") if isinstance(winners, dict) else winners
-            if isinstance(rows, dict):
-                rows = rows.get("results") or rows.get("items") or []
-            if rows:
-                candidates = catalog_offer_candidates(rows, sort_by_price=True)
-                explicit_winner = next((candidate for candidate in candidates if candidate.get("is_winner")), None)
-                lowest_active = candidates[0] if candidates else None
-                reference = explicit_winner or lowest_active or {"raw": rows[0], "price": None, "item_id": "", "seller_id": ""}
-                raw_reference = reference.get("raw") or rows[0]
-                reference_seller_id = str(reference.get("seller_id") or first_present(raw_reference, ["seller_id", "seller.id", "seller.id_seller"], ""))
-                reference_item_id = reference.get("item_id") or first_present(raw_reference, ["item_id", "id", "item.id"], "")
-                reference_price = reference.get("price") or first_present(raw_reference, ["price", "sale_price.amount", "current_price"], None)
-                if reference_item_id:
+            product = client.product(catalog_product_id)
+            winner = (product or {}).get("buy_box_winner") or {}
+            winner_item_id = str(winner.get("item_id") or "")
+            winner_price = winner.get("price")
+            if winner_item_id and winner_price not in (None, ""):
+                winner_seller_id = str(winner.get("seller_id") or "")
+                winner_name = ""
+                if winner_seller_id:
                     try:
-                        reference_item = client.item(reference_item_id)
-                        if reference_item.get("status") in {"active", "under_review", None, ""}:
-                            reference_seller_id = reference_seller_id or str(reference_item.get("seller_id") or "")
-                            reference_price = reference_item.get("price") or reference_price
+                        winner_name = seller_nickname(client, winner_seller_id)
                     except Exception:
-                        pass
-                data["competition_status"] = data["competition_status"] if data["competition_status"] != "not_checked" else "listed"
-                data["catalog_reference_seller_id"] = reference_seller_id
-                data["catalog_reference_price"] = reference_price
-                if reference_seller_id:
-                    try:
-                        seller = client.user(reference_seller_id)
-                        data["catalog_reference_name"] = seller.get("nickname") or f"Seller {reference_seller_id}"
-                    except Exception:
-                        data["catalog_reference_name"] = f"Seller {reference_seller_id}"
-                if not data.get("winner_confirmed") and lowest_active:
-                    data["competition_reason"] = (
-                        "A API oficial confirmou a disputa e o preço para ganhar, mas não expõe o vendedor da buybox. "
-                        "A menor oferta ativa não será tratada como vencedora."
-                    )
-        except Exception as exc:
-            if not data["competition_reason"]:
-                data["competition_reason"] = str(exc)
+                        winner_name = f"Seller {winner_seller_id}"
+                data.update(
+                    {
+                        "winner_item_id": winner_item_id,
+                        "winner_seller_id": winner_seller_id,
+                        "winner_name": winner_name or f"Anúncio {winner_item_id}",
+                        "winner_price": winner_price,
+                        "winner_confirmed": True,
+                        "winner_source": "product_buy_box_winner",
+                    }
+                )
+        except Exception:
+            pass
 
     if not data.get("winner_confirmed"):
+        data["winner_item_id"] = ""
         data["winner_seller_id"] = ""
-        data["winner_name"] = "Não exposto pela API oficial"
+        data["winner_name"] = "Aguardando API oficial"
         data["winner_price"] = None
     if data["competition_status"] == "not_listed" and not data.get("winner_seller_id"):
         data["winner_name"] = "Sem vencedor disponível"
@@ -2078,15 +2116,21 @@ def classified_catalog_status(account, item, stock, is_catalog, competition):
     except (TypeError, ValueError):
         price_to_win = 0
 
-    if price_to_win and own_price and own_price > price_to_win:
-        return "losing", "Sua conta não está vencendo este catálogo. Revise preço, reputação e condições comerciais."
+    # price_to_win v2 is authoritative. Do not infer the position only from
+    # prices: reputation, delivery and installments also decide the buy box.
+    if status_text in {"winning", "winner"}:
+        return "winning", "Sua conta está vencendo a buybox deste catálogo."
+    if status_text in {"sharing_first_place", "sharing", "shared"}:
+        return "sharing", "Sua conta está compartilhando a primeira posição deste catálogo."
+    if status_text in {"competing", "losing", "not_winning", "listed", "not_listed"}:
+        return "losing", "Sua conta não está vencendo este catálogo. Revise preço, reputação, entrega e condições comerciais."
     if winner_seller_id and own_seller_id and winner_seller_id == own_seller_id:
         return "winning", "Sua conta está vencendo a buybox deste catálogo."
     if winner_name and own_name and winner_name.strip().lower() == own_name.strip().lower():
         return "winning", "Sua conta está vencendo a buybox deste catálogo."
-    if "sharing" in status_text or "shared" in status_text or competition.get("competitors_sharing_first_place"):
+    if competition.get("competitors_sharing_first_place"):
         return "sharing", "Sua conta está compartilhando a primeira posição do catálogo."
-    if competition.get("price_to_win") or status_text in {"competing", "losing", "not_winning"}:
+    if price_to_win and own_price and own_price > price_to_win:
         return "losing", "Sua conta não está vencendo este catálogo. Revise preço, reputação e condições comerciais."
     if competition.get("winner_confirmed") and winner_price and own_price:
         if own_price > winner_price:
@@ -2097,13 +2141,24 @@ def classified_catalog_status(account, item, stock, is_catalog, competition):
     return "sharing", "Anúncio de catálogo importado da API oficial. Aguardando confirmação completa da buybox."
 
 
+def competition_share(status, visit_share=None):
+    status = str(status or "").lower()
+    if status in {"winning", "winner"}:
+        return 100
+    if status in {"sharing_first_place", "sharing", "shared"}:
+        return 50
+    if status in {"competing", "losing", "not_winning", "listed", "not_listed"}:
+        return 0
+    return {"maximum": 100, "medium": 50, "minimum": 0}.get(str(visit_share or "").lower(), 0)
+
+
 def synced_catalog_item(account, item, competition=None):
     stock = item_available_quantity(item)
     catalog_product_id = item.get("catalog_product_id") or "-"
     listing_type_id = item.get("listing_type_id") or first_present(item, ["listing_type.id", "listing_type"], "")
     shipping_logistic_type = item_flex_logistic_type(item)
     shipping_mode = first_present(item, ["shipping.mode"], "")
-    is_catalog = bool(item.get("catalog_listing") or item.get("catalog_product_id"))
+    is_catalog = is_catalog_listing(item)
     competition = competition or {}
     status, action = classified_catalog_status(account, item, stock, is_catalog, competition)
     package_values = package_values_from_item(item)
@@ -2116,13 +2171,13 @@ def synced_catalog_item(account, item, competition=None):
         "thumbnail": item_thumbnail(item),
         "sku": item_sku(item),
         "catalog_product_id": catalog_product_id,
-        "catalog_listing": bool(item.get("catalog_listing")),
+        "catalog_listing": is_catalog,
         "listing_type_id": listing_type_id,
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
         **package_values,
         "status": status,
-        "share": 0 if is_catalog else 100,
+        "share": competition_share(competition.get("competition_status"), competition.get("visit_share")) if is_catalog else 100,
         "price": item.get("price") or 0,
         "stock": stock,
         "competitor": "A sincronizar",
@@ -2502,6 +2557,9 @@ def sync_pending_shipments_from_orders(payload, account, orders):
 
 COMPETITION_FIELDS = (
     "competition_status",
+    "competition_consistent",
+    "competition_checked_at",
+    "winner_item_id",
     "winner_seller_id",
     "winner_name",
     "winner_price",
@@ -2526,6 +2584,7 @@ def competition_snapshot(item):
         "catalog_reference",
         "products_items_winner_marker",
         "public_purchase_options",
+        "public_product_page",
     }:
         snapshot.update(
             {
@@ -2620,7 +2679,7 @@ def sync_official_account(payload, account_id, limit=None):
             index = batch_start + batch_offset
             if not item_id:
                 continue
-            is_catalog = bool(item.get("catalog_listing") or item.get("catalog_product_id"))
+            is_catalog = is_catalog_listing(item)
             if is_catalog and index < competition_inline_limit:
                 competition = normalize_competition(client, account, item)
             else:
@@ -2644,6 +2703,20 @@ def sync_official_account(payload, account_id, limit=None):
     return {"account": public_account(account), "items": len(imported), "catalog": imported}
 
 
+def rotating_batch(rows, cursor, batch_size):
+    if not rows or batch_size <= 0:
+        return [], 0
+    count = min(int(batch_size), len(rows))
+    cursor = int(cursor or 0) % len(rows)
+    end = cursor + count
+    if end <= len(rows):
+        selected = rows[cursor:end]
+    else:
+        selected = [*rows[cursor:], *rows[: end - len(rows)]]
+    next_cursor = 0 if count >= len(rows) else end % len(rows)
+    return selected, next_cursor
+
+
 def refresh_official_account_items(payload, account, batch_size=None):
     batch_size = max(1, int(batch_size or os.getenv("AUTO_REFRESH_BATCH_SIZE", "400")))
     rows = [
@@ -2655,15 +2728,21 @@ def refresh_official_account_items(payload, account, batch_size=None):
         return {"items": 0, "alerts": 0}
     cursor_key = f"auto_refresh_cursor_{account.get('id')}"
     cursor = int(account.get(cursor_key) or 0)
-    selected = rows[cursor : cursor + batch_size]
-    if len(selected) < batch_size:
-        selected.extend(rows[: max(0, batch_size - len(selected))])
-    selected = selected[:batch_size]
-    account[cursor_key] = 0 if cursor + batch_size >= len(rows) else cursor + batch_size
+    selected, account[cursor_key] = rotating_batch(rows, cursor, batch_size)
+
+    catalog_rows = [item for item in rows if is_catalog_listing(item) and item.get("meli_status") != "closed"]
+    competition_limit = max(0, int(os.getenv("AUTO_COMPETITION_BATCH_SIZE", "200")))
+    competition_cursor_key = f"competition_refresh_cursor_{account.get('id')}"
+    competition_cursor = int(account.get(competition_cursor_key) or 0)
+    competition_selected, account[competition_cursor_key] = rotating_batch(
+        catalog_rows,
+        competition_cursor,
+        competition_limit,
+    )
 
     client = account_client(account)
     refreshed = 0
-    prior_by_id = {item.get("id"): dict(item) for item in selected}
+    prior_by_id = {item.get("id"): dict(item) for item in [*selected, *competition_selected]}
     official_by_id = {}
     bulk_size = max(1, min(20, int(os.getenv("MELI_ITEM_BULK_SIZE", "20"))))
     selected_ids = [item.get("id") for item in selected if item.get("id")]
@@ -2679,19 +2758,12 @@ def refresh_official_account_items(payload, account, batch_size=None):
                     official_by_id[item_id] = client.item(item_id)
                 except Exception:
                     pass
-    competition_limit = max(0, int(os.getenv("AUTO_COMPETITION_BATCH_SIZE", "12")))
-    competition_checked = 0
     for current in selected:
         try:
             official = official_by_id.get(current.get("id"))
             if not official:
                 raise RuntimeError("Anúncio não retornado pelo lote oficial nesta rodada.")
-            is_catalog = bool(official.get("catalog_listing") or official.get("catalog_product_id"))
-            if is_catalog and competition_checked < competition_limit:
-                competition = normalize_competition(client, account, official)
-                competition_checked += 1
-            else:
-                competition = competition_snapshot(current)
+            competition = competition_snapshot(current)
             updated = synced_catalog_item(account, official, competition)
             current.update(updated)
             current["updated_at"] = now_label()
@@ -2700,9 +2772,35 @@ def refresh_official_account_items(payload, account, batch_size=None):
             current["auto_refresh_error"] = str(exc)
             current["auto_refresh_at"] = now_label()
 
+    competition_checked = 0
+    request_delay = max(0.0, float(os.getenv("AUTO_COMPETITION_REQUEST_DELAY_SECONDS", "0.05")))
+    for current in competition_selected:
+        try:
+            competition = normalize_competition(client, account, current)
+            current.update(competition)
+            current["status"], current["action"] = classified_catalog_status(
+                account,
+                current,
+                int(current.get("stock") or 0),
+                True,
+                competition,
+            )
+            current["share"] = competition_share(
+                competition.get("competition_status"),
+                competition.get("visit_share"),
+            )
+            current["updated_at"] = now_label()
+            current.pop("competition_refresh_error", None)
+            competition_checked += 1
+        except Exception as exc:
+            current["competition_refresh_error"] = str(exc)
+            current["competition_checked_at"] = now_label()
+        if request_delay:
+            time.sleep(request_delay)
+
     alerts_created = 0
     existing_alert_ids = {alert.get("id") for alert in payload.get("alerts", [])}
-    for item in selected:
+    for item in competition_selected:
         before = prior_by_id.get(item.get("id")) or {}
         if int(before.get("stock") or 0) > 0 and int(item.get("stock") or 0) == 0:
             alert_id = f"stock-{account.get('id')}-{item.get('id')}-{now_label()[:10]}"
@@ -2856,16 +2954,15 @@ def clone_picture_payload(item):
     return rows
 
 
-PRODUCT_IDENTIFIER_ATTRS = {
+GTIN_IDENTIFIER_ATTRS = {
     "GTIN",
     "EAN",
     "UPC",
     "ISBN",
     "JAN",
-    "MPN",
-    "PART_NUMBER",
     "UNIVERSAL_PRODUCT_CODE",
 }
+PRODUCT_IDENTIFIER_ATTRS = {*GTIN_IDENTIFIER_ATTRS, "MPN", "PART_NUMBER"}
 
 CLONE_ATTRIBUTE_ALIASES = {
     "PACKAGE_HEIGHT": "SELLER_PACKAGE_HEIGHT",
@@ -2901,9 +2998,6 @@ def clone_attributes_payload(item, source_sku):
     for attribute in item.get("attributes") or []:
         attr_id = attribute.get("id")
         if not attr_id:
-            continue
-        attr_id_text = str(attr_id).upper()
-        if attr_id_text in PRODUCT_IDENTIFIER_ATTRS:
             continue
         row = clone_attribute_row(attribute)
         if row:
@@ -2961,6 +3055,71 @@ def clone_source_item(client, item_id):
     return client.item(item_id)
 
 
+def clone_source_user_product(client, source_item):
+    user_product_id = (source_item or {}).get("user_product_id")
+    method = getattr(client, "user_product", None)
+    if not user_product_id or not callable(method):
+        return {}
+    try:
+        user_product = method(user_product_id)
+        return user_product if isinstance(user_product, dict) else {}
+    except Exception:
+        return {}
+
+
+def enrich_clone_source_item(client, source_item):
+    """Merge the current User Product sheet into the legacy item representation."""
+    source_item = json.loads(json.dumps(source_item or {}, ensure_ascii=False))
+    user_product = clone_source_user_product(client, source_item)
+    if not user_product:
+        return source_item
+
+    attributes = {}
+    # The User Product sheet is the current source of truth and wins over legacy item values.
+    for container in (source_item, user_product):
+        for attribute in container.get("attributes") or []:
+            attr_id = str(attribute.get("id") or "").upper()
+            if attr_id and clone_attribute_row(attribute):
+                attributes[attr_id] = attribute
+    if attributes:
+        source_item["attributes"] = list(attributes.values())
+
+    user_variations = user_product.get("variations") or []
+    if user_variations:
+        source_variations = source_item.get("variations") or []
+        if not source_variations:
+            source_item["variations"] = json.loads(json.dumps(user_variations, ensure_ascii=False))
+        else:
+            user_by_id = {str(row.get("id")): row for row in user_variations if row.get("id") not in (None, "")}
+            for index, variation in enumerate(source_variations):
+                user_variation = user_by_id.get(str(variation.get("id")))
+                if not user_variation and index < len(user_variations):
+                    user_variation = user_variations[index]
+                if not user_variation:
+                    continue
+                for section_name in ("attributes", "attribute_combinations"):
+                    merged = {}
+                    for container in (variation, user_variation):
+                        for attribute in container.get(section_name) or []:
+                            attr_id = str(attribute.get("id") or "").upper()
+                            if attr_id and clone_attribute_row(attribute):
+                                merged[attr_id] = attribute
+                    if merged:
+                        variation[section_name] = list(merged.values())
+
+    for source_key, target_key in (
+        ("name", "title"),
+        ("family_name", "family_name"),
+        ("domain_id", "domain_id"),
+        ("catalog_product_id", "catalog_product_id"),
+        ("pictures", "pictures"),
+    ):
+        if not source_item.get(target_key) and user_product.get(source_key):
+            source_item[target_key] = user_product.get(source_key)
+    source_item["_user_product_hydrated"] = True
+    return source_item
+
+
 def clone_source_catalog_product(client, source_item):
     product_id = source_item.get("catalog_product_id")
     if not product_id:
@@ -2978,13 +3137,20 @@ def source_clone_attribute(source_item, catalog_product, attr_id):
     wanted_ids.update(key for key, value in CLONE_ATTRIBUTE_ALIASES.items() if value == wanted)
     if wanted == "GTIN":
         wanted_ids.update({"EAN", "UPC", "JAN", "ISBN", "UNIVERSAL_PRODUCT_CODE"})
-    for container in (source_item, catalog_product or {}):
+    embedded_catalog = source_item.get("_clone_catalog_product") or {}
+    for container in (source_item, catalog_product or {}, embedded_catalog):
         for attribute in container.get("attributes") or []:
             if str(attribute.get("id") or "").upper() in wanted_ids:
                 row = clone_attribute_row(attribute)
                 if row:
                     row["id"] = wanted
                     return row
+
+        if wanted == "GTIN":
+            for key in ("gtin", "ean", "upc", "isbn", "jan"):
+                value = clean_attribute_value(container.get(key))
+                if value:
+                    return {"id": "GTIN", "value_name": value}
 
     variations = source_item.get("variations") or []
     variation_rows = []
@@ -3005,6 +3171,135 @@ def source_clone_attribute(source_item, catalog_product, attr_id):
         if len(signatures) == 1:
             return variation_rows[0]
     return {}
+
+
+def clone_attribute_display_value(attribute):
+    if not attribute:
+        return ""
+    if clean_attribute_value(attribute.get("value_name")):
+        return clean_attribute_value(attribute.get("value_name"))
+    values = []
+    for value in attribute.get("values") or []:
+        name = clean_attribute_value(value.get("name"))
+        if name and name not in values:
+            values.append(name)
+    return ", ".join(values)
+
+
+def source_clone_identifiers(source_item, catalog_product=None):
+    wanted = GTIN_IDENTIFIER_ATTRS
+    values = []
+    containers = [source_item, catalog_product or {}, source_item.get("_clone_catalog_product") or {}]
+    for container in containers:
+        sections = [container.get("attributes") or []]
+        for variation in container.get("variations") or []:
+            sections.append(variation.get("attributes") or [])
+            sections.append(variation.get("attribute_combinations") or [])
+        for section in sections:
+            for attribute in section:
+                if str(attribute.get("id") or "").upper() not in wanted:
+                    continue
+                row = clone_attribute_row(attribute)
+                value = clone_attribute_display_value(row)
+                if value and value not in values:
+                    values.append(value)
+        for key in ("gtin", "ean", "upc", "isbn", "jan"):
+            value = clean_attribute_value(container.get(key))
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def normalize_clone_identifier_codes(value):
+    raw = clean_attribute_value(value)
+    if not raw:
+        return []
+    codes = []
+    for part in re.split(r"[,;\n]+", raw):
+        code = re.sub(r"[\s.\-]+", "", part or "")
+        if not code:
+            continue
+        if not code.isdigit() or len(code) not in {8, 10, 12, 13, 14}:
+            raise RuntimeError(
+                f'O código "{part.strip()}" não é um GTIN/EAN/UPC válido. Use apenas 8, 10, 12, 13 ou 14 dígitos.'
+            )
+        if code not in codes:
+            codes.append(code)
+    return codes
+
+
+def remove_clone_product_identifiers(attributes):
+    return [
+        attribute
+        for attribute in attributes or []
+        if str(attribute.get("id") or "").upper() not in GTIN_IDENTIFIER_ATTRS
+    ]
+
+
+def clone_variations_payload(item, sku_override="", price_override="", stock_override=""):
+    source_variations = item.get("variations") or []
+    if not source_variations:
+        return []
+    rows = []
+    single_variation = len(source_variations) == 1
+    for variation in source_variations:
+        row = {}
+        combinations = [
+            clean
+            for attribute in variation.get("attribute_combinations") or []
+            if (clean := clone_attribute_row(attribute))
+        ]
+        attributes = [
+            clean
+            for attribute in variation.get("attributes") or []
+            if (clean := clone_attribute_row(attribute))
+        ]
+        if single_variation and sku_override:
+            attributes = [
+                attribute for attribute in attributes if str(attribute.get("id") or "").upper() not in {"SELLER_SKU", "SKU"}
+            ]
+            attributes.append({"id": "SELLER_SKU", "value_name": sku_override})
+        if combinations:
+            row["attribute_combinations"] = combinations
+        if attributes:
+            row["attributes"] = attributes
+        price = price_override or variation.get("price") or item.get("price")
+        if price not in (None, ""):
+            row["price"] = float(price)
+        quantity = stock_override if single_variation and stock_override not in (None, "") else variation.get("available_quantity")
+        if quantity in (None, ""):
+            quantity = variation.get("available_quantity_by_channel") or 0
+        try:
+            row["available_quantity"] = max(0, int(float(quantity or 0)))
+        except (TypeError, ValueError):
+            row["available_quantity"] = 0
+        picture_ids = [picture_id for picture_id in variation.get("picture_ids") or [] if picture_id]
+        if picture_ids:
+            row["picture_ids"] = picture_ids
+        sale_terms = clone_sale_terms_payload(variation)
+        if sale_terms:
+            row["sale_terms"] = sale_terms
+        rows.append(row)
+    return rows
+
+
+def apply_clone_gtin_override(create_payload, raw_value):
+    codes = normalize_clone_identifier_codes(raw_value)
+    if not codes:
+        return create_payload
+    create_payload["attributes"] = remove_clone_product_identifiers(create_payload.get("attributes") or [])
+    variations = create_payload.get("variations") or []
+    if variations:
+        if len(codes) != len(variations):
+            raise RuntimeError(
+                f"Este anúncio possui {len(variations)} variações. Informe {len(variations)} códigos GTIN/EAN/UPC separados por vírgula, um para cada variação."
+            )
+        for variation, code in zip(variations, codes):
+            variation["attributes"] = remove_clone_product_identifiers(variation.get("attributes") or [])
+            variation.setdefault("attributes", []).append({"id": "GTIN", "value_name": code})
+    else:
+        create_payload.setdefault("attributes", []).append({"id": "GTIN", "value_name": ",".join(codes)})
+    return create_payload
 
 
 def clone_required_attribute_satisfied(create_payload, attr_id):
@@ -3108,7 +3403,6 @@ def clone_extra_required_fields(item):
     fields = {}
     body_fields = (
         "family_name",
-        "catalog_product_id",
         "domain_id",
     )
     for field in body_fields:
@@ -3137,13 +3431,18 @@ def build_clone_item_payload(source_item, edits):
     new_sku = clean_attribute_value(edits.get("sku") or edits.get("sku_suffix")) or source_sku
     requested_listing_type = edits.get("listing_type_id") or ""
     listing_type_id = requested_listing_type if requested_listing_type in {"gold_special", "gold_pro"} else source_item.get("listing_type_id") or "gold_special"
-    source_quantity = item_available_quantity(source_item) or 1
+    source_quantity = item_available_quantity(source_item)
+    if source_quantity in (None, ""):
+        source_quantity = 1
     payload = {
         "title": (edits.get("title") or source_item.get("title") or "").strip()[:60],
         "category_id": source_item.get("category_id"),
         "price": float(edits.get("price") or source_item.get("price") or 0),
         "currency_id": source_item.get("currency_id") or "BRL",
-        "available_quantity": max(1, int(float(edits.get("stock") or source_quantity or 1))),
+        "available_quantity": max(
+            0,
+            int(float(edits.get("stock") if edits.get("stock") not in (None, "") else source_quantity)),
+        ),
         "buying_mode": source_item.get("buying_mode") or "buy_it_now",
         "listing_type_id": listing_type_id,
         "condition": source_item.get("condition") or "new",
@@ -3151,12 +3450,27 @@ def build_clone_item_payload(source_item, edits):
         "attributes": clone_attributes_payload(source_item, new_sku),
         "sale_terms": clone_sale_terms_payload(source_item),
     }
+    variations = clone_variations_payload(
+        source_item,
+        new_sku,
+        edits.get("price"),
+        edits.get("stock"),
+    )
+    if variations:
+        payload["variations"] = variations
+        payload.pop("available_quantity", None)
     payload.update(clone_extra_required_fields(source_item))
+    if source_item.get("catalog_product_id"):
+        payload["catalog_product_id"] = source_item.get("catalog_product_id")
+    if is_catalog_listing(source_item):
+        payload["catalog_listing"] = True
     shipping = clone_shipping_payload(source_item)
     if shipping:
         payload["shipping"] = shipping
     if source_item.get("seller_custom_field"):
         payload["seller_custom_field"] = new_sku
+    if clean_attribute_value(edits.get("gtin")):
+        apply_clone_gtin_override(payload, edits.get("gtin"))
     return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
 
 
@@ -3524,17 +3838,32 @@ def sanitize_clone_payload_attributes(create_payload, category_attributes):
         return []
     allowed = category_attribute_ids(category_attributes)
     removed = []
-    kept = []
-    for attribute in create_payload.get("attributes") or []:
-        original_id = str(attribute.get("id") or "").upper()
-        attr_id = canonical_clone_attribute_id(original_id)
-        if original_id in CLONE_ATTRIBUTE_ALIASES or not attr_id:
-            removed.append(original_id)
-        elif attr_id in allowed or attr_id in CLONE_ALWAYS_ALLOWED_ATTRIBUTES:
-            kept.append(attribute)
-        else:
-            removed.append(original_id)
-    create_payload["attributes"] = kept
+
+    def sanitize_section(section):
+        kept = []
+        seen = set()
+        for attribute in section or []:
+            original_id = str(attribute.get("id") or "").upper()
+            attr_id = canonical_clone_attribute_id(original_id)
+            clean = attribute
+            if original_id in GTIN_IDENTIFIER_ATTRS and original_id != "GTIN" and "GTIN" in allowed and original_id not in allowed:
+                attr_id = "GTIN"
+                clean = {**attribute, "id": "GTIN"}
+            if original_id in CLONE_ATTRIBUTE_ALIASES or not attr_id:
+                removed.append(original_id)
+            elif attr_id in allowed or attr_id in CLONE_ALWAYS_ALLOWED_ATTRIBUTES:
+                signature = (attr_id, clone_attribute_display_value(clean), clean.get("value_id"))
+                if signature not in seen:
+                    seen.add(signature)
+                    kept.append(clean)
+            else:
+                removed.append(original_id)
+        return kept
+
+    create_payload["attributes"] = sanitize_section(create_payload.get("attributes") or [])
+    for variation in create_payload.get("variations") or []:
+        variation["attributes"] = sanitize_section(variation.get("attributes") or [])
+        variation["attribute_combinations"] = sanitize_section(variation.get("attribute_combinations") or [])
     return list(dict.fromkeys(removed))
 
 
@@ -3680,7 +4009,11 @@ def clone_payload_from_answers(create_payload, answers):
         if not clean_attribute_value(value):
             continue
         if key.startswith("attribute:"):
-            add_or_update_clone_attribute(create_payload, key.split(":", 1)[1], value)
+            attr_id = canonical_clone_attribute_id(key.split(":", 1)[1])
+            if attr_id == "GTIN":
+                apply_clone_gtin_override(create_payload, value)
+            else:
+                add_or_update_clone_attribute(create_payload, attr_id, value)
         elif key == "family_name":
             create_payload["family_name"] = normalize_family_name(value)
         elif key in {"title", "price", "available_quantity", "listing_type_id", "condition"}:
@@ -3785,7 +4118,17 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
         if code in {"item.attributes.ignored", "invalid.item.attribute.values", "item.attribute.invalid_product_identifier"}:
             attrs_to_remove.extend(attribute_ids_from_error_text(message))
         if code == "item.attribute.invalid_product_identifier":
-            attrs_to_remove.extend(PRODUCT_IDENTIFIER_ATTRS)
+            attrs_to_remove.extend(GTIN_IDENTIFIER_ATTRS)
+            gtin_definition = category_attribute_definition(category_attributes or [], "GTIN")
+            if gtin_definition and clone_attribute_is_required(gtin_definition):
+                pending = pending_clone_attribute("GTIN", source_item, category_attributes or [], item_id)
+                if pending:
+                    pending["message"] = "Informe um GTIN/EAN/UPC válido. Para variações, separe um código por vírgula para cada variação."
+                    pending_fields.append(pending)
+                empty_reason = pending_clone_attribute("EMPTY_GTIN_REASON", source_item, category_attributes or [], item_id)
+                if empty_reason:
+                    empty_reason["message"] = "Use este campo somente quando o produto realmente não possuir código universal."
+                    pending_fields.append(empty_reason)
         if code == "item.attribute.invalid":
             attr_ids = attribute_ids_from_error_text(message)
             attr_ids.extend(attribute_id_from_human_name(name) for name in human_attribute_names_from_error_text(message))
@@ -3943,13 +4286,15 @@ def create_official_clone(payload, job, source_item_id, edits):
         raise RuntimeError("Conta destino oficial não encontrada para clonar via Mercado Livre.")
     source_client = account_client(source_account)
     target_client = account_client(target_account)
-    source_item = clone_source_item(source_client, source_item_id)
+    source_item = enrich_clone_source_item(source_client, clone_source_item(source_client, source_item_id))
     create_payload = build_clone_item_payload(source_item, edits)
     try:
         category_attributes = cached_category_attributes(source_client, source_item.get("category_id"))
     except Exception:
         category_attributes = []
     catalog_product = clone_source_catalog_product(source_client, source_item)
+    if catalog_product:
+        source_item["_clone_catalog_product"] = catalog_product
     hydrate_clone_package_attributes(create_payload, source_item)
     hydrate_required_clone_attributes(create_payload, source_item, category_attributes, catalog_product)
     create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
@@ -3985,11 +4330,22 @@ def create_official_clone(payload, job, source_item_id, edits):
 
 def clone_payload_has_attribute(create_payload, attr_id):
     attr_id = str(attr_id or "").upper()
-    for attribute in create_payload.get("attributes") or []:
-        if str(attribute.get("id") or "").upper() != attr_id:
-            continue
-        if clean_attribute_value(attribute.get("value_name")) or attribute.get("value_id") or attribute.get("values"):
-            return True
+    def section_has(section):
+        for attribute in section or []:
+            if str(attribute.get("id") or "").upper() != attr_id:
+                continue
+            if clean_attribute_value(attribute.get("value_name")) or attribute.get("value_id") or attribute.get("values"):
+                return True
+        return False
+
+    if section_has(create_payload.get("attributes") or []):
+        return True
+    variations = create_payload.get("variations") or []
+    if variations and all(
+        section_has([*(variation.get("attributes") or []), *(variation.get("attribute_combinations") or [])])
+        for variation in variations
+    ):
+        return True
     return False
 
 
@@ -4002,7 +4358,7 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
     category_cache = {}
     for item_id in item_ids:
         try:
-            source_item = clone_source_item(client, item_id)
+            source_item = enrich_clone_source_item(client, clone_source_item(client, item_id))
             create_payload = build_clone_item_payload(source_item, edits)
             category_id = create_payload.get("category_id")
             if not category_id:
@@ -4044,6 +4400,362 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
         except Exception:
             continue
     return pending
+
+
+def clone_source_snapshot(payload, account_identifier, item_id):
+    account = official_account_by_name(payload, account_identifier)
+    if not account or not account.get("official") or not account.get("access_token"):
+        raise RuntimeError("Conta origem oficial não encontrada para ler o anúncio.")
+    client = account_client(account)
+    source_item = enrich_clone_source_item(client, clone_source_item(client, item_id))
+    catalog_product = clone_source_catalog_product(client, source_item)
+    identifiers = source_clone_identifiers(source_item, catalog_product)
+    description_text = ""
+    try:
+        description = client.item_description(item_id)
+        description_text = description.get("plain_text") or description.get("text") or ""
+    except Exception:
+        description_text = ""
+    sku = item_sku(source_item)
+    return {
+        "item_id": source_item.get("id") or item_id,
+        "title": source_item.get("title") or "",
+        "sku": "" if sku in (None, "", "-") else sku,
+        "price": source_item.get("price") or 0,
+        "stock": item_available_quantity(source_item),
+        "listing_type_id": source_item.get("listing_type_id") or "",
+        "catalog_listing": is_catalog_listing(source_item),
+        "description": description_text,
+        "gtin": ", ".join(identifiers),
+        "identifier_count": len(identifiers),
+        "variation_count": len(source_item.get("variations") or []),
+        "hydrated_from_user_product": bool(source_item.get("_user_product_hydrated")),
+    }
+
+
+def statistics_date_window(date_from, date_to):
+    try:
+        start = date.fromisoformat(str(date_from or "")[:10])
+        end = date.fromisoformat(str(date_to or "")[:10])
+    except ValueError as exc:
+        raise RuntimeError("Informe um período válido para consultar as vendas.") from exc
+    if end < start:
+        raise RuntimeError("A data final precisa ser igual ou posterior à data inicial.")
+    maximum_days = max(1, int(os.getenv("MELI_STATISTICS_MAX_DAYS", "366")))
+    if (end - start).days + 1 > maximum_days:
+        raise RuntimeError(f"O período máximo por consulta é de {maximum_days} dias.")
+    start_at = datetime.combine(start, datetime_time.min).replace(tzinfo=APP_TZ)
+    end_at = datetime.combine(end, datetime_time.max).replace(tzinfo=APP_TZ)
+    return start, end, start_at.isoformat(timespec="milliseconds"), end_at.isoformat(timespec="milliseconds")
+
+
+def statistics_order_windows(start, end):
+    days_per_window = max(1, min(31, int(os.getenv("MELI_STATISTICS_WINDOW_DAYS", "7"))))
+    current = start
+    while current <= end:
+        window_end = min(end, current + timedelta(days=days_per_window - 1))
+        start_at = datetime.combine(current, datetime_time.min).replace(tzinfo=APP_TZ)
+        end_at = datetime.combine(window_end, datetime_time.max).replace(tzinfo=APP_TZ)
+        yield start_at.isoformat(timespec="milliseconds"), end_at.isoformat(timespec="milliseconds")
+        current = window_end + timedelta(days=1)
+
+
+def fetch_statistics_orders(client, seller_id, start, end):
+    maximum = max(1, int(os.getenv("MELI_STATISTICS_ORDERS_LIMIT", "50000")))
+    orders = []
+    seen = set()
+    truncated = False
+    for window_from, window_to in statistics_order_windows(start, end):
+        offset = 0
+        while len(orders) < maximum:
+            data = client.seller_orders(
+                seller_id,
+                limit=50,
+                offset=offset,
+                date_from=window_from,
+                date_to=window_to,
+            )
+            batch = data.get("results") or []
+            for order in batch:
+                order_id = str(order.get("id") or "")
+                signature = order_id or json.dumps(order, sort_keys=True, ensure_ascii=False)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                orders.append(order)
+                if len(orders) >= maximum:
+                    truncated = True
+                    break
+            total = int((data.get("paging") or {}).get("total") or len(batch))
+            offset += len(batch)
+            if not batch or offset >= total or len(orders) >= maximum:
+                break
+        if len(orders) >= maximum:
+            truncated = True
+            break
+    return orders, truncated
+
+
+def shipment_id_from_order(order):
+    shipping = order.get("shipping")
+    if isinstance(shipping, dict):
+        return shipping.get("id") or shipping.get("shipment_id")
+    if shipping not in (None, "", 0, "0"):
+        return shipping
+    return order.get("shipping_id")
+
+
+def flex_hint_from_payload(value):
+    if not isinstance(value, dict):
+        return None
+    shipping = value.get("shipping") if isinstance(value.get("shipping"), dict) else {}
+    candidates = [
+        value.get("logistic_type"),
+        value.get("shipping_logistic_type"),
+        shipping.get("logistic_type"),
+        first_present(value, ["shipping_option.logistic_type", "shipping_option.shipping_method.logistic_type"], ""),
+    ]
+    tags = [str(tag).lower() for tag in value.get("tags") or []]
+    if any(str(candidate or "").lower() == "self_service" for candidate in candidates) or "self_service" in tags:
+        return True
+    if any(clean_attribute_value(candidate) for candidate in candidates):
+        return False
+    return None
+
+
+def order_is_flex(client, order, catalog_by_id, shipment_cache, lookup_state):
+    hint = flex_hint_from_payload(order)
+    if hint is not None:
+        return hint
+    shipment_id = shipment_id_from_order(order)
+    maximum_lookups = max(0, int(os.getenv("MELI_STATISTICS_SHIPMENT_LOOKUPS", "300")))
+    if shipment_id not in (None, "", 0, "0"):
+        cache_key = str(shipment_id)
+        if cache_key in shipment_cache:
+            shipment = shipment_cache[cache_key]
+        elif lookup_state["count"] < maximum_lookups:
+            lookup_state["count"] += 1
+            try:
+                shipment = client.shipment(shipment_id)
+            except Exception:
+                shipment = {}
+            shipment_cache[cache_key] = shipment
+        else:
+            shipment = {}
+        hint = flex_hint_from_payload(shipment)
+        if hint is not None:
+            return hint
+    item_hints = []
+    for order_item in order.get("order_items") or []:
+        item_id = str((order_item.get("item") or {}).get("id") or "")
+        current_item = catalog_by_id.get(item_id) or {}
+        logistic_type = str(current_item.get("shipping_logistic_type") or "").lower()
+        if logistic_type:
+            item_hints.append(logistic_type == "self_service")
+    return any(item_hints) if item_hints else False
+
+
+def order_item_sku(order_item, catalog_item):
+    item = order_item.get("item") or {}
+    candidates = (
+        order_item.get("seller_sku"),
+        item.get("seller_sku"),
+        item.get("seller_custom_field"),
+        catalog_item.get("sku"),
+    )
+    return next((clean_attribute_value(value) for value in candidates if clean_attribute_value(value)), "")
+
+
+def aggregate_sku_statistics(account_orders, catalog):
+    catalog_by_id = {str(item.get("id")): item for item in catalog or [] if item.get("id")}
+    aggregates = {}
+    ignored_statuses = {"cancelled", "canceled", "invalid"}
+    warnings = []
+    truncated = False
+    for account, client, orders, account_truncated in account_orders:
+        truncated = truncated or account_truncated
+        shipment_cache = {}
+        lookup_state = {"count": 0}
+        for order in orders:
+            if str(order.get("status") or "").lower() in ignored_statuses:
+                continue
+            order_id = str(order.get("id") or "-")
+            flex = order_is_flex(client, order, catalog_by_id, shipment_cache, lookup_state)
+            for order_item in order.get("order_items") or []:
+                item = order_item.get("item") or {}
+                item_id = str(item.get("id") or "")
+                catalog_item = catalog_by_id.get(item_id) or {}
+                try:
+                    quantity = max(0, int(float(order_item.get("quantity") or 0)))
+                except (TypeError, ValueError):
+                    quantity = 0
+                if quantity <= 0:
+                    continue
+                sku = order_item_sku(order_item, catalog_item)
+                key = sku.upper() if sku else f"SEM-SKU:{item_id or order_id}"
+                row = aggregates.setdefault(
+                    key,
+                    {
+                        "sku": sku or "Sem SKU",
+                        "product": item.get("title") or catalog_item.get("title") or "Produto sem título",
+                        "thumbnail": item.get("thumbnail") or item.get("secure_thumbnail") or catalog_item.get("thumbnail") or "",
+                        "units": 0,
+                        "flex_units": 0,
+                        "non_flex_units": 0,
+                        "revenue": 0.0,
+                        "flex_revenue": 0.0,
+                        "non_flex_revenue": 0.0,
+                        "accounts": set(),
+                        "item_ids": set(),
+                        "order_ids": set(),
+                        "flex_order_ids": set(),
+                        "non_flex_order_ids": set(),
+                    },
+                )
+                unit_price = order_item.get("unit_price") or order_item.get("full_unit_price") or 0
+                try:
+                    line_total = float(unit_price or 0) * quantity
+                except (TypeError, ValueError):
+                    line_total = 0
+                row["units"] += quantity
+                row["revenue"] += line_total
+                row["accounts"].add(account.get("nickname") or str(account.get("seller_id") or "Conta"))
+                if item_id:
+                    row["item_ids"].add(item_id)
+                row["order_ids"].add(order_id)
+                if flex:
+                    row["flex_units"] += quantity
+                    row["flex_revenue"] += line_total
+                    row["flex_order_ids"].add(order_id)
+                else:
+                    row["non_flex_units"] += quantity
+                    row["non_flex_revenue"] += line_total
+                    row["non_flex_order_ids"].add(order_id)
+        shipment_lookup_limit = max(0, int(os.getenv("MELI_STATISTICS_SHIPMENT_LOOKUPS", "300")))
+        if shipment_lookup_limit and lookup_state["count"] >= shipment_lookup_limit:
+            warnings.append(f"O limite de conferências de Envios Flex foi atingido para {account.get('nickname') or 'uma conta'}.")
+    rows = []
+    for row in aggregates.values():
+        rows.append(
+            {
+                **{key: value for key, value in row.items() if not isinstance(value, set)},
+                "revenue": round(row["revenue"], 2),
+                "flex_revenue": round(row["flex_revenue"], 2),
+                "non_flex_revenue": round(row["non_flex_revenue"], 2),
+                "accounts": sorted(row["accounts"]),
+                "item_ids": sorted(row["item_ids"]),
+                "order_ids": sorted(row["order_ids"]),
+                "flex_order_ids": sorted(row["flex_order_ids"]),
+                "non_flex_order_ids": sorted(row["non_flex_order_ids"]),
+            }
+        )
+    rows.sort(key=lambda row: (-row["units"], -row["revenue"], row["sku"]))
+    return {"rows": rows, "truncated": truncated, "warnings": warnings}
+
+
+def query_sku_statistics(payload, request):
+    start, end, _, _ = statistics_date_window(request.get("date_from"), request.get("date_to"))
+    account_filter = str(request.get("account") or "all")
+    accounts = [
+        account
+        for account in payload.get("accounts") or []
+        if account.get("official") and account.get("access_token") and account.get("status") == "connected"
+    ]
+    if account_filter != "all":
+        accounts = [
+            account
+            for account in accounts
+            if account.get("id") == account_filter
+            or str(account.get("seller_id")) == account_filter
+            or account.get("nickname") == account_filter
+        ]
+    if not accounts:
+        raise RuntimeError("Nenhuma conta oficial conectada corresponde ao filtro selecionado.")
+
+    cache_key = (
+        tuple(sorted(str(account.get("seller_id") or account.get("id")) for account in accounts)),
+        start.isoformat(),
+        end.isoformat(),
+    )
+    cache_ttl = max(30, int(os.getenv("MELI_STATISTICS_CACHE_SECONDS", "300")))
+    now = time.monotonic()
+    with STATISTICS_CACHE_LOCK:
+        cached = STATISTICS_CACHE.get(cache_key)
+    if cached and now - cached["time"] < cache_ttl:
+        base = json.loads(json.dumps(cached["result"], ensure_ascii=False))
+        from_cache = True
+    else:
+        account_orders = []
+        warnings = []
+        for account in accounts:
+            try:
+                client = account_client(account)
+                orders, truncated = fetch_statistics_orders(client, account.get("seller_id"), start, end)
+                account_orders.append((account, client, orders, truncated))
+            except Exception as exc:
+                warnings.append(f"{account.get('nickname')}: {policy_error_message(exc, 'a leitura das vendas do período')}")
+        if not account_orders and warnings:
+            raise RuntimeError(" ".join(warnings))
+        base = aggregate_sku_statistics(account_orders, payload.get("catalog") or [])
+        base["warnings"] = [*base.get("warnings", []), *warnings]
+        with STATISTICS_CACHE_LOCK:
+            STATISTICS_CACHE[cache_key] = {"time": now, "result": base}
+        from_cache = False
+
+    sku_filter = normalized_attribute_label(request.get("sku") or "")
+    flex_filter = str(request.get("flex") or "all")
+    rows = []
+    selected_order_ids = set()
+    for original in base.get("rows") or []:
+        if sku_filter and sku_filter not in normalized_attribute_label(original.get("sku") or ""):
+            continue
+        row = dict(original)
+        row["total_units"] = row.get("units") or 0
+        if flex_filter == "flex":
+            row["units"] = row.get("flex_units") or 0
+            row["orders"] = len(row.get("flex_order_ids") or [])
+            row["revenue"] = row.get("flex_revenue") or 0
+            selected_order_ids.update(row.get("flex_order_ids") or [])
+        elif flex_filter == "non_flex":
+            row["units"] = row.get("non_flex_units") or 0
+            row["orders"] = len(row.get("non_flex_order_ids") or [])
+            row["revenue"] = row.get("non_flex_revenue") or 0
+            selected_order_ids.update(row.get("non_flex_order_ids") or [])
+        else:
+            row["orders"] = len(row.get("order_ids") or [])
+            selected_order_ids.update(row.get("order_ids") or [])
+        if row["units"] <= 0:
+            continue
+        row.pop("order_ids", None)
+        row.pop("flex_order_ids", None)
+        row.pop("non_flex_order_ids", None)
+        rows.append(row)
+    rows.sort(key=lambda row: (-row["units"], -row["revenue"], row["sku"]))
+    return {
+        "ok": True,
+        "date_from": start.isoformat(),
+        "date_to": end.isoformat(),
+        "account": account_filter,
+        "flex": flex_filter,
+        "rows": rows,
+        "summary": {
+            "units": sum(row.get("units") or 0 for row in rows),
+            "skus": len(rows),
+            "orders": len(selected_order_ids),
+            "flex_units": (
+                sum(row.get("units") or 0 for row in rows)
+                if flex_filter == "flex"
+                else 0
+                if flex_filter == "non_flex"
+                else sum(row.get("flex_units") or 0 for row in rows)
+            ),
+            "revenue": round(sum(row.get("revenue") or 0 for row in rows), 2),
+        },
+        "warnings": base.get("warnings") or [],
+        "truncated": bool(base.get("truncated")),
+        "cached": from_cache,
+        "generated_at": now_label(),
+    }
 
 
 class App(BaseHTTPRequestHandler):
@@ -4734,6 +5446,13 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=400)
             return
 
+        if parsed.path == "/api/statistics/query":
+            try:
+                self.send_json(query_sku_statistics(payload, request))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
         if parsed.path == "/api/meli/sync":
             try:
                 raw_limit = request.get("limit", "all")
@@ -4829,7 +5548,7 @@ class App(BaseHTTPRequestHandler):
                             item["meli_status"] = "paused"
                         if update.get("status") == "active":
                             changes["status"] = {"from": item.get("meli_status"), "to": "active"}
-                            item["status"] = "sharing" if item.get("catalog_product_id") not in ("", "-") else "winning"
+                            item["status"] = "sharing" if is_catalog_listing(item) else "winning"
                             item["meli_status"] = "active"
                         item["updated_at"] = now_label()
                         append_item_log(payload, item, user, "Atualização manual", changes)
@@ -4841,6 +5560,18 @@ class App(BaseHTTPRequestHandler):
                     notify_alert(payload, alert)
                 write_payload(payload)
                 self.send_json({"ok": True, "official": official, "catalog": public_payload(payload, user)["catalog"]})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/item/clone-source":
+            try:
+                snapshot = clone_source_snapshot(
+                    payload,
+                    request.get("account_id") or request.get("account") or "",
+                    request.get("item_id") or "",
+                )
+                self.send_json({"ok": True, **snapshot})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
