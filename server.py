@@ -43,6 +43,8 @@ PUBLIC_BUYBOX_CACHE_LOCK = threading.RLock()
 PUBLIC_BUYBOX_CACHE = {}
 STATISTICS_CACHE_LOCK = threading.RLock()
 STATISTICS_CACHE = {}
+STATISTICS_JOBS_LOCK = threading.RLock()
+STATISTICS_JOBS = {}
 SPREADSHEET_JOBS_LOCK = threading.RLock()
 SPREADSHEET_JOBS = {}
 SHIPMENT_MODE_CACHE_LOCK = threading.RLock()
@@ -1014,13 +1016,7 @@ class MercadoLivreClient:
             "limit": min(int(limit or 50), 100),
             "offset": max(int(offset or 0), 0),
         }
-        last_error = None
-        for resource in ("/post-purchase/v1/claims/search", "/v1/claims/search"):
-            try:
-                return self.get(f"{resource}?{urlencode(params)}")
-            except Exception as exc:
-                last_error = exc
-        raise last_error
+        return self.get(f"/post-purchase/v1/claims/search?{urlencode(params)}")
 
     def claim_detail(self, claim_id):
         return self.get(f"/post-purchase/v1/claims/{claim_id}/detail")
@@ -2464,6 +2460,50 @@ def preserve_shipping_cost_snapshot(target, previous):
     return target
 
 
+def preserve_identifier_snapshot(target, previous):
+    if not target.get("gtin") and previous.get("gtin"):
+        target["gtin"] = previous.get("gtin")
+    for key in ("gtin_status", "gtin_updated_at", "gtin_error"):
+        if key in previous and key not in target:
+            target[key] = previous[key]
+    return target
+
+
+def refresh_identifiers_for_items(payload, item_ids):
+    maximum = max(1, int(os.getenv("MELI_GTIN_ON_DEMAND_LIMIT", "15")))
+    requested = list(dict.fromkeys(str(item_id) for item_id in (item_ids or []) if item_id))[:maximum]
+    catalog_by_id = {item.get("id"): item for item in payload.get("catalog", []) if item.get("id") in requested}
+    accounts_by_id = {
+        str(account.get("id")): account
+        for account in payload.get("accounts", [])
+        if account.get("official") and account.get("access_token")
+    }
+    results = []
+    for item_id in requested:
+        target = catalog_by_id.get(item_id)
+        account = accounts_by_id.get(str((target or {}).get("account_id") or ""))
+        if not target or not account:
+            continue
+        try:
+            client = account_client(account)
+            source = enrich_clone_source_item(client, clone_source_item(client, item_id))
+            identifiers = source_clone_identifiers(source, clone_source_catalog_product(client, source))
+            target["gtin"] = ", ".join(identifiers)
+            target["gtin_status"] = "ok" if identifiers else "not_available"
+            target["gtin_error"] = ""
+        except Exception as exc:
+            target["gtin_status"] = "error"
+            target["gtin_error"] = str(exc)
+        target["gtin_updated_at"] = now_label()
+        results.append(
+            {
+                key: target.get(key)
+                for key in ("id", "gtin", "gtin_status", "gtin_error", "gtin_updated_at")
+            }
+        )
+    return results
+
+
 def refresh_shipping_costs_for_items(payload, item_ids):
     maximum = max(1, int(os.getenv("MELI_SHIPPING_COST_ON_DEMAND_LIMIT", "25")))
     requested = list(dict.fromkeys(str(item_id) for item_id in (item_ids or []) if item_id))[:maximum]
@@ -2496,11 +2536,25 @@ def reclassify_internal_competition(payload):
     accounts = [account for account in payload.get("accounts") or [] if account.get("official")]
     by_seller = {str(account.get("seller_id")): account for account in accounts if account.get("seller_id") not in (None, "")}
     by_name = {normalized_account_name(account.get("nickname")): account for account in accounts if account.get("nickname")}
+    by_item = {
+        str(item.get("id")): next(
+            (
+                account
+                for account in accounts
+                if account.get("id") == item.get("account_id") or account.get("nickname") == item.get("account")
+            ),
+            None,
+        )
+        for item in payload.get("catalog") or []
+        if item.get("id")
+    }
     changed = False
     for item in payload.get("catalog") or []:
         if not is_catalog_listing(item):
             continue
         winner_account = by_seller.get(str(item.get("winner_seller_id") or ""))
+        if not winner_account:
+            winner_account = by_item.get(str(item.get("winner_item_id") or ""))
         if not winner_account:
             winner_account = by_name.get(normalized_account_name(item.get("winner_name")))
         is_internal_loss = bool(winner_account) and (item.get("status") == "losing" or item.get("internal_competition"))
@@ -2903,7 +2957,7 @@ def sync_pending_shipments_from_orders(payload, account, orders):
     pending = []
     pending_statuses = {"paid", "confirmed", "payment_required", "partially_paid"}
     final_statuses = {"cancelled", "canceled", "invalid"}
-    final_shipping_statuses = {"delivered", "cancelled", "canceled", "not_delivered"}
+    final_shipping_statuses = {"shipped", "delivered", "cancelled", "canceled", "not_delivered"}
     sla_lookup_limit = max(0, int(os.getenv("MELI_PENDING_SLA_LIMIT", "100")))
     sla_lookups = 0
     for order in orders:
@@ -2921,7 +2975,12 @@ def sync_pending_shipments_from_orders(payload, account, orders):
             shipping_status = str(official_shipment.get("status") or "").lower()
         else:
             shipping_status = str(shipping.get("status") or first_present(shipping, ["status_history.status"], "") or "").lower()
-        fulfilled = any(tag in {"delivered", "cancelled", "canceled"} for tag in tags) or shipping_status in final_shipping_statuses
+        shipping_substatus = str(official_shipment.get("substatus") or first_present(shipping, ["substatus", "status_history.substatus"], "") or "").lower()
+        fulfilled = (
+            any(tag in {"shipped", "delivered", "cancelled", "canceled"} for tag in tags)
+            or shipping_status in final_shipping_statuses
+            or shipping_substatus in final_shipping_statuses
+        )
         if status in final_statuses or status not in pending_statuses or fulfilled:
             continue
         deadline = ""
@@ -3088,6 +3147,7 @@ def sync_official_account(payload, account_id, limit=None):
             row = synced_catalog_item(account, item, competition)
             previous = existing_by_id.get(item_id, {})
             preserve_shipping_cost_snapshot(row, previous)
+            preserve_identifier_snapshot(row, previous)
             row["first_seen_at"] = previous.get("first_seen_at") or now_label()
             imported.append(row)
 
@@ -3167,6 +3227,8 @@ def refresh_official_account_items(payload, account, batch_size=None):
                 raise RuntimeError("Anúncio não retornado pelo lote oficial nesta rodada.")
             competition = competition_snapshot(current)
             updated = synced_catalog_item(account, official, competition)
+            preserve_identifier_snapshot(updated, current)
+            preserve_shipping_cost_snapshot(updated, current)
             current.update(updated)
             current["updated_at"] = now_label()
             refreshed += 1
@@ -4925,7 +4987,7 @@ def statistics_date_window(date_from, date_to):
 
 
 def statistics_order_windows(start, end):
-    days_per_window = max(1, min(31, int(os.getenv("MELI_STATISTICS_WINDOW_DAYS", "7"))))
+    days_per_window = max(1, min(31, int(os.getenv("MELI_STATISTICS_WINDOW_DAYS", "31"))))
     current = start
     while current <= end:
         window_end = min(end, current + timedelta(days=days_per_window - 1))
@@ -5058,6 +5120,22 @@ def order_item_sku(order_item, catalog_item):
 
 def aggregate_sku_statistics(account_orders, catalog, maximum_shipment_lookups=None):
     catalog_by_id = {str(item.get("id")): item for item in catalog or [] if item.get("id")}
+    selected_accounts = {
+        str(account.get("nickname") or "")
+        for account, _client, _orders, _truncated in account_orders
+        if account.get("nickname")
+    }
+    current_stock_by_sku = {}
+    for catalog_item in catalog or []:
+        if selected_accounts and str(catalog_item.get("account") or "") not in selected_accounts:
+            continue
+        sku_key = clean_attribute_value(catalog_item.get("sku")).upper()
+        if not sku_key or sku_key == "-":
+            continue
+        try:
+            current_stock_by_sku[sku_key] = current_stock_by_sku.get(sku_key, 0) + max(0, int(catalog_item.get("stock") or 0))
+        except (TypeError, ValueError):
+            continue
     aggregates = {}
     ignored_statuses = {"cancelled", "canceled", "invalid"}
     warnings = []
@@ -5147,6 +5225,7 @@ def aggregate_sku_statistics(account_orders, catalog, maximum_shipment_lookups=N
                 "flex_revenue": round(row["flex_revenue"], 2),
                 "non_flex_revenue": round(row["non_flex_revenue"], 2),
                 "unknown_revenue": round(row["unknown_revenue"], 2),
+                "current_stock": current_stock_by_sku.get(str(row.get("sku") or "").upper(), 0),
                 "accounts": sorted(row["accounts"]),
                 "item_ids": sorted(row["item_ids"]),
                 "order_ids": sorted(row["order_ids"]),
@@ -5277,6 +5356,100 @@ def query_sku_statistics(payload, request):
     }
 
 
+def statistics_job_signature(request):
+    keys = ("account", "sku", "flex", "date_from", "date_to")
+    normalized = {key: str((request or {}).get(key) or "") for key in keys}
+    return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+
+
+def cleanup_statistics_jobs(now=None):
+    now = now or time.time()
+    maximum_age = max(900, int(os.getenv("MELI_STATISTICS_JOB_TTL_SECONDS", "21600")))
+    with STATISTICS_JOBS_LOCK:
+        expired = [
+            job_id
+            for job_id, job in STATISTICS_JOBS.items()
+            if now - float(job.get("created_epoch") or now) > maximum_age
+        ]
+        for job_id in expired:
+            STATISTICS_JOBS.pop(job_id, None)
+
+
+def start_statistics_job(request):
+    cleanup_statistics_jobs()
+    safe_request = {
+        key: str((request or {}).get(key) or "")
+        for key in ("account", "sku", "flex", "date_from", "date_to")
+    }
+    signature = statistics_job_signature(safe_request)
+    with STATISTICS_JOBS_LOCK:
+        existing = next(
+            (
+                job
+                for job in STATISTICS_JOBS.values()
+                if job.get("signature") == signature and job.get("status") in {"queued", "processing"}
+            ),
+            None,
+        )
+        if existing:
+            return {key: value for key, value in existing.items() if key not in {"result", "signature", "created_epoch"}}
+        job_id = uuid.uuid4().hex
+        job = {
+            "id": job_id,
+            "signature": signature,
+            "status": "queued",
+            "message": "Consulta adicionada à fila.",
+            "created_at": now_label(),
+            "created_epoch": time.time(),
+        }
+        STATISTICS_JOBS[job_id] = job
+
+    def worker():
+        with STATISTICS_JOBS_LOCK:
+            current = STATISTICS_JOBS.get(job_id)
+            if current:
+                current.update({"status": "processing", "message": "Consultando vendas oficiais no Mercado Livre."})
+        try:
+            result = query_sku_statistics(read_payload(), safe_request)
+            with STATISTICS_JOBS_LOCK:
+                current = STATISTICS_JOBS.get(job_id)
+                if current:
+                    current.update(
+                        {
+                            "status": "completed",
+                            "message": "Consulta concluída.",
+                            "result": result,
+                            "finished_at": now_label(),
+                        }
+                    )
+        except Exception as exc:
+            with STATISTICS_JOBS_LOCK:
+                current = STATISTICS_JOBS.get(job_id)
+                if current:
+                    current.update(
+                        {
+                            "status": "error",
+                            "message": str(exc),
+                            "finished_at": now_label(),
+                        }
+                    )
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {key: value for key, value in job.items() if key not in {"result", "signature", "created_epoch"}}
+
+
+def statistics_job_result(job_id, include_result=True):
+    cleanup_statistics_jobs()
+    with STATISTICS_JOBS_LOCK:
+        job = STATISTICS_JOBS.get(str(job_id or ""))
+        if not job:
+            return None
+        public = {key: value for key, value in job.items() if key not in {"signature", "created_epoch"}}
+        if not include_result:
+            public.pop("result", None)
+        return json.loads(json.dumps(public, ensure_ascii=False))
+
+
 def report_filtered_catalog(payload, report_type, filters):
     account_filter = str(filters.get("account") or "all")
     search = normalized_attribute_label(filters.get("search") or filters.get("product") or "")
@@ -5327,9 +5500,9 @@ def report_filtered_catalog(payload, report_type, filters):
     return rows
 
 
-def report_dataset(payload, report_type, filters):
+def report_dataset(payload, report_type, filters, statistics_result=None):
     if report_type == "statistics":
-        result = query_sku_statistics(payload, filters)
+        result = statistics_result or query_sku_statistics(payload, filters)
         columns = [
             ("rank", "Posição", "integer"),
             ("sku", "SKU", "text"),
@@ -6111,6 +6284,14 @@ class App(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path.startswith("/api/statistics/jobs/"):
+            job_id = parsed.path.rsplit("/", 1)[-1]
+            job = statistics_job_result(job_id)
+            if not job:
+                self.send_json({"error": "Consulta de estatísticas não encontrada ou expirada."}, status=404)
+            else:
+                self.send_json({"ok": True, **job})
+            return
         if parsed.path == "/api/accounts":
             self.send_json([public_account(account) for account in payload["accounts"]])
             return
@@ -6610,7 +6791,8 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/statistics/query":
             try:
-                self.send_json(query_sku_statistics(payload, request))
+                job = start_statistics_job(request)
+                self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
@@ -6623,7 +6805,18 @@ class App(BaseHTTPRequestHandler):
                     raise RuntimeError("Selecione Estatísticas, Catálogo ou Anúncios para exportar.")
                 if output_format not in {"xlsx", "pdf"}:
                     raise RuntimeError("Formato de relatório inválido.")
-                title, columns, rows, metadata = report_dataset(payload, report_type, request.get("filters") or {})
+                statistics_result = None
+                if report_type == "statistics" and request.get("statistics_job_id"):
+                    job = statistics_job_result(request.get("statistics_job_id"))
+                    if not job or job.get("status") != "completed" or not job.get("result"):
+                        raise RuntimeError("A consulta de estatísticas ainda não foi concluída. Aguarde e tente exportar novamente.")
+                    statistics_result = job.get("result")
+                title, columns, rows, metadata = report_dataset(
+                    payload,
+                    report_type,
+                    request.get("filters") or {},
+                    statistics_result,
+                )
                 stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M")
                 if output_format == "xlsx":
                     body = build_report_xlsx(title, columns, rows, metadata)
@@ -6718,6 +6911,15 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/meli/shipping-costs/refresh":
             try:
                 results = refresh_shipping_costs_for_items(payload, request.get("item_ids") or [])
+                write_payload(payload)
+                self.send_json({"ok": True, "items": results})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/identifiers/refresh":
+            try:
+                results = refresh_identifiers_for_items(payload, request.get("item_ids") or [])
                 write_payload(payload)
                 self.send_json({"ok": True, "items": results})
             except Exception as exc:

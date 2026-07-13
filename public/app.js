@@ -20,6 +20,7 @@
   dashboardCatalogPage: 1,
   dashboardShipmentPage: 1,
   dashboardSalesPage: 1,
+  dashboardTopSkuPage: 1,
   dashboardShipmentAccount: "all",
   dashboardSalesAccount: "all",
   alertType: "all",
@@ -45,10 +46,14 @@
   statisticsLoading: false,
   statisticsAttempted: false,
   statisticsError: "",
+  statisticsProgress: "",
+  statisticsJobId: "",
+  statisticsRequestToken: 0,
   statisticsPage: 1,
   statisticsPageSize: 50,
   spreadsheetPreview: null,
   shippingCostsLoading: false,
+  identifiersLoading: false,
 };
 
 const PAGE_SIZE = 100;
@@ -446,9 +451,11 @@ function renderDashboard() {
     </article>
   `).join("") + paginationHtml("dashboardSalesPage", salesPage) || `<div class="notice">Nenhuma venda recente sincronizada. Sincronize uma conta oficial com permissão de vendas/pedidos para preencher este bloco.</div>`;
 
-  document.querySelector("#dashboard-top-skus").innerHTML = (ops.top_skus_today || []).map((item, index) => `
+  const topSkuPage = paginate(ops.top_skus_today || [], state.dashboardTopSkuPage, 10);
+  state.dashboardTopSkuPage = topSkuPage.current;
+  document.querySelector("#dashboard-top-skus").innerHTML = topSkuPage.items.map((item, index) => `
     <article class="sale-item top-sku-item">
-      <span class="sku-rank">${index + 1}</span>
+      <span class="sku-rank">${topSkuPage.start + index + 1}</span>
       ${item.thumbnail ? `<img class="sale-thumb" src="${item.thumbnail}" alt="${escapeAttr(item.product || item.sku)}" loading="lazy" />` : `<span class="sale-thumb sale-thumb-empty"></span>`}
       <div>
         <strong>${escapeText(item.product || item.sku || "SKU vendido")}</strong>
@@ -456,7 +463,7 @@ function renderDashboard() {
       </div>
       <div class="sale-total"><span>Unidades vendidas</span><strong>${Number(item.units || 0)}</strong><small>${money.format(item.revenue || 0)}</small></div>
     </article>
-  `).join("") || `<div class="notice">Nenhum SKU vendido hoje foi sincronizado.</div>`;
+  `).join("") + paginationHtml("dashboardTopSkuPage", topSkuPage) || `<div class="notice">Nenhum SKU vendido hoje foi sincronizado.</div>`;
 
   document.querySelector("#dashboard-metrics").innerHTML = state.data.metrics
     .map(
@@ -740,6 +747,7 @@ function renderAds() {
     </article>
   `).join("") + paginationHtml("adsPage", pageInfo) : `<div class="notice">Nenhum anúncio encontrado.</div>`;
   queueShippingCostRefresh(pageInfo.items);
+  queueIdentifierRefresh(pageInfo.items);
 }
 
 function shippingCostLabel(item) {
@@ -777,6 +785,35 @@ async function queueShippingCostRefresh(items) {
     showToast(error.message || "Não foi possível consultar o frete dos anúncios.", "error");
   } finally {
     state.shippingCostsLoading = false;
+    if (state.route === "anuncios") renderAds();
+  }
+}
+
+function identifierNeedsRefresh(item) {
+  if (!item.official_source || item.gtin) return false;
+  const raw = String(item.gtin_updated_at || "").replace(" ", "T");
+  const updated = new Date(raw);
+  if (Number.isNaN(updated.getTime())) return true;
+  const age = Date.now() - updated.getTime();
+  return age > (item.gtin_status === "error" ? 30 * 60 * 1000 : 24 * 60 * 60 * 1000);
+}
+
+async function queueIdentifierRefresh(items) {
+  if (state.identifiersLoading || state.route !== "anuncios") return;
+  const itemIds = (items || []).filter(identifierNeedsRefresh).slice(0, 15).map((item) => item.id);
+  if (!itemIds.length) return;
+  state.identifiersLoading = true;
+  try {
+    const result = await api("/api/meli/identifiers/refresh", {
+      method: "POST",
+      body: JSON.stringify({ item_ids: itemIds }),
+    });
+    const updates = new Map((result.items || []).map((item) => [item.id, item]));
+    state.data.catalog = state.data.catalog.map((item) => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
+  } catch (_) {
+    // A consulta volta a ser tentada após o intervalo de erro sem interromper a gestão dos anúncios.
+  } finally {
+    state.identifiersLoading = false;
     if (state.route === "anuncios") renderAds();
   }
 }
@@ -1124,7 +1161,7 @@ function renderStatistics() {
     return;
   }
   if (state.statisticsLoading) {
-    feedback.innerHTML = `<div class="statistics-loading"><span></span><strong>Consultando pedidos oficiais...</strong></div>`;
+    feedback.innerHTML = `<div class="statistics-loading"><span></span><strong>${escapeText(state.statisticsProgress || "Consultando pedidos oficiais...")}</strong></div>`;
   } else if (state.statisticsError) {
     feedback.innerHTML = `<div class="notice danger-notice">${escapeText(state.statisticsError)}</div>`;
   } else {
@@ -1158,7 +1195,7 @@ function renderStatistics() {
   results.innerHTML = `${warning}${messages}${paginationHtml("statisticsPage", pageInfo)}${pageInfo.items.length ? `
     <div class="statistics-table" role="table" aria-label="SKUs vendidos">
       <div class="statistics-table-head" role="row">
-        <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Unidades</span><span>Pedidos</span><span>Flex confirmado</span><span>Valor</span>
+        <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Unidades</span><span>Pedidos</span><span>Flex confirmado</span><span>Valor</span><span>Estoque ideal</span>
       </div>
       ${pageInfo.items.map((row, index) => `
         <article class="statistics-row" role="row">
@@ -1172,10 +1209,68 @@ function renderStatistics() {
           <span>${Number(row.orders || 0).toLocaleString("pt-BR")}</span>
           <span class="statistics-flex">${Number(row.flex_units || 0).toLocaleString("pt-BR")}</span>
           <strong>${money.format(row.revenue || 0)}</strong>
+          <button class="mini-button stock-calculator-button" type="button" data-stock-calculator="${pageInfo.start + index}">Calcular</button>
         </article>
       `).join("")}
     </div>
   ` : `<div class="notice">Nenhum SKU vendido corresponde aos filtros selecionados.</div>`}${paginationHtml("statisticsPage", pageInfo)}`;
+}
+
+function openStockCalculator(row) {
+  if (!row || !state.statistics) return;
+  document.querySelector("#stock-calculator-dialog")?.remove();
+  const start = new Date(`${state.statistics.date_from}T00:00:00`);
+  const end = new Date(`${state.statistics.date_to}T00:00:00`);
+  const periodDays = Math.max(1, Math.round((end - start) / 86400000) + 1);
+  const average = Number(row.units || 0) / periodDays;
+  const dialog = document.createElement("dialog");
+  dialog.id = "stock-calculator-dialog";
+  dialog.className = "stock-calculator-dialog";
+  dialog.innerHTML = `
+    <form method="dialog" class="stock-calculator-card">
+      <div class="stock-calculator-heading">
+        <div><small>Planejamento por SKU</small><h3>${escapeText(row.sku || "Sem SKU")}</h3><p>${escapeText(row.product || "Produto")}</p></div>
+        <button class="icon-button" type="button" data-close-stock-calculator aria-label="Fechar">×</button>
+      </div>
+      <div class="stock-calculator-baseline">
+        <span><small>Período analisado</small><strong>${periodDays} dias</strong></span>
+        <span><small>Unidades vendidas</small><strong>${Number(row.units || 0).toLocaleString("pt-BR")}</strong></span>
+        <span><small>Média diária</small><strong>${average.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}</strong></span>
+      </div>
+      <div class="stock-calculator-fields">
+        <label>Estoque atual<input name="current_stock" type="number" min="0" step="1" value="${Number(row.current_stock || 0)}" /></label>
+        <label>Prazo de reposição (dias)<input name="lead_days" type="number" min="0" step="1" value="15" /></label>
+        <label>Estoque de segurança (dias)<input name="safety_days" type="number" min="0" step="1" value="7" /></label>
+        <label>Cobertura após reposição (dias)<input name="coverage_days" type="number" min="1" step="1" value="30" /></label>
+      </div>
+      <button class="primary" type="submit" value="calculate">Calcular estoque ideal</button>
+      <div class="stock-calculator-result" aria-live="polite"></div>
+    </form>`;
+  document.body.appendChild(dialog);
+  const calculate = () => {
+    const form = dialog.querySelector("form");
+    const current = Math.max(0, Number(form.elements.current_stock.value || 0));
+    const lead = Math.max(0, Number(form.elements.lead_days.value || 0));
+    const safety = Math.max(0, Number(form.elements.safety_days.value || 0));
+    const coverage = Math.max(1, Number(form.elements.coverage_days.value || 1));
+    const reorderPoint = Math.ceil(average * (lead + safety));
+    const ideal = Math.ceil(average * (lead + safety + coverage));
+    const purchase = Math.max(0, ideal - current);
+    dialog.querySelector(".stock-calculator-result").innerHTML = `
+      <span><small>Ponto de reposição</small><strong>${reorderPoint.toLocaleString("pt-BR")}</strong></span>
+      <span><small>Estoque ideal</small><strong>${ideal.toLocaleString("pt-BR")}</strong></span>
+      <span class="highlight"><small>Compra sugerida</small><strong>${purchase.toLocaleString("pt-BR")}</strong></span>
+      <p>Baseado na média de ${average.toLocaleString("pt-BR", { maximumFractionDigits: 2 })} unidade(s) por dia. Ajuste sazonalidade, promoções e múltiplos de compra antes de emitir o pedido.</p>`;
+  };
+  dialog.addEventListener("submit", (event) => {
+    if (event.submitter?.value !== "calculate") return;
+    event.preventDefault();
+    calculate();
+  });
+  dialog.querySelector("[data-close-stock-calculator]").addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.showModal();
+  calculate();
 }
 
 async function loadStatistics() {
@@ -1186,10 +1281,12 @@ async function loadStatistics() {
   }
   state.statisticsLoading = true;
   state.statisticsAttempted = true;
+  state.statisticsProgress = "Preparando a consulta no servidor...";
+  const requestToken = ++state.statisticsRequestToken;
   renderStatistics();
   try {
     const range = statisticsDateRange(form);
-    const data = await api("/api/statistics/query", {
+    let job = await api("/api/statistics/query", {
       method: "POST",
       body: JSON.stringify({
         account: form.elements.account.value,
@@ -1198,7 +1295,19 @@ async function loadStatistics() {
         ...range,
       }),
     });
-    state.statistics = data;
+    state.statisticsJobId = job.id || "";
+    while (["queued", "processing"].includes(job.status)) {
+      if (requestToken !== state.statisticsRequestToken) return;
+      state.statisticsProgress = job.message || "Consulta em andamento no servidor...";
+      renderStatistics();
+      await new Promise((resolve) => window.setTimeout(resolve, 1800));
+      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+    }
+    if (job.status !== "completed" || !job.result) {
+      throw new Error(job.message || "A consulta de estatísticas não foi concluída.");
+    }
+    if (requestToken !== state.statisticsRequestToken) return;
+    state.statistics = job.result;
     state.statisticsError = "";
     state.statisticsPage = 1;
   } catch (error) {
@@ -1206,8 +1315,11 @@ async function loadStatistics() {
     state.statisticsError = error.message || "Não foi possível consultar as estatísticas.";
     showToast(error.message || "Não foi possível consultar as estatísticas.", "error");
   } finally {
-    state.statisticsLoading = false;
-    renderStatistics();
+    if (requestToken === state.statisticsRequestToken) {
+      state.statisticsLoading = false;
+      state.statisticsProgress = "";
+      renderStatistics();
+    }
   }
 }
 
@@ -1252,7 +1364,12 @@ async function downloadReport(button) {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ report_type: reportType, format, filters: currentReportFilters(reportType) }),
+      body: JSON.stringify({
+        report_type: reportType,
+        format,
+        filters: currentReportFilters(reportType),
+        statistics_job_id: reportType === "statistics" ? state.statisticsJobId : "",
+      }),
     });
     if (!response.ok) {
       const error = await response.json().catch(() => ({}));
@@ -1845,7 +1962,7 @@ document.addEventListener("click", (event) => {
   if (key === "scanPage") renderScan();
   if (key === "competitorsPage") renderCompetitors();
   if (key === "statisticsPage") renderStatistics();
-  if (["dashboardStockPage", "dashboardCatalogPage", "dashboardShipmentPage", "dashboardSalesPage"].includes(key)) renderDashboard();
+  if (["dashboardStockPage", "dashboardCatalogPage", "dashboardShipmentPage", "dashboardSalesPage", "dashboardTopSkuPage"].includes(key)) renderDashboard();
 });
 
 document.querySelector("#dashboard-shipment-account")?.addEventListener("change", (event) => {
@@ -1891,6 +2008,11 @@ document.querySelector("#statistics-form")?.addEventListener("submit", async (ev
 });
 
 document.addEventListener("click", (event) => {
+  const calculator = event.target.closest("[data-stock-calculator]");
+  if (calculator) {
+    openStockCalculator((state.statistics?.rows || [])[Number(calculator.dataset.stockCalculator)]);
+    return;
+  }
   const button = event.target.closest("[data-export-report]");
   if (button) downloadReport(button);
 });
