@@ -136,6 +136,9 @@
                 <p class="eyebrow">Envios pendentes</p>
                 <h2>Prazo limite de despacho</h2>
               </div>
+              <label class="dashboard-account-filter">Conta
+                <select id="dashboard-shipment-account"><option value="all">Todas as contas</option></select>
+              </label>
             </div>
             <div id="dashboard-shipments" class="ops-list"></div>
           </div>
@@ -145,8 +148,20 @@
                 <p class="eyebrow">Últimas vendas</p>
                 <h2>Vendas recentes das contas conectadas</h2>
               </div>
+              <label class="dashboard-account-filter">Conta
+                <select id="dashboard-sales-account"><option value="all">Todas as contas</option></select>
+              </label>
             </div>
             <div id="dashboard-sales" class="sales-list"></div>
+          </div>
+          <div class="panel wide-panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">Desempenho de hoje</p>
+                <h2>SKUs mais vendidos hoje</h2>
+              </div>
+            </div>
+            <div id="dashboard-top-skus" class="sales-list"></div>
           </div>
           <div class="panel">
             <div class="panel-heading compact">
@@ -167,7 +182,13 @@
               <p class="eyebrow">Vendas oficiais Mercado Livre</p>
               <h2>Desempenho por SKU</h2>
             </div>
-            <span id="statistics-updated" class="statistics-updated"></span>
+            <div class="heading-actions">
+              <span id="statistics-updated" class="statistics-updated"></span>
+              <div class="report-actions" aria-label="Exportar estatísticas">
+                <button class="mini-button" type="button" data-export-report="statistics" data-export-format="pdf">PDF</button>
+                <button class="mini-button" type="button" data-export-report="statistics" data-export-format="xlsx">Excel</button>
+              </div>
+            </div>
           </div>
           <form id="statistics-form" class="statistics-filters">
             <label>Conta
@@ -287,12 +308,19 @@
               <p class="eyebrow">Buy box / catálogo</p>
               <h2>Produtos disputando catálogo</h2>
             </div>
-            <div class="segmented" role="tablist" aria-label="Filtro de catálogo">
-              <button class="active" data-filter="all">Todos</button>
-              <button data-filter="winning">Ganhando</button>
-              <button data-filter="losing">Perdendo</button>
-              <button data-filter="sharing">Compartilhando</button>
-              <button data-filter="paused">Pausados</button>
+            <div class="heading-actions">
+              <div class="segmented" role="tablist" aria-label="Filtro de catálogo">
+                <button class="active" data-filter="all">Todos</button>
+                <button data-filter="winning">Ganhando</button>
+                <button data-filter="losing">Perdendo</button>
+                <button data-filter="sharing">Compartilhando</button>
+                <button data-filter="internal">Entre suas contas</button>
+                <button data-filter="paused">Pausados</button>
+              </div>
+              <div class="report-actions" aria-label="Exportar catálogo">
+                <button class="mini-button" type="button" data-export-report="catalog" data-export-format="pdf">PDF</button>
+                <button class="mini-button" type="button" data-export-report="catalog" data-export-format="xlsx">Excel</button>
+              </div>
             </div>
           </div>
           <div class="filter-bar">
@@ -311,6 +339,13 @@
             <div>
               <p class="eyebrow">Anúncios</p>
               <h2>Todos os anúncios conectados</h2>
+            </div>
+            <div class="report-actions" aria-label="Exportar anúncios">
+              <button class="mini-button" type="button" data-export-report="ads" data-export-format="pdf">PDF</button>
+              <button class="mini-button" type="button" data-export-report="ads" data-export-format="xlsx">Excel</button>
+              <button class="mini-button" type="button" id="download-bulk-sheet">Planilha ML</button>
+              <button class="mini-button success-button" type="button" id="import-bulk-sheet">Importar planilha</button>
+              <input id="bulk-sheet-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden />
             </div>
           </div>
           <div class="filter-bar">
@@ -334,6 +369,7 @@
               </select>
             </label>
           </div>
+          <div id="spreadsheet-preview"></div>
           <div id="ads-list" class="ads-list"></div>
         </div>
       </section>
@@ -384,10 +420,10 @@
               Conta origem
               <select name="source"></select>
             </label>
-            <label>
-              Conta destino
-              <select name="target"></select>
-            </label>
+            <fieldset class="clone-target-panel">
+              <legend>Contas destino</legend>
+              <div id="clone-targets" class="clone-targets"></div>
+            </fieldset>
             <div class="item-picker">
               <div class="item-picker-head">
                 <strong>Anúncios da origem</strong>
@@ -420,17 +456,17 @@
                 <input name="gtin_override" inputmode="text" placeholder="Código original ou novo código universal" />
                 <small id="clone-gtin-hint">Para variações, use um código por variação separado por vírgula.</small>
               </label>
-              <label>Tipo de anúncio
-                <select name="listing_type_override">
-                  <option value="">Mesmo tipo do anúncio</option>
-                  <option value="gold_special">Clássico</option>
-                  <option value="gold_pro">Premium</option>
-                </select>
-              </label>
-              <label>Preço <input name="price_override" type="number" step="0.01" placeholder="Opcional" /></label>
+              <input name="listing_type_override" type="hidden" />
+              <label>Preço do tipo original <input name="price_override" type="number" step="0.01" placeholder="Opcional" /></label>
               <label>Estoque <input name="stock_override" type="number" step="1" placeholder="Opcional" /></label>
               <label class="span-2">Descrição <textarea name="description_override" rows="7" placeholder="Descrição do anúncio"></textarea></label>
             </div>
+            <fieldset class="clone-variants-panel">
+              <legend>Versões a criar</legend>
+              <label class="clone-variant-option"><input type="checkbox" name="variant_same" checked /><span><strong>Mesmo tipo</strong><small>Usa o preço do tipo original</small></span></label>
+              <label class="clone-variant-option"><input type="checkbox" name="variant_classic" /><span><strong>Clássico</strong><small>Preço específico</small></span><input name="classic_price" type="number" min="0" step="0.01" placeholder="R$" /></label>
+              <label class="clone-variant-option"><input type="checkbox" name="variant_premium" /><span><strong>Premium</strong><small>Preço específico</small></span><input name="premium_price" type="number" min="0" step="0.01" placeholder="R$" /></label>
+            </fieldset>
             <button class="primary" type="submit">Preparar cópia</button>
           </form>
           <div id="clone-jobs" class="clone-jobs"></div>

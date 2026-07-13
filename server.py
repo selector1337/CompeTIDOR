@@ -3,6 +3,8 @@ from pathlib import Path
 from datetime import date, datetime, time as datetime_time, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlencode, urlparse
+from io import BytesIO
+import base64
 import json
 import html
 import hashlib
@@ -37,8 +39,14 @@ CATEGORY_ATTRIBUTES_LOCK = threading.RLock()
 CATEGORY_ATTRIBUTES_CACHE = {}
 SELLER_PROFILE_LOCK = threading.RLock()
 SELLER_PROFILE_CACHE = {}
+PUBLIC_BUYBOX_CACHE_LOCK = threading.RLock()
+PUBLIC_BUYBOX_CACHE = {}
 STATISTICS_CACHE_LOCK = threading.RLock()
 STATISTICS_CACHE = {}
+SPREADSHEET_JOBS_LOCK = threading.RLock()
+SPREADSHEET_JOBS = {}
+SHIPMENT_MODE_CACHE_LOCK = threading.RLock()
+SHIPMENT_MODE_CACHE = {}
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -61,6 +69,7 @@ SENSITIVE_MELI_PATH_TERMS = (
 ALLOWED_MELI_PATHS = (
     re.compile(r"^/users/me$"),
     re.compile(r"^/users/[^/]+$"),
+    re.compile(r"^/users/[^/]+/shipping_options/free(\?|$)"),
     re.compile(r"^/users/[^/]+/items/search(\?|$)"),
     re.compile(r"^/items[^/]*(\?|$)"),
     re.compile(r"^/items/[^/]+(\?|$)"),
@@ -72,8 +81,11 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/user-products/[^/]+(\?|$)"),
     re.compile(r"^/orders/search(\?|$)"),
     re.compile(r"^/shipments/[^/]+(\?|$)"),
+    re.compile(r"^/shipments/[^/]+/sla(\?|$)"),
     re.compile(r"^/claims/search(\?|$)"),
+    re.compile(r"^/v1/claims/search(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/search(\?|$)"),
+    re.compile(r"^/post-purchase/v1/claims/[^/]+/detail(\?|$)"),
 )
 
 
@@ -217,6 +229,45 @@ def catalog_counts(catalog):
 
 def now_label():
     return datetime.now(APP_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def parse_meli_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=APP_TZ)
+    return parsed.astimezone(APP_TZ)
+
+
+def dispatch_time_left(value, reference=None):
+    deadline = parse_meli_datetime(value)
+    if not deadline:
+        return "-"
+    current = reference or datetime.now(APP_TZ)
+    seconds = int((deadline - current).total_seconds())
+    if seconds <= 0:
+        overdue = abs(seconds)
+        hours, remainder = divmod(overdue, 3600)
+        minutes = remainder // 60
+        return f"Atrasado {hours}h {minutes:02d}min"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    return f"{days}d {hours}h {minutes:02d}min" if days else f"{hours}h {minutes:02d}min"
+
+
+def brl_label(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "não informado pela API"
+    formatted = f"{number:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    return f"R$ {formatted}"
 
 
 def https_port():
@@ -418,6 +469,8 @@ def telegram_type_enabled(config, alert_type):
 
 
 def public_payload(payload, actor=None, include_catalog=True):
+    if include_catalog:
+        reclassify_internal_competition(payload)
     if payload.get("catalog"):
         enrich_recent_sale_thumbnails(payload)
     if include_catalog:
@@ -428,6 +481,9 @@ def public_payload(payload, actor=None, include_catalog=True):
         clean["item_logs"] = []
     clean.setdefault("scan_items", [])
     clean.setdefault("recent_sales", [])
+    for alert in clean.get("alerts", []):
+        if alert.get("type") == "catalog":
+            alert["message"] = normalize_catalog_alert_price(alert.get("message"))
     clean["clone_jobs"] = clean.get("clone_jobs", [])[:50]
     for job in clean["clone_jobs"]:
         if job.get("errors"):
@@ -448,6 +504,17 @@ def public_payload(payload, actor=None, include_catalog=True):
     clean.pop("operations_snapshot", None)
     clean.pop("catalog_counts_snapshot", None)
     return clean
+
+
+def normalize_catalog_alert_price(message):
+    text = str(message or "")
+    pattern = re.compile(r"(Pre[cç]o para ganhar:\s*)(?!R\$\s*)(\d+(?:[.,]\d+)?)", re.I)
+
+    def replace(match):
+        raw = match.group(2).replace(".", "").replace(",", ".")
+        return f"{match.group(1)}{brl_label(raw)}"
+
+    return pattern.sub(replace, text)
 
 
 def enrich_recent_sale_thumbnails(payload):
@@ -607,7 +674,11 @@ def build_operations(payload):
             "thumbnail": item.get("thumbnail"),
             "occurred_at": item.get("updated_at") or fallback_time(index + 1),
         }
-        if item.get("status") == "losing" or item.get("competition_status") in {"competing", "sharing"} and item.get("winner_name") not in ("", None, item.get("account")):
+        if not item.get("internal_competition") and (
+            item.get("status") == "losing"
+            or item.get("competition_status") in {"competing", "sharing"}
+            and item.get("winner_name") not in ("", None, item.get("account"))
+        ):
             catalog_attention.append({**row, "winner_name": item.get("winner_name"), "winner_price": item.get("winner_price")})
 
     stock.sort(key=lambda item: item["occurred_at"], reverse=True)
@@ -644,14 +715,20 @@ def build_operations(payload):
         for account in accounts
         if account.get("official")
     ]
+    top_skus_today = sorted(
+        payload.get("daily_sku_sales", []),
+        key=lambda item: (int(item.get("units") or 0), float(item.get("revenue") or 0)),
+        reverse=True,
+    )[:20]
 
     return {
         "revenue": revenue,
         "total_monthly_revenue": total_revenue,
-        "attention_stock": stock[:30],
-        "attention_catalog": catalog_attention[:30],
+        "attention_stock": stock[:200],
+        "attention_catalog": catalog_attention[:200],
         "claims": claims,
         "pending_shipments": shipments,
+        "top_skus_today": top_skus_today,
     }
 
 
@@ -769,11 +846,13 @@ class MercadoLivreClient:
         }
         return request_form(MELI_TOKEN_URL, payload)
 
-    def get(self, path):
+    def get(self, path, extra_headers=None):
         validate_meli_path(path)
+        headers = {"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"}
+        headers.update(extra_headers or {})
         return request_json(
             f"{MELI_API_URL}{path}",
-            headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"},
+            headers=headers,
         )
 
     def post(self, path, payload):
@@ -868,7 +947,7 @@ class MercadoLivreClient:
 
     def items_bulk(self, item_ids):
         ids = ",".join(item_ids)
-        rows = self.get(f"/items?ids={ids}")
+        rows = self.get(f"/items?ids={ids}&include_attributes=all")
         items = []
         for row in rows if isinstance(rows, list) else []:
             body = row.get("body") if isinstance(row, dict) else None
@@ -884,6 +963,10 @@ class MercadoLivreClient:
 
     def user_product(self, user_product_id):
         return self.get(f"/user-products/{user_product_id}")
+
+    def item_shipping_cost(self, seller_id, item_id):
+        params = {"item_id": item_id, "verbose": "true"}
+        return self.get(f"/users/{seller_id}/shipping_options/free?{urlencode(params)}")
 
     def price_to_win(self, item_id):
         return self.get(f"/items/{item_id}/price_to_win?version=v2")
@@ -917,14 +1000,30 @@ class MercadoLivreClient:
         return self.get(f"/orders/search?{urlencode(params)}")
 
     def shipment(self, shipment_id):
-        return self.get(f"/shipments/{shipment_id}")
+        return self.get(f"/shipments/{shipment_id}", extra_headers={"x-format-new": "true"})
+
+    def shipment_sla(self, shipment_id):
+        return self.get(f"/shipments/{shipment_id}/sla")
 
     def seller_claims(self, seller_id, limit=50, offset=0):
-        params = {"seller_id": seller_id, "limit": min(int(limit or 50), 50), "offset": max(int(offset or 0), 0)}
-        try:
-            return self.get(f"/post-purchase/v1/claims/search?{urlencode(params)}")
-        except Exception:
-            return self.get(f"/claims/search?{urlencode(params)}")
+        params = {
+            "players.user_id": seller_id,
+            "players.role": "respondent",
+            "status": "opened",
+            "sort": "last_updated:desc",
+            "limit": min(int(limit or 50), 100),
+            "offset": max(int(offset or 0), 0),
+        }
+        last_error = None
+        for resource in ("/post-purchase/v1/claims/search", "/v1/claims/search"):
+            try:
+                return self.get(f"{resource}?{urlencode(params)}")
+            except Exception as exc:
+                last_error = exc
+        raise last_error
+
+    def claim_detail(self, claim_id):
+        return self.get(f"/post-purchase/v1/claims/{claim_id}/detail")
 
 
 class Notifier:
@@ -1030,9 +1129,14 @@ def item_flex_logistic_type(item):
     tags = shipping.get("tags") or item.get("shipping_tags") or item.get("tags") or item.get("sub_status") or []
     if isinstance(tags, str):
         tags = [tags]
-    tag_text = " ".join(str(tag).lower() for tag in tags)
-    if logistic_type == "self_service" or mode == "self_service" or "self_service" in tag_text or "mercado_envios_flex" in tag_text or "flex" in tag_text:
+    normalized_tags = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+    active_tags = {"self_service_in", "self_service", "mercado_envios_flex", "flex"}
+    if logistic_type == "self_service" or mode == "self_service" or normalized_tags.intersection(active_tags):
         return "self_service"
+    # self_service_available only means that Flex can be enabled; self_service_out
+    # explicitly means that the listing is currently outside the service.
+    if normalized_tags.intersection({"self_service_out", "self_service_available"}):
+        return logistic_type if logistic_type and logistic_type != "self_service" else mode
     return logistic_type or mode
 
 
@@ -1693,7 +1797,7 @@ def process_meli_notification(event):
             "title": "Produto começou a perder catálogo",
             "message": (
                 f"{updated.get('title')} deixou de vencer o catálogo. "
-                f"Preço para ganhar: {updated.get('price_to_win') or 'não informado pela API'}."
+                f"Preço para ganhar: {brl_label(updated.get('price_to_win'))}."
             ),
             "account": updated.get("account"),
             "item_id": item_id,
@@ -1754,6 +1858,7 @@ def auto_official_sync_loop():
     interval = max(120, int(os.getenv("AUTO_SYNC_INTERVAL_SECONDS", "300")))
     startup_delay = max(20, int(os.getenv("AUTO_SYNC_STARTUP_DELAY_SECONDS", "45")))
     full_every = max(1, int(os.getenv("AUTO_FULL_SYNC_EVERY_N_RUNS", "72")))
+    operations_every = max(1, int(os.getenv("AUTO_OPERATIONS_SYNC_EVERY_N_RUNS", "6")))
     run_count = 0
     time.sleep(startup_delay)
     while True:
@@ -1774,6 +1879,10 @@ def auto_official_sync_loop():
                     else:
                         result = refresh_official_account_items(payload, account)
                         account["auto_sync_status"] = account.get("auto_refresh_status") or f"Atualização automática OK: {result.get('items', 0)} anúncios"
+                        if run_count % operations_every == 0:
+                            client = account_client(account)
+                            sync_recent_sales(payload, account, client)
+                            sync_claims(payload, account, client)
                     account["auto_sync_error"] = ""
                     account["last_auto_sync_at"] = now_label()
                     changed = True
@@ -1972,10 +2081,87 @@ def seller_nickname(client, seller_id):
         if cached and now - cached["time"] < ttl:
             return cached["nickname"]
     profile = client.user(seller_id)
-    nickname = str((profile or {}).get("nickname") or f"Seller {seller_id}")
+    nickname = str((profile or {}).get("nickname") or f"Vendedor {seller_id}")
     with SELLER_PROFILE_LOCK:
         SELLER_PROFILE_CACHE[seller_id] = {"time": now, "nickname": nickname}
     return nickname
+
+
+def winner_embedded_name(value):
+    if not isinstance(value, dict):
+        return ""
+    seller = value.get("seller") if isinstance(value.get("seller"), dict) else {}
+    official_store = value.get("official_store") if isinstance(value.get("official_store"), dict) else {}
+    for candidate in (
+        value.get("seller_name"),
+        value.get("seller_nickname"),
+        value.get("nickname"),
+        value.get("official_store_name"),
+        seller.get("nickname"),
+        seller.get("name"),
+        official_store.get("name"),
+    ):
+        name = clean_attribute_value(candidate)
+        if name:
+            return name
+    return ""
+
+
+def cached_public_buybox(client, catalog_product_id, item=None):
+    cache_key = str(catalog_product_id or "")
+    ttl = max(60, int(os.getenv("MELI_PUBLIC_BUYBOX_CACHE_SECONDS", "300")))
+    now = time.monotonic()
+    with PUBLIC_BUYBOX_CACHE_LOCK:
+        cached = PUBLIC_BUYBOX_CACHE.get(cache_key)
+    if cached and now - cached.get("time", 0) < ttl:
+        return cached.get("value") or {}
+    value = fetch_public_buybox(client, catalog_product_id, item)
+    with PUBLIC_BUYBOX_CACHE_LOCK:
+        PUBLIC_BUYBOX_CACHE[cache_key] = {"time": now, "value": value}
+    return value
+
+
+def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, source_item=None, expected_price=None):
+    winner = winner if isinstance(winner, dict) else {}
+    seller_id = str(winner.get("seller_id") or first_present(winner, ["seller.id"], "") or "")
+    seller_name = winner_embedded_name(winner)
+    winner_item = {}
+    if winner_item_id:
+        try:
+            winner_item = client.item(winner_item_id) or {}
+            seller_id = seller_id or str(winner_item.get("seller_id") or first_present(winner_item, ["seller.id"], "") or "")
+            seller_name = seller_name or winner_embedded_name(winner_item)
+        except Exception:
+            winner_item = {}
+    if catalog_product_id and (not seller_id or not seller_name):
+        try:
+            offers = client.product_winners(catalog_product_id)
+            rows = offers.get("results") if isinstance(offers, dict) else offers
+            for offer in rows or []:
+                offer_item_id = str(offer.get("item_id") or offer.get("id") or "")
+                if winner_item_id and offer_item_id != str(winner_item_id):
+                    continue
+                seller_id = seller_id or str(offer.get("seller_id") or first_present(offer, ["seller.id"], "") or "")
+                seller_name = seller_name or winner_embedded_name(offer)
+                if seller_id or seller_name:
+                    break
+        except Exception:
+            pass
+    if seller_id and not seller_name:
+        try:
+            seller_name = seller_nickname(client, seller_id)
+        except Exception:
+            seller_name = ""
+    # The public page is only used to resolve the display name when its buy-box
+    # price agrees with the price already returned by the official API.
+    if not seller_name and catalog_product_id and expected_price not in (None, ""):
+        try:
+            public = cached_public_buybox(client, catalog_product_id, source_item)
+            if abs(float(public.get("price") or 0) - float(expected_price or 0)) <= 0.02:
+                seller_name = clean_attribute_value(public.get("seller_name"))
+        except Exception:
+            pass
+    return seller_id, seller_name
 
 
 def normalize_competition(client, account, item):
@@ -2017,26 +2203,21 @@ def normalize_competition(client, account, item):
         )
         if isinstance(winner, dict) and winner.get("item_id"):
             winner_item_id = str(winner.get("item_id") or "")
-            winner_seller_id = str(winner.get("seller_id") or "")
-            winner_name = ""
-            try:
-                winner_item = client.item(winner_item_id)
-                winner_seller_id = winner_seller_id or str(winner_item.get("seller_id") or "")
-                if winner_seller_id:
-                    winner_name = seller_nickname(client, winner_seller_id)
-            except Exception:
-                if winner_seller_id:
-                    try:
-                        winner_name = seller_nickname(client, winner_seller_id)
-                    except Exception:
-                        winner_name = f"Seller {winner_seller_id}"
+            winner_seller_id, winner_name = resolve_winner_identity(
+                client,
+                winner,
+                winner_item_id,
+                catalog_product_id,
+                item,
+                winner.get("price"),
+            )
             if str(winner_item_id) == str(item_id):
                 winner_seller_id = str(account.get("seller_id") or winner_seller_id)
                 winner_name = account.get("nickname") or winner_name or "Sua conta"
             winner_price = winner.get("price")
             data["winner_item_id"] = winner_item_id
             data["winner_seller_id"] = winner_seller_id
-            data["winner_name"] = winner_name or f"Anúncio {winner_item_id}"
+            data["winner_name"] = winner_name or (f"Vendedor {winner_seller_id}" if winner_seller_id else f"Anúncio {winner_item_id}")
             data["winner_price"] = winner_price
             data["winner_confirmed"] = winner_price not in (None, "")
             data["winner_source"] = "price_to_win_winner"
@@ -2060,18 +2241,19 @@ def normalize_competition(client, account, item):
             winner_item_id = str(winner.get("item_id") or "")
             winner_price = winner.get("price")
             if winner_item_id and winner_price not in (None, ""):
-                winner_seller_id = str(winner.get("seller_id") or "")
-                winner_name = ""
-                if winner_seller_id:
-                    try:
-                        winner_name = seller_nickname(client, winner_seller_id)
-                    except Exception:
-                        winner_name = f"Seller {winner_seller_id}"
+                winner_seller_id, winner_name = resolve_winner_identity(
+                    client,
+                    winner,
+                    winner_item_id,
+                    catalog_product_id,
+                    item,
+                    winner_price,
+                )
                 data.update(
                     {
                         "winner_item_id": winner_item_id,
                         "winner_seller_id": winner_seller_id,
-                        "winner_name": winner_name or f"Anúncio {winner_item_id}",
+                        "winner_name": winner_name or (f"Vendedor {winner_seller_id}" if winner_seller_id else f"Anúncio {winner_item_id}"),
                         "winner_price": winner_price,
                         "winner_confirmed": True,
                         "winner_source": "product_buy_box_winner",
@@ -2162,6 +2344,7 @@ def synced_catalog_item(account, item, competition=None):
     competition = competition or {}
     status, action = classified_catalog_status(account, item, stock, is_catalog, competition)
     package_values = package_values_from_item(item)
+    identifier_values = source_clone_identifiers(item, {})
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
@@ -2170,11 +2353,14 @@ def synced_catalog_item(account, item, competition=None):
         "official_source": True,
         "thumbnail": item_thumbnail(item),
         "sku": item_sku(item),
+        "gtin": ", ".join(identifier_values),
+        "variation_count": len(item.get("variations") or []),
         "catalog_product_id": catalog_product_id,
         "catalog_listing": is_catalog,
         "listing_type_id": listing_type_id,
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
+        "free_shipping": bool(first_present(item, ["shipping.free_shipping"], False)),
         **package_values,
         "status": status,
         "share": competition_share(competition.get("competition_status"), competition.get("visit_share")) if is_catalog else 100,
@@ -2186,6 +2372,162 @@ def synced_catalog_item(account, item, competition=None):
         "permalink": item.get("permalink", ""),
         **competition,
     }
+
+
+def shipping_quote_values(response):
+    data = response if isinstance(response, dict) else {}
+    coverage = first_present(data, ["coverage.all_country"], {})
+    if not isinstance(coverage, dict):
+        coverage = {}
+    raw_cost = coverage.get("list_cost")
+    if raw_cost in (None, ""):
+        raw_cost = first_present(data, ["list_cost", "shipping_option.list_cost", "cost"], None)
+    try:
+        cost = round(float(raw_cost), 2) if raw_cost not in (None, "") else None
+    except (TypeError, ValueError):
+        cost = None
+    currency = (
+        coverage.get("currency_id")
+        or data.get("currency_id")
+        or first_present(data, ["shipping_option.currency_id"], "BRL")
+        or "BRL"
+    )
+    billable_weight = first_present(
+        data,
+        ["billable_weight", "shipping_option.billable_weight", "coverage.all_country.billable_weight"],
+        None,
+    )
+    return {"cost": cost, "currency": currency, "billable_weight": billable_weight}
+
+
+def refresh_account_shipping_costs(payload, account, item_ids=None, limit=None):
+    maximum = max(1, int(limit or os.getenv("AUTO_SHIPPING_COST_BATCH_SIZE", "20")))
+    requested = {str(item_id) for item_id in (item_ids or []) if item_id}
+    rows = [
+        item
+        for item in payload.get("catalog", [])
+        if item.get("official_source")
+        and item.get("account_id") == account.get("id")
+        and item.get("id")
+        and (not requested or item.get("id") in requested)
+    ]
+    if not rows:
+        return []
+    if requested:
+        selected = rows[:maximum]
+    else:
+        cursor_key = f"shipping_cost_cursor_{account.get('id')}"
+        selected, account[cursor_key] = rotating_batch(rows, account.get(cursor_key) or 0, maximum)
+    client = account_client(account)
+    results = []
+    for item in selected:
+        try:
+            quote = client.item_shipping_cost(account.get("seller_id"), item.get("id"))
+            values = shipping_quote_values(quote)
+            item["shipping_cost"] = values["cost"]
+            item["shipping_cost_currency"] = values["currency"]
+            item["shipping_billable_weight"] = values["billable_weight"]
+            item["shipping_cost_source"] = "Cotação oficial Mercado Livre"
+            item["shipping_cost_status"] = "ok" if values["cost"] is not None else "not_available"
+            item["shipping_cost_error"] = "" if values["cost"] is not None else "A API não informou uma cotação para este anúncio."
+        except Exception as exc:
+            item["shipping_cost_status"] = "error"
+            item["shipping_cost_error"] = policy_error_message(exc, "a cotação de frete do anúncio")
+        item["shipping_cost_updated_at"] = now_label()
+        results.append(
+            {
+                "id": item.get("id"),
+                "account_id": item.get("account_id"),
+                "shipping_cost": item.get("shipping_cost"),
+                "shipping_cost_currency": item.get("shipping_cost_currency") or "BRL",
+                "shipping_billable_weight": item.get("shipping_billable_weight"),
+                "shipping_cost_status": item.get("shipping_cost_status"),
+                "shipping_cost_error": item.get("shipping_cost_error") or "",
+                "shipping_cost_updated_at": item.get("shipping_cost_updated_at"),
+            }
+        )
+    return results
+
+
+def preserve_shipping_cost_snapshot(target, previous):
+    for key in (
+        "shipping_cost",
+        "shipping_cost_currency",
+        "shipping_billable_weight",
+        "shipping_cost_source",
+        "shipping_cost_status",
+        "shipping_cost_error",
+        "shipping_cost_updated_at",
+    ):
+        if key in (previous or {}):
+            target[key] = previous[key]
+    return target
+
+
+def refresh_shipping_costs_for_items(payload, item_ids):
+    maximum = max(1, int(os.getenv("MELI_SHIPPING_COST_ON_DEMAND_LIMIT", "25")))
+    requested = list(dict.fromkeys(str(item_id) for item_id in (item_ids or []) if item_id))[:maximum]
+    by_account = {}
+    catalog_by_id = {item.get("id"): item for item in payload.get("catalog", []) if item.get("id") in requested}
+    for item_id in requested:
+        item = catalog_by_id.get(item_id)
+        if item and item.get("account_id"):
+            by_account.setdefault(item.get("account_id"), []).append(item_id)
+    results = []
+    for account_id, ids in by_account.items():
+        account = next(
+            (
+                row
+                for row in payload.get("accounts", [])
+                if row.get("id") == account_id and row.get("official") and row.get("access_token")
+            ),
+            None,
+        )
+        if account:
+            results.extend(refresh_account_shipping_costs(payload, account, ids, len(ids)))
+    return results
+
+
+def normalized_account_name(value):
+    return normalized_attribute_label(value or "")
+
+
+def reclassify_internal_competition(payload):
+    accounts = [account for account in payload.get("accounts") or [] if account.get("official")]
+    by_seller = {str(account.get("seller_id")): account for account in accounts if account.get("seller_id") not in (None, "")}
+    by_name = {normalized_account_name(account.get("nickname")): account for account in accounts if account.get("nickname")}
+    changed = False
+    for item in payload.get("catalog") or []:
+        if not is_catalog_listing(item):
+            continue
+        winner_account = by_seller.get(str(item.get("winner_seller_id") or ""))
+        if not winner_account:
+            winner_account = by_name.get(normalized_account_name(item.get("winner_name")))
+        is_internal_loss = bool(winner_account) and (item.get("status") == "losing" or item.get("internal_competition"))
+        if is_internal_loss:
+            if not item.get("internal_competition"):
+                item["external_status"] = item.get("status") or "losing"
+            target_name = winner_account.get("nickname") or item.get("winner_name")
+            updates = {
+                "internal_competition": True,
+                "internal_winner_account_id": winner_account.get("id"),
+                "winner_name": target_name,
+                "status": "sharing",
+                "share": 50,
+                "action": f"A oferta vencedora pertence à conta conectada {target_name}. Esta disputa não é tratada como perda externa.",
+            }
+            for key, value in updates.items():
+                if item.get(key) != value:
+                    item[key] = value
+                    changed = True
+        elif item.get("internal_competition"):
+            item.pop("internal_competition", None)
+            item.pop("internal_winner_account_id", None)
+            restored = item.pop("external_status", None)
+            if restored:
+                item["status"] = restored
+            changed = True
+    return changed
 
 
 def append_item_log(payload, item, user, action, changes=None, sale_id=None):
@@ -2474,6 +2816,32 @@ def sync_recent_sales(payload, account, client):
         if item.get("account") != account.get("nickname")
     ]
     payload["recent_sales"] = sorted([*rows, *existing], key=lambda item: item.get("date") or "", reverse=True)[:80]
+    today = datetime.now(APP_TZ).date()
+    by_sku = {}
+    for sale in rows:
+        sold_at = parse_meli_datetime(sale.get("date"))
+        if not sold_at or sold_at.date() != today:
+            continue
+        sku = str(sale.get("sku") or "-")
+        key = (sku, sale.get("item_id") or "")
+        summary = by_sku.setdefault(
+            key,
+            {
+                "account": account.get("nickname"),
+                "sku": sku,
+                "item_id": sale.get("item_id") or "",
+                "product": sale.get("product") or "Produto vendido",
+                "thumbnail": sale.get("thumbnail") or "",
+                "units": 0,
+                "revenue": 0.0,
+                "date": today.isoformat(),
+            },
+        )
+        summary["units"] += int(sale.get("quantity") or 0)
+        summary["revenue"] = round(float(summary["revenue"]) + float(sale.get("total") or 0), 2)
+    daily = [row for row in payload.get("daily_sku_sales", []) if row.get("account") != account.get("nickname")]
+    daily.extend(by_sku.values())
+    payload["daily_sku_sales"] = daily
     account["sales_sync_status"] = f"{revenue_orders} pedidos reais sincronizados no mês"
     upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"])
     sync_pending_shipments_from_orders(payload, account, orders)
@@ -2483,7 +2851,7 @@ def sync_recent_sales(payload, account, client):
 def sync_claims(payload, account, client):
     try:
         data = client.seller_claims(account.get("seller_id"), 50, 0)
-        rows = data.get("results") or data.get("claims") or []
+        rows = data.get("data") or data.get("results") or data.get("claims") or []
     except Exception as exc:
         account["claims_sync_status"] = policy_error_message(exc, "a leitura das reclamações")
         if "404" in str(exc) or "resource not found" in str(exc).lower():
@@ -2495,20 +2863,31 @@ def sync_claims(payload, account, client):
     details = []
     open_count = 0
     mediation_count = 0
-    for claim in rows:
+    detail_limit = max(0, int(os.getenv("MELI_CLAIM_DETAIL_LIMIT", "20")))
+    for index, claim in enumerate(rows):
         status = str(claim.get("status") or claim.get("stage") or "").lower()
-        if "medi" in status:
+        claim_type = str(claim.get("type") or "").lower()
+        claim_stage = str(claim.get("stage") or "").lower()
+        if "medi" in status or "medi" in claim_type or claim_stage == "dispute":
             mediation_count += 1
         elif status not in {"closed", "resolved", "cancelled", "canceled"}:
             open_count += 1
+        detail = {}
+        if index < detail_limit and claim.get("id"):
+            try:
+                detail = client.claim_detail(claim.get("id")) or {}
+            except Exception:
+                detail = {}
         details.append(
             {
                 "id": claim.get("id") or claim.get("claim_id") or "-",
                 "account": account.get("nickname"),
                 "status": claim.get("status") or claim.get("stage") or "-",
-                "subject": claim.get("type") or claim.get("reason") or "Reclamação Mercado Livre",
-                "description": claim.get("description") or claim.get("detail") or claim.get("reason") or "",
+                "subject": detail.get("title") or claim.get("type") or claim.get("reason") or "Reclamação Mercado Livre",
+                "description": detail.get("problem") or detail.get("description") or claim.get("description") or claim.get("detail") or claim.get("reason") or "",
                 "created_at": claim.get("date_created") or claim.get("created_at") or now_label(),
+                "due_date": detail.get("due_date") or "",
+                "order_id": claim.get("resource_id") if claim.get("resource") == "order" else "",
             }
         )
     payload["claim_details"] = [item for item in payload.get("claim_details", []) if item.get("account") != account.get("nickname")]
@@ -2525,33 +2904,55 @@ def sync_pending_shipments_from_orders(payload, account, orders):
     pending_statuses = {"paid", "confirmed", "payment_required", "partially_paid"}
     final_statuses = {"cancelled", "canceled", "invalid"}
     final_shipping_statuses = {"delivered", "cancelled", "canceled", "not_delivered"}
+    sla_lookup_limit = max(0, int(os.getenv("MELI_PENDING_SLA_LIMIT", "100")))
+    sla_lookups = 0
     for order in orders:
         status = str(order.get("status") or "").lower()
         tags = [str(tag).lower() for tag in order.get("tags", []) or []]
         shipping = order.get("shipping") or {}
-        shipping_status = str(shipping.get("status") or first_present(shipping, ["status_history.status"], "") or "").lower()
+        shipment_id = shipment_id_from_order(order)
+        official_shipment = {}
+        if shipment_id not in (None, "", 0, "0"):
+            try:
+                official_shipment = account_client(account).shipment(shipment_id) or {}
+            except Exception:
+                official_shipment = {}
+        if official_shipment:
+            shipping_status = str(official_shipment.get("status") or "").lower()
+        else:
+            shipping_status = str(shipping.get("status") or first_present(shipping, ["status_history.status"], "") or "").lower()
         fulfilled = any(tag in {"delivered", "cancelled", "canceled"} for tag in tags) or shipping_status in final_shipping_statuses
         if status in final_statuses or status not in pending_statuses or fulfilled:
             continue
-        deadline = (
-            first_present(shipping, ["estimated_handling_limit.date", "estimated_handling_limit", "shipping_option.estimated_handling_limit"])
-            or first_present(shipping, ["estimated_delivery_time.date", "shipping_option.estimated_delivery_time.date"])
-            or shipping.get("date_first_printed")
-            or order.get("expiration_date")
-            or order.get("date_closed")
-            or "Aguardando prazo oficial"
-        )
+        deadline = ""
+        sla_status = ""
+        if shipment_id not in (None, "", 0, "0") and sla_lookups < sla_lookup_limit:
+            try:
+                sla = account_client(account).shipment_sla(shipment_id) or {}
+                deadline = sla.get("expected_date") or ""
+                sla_status = sla.get("status") or ""
+            except Exception:
+                deadline = ""
+            sla_lookups += 1
+        if not deadline:
+            deadline = (
+                first_present(official_shipment, ["lead_time.estimated_handling_limit.date", "shipping_option.estimated_handling_limit.date"])
+                or first_present(shipping, ["estimated_handling_limit.date", "estimated_handling_limit", "shipping_option.estimated_handling_limit"])
+                or "Aguardando SLA oficial"
+            )
         pending.append(
             {
                 "account": account.get("nickname"),
                 "order_id": order.get("id") or "-",
                 "buyer": first_present(order, ["buyer.nickname", "buyer.first_name"], "Comprador Mercado Livre"),
                 "deadline": deadline,
-                "time_left": "-",
+                "time_left": dispatch_time_left(deadline),
+                "shipment_id": shipment_id or "-",
+                "sla_status": sla_status,
             }
         )
     payload["pending_shipments"] = [item for item in payload.get("pending_shipments", []) if item.get("account") != account.get("nickname")]
-    payload["pending_shipments"].extend(pending[:30])
+    payload["pending_shipments"].extend(pending[:200])
     return pending
 
 
@@ -2686,6 +3087,7 @@ def sync_official_account(payload, account_id, limit=None):
                 competition = competition_snapshot(existing_by_id.get(item_id, {}))
             row = synced_catalog_item(account, item, competition)
             previous = existing_by_id.get(item_id, {})
+            preserve_shipping_cost_snapshot(row, previous)
             row["first_seen_at"] = previous.get("first_seen_at") or now_label()
             imported.append(row)
 
@@ -2798,9 +3200,10 @@ def refresh_official_account_items(payload, account, batch_size=None):
         if request_delay:
             time.sleep(request_delay)
 
+    reclassify_internal_competition(payload)
     alerts_created = 0
     existing_alert_ids = {alert.get("id") for alert in payload.get("alerts", [])}
-    for item in competition_selected:
+    for item in selected:
         before = prior_by_id.get(item.get("id")) or {}
         if int(before.get("stock") or 0) > 0 and int(item.get("stock") or 0) == 0:
             alert_id = f"stock-{account.get('id')}-{item.get('id')}-{now_label()[:10]}"
@@ -2810,9 +3213,14 @@ def refresh_official_account_items(payload, account, batch_size=None):
                 notify_alert(payload, alert)
                 alerts_created += 1
                 existing_alert_ids.add(alert_id)
-    for item in selected:
+    for item in competition_selected:
         before = prior_by_id.get(item.get("id")) or {}
-        if before and before.get("status") != item.get("status") and item.get("status") == "losing":
+        if (
+            before
+            and before.get("status") != item.get("status")
+            and item.get("status") == "losing"
+            and not item.get("internal_competition")
+        ):
             alert_id = f"catalog-{account.get('id')}-{item.get('id')}-{now_label()[:10]}"
             existing_ids = {alert.get("id") for alert in payload.get("alerts", [])}
             if alert_id not in existing_ids:
@@ -2832,12 +3240,14 @@ def refresh_official_account_items(payload, account, batch_size=None):
                 notify_alert(payload, alert)
                 alerts_created += 1
 
+    shipping_quotes = refresh_account_shipping_costs(payload, account)
     account["auto_refresh_status"] = (
         f"Atualização automática OK: {refreshed}/{len(rows)} anúncios revisados; "
-        f"{competition_checked} disputas de catálogo recalculadas"
+        f"{competition_checked} disputas de catálogo recalculadas; "
+        f"{len(shipping_quotes)} cotações de frete atualizadas"
     )
     account["last_auto_refresh_at"] = now_label()
-    return {"items": refreshed, "total": len(rows), "alerts": alerts_created}
+    return {"items": refreshed, "total": len(rows), "alerts": alerts_created, "shipping_quotes": len(shipping_quotes)}
 
 
 def enqueue_official_sync(account_id, limit=None, reason="manual"):
@@ -3228,6 +3638,50 @@ def normalize_clone_identifier_codes(value):
     return codes
 
 
+def item_gtin_update_fragment(client, item_id, raw_codes):
+    codes = normalize_clone_identifier_codes(raw_codes)
+    if not codes:
+        raise RuntimeError("Informe um EAN, UPC ou GTIN válido para atualizar o anúncio.")
+    source_item = enrich_clone_source_item(client, clone_source_item(client, item_id))
+    variations = source_item.get("variations") or []
+    if variations:
+        if len(codes) != len(variations):
+            raise RuntimeError(
+                f"Este anúncio possui {len(variations)} variações. Informe exatamente {len(variations)} códigos, um por variação, separados por vírgula."
+            )
+        rows = []
+        for variation, code in zip(variations, codes):
+            variation_id = variation.get("id")
+            if variation_id in (None, ""):
+                raise RuntimeError("O Mercado Livre não retornou o ID de uma das variações; sincronize o anúncio e tente novamente.")
+            attributes = [
+                row
+                for attribute in variation.get("attributes") or []
+                if str(attribute.get("id") or "").upper() not in GTIN_IDENTIFIER_ATTRS
+                if (row := clone_attribute_row(attribute))
+            ]
+            attributes.append({"id": "GTIN", "value_name": code})
+            rows.append({"id": variation_id, "attributes": attributes})
+        return {"variations": rows}, codes
+    if len(codes) != 1:
+        raise RuntimeError("Este anúncio não possui variações. Informe somente um código EAN, UPC ou GTIN.")
+    return {"attributes": [{"id": "GTIN", "value_name": codes[0]}]}, codes
+
+
+def verify_gtin_update(client, item_id, expected_codes, attempts=4):
+    last_item = {}
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(min(2.0, 0.35 * attempt))
+        last_item = enrich_clone_source_item(client, clone_source_item(client, item_id))
+        current_codes = normalize_clone_identifier_codes(",".join(source_clone_identifiers(last_item, {})))
+        if current_codes == expected_codes:
+            return last_item
+    raise RuntimeError(
+        "O Mercado Livre recebeu a atualização, mas não confirmou o EAN/UPC/GTIN na leitura de verificação. Nenhuma confirmação local foi gravada."
+    )
+
+
 def remove_clone_product_identifiers(attributes):
     return [
         attribute
@@ -3475,7 +3929,7 @@ def build_clone_item_payload(source_item, edits):
 
 
 def apply_target_account_clone_rules(create_payload, source_item, source_account, target_account):
-    source_seller_id = str(source_account.get("seller_id") or "")
+    source_seller_id = str(first_present(source_item, ["seller_id", "seller.id"], "") or source_account.get("seller_id") or "")
     target_seller_id = str(target_account.get("seller_id") or "")
     same_seller = bool(source_seller_id and target_seller_id and source_seller_id == target_seller_id)
     if same_seller and source_item.get("official_store_id") not in (None, "", [], {}):
@@ -3483,6 +3937,21 @@ def apply_target_account_clone_rules(create_payload, source_item, source_account
     else:
         create_payload.pop("official_store_id", None)
     return create_payload
+
+
+def strip_official_store_clone_fields(value):
+    removed = False
+    if isinstance(value, dict):
+        for key in list(value):
+            if str(key).lower() in {"official_store_id", "official_store", "official_store_name"}:
+                value.pop(key, None)
+                removed = True
+                continue
+            removed = strip_official_store_clone_fields(value.get(key)) or removed
+    elif isinstance(value, list):
+        for row in value:
+            removed = strip_official_store_clone_fields(row) or removed
+    return removed
 
 
 def required_fields_from_error(exc):
@@ -4229,7 +4698,7 @@ def friendly_clone_error(exc):
     return " ".join(dict.fromkeys(messages)) or str(exc)
 
 
-def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id="", category_attributes=None):
+def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id="", category_attributes=None, cross_account=False):
     payload = json.loads(json.dumps(create_payload, ensure_ascii=False))
     sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [])
     payload = clone_payload_from_answers(payload, sanitize_clone_answers(answers or {}, category_attributes or []))
@@ -4243,6 +4712,8 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
     max_rate_limit_attempts = max(0, int(os.getenv("MELI_CLONE_RATE_LIMIT_RETRIES", "3")))
     while validation_attempts < 5:
         try:
+            if cross_account and strip_official_store_clone_fields(payload):
+                adjustments.append({"tipo": "vinculo_loja_oficial_origem_removido", "campos": ["official_store_id"]})
             created = target_client.create_item(payload)
             if adjustments and isinstance(created, dict):
                 created["_clone_adjustments"] = adjustments
@@ -4287,6 +4758,9 @@ def create_official_clone(payload, job, source_item_id, edits):
     source_client = account_client(source_account)
     target_client = account_client(target_account)
     source_item = enrich_clone_source_item(source_client, clone_source_item(source_client, source_item_id))
+    source_seller_id = str(first_present(source_item, ["seller_id", "seller.id"], "") or source_account.get("seller_id") or "")
+    target_seller_id = str(target_account.get("seller_id") or "")
+    cross_account = bool(source_seller_id and target_seller_id and source_seller_id != target_seller_id)
     create_payload = build_clone_item_payload(source_item, edits)
     try:
         category_attributes = cached_category_attributes(source_client, source_item.get("category_id"))
@@ -4306,6 +4780,7 @@ def create_official_clone(payload, job, source_item_id, edits):
         answers,
         source_item_id,
         category_attributes,
+        cross_account,
     )
     verified_item = {}
     if created.get("id"):
@@ -4512,13 +4987,24 @@ def flex_hint_from_payload(value):
     candidates = [
         value.get("logistic_type"),
         value.get("shipping_logistic_type"),
+        first_present(value, ["logistic.type", "logistic_type"], ""),
         shipping.get("logistic_type"),
-        first_present(value, ["shipping_option.logistic_type", "shipping_option.shipping_method.logistic_type"], ""),
+        first_present(
+            value,
+            [
+                "shipping_option.logistic_type",
+                "shipping_option.logistic.type",
+                "shipping_option.shipping_method.logistic_type",
+                "shipping_option.shipping_method.logistic.type",
+            ],
+            "",
+        ),
     ]
-    tags = [str(tag).lower() for tag in value.get("tags") or []]
-    if any(str(candidate or "").lower() == "self_service" for candidate in candidates) or "self_service" in tags:
+    tags = {str(tag).strip().lower() for tag in value.get("tags") or [] if str(tag).strip()}
+    normalized_candidates = {str(candidate or "").strip().lower() for candidate in candidates if str(candidate or "").strip()}
+    if "self_service" in normalized_candidates or tags.intersection({"self_service", "self_service_in"}):
         return True
-    if any(clean_attribute_value(candidate) for candidate in candidates):
+    if normalized_candidates or tags.intersection({"self_service_out", "self_service_available"}):
         return False
     return None
 
@@ -4528,31 +5014,35 @@ def order_is_flex(client, order, catalog_by_id, shipment_cache, lookup_state):
     if hint is not None:
         return hint
     shipment_id = shipment_id_from_order(order)
-    maximum_lookups = max(0, int(os.getenv("MELI_STATISTICS_SHIPMENT_LOOKUPS", "300")))
+    maximum_lookups = max(0, int(lookup_state.get("maximum", os.getenv("MELI_STATISTICS_SHIPMENT_LOOKUPS", "500"))))
     if shipment_id not in (None, "", 0, "0"):
         cache_key = str(shipment_id)
         if cache_key in shipment_cache:
-            shipment = shipment_cache[cache_key]
+            return shipment_cache[cache_key]
+        cache_ttl = max(300, int(os.getenv("MELI_STATISTICS_SHIPMENT_CACHE_SECONDS", "86400")))
+        now = time.monotonic()
+        with SHIPMENT_MODE_CACHE_LOCK:
+            cached = SHIPMENT_MODE_CACHE.get(cache_key)
+        if cached and now - cached.get("time", 0) < cache_ttl:
+            shipment_cache[cache_key] = cached.get("flex")
+            return cached.get("flex")
         elif lookup_state["count"] < maximum_lookups:
             lookup_state["count"] += 1
             try:
                 shipment = client.shipment(shipment_id)
             except Exception:
                 shipment = {}
-            shipment_cache[cache_key] = shipment
-        else:
-            shipment = {}
-        hint = flex_hint_from_payload(shipment)
-        if hint is not None:
+            hint = flex_hint_from_payload(shipment)
+            shipment_cache[cache_key] = hint
+            with SHIPMENT_MODE_CACHE_LOCK:
+                SHIPMENT_MODE_CACHE[cache_key] = {"time": now, "flex": hint}
             return hint
-    item_hints = []
-    for order_item in order.get("order_items") or []:
-        item_id = str((order_item.get("item") or {}).get("id") or "")
-        current_item = catalog_by_id.get(item_id) or {}
-        logistic_type = str(current_item.get("shipping_logistic_type") or "").lower()
-        if logistic_type:
-            item_hints.append(logistic_type == "self_service")
-    return any(item_hints) if item_hints else False
+        else:
+            shipment_cache[cache_key] = None
+    # Never infer a historical order from the listing's current Flex state. A
+    # listing can enter or leave Flex after the sale, which previously inflated
+    # broad-period Flex statistics.
+    return None
 
 
 def order_item_sku(order_item, catalog_item):
@@ -4566,7 +5056,7 @@ def order_item_sku(order_item, catalog_item):
     return next((clean_attribute_value(value) for value in candidates if clean_attribute_value(value)), "")
 
 
-def aggregate_sku_statistics(account_orders, catalog):
+def aggregate_sku_statistics(account_orders, catalog, maximum_shipment_lookups=None):
     catalog_by_id = {str(item.get("id")): item for item in catalog or [] if item.get("id")}
     aggregates = {}
     ignored_statuses = {"cancelled", "canceled", "invalid"}
@@ -4575,7 +5065,17 @@ def aggregate_sku_statistics(account_orders, catalog):
     for account, client, orders, account_truncated in account_orders:
         truncated = truncated or account_truncated
         shipment_cache = {}
-        lookup_state = {"count": 0}
+        lookup_state = {
+            "count": 0,
+            "maximum": max(
+                0,
+                int(
+                    maximum_shipment_lookups
+                    if maximum_shipment_lookups is not None
+                    else os.getenv("MELI_STATISTICS_SHIPMENT_LOOKUPS", "500")
+                ),
+            ),
+        }
         for order in orders:
             if str(order.get("status") or "").lower() in ignored_statuses:
                 continue
@@ -4602,14 +5102,17 @@ def aggregate_sku_statistics(account_orders, catalog):
                         "units": 0,
                         "flex_units": 0,
                         "non_flex_units": 0,
+                        "unknown_units": 0,
                         "revenue": 0.0,
                         "flex_revenue": 0.0,
                         "non_flex_revenue": 0.0,
+                        "unknown_revenue": 0.0,
                         "accounts": set(),
                         "item_ids": set(),
                         "order_ids": set(),
                         "flex_order_ids": set(),
                         "non_flex_order_ids": set(),
+                        "unknown_order_ids": set(),
                     },
                 )
                 unit_price = order_item.get("unit_price") or order_item.get("full_unit_price") or 0
@@ -4623,17 +5126,18 @@ def aggregate_sku_statistics(account_orders, catalog):
                 if item_id:
                     row["item_ids"].add(item_id)
                 row["order_ids"].add(order_id)
-                if flex:
+                if flex is True:
                     row["flex_units"] += quantity
                     row["flex_revenue"] += line_total
                     row["flex_order_ids"].add(order_id)
-                else:
+                elif flex is False:
                     row["non_flex_units"] += quantity
                     row["non_flex_revenue"] += line_total
                     row["non_flex_order_ids"].add(order_id)
-        shipment_lookup_limit = max(0, int(os.getenv("MELI_STATISTICS_SHIPMENT_LOOKUPS", "300")))
-        if shipment_lookup_limit and lookup_state["count"] >= shipment_lookup_limit:
-            warnings.append(f"O limite de conferências de Envios Flex foi atingido para {account.get('nickname') or 'uma conta'}.")
+                else:
+                    row["unknown_units"] += quantity
+                    row["unknown_revenue"] += line_total
+                    row["unknown_order_ids"].add(order_id)
     rows = []
     for row in aggregates.values():
         rows.append(
@@ -4642,11 +5146,13 @@ def aggregate_sku_statistics(account_orders, catalog):
                 "revenue": round(row["revenue"], 2),
                 "flex_revenue": round(row["flex_revenue"], 2),
                 "non_flex_revenue": round(row["non_flex_revenue"], 2),
+                "unknown_revenue": round(row["unknown_revenue"], 2),
                 "accounts": sorted(row["accounts"]),
                 "item_ids": sorted(row["item_ids"]),
                 "order_ids": sorted(row["order_ids"]),
                 "flex_order_ids": sorted(row["flex_order_ids"]),
                 "non_flex_order_ids": sorted(row["non_flex_order_ids"]),
+                "unknown_order_ids": sorted(row["unknown_order_ids"]),
             }
         )
     rows.sort(key=lambda row: (-row["units"], -row["revenue"], row["sku"]))
@@ -4656,6 +5162,10 @@ def aggregate_sku_statistics(account_orders, catalog):
 def query_sku_statistics(payload, request):
     start, end, _, _ = statistics_date_window(request.get("date_from"), request.get("date_to"))
     account_filter = str(request.get("account") or "all")
+    requested_flex = str(request.get("flex") or "all")
+    default_lookups = int(os.getenv("MELI_STATISTICS_SHIPMENT_LOOKUPS", "500"))
+    focused_lookups = int(os.getenv("MELI_STATISTICS_FLEX_LOOKUPS", "5000"))
+    maximum_lookups = focused_lookups if requested_flex in {"flex", "non_flex"} else default_lookups
     accounts = [
         account
         for account in payload.get("accounts") or []
@@ -4673,9 +5183,11 @@ def query_sku_statistics(payload, request):
         raise RuntimeError("Nenhuma conta oficial conectada corresponde ao filtro selecionado.")
 
     cache_key = (
+        "flex-tristate-v2",
         tuple(sorted(str(account.get("seller_id") or account.get("id")) for account in accounts)),
         start.isoformat(),
         end.isoformat(),
+        maximum_lookups,
     )
     cache_ttl = max(30, int(os.getenv("MELI_STATISTICS_CACHE_SECONDS", "300")))
     now = time.monotonic()
@@ -4696,7 +5208,12 @@ def query_sku_statistics(payload, request):
                 warnings.append(f"{account.get('nickname')}: {policy_error_message(exc, 'a leitura das vendas do período')}")
         if not account_orders and warnings:
             raise RuntimeError(" ".join(warnings))
-        base = aggregate_sku_statistics(account_orders, payload.get("catalog") or [])
+        base = aggregate_sku_statistics(account_orders, payload.get("catalog") or [], maximum_lookups)
+        unknown_units = sum(row.get("unknown_units") or 0 for row in base.get("rows") or [])
+        if unknown_units:
+            base.setdefault("warnings", []).append(
+                f"{unknown_units} unidade(s) ficaram com a modalidade de envio não confirmada pela remessa histórica e não foram atribuídas ao Flex."
+            )
         base["warnings"] = [*base.get("warnings", []), *warnings]
         with STATISTICS_CACHE_LOCK:
             STATISTICS_CACHE[cache_key] = {"time": now, "result": base}
@@ -4729,6 +5246,7 @@ def query_sku_statistics(payload, request):
         row.pop("order_ids", None)
         row.pop("flex_order_ids", None)
         row.pop("non_flex_order_ids", None)
+        row.pop("unknown_order_ids", None)
         rows.append(row)
     rows.sort(key=lambda row: (-row["units"], -row["revenue"], row["sku"]))
     return {
@@ -4749,6 +5267,7 @@ def query_sku_statistics(payload, request):
                 if flex_filter == "non_flex"
                 else sum(row.get("flex_units") or 0 for row in rows)
             ),
+            "unknown_units": sum(row.get("unknown_units") or 0 for row in rows),
             "revenue": round(sum(row.get("revenue") or 0 for row in rows), 2),
         },
         "warnings": base.get("warnings") or [],
@@ -4756,6 +5275,635 @@ def query_sku_statistics(payload, request):
         "cached": from_cache,
         "generated_at": now_label(),
     }
+
+
+def report_filtered_catalog(payload, report_type, filters):
+    account_filter = str(filters.get("account") or "all")
+    search = normalized_attribute_label(filters.get("search") or filters.get("product") or "")
+    sku_search = normalized_attribute_label(filters.get("sku") or "")
+    code_search = normalized_attribute_label(filters.get("code") or "")
+    status_filter = str(filters.get("status") or "all")
+    ml_status_filter = str(filters.get("ml_status") or "all")
+    stock_filter = str(filters.get("stock") or "all")
+    catalog_filter = str(filters.get("catalog") or "all")
+    flex_filter = str(filters.get("flex") or "all")
+    rows = []
+    for item in payload.get("catalog") or []:
+        if report_type == "catalog" and not is_catalog_listing(item):
+            continue
+        if account_filter != "all" and account_filter not in {
+            str(item.get("account_id") or ""),
+            str(item.get("account") or ""),
+        }:
+            continue
+        if status_filter != "all":
+            if status_filter == "internal" and not item.get("internal_competition"):
+                continue
+            if status_filter != "internal" and item.get("status") != status_filter:
+                continue
+        if ml_status_filter != "all" and item.get("meli_status") != ml_status_filter:
+            continue
+        if stock_filter == "zero" and int(float(item.get("stock") or 0)) != 0:
+            continue
+        if stock_filter == "available" and int(float(item.get("stock") or 0)) <= 0:
+            continue
+        if catalog_filter == "catalog" and not is_catalog_listing(item):
+            continue
+        if catalog_filter == "traditional" and is_catalog_listing(item):
+            continue
+        is_flex = item.get("shipping_logistic_type") == "self_service"
+        if flex_filter == "active" and not is_flex:
+            continue
+        if flex_filter == "inactive" and is_flex:
+            continue
+        haystack = normalized_attribute_label(f"{item.get('title', '')} {item.get('sku', '')} {item.get('id', '')}")
+        if search and search not in haystack:
+            continue
+        if sku_search and sku_search not in normalized_attribute_label(item.get("sku") or ""):
+            continue
+        if code_search and code_search not in normalized_attribute_label(item.get("id") or ""):
+            continue
+        rows.append(item)
+    return rows
+
+
+def report_dataset(payload, report_type, filters):
+    if report_type == "statistics":
+        result = query_sku_statistics(payload, filters)
+        columns = [
+            ("rank", "Posição", "integer"),
+            ("sku", "SKU", "text"),
+            ("product", "Produto", "text"),
+            ("accounts_label", "Contas", "text"),
+            ("units", "Unidades", "integer"),
+            ("orders", "Pedidos", "integer"),
+            ("flex_units", "Flex confirmado", "integer"),
+            ("unknown_units", "Modalidade pendente", "integer"),
+            ("revenue", "Valor dos itens", "currency"),
+        ]
+        rows = []
+        for index, row in enumerate(result.get("rows") or [], 1):
+            rows.append({**row, "rank": index, "accounts_label": ", ".join(row.get("accounts") or [])})
+        title = "Estatísticas de vendas por SKU"
+        metadata = {
+            "Período": f"{result.get('date_from')} a {result.get('date_to')}",
+            "Conta": filters.get("account") or "Todas",
+            "Modalidade": filters.get("flex") or "Todas",
+            "SKU": filters.get("sku") or "Todos",
+        }
+        return title, columns, rows, metadata
+
+    reclassify_internal_competition(payload)
+    rows = report_filtered_catalog(payload, report_type, filters)
+    common = [
+        ("account", "Conta", "text"),
+        ("id", "ID do anúncio", "text"),
+        ("sku", "SKU", "text"),
+        ("title", "Produto", "text"),
+        ("listing_type_label", "Tipo", "text"),
+        ("catalog_mode", "Modalidade", "text"),
+        ("meli_status_label", "Status ML", "text"),
+        ("stock", "Estoque", "integer"),
+        ("price", "Preço", "currency"),
+        ("shipping_cost", "Frete estimado ML", "currency"),
+        ("shipping_cost_status_label", "Situação do frete", "text"),
+        ("shipping_cost_updated_at", "Frete consultado em", "text"),
+    ]
+    if report_type == "catalog":
+        columns = [
+            *common,
+            ("catalog_product_id", "ID do catálogo", "text"),
+            ("status_label", "Situação", "text"),
+            ("winner_name", "Vencedor", "text"),
+            ("winner_price", "Preço vencedor", "currency"),
+            ("price_to_win", "Preço para ganhar", "currency"),
+            ("internal_label", "Entre contas conectadas", "text"),
+            ("competition_checked_at", "Verificado em", "text"),
+        ]
+        title = "Disputa de catálogo"
+    else:
+        columns = [
+            *common,
+            ("gtin", "EAN / UPC / GTIN", "text"),
+            ("flex_label", "Mercado Envios Flex", "text"),
+            ("package_weight", "Peso", "text"),
+            ("package_height", "Altura", "text"),
+            ("package_width", "Largura", "text"),
+            ("package_length", "Comprimento", "text"),
+        ]
+        title = "Anúncios Mercado Livre"
+    normalized_rows = []
+    for item in rows:
+        normalized_rows.append(
+            {
+                **item,
+                "listing_type_label": "Premium" if item.get("listing_type_id") == "gold_pro" else "Clássico" if item.get("listing_type_id") == "gold_special" else item.get("listing_type_id") or "-",
+                "catalog_mode": "Catálogo" if is_catalog_listing(item) else "Tradicional",
+                "meli_status_label": {"active": "Ativo", "paused": "Pausado", "under_review": "Aguardando revisão"}.get(item.get("meli_status"), item.get("meli_status") or "-"),
+                "status_label": "Entre suas contas" if item.get("internal_competition") else {"winning": "Ganhando", "losing": "Perdendo", "sharing": "Compartilhando", "paused": "Pausado"}.get(item.get("status"), item.get("status") or "-"),
+                "internal_label": "Sim" if item.get("internal_competition") else "Não",
+                "flex_label": "Ativo" if item.get("shipping_logistic_type") == "self_service" else "Inativo",
+                "shipping_cost_status_label": {
+                    "ok": "Cotação oficial",
+                    "not_available": "Não informado pela API",
+                    "error": "Erro na consulta",
+                }.get(item.get("shipping_cost_status"), "Aguardando cotação"),
+            }
+        )
+    metadata = {
+        "Conta": filters.get("account") or "Todas",
+        "Busca": filters.get("search") or filters.get("product") or "Todos",
+        "Status": filters.get("status") or filters.get("ml_status") or "Todos",
+        "Gerado em": now_label(),
+    }
+    return title, columns, normalized_rows, metadata
+
+
+def build_report_xlsx(title, columns, rows, metadata):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "RELATORIO"
+    sheet.append([label for _, label, _ in columns])
+    header_fill = PatternFill("solid", fgColor="FFD600")
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = Font(bold=True, color="111827")
+        cell.alignment = Alignment(vertical="center")
+    for row in rows:
+        sheet.append([row.get(key, "") if row.get(key, "") is not None else "" for key, _, _ in columns])
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    for column_index, (key, label, kind) in enumerate(columns, 1):
+        max_length = len(label)
+        for row_index in range(2, sheet.max_row + 1):
+            cell = sheet.cell(row=row_index, column=column_index)
+            max_length = max(max_length, len(str(cell.value or "")))
+            if kind == "currency" and cell.value not in (None, ""):
+                cell.number_format = 'R$ #,##0.00'
+            elif kind == "integer" and cell.value not in (None, ""):
+                cell.number_format = '#,##0'
+        sheet.column_dimensions[sheet.cell(row=1, column=column_index).column_letter].width = min(max(max_length + 2, 12), 46)
+    info = workbook.create_sheet("FILTROS")
+    info.append([title])
+    info["A1"].font = Font(size=16, bold=True)
+    info.append(["Filtro", "Valor"])
+    for key, value in metadata.items():
+        info.append([key, value])
+    info.column_dimensions["A"].width = 28
+    info.column_dimensions["B"].width = 65
+    stream = BytesIO()
+    workbook.save(stream)
+    return stream.getvalue()
+
+
+def build_report_pdf(title, columns, rows, metadata):
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A3, A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    stream = BytesIO()
+    page_size = landscape(A3 if len(columns) > 14 else A4)
+    document = SimpleDocTemplate(
+        stream,
+        pagesize=page_size,
+        leftMargin=9 * mm,
+        rightMargin=9 * mm,
+        topMargin=9 * mm,
+        bottomMargin=9 * mm,
+        title=title,
+    )
+    styles = getSampleStyleSheet()
+    cell_style = ParagraphStyle("report-cell", parent=styles["BodyText"], fontName="Helvetica", fontSize=6.2, leading=7.3, alignment=TA_LEFT)
+    header_style = ParagraphStyle("report-header", parent=cell_style, fontName="Helvetica-Bold", textColor=colors.HexColor("#111827"))
+    story = [Paragraph(html.escape(title), styles["Title"])]
+    story.append(Paragraph(" · ".join(f"<b>{html.escape(str(key))}:</b> {html.escape(str(value))}" for key, value in metadata.items()), styles["BodyText"]))
+    story.append(Spacer(1, 5 * mm))
+    table_rows = [[Paragraph(html.escape(label), header_style) for _, label, _ in columns]]
+    for row in rows[:5000]:
+        values = []
+        for key, _, kind in columns:
+            value = row.get(key, "")
+            if kind == "currency" and value not in (None, ""):
+                value = brl(value)
+            values.append(Paragraph(html.escape(str(value if value not in (None, "") else "-")), cell_style))
+        table_rows.append(values)
+    available_width = page_size[0] - 18 * mm
+    weights = []
+    for key, _, kind in columns:
+        weights.append(2.4 if key in {"title", "product"} else 1.7 if key in {"winner_name", "accounts_label"} else 1.0)
+    total_weight = sum(weights)
+    widths = [available_width * weight / total_weight for weight in weights]
+    table = Table(table_rows, colWidths=widths, repeatRows=1, hAlign="LEFT")
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#FFD600")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#9CA3AF")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3F4F6")]),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]
+        )
+    )
+    story.append(table)
+    document.build(story)
+    return stream.getvalue()
+
+
+BULK_SHEET_HEADERS = [
+    "AÇÃO",
+    "CONTA",
+    "ID_ANÚNCIO",
+    "SKU",
+    "TÍTULO",
+    "PREÇO",
+    "ESTOQUE",
+    "STATUS",
+    "EAN_UPC_GTIN",
+    "ME_FLEX",
+    "PESO_KG",
+    "ALTURA_CM",
+    "LARGURA_CM",
+    "COMPRIMENTO_CM",
+]
+
+
+def spreadsheet_number(value, field_name):
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("R$", "").replace(" ", "")
+    if "," in text:
+        text = text.replace(".", "").replace(",", ".")
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise RuntimeError(f"{field_name}: informe um número válido.") from exc
+
+
+def measure_sheet_value(value):
+    if clean_attribute_value(value) in ("", "-"):
+        return ""
+    parsed = parse_decimal_number(value)
+    return parsed if parsed else ""
+
+
+def build_bulk_spreadsheet(payload, filters):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill, Protection
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    rows = report_filtered_catalog(payload, "ads", filters)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "ANUNCIOS"
+    sheet.append(BULK_SHEET_HEADERS)
+    for cell in sheet[1]:
+        cell.fill = PatternFill("solid", fgColor="FFD600")
+        cell.font = Font(bold=True, color="111827")
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+        cell.protection = Protection(locked=True)
+    for item in rows:
+        sheet.append(
+            [
+                "",
+                item.get("account") or "",
+                item.get("id") or "",
+                item.get("sku") or "",
+                item.get("title") or "",
+                item.get("price") or 0,
+                item.get("stock") or 0,
+                {"active": "ATIVO", "paused": "PAUSADO", "under_review": "EM_REVISÃO"}.get(item.get("meli_status"), item.get("meli_status") or ""),
+                item.get("gtin") or "",
+                "ATIVO" if item.get("shipping_logistic_type") == "self_service" else "INATIVO",
+                measure_sheet_value(item.get("package_weight")),
+                measure_sheet_value(item.get("package_height")),
+                measure_sheet_value(item.get("package_width")),
+                measure_sheet_value(item.get("package_length")),
+            ]
+        )
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    sheet.column_dimensions["A"].width = 14
+    sheet.column_dimensions["B"].width = 24
+    sheet.column_dimensions["C"].width = 18
+    sheet.column_dimensions["D"].width = 22
+    sheet.column_dimensions["E"].width = 58
+    for letter in "FGHIJKLMN":
+        sheet.column_dimensions[letter].width = 18
+    for row_index in range(2, sheet.max_row + 1):
+        sheet.cell(row_index, 3).number_format = "@"
+        sheet.cell(row_index, 4).number_format = "@"
+        sheet.cell(row_index, 9).number_format = "@"
+        sheet.cell(row_index, 6).number_format = 'R$ #,##0.00'
+        sheet.cell(row_index, 7).number_format = '#,##0'
+    action_validation = DataValidation(type="list", formula1='"ATUALIZAR"', allow_blank=True)
+    status_validation = DataValidation(type="list", formula1='"ATIVO,PAUSADO"', allow_blank=True)
+    flex_validation = DataValidation(type="list", formula1='"ATIVO,INATIVO"', allow_blank=True)
+    sheet.add_data_validation(action_validation)
+    sheet.add_data_validation(status_validation)
+    sheet.add_data_validation(flex_validation)
+    if sheet.max_row >= 2:
+        action_validation.add(f"A2:A{sheet.max_row}")
+        status_validation.add(f"H2:H{sheet.max_row}")
+        flex_validation.add(f"J2:J{sheet.max_row}")
+    instructions = workbook.create_sheet("INSTRUCOES")
+    instructions.append(["Edição em massa CompeTIDOR / Mercado Livre"])
+    instructions["A1"].font = Font(size=16, bold=True)
+    instructions.append(["1", "Edite somente os valores necessários e escreva ATUALIZAR na coluna A da linha."])
+    instructions.append(["2", "Não altere nomes, ordem ou quantidade das colunas."])
+    instructions.append(["3", "Preço usa reais; medidas usam kg e cm. Ponto e vírgula decimal são aceitos."])
+    instructions.append(["4", "Para anúncio com variações, separe os códigos EAN/UPC/GTIN por vírgula, na ordem das variações."])
+    instructions.append(["5", "Importe a planilha no CompeTIDOR, confira a prévia e só então aplique as alterações."])
+    instructions.column_dimensions["A"].width = 8
+    instructions.column_dimensions["B"].width = 110
+    stream = BytesIO()
+    workbook.save(stream)
+    return stream.getvalue()
+
+
+def parse_bulk_spreadsheet(payload, encoded_file, actor):
+    from openpyxl import load_workbook
+
+    try:
+        raw = base64.b64decode(encoded_file, validate=True)
+    except Exception as exc:
+        raise RuntimeError("O arquivo enviado não é uma planilha válida.") from exc
+    if len(raw) > 20 * 1024 * 1024:
+        raise RuntimeError("A planilha excede o limite de 20 MB.")
+    try:
+        workbook = load_workbook(BytesIO(raw), read_only=True, data_only=True)
+        sheet = workbook["ANUNCIOS"]
+    except Exception as exc:
+        raise RuntimeError("Use a planilha XLSX gerada pelo CompeTIDOR e preserve a aba ANUNCIOS.") from exc
+    headers = [clean_attribute_value(cell.value) for cell in sheet[1]]
+    if headers != BULK_SHEET_HEADERS:
+        raise RuntimeError("Os cabeçalhos ou a ordem das colunas foram alterados. Baixe uma nova planilha e mantenha a primeira linha intacta.")
+    catalog_by_id = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
+    accounts = payload.get("accounts") or []
+    changes = []
+    errors = []
+    maximum_rows = max(1, int(os.getenv("MELI_SPREADSHEET_MAX_ROWS", "10000")))
+    for row_index, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2):
+        if row_index > maximum_rows + 1:
+            errors.append({"row": row_index, "error": f"A planilha ultrapassou o limite de {maximum_rows} anúncios."})
+            break
+        row = dict(zip(BULK_SHEET_HEADERS, values))
+        if normalized_attribute_label(row.get("AÇÃO")) != "atualizar":
+            continue
+        item_id = clean_attribute_value(row.get("ID_ANÚNCIO"))
+        item = catalog_by_id.get(item_id)
+        if not item:
+            errors.append({"row": row_index, "item_id": item_id, "error": "Anúncio não encontrado entre as contas conectadas."})
+            continue
+        account = next(
+            (
+                account
+                for account in accounts
+                if account.get("id") == item.get("account_id")
+                or normalized_account_name(account.get("nickname")) == normalized_account_name(row.get("CONTA"))
+            ),
+            None,
+        )
+        if not account or not account.get("official") or not account.get("access_token"):
+            errors.append({"row": row_index, "item_id": item_id, "error": "Conta oficial do anúncio não está conectada."})
+            continue
+        try:
+            change = {
+                "item_id": item_id,
+                "account_id": account.get("id"),
+                "account": account.get("nickname"),
+                "row": row_index,
+            }
+            price = spreadsheet_number(row.get("PREÇO"), "Preço")
+            stock = spreadsheet_number(row.get("ESTOQUE"), "Estoque")
+            if price is not None and abs(price - float(item.get("price") or 0)) > 0.0001:
+                change["price"] = price
+            if stock is not None and int(stock) != int(float(item.get("stock") or 0)):
+                change["available_quantity"] = int(stock)
+            title = clean_attribute_value(row.get("TÍTULO"))
+            if title and title != clean_attribute_value(item.get("title")):
+                change["title"] = title[:60]
+            status = normalized_attribute_label(row.get("STATUS"))
+            status_value = {"ativo": "active", "pausado": "paused"}.get(status)
+            if status_value and status_value != item.get("meli_status"):
+                change["status_action"] = "activate" if status_value == "active" else "pause"
+            gtin = clean_attribute_value(row.get("EAN_UPC_GTIN"))
+            if gtin and gtin != clean_attribute_value(item.get("gtin")):
+                normalize_clone_identifier_codes(gtin)
+                change["gtin"] = gtin
+            flex = normalized_attribute_label(row.get("ME_FLEX"))
+            current_flex = item.get("shipping_logistic_type") == "self_service"
+            if flex in {"ativo", "inativo"} and (flex == "ativo") != current_flex:
+                change["flex_action"] = "activate" if flex == "ativo" else "remove"
+            for sheet_key, request_key in (
+                ("PESO_KG", "package_weight"),
+                ("ALTURA_CM", "package_height"),
+                ("LARGURA_CM", "package_width"),
+                ("COMPRIMENTO_CM", "package_length"),
+            ):
+                value = spreadsheet_number(row.get(sheet_key), sheet_key)
+                if value is None:
+                    continue
+                unit = "kg" if request_key == "package_weight" else "cm"
+                current = parse_decimal_number(item.get(request_key))
+                if abs(value - current) > 0.0001:
+                    change[request_key] = f"{value:g} {unit}"
+            editable = {key: value for key, value in change.items() if key not in {"item_id", "account_id", "account", "row"}}
+            if editable:
+                change["changes"] = editable
+                changes.append(change)
+        except Exception as exc:
+            errors.append({"row": row_index, "item_id": item_id, "error": str(exc)})
+    token = secrets.token_urlsafe(24)
+    with SPREADSHEET_JOBS_LOCK:
+        SPREADSHEET_JOBS[token] = {
+            "created": time.monotonic(),
+            "user_id": (actor or {}).get("id"),
+            "changes": changes,
+            "errors": errors,
+        }
+        expired = [key for key, value in SPREADSHEET_JOBS.items() if time.monotonic() - value.get("created", 0) > 1800]
+        for key in expired:
+            SPREADSHEET_JOBS.pop(key, None)
+    return {"token": token, "changes": changes, "errors": errors, "ready": len(changes), "invalid": len(errors)}
+
+
+def apply_spreadsheet_change(payload, row, actor):
+    item_id = row.get("item_id")
+    account = official_account_by_name(payload, row.get("account_id") or row.get("account"))
+    item = next((entry for entry in payload.get("catalog") or [] if entry.get("id") == item_id), None)
+    if not account or not item:
+        raise RuntimeError("Conta ou anúncio não encontrado no momento da aplicação.")
+    changes = row.get("changes") or {}
+    client = account_client(account)
+    update = {}
+    for key in ("price", "available_quantity", "title"):
+        if key in changes:
+            update[key] = changes[key]
+    if changes.get("status_action") == "pause":
+        update["status"] = "paused"
+    elif changes.get("status_action") == "activate":
+        update["status"] = "active"
+    dimension_map = {
+        "package_weight": "SELLER_PACKAGE_WEIGHT",
+        "package_height": "SELLER_PACKAGE_HEIGHT",
+        "package_width": "SELLER_PACKAGE_WIDTH",
+        "package_length": "SELLER_PACKAGE_LENGTH",
+    }
+    attributes = []
+    expected_package = {}
+    for request_key, attr_id in dimension_map.items():
+        if changes.get(request_key):
+            api_value = seller_package_api_value(request_key, changes[request_key])
+            expected_package[request_key] = api_value
+            attributes.append({"id": attr_id, "value_name": api_value})
+    expected_gtin = []
+    if changes.get("gtin"):
+        fragment, expected_gtin = item_gtin_update_fragment(client, item_id, changes["gtin"])
+        attributes.extend(fragment.get("attributes") or [])
+        if fragment.get("variations"):
+            update["variations"] = fragment["variations"]
+    if attributes:
+        update["attributes"] = attributes
+    if changes.get("flex_action"):
+        update["shipping"] = {
+            "mode": item.get("shipping_mode") or "me2",
+            "logistic_type": "self_service" if changes["flex_action"] == "activate" else "drop_off",
+        }
+    if not update:
+        return {"item_id": item_id, "status": "ignored"}
+    client.update_item(item_id, update)
+    verified = verify_package_update(client, item_id, expected_package) if expected_package else {}
+    if expected_gtin:
+        verified = verify_gtin_update(client, item_id, expected_gtin)
+    local_changes = {}
+    for key, local_key in (("price", "price"), ("available_quantity", "stock"), ("title", "title")):
+        if key in update:
+            local_changes[local_key] = {"from": item.get(local_key), "to": update[key]}
+            item[local_key] = update[key]
+    package_values = package_values_from_item(verified) if verified else {}
+    for request_key in dimension_map:
+        if request_key in changes:
+            value = package_values.get(request_key) or changes[request_key]
+            local_changes[request_key] = {"from": item.get(request_key), "to": value}
+            item[request_key] = value
+    if expected_gtin:
+        value = ", ".join(expected_gtin)
+        local_changes["gtin"] = {"from": item.get("gtin"), "to": value}
+        item["gtin"] = value
+    if update.get("status"):
+        local_changes["status"] = {"from": item.get("meli_status"), "to": update["status"]}
+        item["meli_status"] = update["status"]
+        item["status"] = "paused" if update["status"] == "paused" else ("sharing" if is_catalog_listing(item) else "winning")
+    if update.get("shipping"):
+        local_changes["shipping_logistic_type"] = {"from": item.get("shipping_logistic_type"), "to": update["shipping"]["logistic_type"]}
+        item["shipping_logistic_type"] = update["shipping"]["logistic_type"]
+    item["updated_at"] = now_label()
+    append_item_log(payload, item, actor, "Atualização por planilha", local_changes)
+    return {"item_id": item_id, "status": "updated", "changes": list(local_changes)}
+
+
+def execute_clone_job(payload, job, incoming_answers=None):
+    incoming_answers = incoming_answers or {}
+    if isinstance(incoming_answers, dict) and incoming_answers:
+        saved_answers = job.setdefault("field_answers", {})
+        for item_id, answers in incoming_answers.items():
+            if isinstance(answers, dict):
+                saved_answers.setdefault(item_id, {}).update(
+                    {key: value for key, value in answers.items() if value not in (None, "")}
+                )
+    catalog = payload.setdefault("catalog", [])
+    existing_ids = {item.get("id") for item in catalog if item.get("id")}
+    copied = []
+    errors = []
+    created_details = []
+    edits = job.get("edits") or {}
+    for item_id in job.get("item_ids", []):
+        source_item = next((item for item in catalog if item.get("id") == item_id), None)
+        if not source_item:
+            errors.append({"item_id": item_id, "error": "O anúncio de origem não foi encontrado na base sincronizada."})
+            continue
+        try:
+            created, official_source, verified_item = create_official_clone(payload, job, item_id, edits)
+        except Exception as exc:
+            pending_fields = getattr(exc, "pending_fields", [])
+            if pending_fields:
+                errors.append(
+                    {
+                        "item_id": item_id,
+                        "error": str(exc),
+                        "pending_fields": pending_fields,
+                        "original_error": getattr(exc, "original_error", ""),
+                    }
+                )
+            else:
+                errors.append({"item_id": item_id, "error": friendly_clone_error(exc)})
+            continue
+        new_id = created.get("id") or f"COPY-{uuid.uuid4().hex[:6].upper()}"
+        if new_id in existing_ids:
+            continue
+        existing_ids.add(new_id)
+        target_account = official_account_by_name(payload, job.get("target_account_id") or job.get("target")) or {}
+        official_sku = item_sku(official_source)
+        source_sku = official_sku if official_sku and official_sku != "-" else source_item.get("sku") or source_item.get("id") or "SEM-SKU"
+        official_created_item = {**official_source, **created, **verified_item}
+        new_item = synced_catalog_item(target_account, official_created_item)
+        display_sku = item_sku(official_created_item) or f"{source_sku}{edits.get('sku_suffix') or ''}"
+        new_item.update(
+            {
+                "id": new_id,
+                "account": job.get("target"),
+                "account_id": target_account.get("id"),
+                "sku": display_sku,
+                "price": official_created_item.get("price") or float(edits.get("price") or source_item.get("price") or 0),
+                "stock": item_available_quantity(official_created_item) or int(float(edits.get("stock") or item_available_quantity(official_source) or source_item.get("stock") or 0)),
+                "status": "sharing",
+                "share": 0,
+                "clone_source_item_id": item_id,
+                "description_override": edits.get("description", ""),
+                "permalink": official_created_item.get("permalink") or created.get("permalink") or "",
+                "meli_status": official_created_item.get("status") or created.get("status") or new_item.get("meli_status"),
+                "verification_warning": created.get("_verification_warning", ""),
+                "action": f"Anúncio criado oficialmente no Mercado Livre a partir de {source_item.get('id')}. Novo código: {new_id}.",
+            }
+        )
+        catalog.append(new_item)
+        copied.append(new_item)
+        created_details.append(
+            {
+                "source_item_id": item_id,
+                "item_id": new_id,
+                "title": new_item.get("title"),
+                "sku": new_item.get("sku"),
+                "status": new_item.get("meli_status") or "-",
+                "permalink": new_item.get("permalink") or "",
+                "verification_warning": new_item.get("verification_warning") or "",
+            }
+        )
+    has_pending = any(row.get("pending_fields") for row in errors)
+    job["validation_version"] = 3
+    job["status"] = "copied" if copied and not errors else "review_required" if has_pending else "partial_error" if copied else "error"
+    job["copied_items"] = [item.get("id") for item in copied]
+    job["created_details"] = created_details
+    job["errors"] = errors
+    created_codes = ", ".join(item.get("item_id") for item in created_details if item.get("item_id"))
+    job["note"] = f"{len(copied)} anúncio(s) criado(s) oficialmente no Mercado Livre para {job.get('target')}."
+    if created_codes:
+        job["note"] += f" Códigos criados: {created_codes}."
+    if errors:
+        job["note"] += f" {len(errors)} anúncio(s) precisam de atenção; veja os detalhes abaixo."
+    return copied
 
 
 class App(BaseHTTPRequestHandler):
@@ -4769,6 +5917,15 @@ class App(BaseHTTPRequestHandler):
         self.send_security_headers()
         for key, value in (headers or {}).items():
             self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_bytes(self, body, content_type, filename, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -4938,6 +6095,7 @@ class App(BaseHTTPRequestHandler):
             self.send_json(public_payload(payload, self.current_user(payload), include_catalog=False))
             return
         if parsed.path == "/api/catalog":
+            reclassify_internal_competition(payload)
             catalog = payload.get("catalog", [])
             self.send_json(
                 {
@@ -5111,6 +6269,10 @@ class App(BaseHTTPRequestHandler):
         if not self.validate_same_origin():
             return
         length = int(self.headers.get("Content-Length", 0))
+        maximum_body = max(1024 * 1024, int(os.getenv("MAX_REQUEST_BODY_BYTES", str(30 * 1024 * 1024))))
+        if length > maximum_body:
+            self.send_json({"error": "O arquivo ou a requisição excede o limite permitido pelo servidor."}, status=413)
+            return
         body = self.rfile.read(length).decode("utf-8") if length else "{}"
         request = json.loads(body or "{}")
         lightweight_paths = {
@@ -5453,6 +6615,75 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=400)
             return
 
+        if parsed.path == "/api/reports/export":
+            try:
+                report_type = str(request.get("report_type") or "").lower()
+                output_format = str(request.get("format") or "xlsx").lower()
+                if report_type not in {"statistics", "catalog", "ads"}:
+                    raise RuntimeError("Selecione Estatísticas, Catálogo ou Anúncios para exportar.")
+                if output_format not in {"xlsx", "pdf"}:
+                    raise RuntimeError("Formato de relatório inválido.")
+                title, columns, rows, metadata = report_dataset(payload, report_type, request.get("filters") or {})
+                stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M")
+                if output_format == "xlsx":
+                    body = build_report_xlsx(title, columns, rows, metadata)
+                    self.send_bytes(body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"competidor-{report_type}-{stamp}.xlsx")
+                else:
+                    body = build_report_pdf(title, columns, rows, metadata)
+                    self.send_bytes(body, "application/pdf", f"competidor-{report_type}-{stamp}.pdf")
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/spreadsheet/template":
+            try:
+                body = build_bulk_spreadsheet(payload, request.get("filters") or {})
+                stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M")
+                self.send_bytes(body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"competidor-edicao-anuncios-{stamp}.xlsx")
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/spreadsheet/import":
+            try:
+                result = parse_bulk_spreadsheet(payload, request.get("file") or "", self.current_user(payload))
+                self.send_json({"ok": True, **result})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/spreadsheet/apply":
+            try:
+                actor = self.current_user(payload)
+                token = str(request.get("token") or "")
+                with SPREADSHEET_JOBS_LOCK:
+                    job = SPREADSHEET_JOBS.get(token)
+                if not job or job.get("user_id") != (actor or {}).get("id") or time.monotonic() - job.get("created", 0) > 1800:
+                    raise RuntimeError("A prévia da planilha expirou. Importe o arquivo novamente.")
+                maximum = max(1, int(os.getenv("MELI_SPREADSHEET_MAX_CHANGES", "500")))
+                if len(job.get("changes") or []) > maximum:
+                    raise RuntimeError(f"Aplique no máximo {maximum} alterações por planilha para respeitar os limites da API.")
+                results = []
+                for row in job.get("changes") or []:
+                    try:
+                        results.append(apply_spreadsheet_change(payload, row, actor))
+                    except Exception as exc:
+                        results.append({"item_id": row.get("item_id"), "row": row.get("row"), "status": "error", "error": str(exc)})
+                write_payload(payload)
+                with SPREADSHEET_JOBS_LOCK:
+                    SPREADSHEET_JOBS.pop(token, None)
+                self.send_json(
+                    {
+                        "ok": not any(row.get("status") == "error" for row in results),
+                        "updated": sum(row.get("status") == "updated" for row in results),
+                        "failed": sum(row.get("status") == "error" for row in results),
+                        "results": results,
+                    }
+                )
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
         if parsed.path == "/api/meli/sync":
             try:
                 raw_limit = request.get("limit", "all")
@@ -5484,6 +6715,15 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=400)
             return
 
+        if parsed.path == "/api/meli/shipping-costs/refresh":
+            try:
+                results = refresh_shipping_costs_for_items(payload, request.get("item_ids") or [])
+                write_payload(payload)
+                self.send_json({"ok": True, "items": results})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
         if parsed.path == "/api/meli/item/update":
             try:
                 user = self.current_user(payload)
@@ -5492,6 +6732,7 @@ class App(BaseHTTPRequestHandler):
                 account = next((item for item in payload.get("accounts", []) if item.get("id") == account_id or item.get("nickname") == request.get("account")), None)
                 if not account or not account.get("official"):
                     raise RuntimeError("Conta oficial não encontrada para atualizar o anúncio.")
+                client = account_client(account)
                 update = {}
                 for key in ["price", "available_quantity", "title"]:
                     if key in request and request[key] not in ("", None):
@@ -5515,11 +6756,24 @@ class App(BaseHTTPRequestHandler):
                         dimension_attrs.append({"id": attr_id, "value_name": api_value})
                 if dimension_attrs:
                     update["attributes"] = dimension_attrs
+                expected_gtin_codes = []
+                if clean_attribute_value(request.get("gtin")):
+                    gtin_fragment, expected_gtin_codes = item_gtin_update_fragment(client, item_id, request.get("gtin"))
+                    if gtin_fragment.get("attributes"):
+                        update["attributes"] = [
+                            *(update.get("attributes") or []),
+                            *gtin_fragment["attributes"],
+                        ]
+                    if gtin_fragment.get("variations"):
+                        update["variations"] = gtin_fragment["variations"]
                 if not update:
                     raise RuntimeError("Nenhum campo informado para atualizar.")
-                client = account_client(account)
                 official = client.update_item(item_id, update)
                 verified_item = verify_package_update(client, item_id, expected_package_values) if expected_package_values else {}
+                if expected_gtin_codes:
+                    verified_gtin_item = verify_gtin_update(client, item_id, expected_gtin_codes)
+                    if not verified_item:
+                        verified_item = verified_gtin_item
                 verified_package_values = package_values_from_item(verified_item) if verified_item else {}
                 stock_transition = None
                 for item in payload.get("catalog", []):
@@ -5542,6 +6796,10 @@ class App(BaseHTTPRequestHandler):
                                 )
                                 changes[request_key] = {"from": item.get(request_key), "to": normalized_value}
                                 item[request_key] = normalized_value
+                        if expected_gtin_codes:
+                            new_gtin = ", ".join(expected_gtin_codes)
+                            changes["gtin"] = {"from": item.get("gtin") or "", "to": new_gtin}
+                            item["gtin"] = new_gtin
                         if update.get("status") == "paused":
                             changes["status"] = {"from": item.get("meli_status"), "to": "paused"}
                             item["status"] = "paused"
@@ -5687,18 +6945,27 @@ class App(BaseHTTPRequestHandler):
                     item_ids = [item.strip() for item in item_ids.split(",") if item.strip()]
                 item_ids = [str(item_id).strip() for item_id in item_ids if str(item_id).strip()]
                 source = (request.get("source") or "").strip()
-                target = (request.get("target") or "").strip()
-                if not source or not target:
-                    self.send_json({"error": "Informe conta origem e conta destino."}, status=400)
+                target_values = request.get("targets") or [request.get("target") or ""]
+                if isinstance(target_values, str):
+                    target_values = [target_values]
+                target_values = list(dict.fromkeys(str(value or "").strip() for value in target_values if str(value or "").strip()))
+                variants = request.get("variants") or [{}]
+                if not isinstance(variants, list):
+                    variants = [{}]
+                if not source or not target_values:
+                    self.send_json({"error": "Informe conta origem e ao menos uma conta destino."}, status=400)
                     return
                 source_account = official_account_by_name(payload, source)
-                target_account = official_account_by_name(payload, target)
                 if not source_account or not source_account.get("official") or not source_account.get("access_token"):
                     self.send_json({"error": "A conta origem não está conectada oficialmente. Reautentique a conta e tente novamente."}, status=400)
                     return
-                if not target_account or not target_account.get("official") or not target_account.get("access_token"):
-                    self.send_json({"error": "A conta destino não está conectada oficialmente. Reautentique a conta e tente novamente."}, status=400)
-                    return
+                target_accounts = []
+                for target in target_values:
+                    target_account = official_account_by_name(payload, target)
+                    if not target_account or not target_account.get("official") or not target_account.get("access_token"):
+                        self.send_json({"error": f"A conta destino {target} não está conectada oficialmente. Reautentique-a e tente novamente."}, status=400)
+                        return
+                    target_accounts.append(target_account)
                 if not item_ids:
                     self.send_json({"error": "Selecione ao menos um anúncio específico."}, status=400)
                     return
@@ -5725,132 +6992,100 @@ class App(BaseHTTPRequestHandler):
                         status=400,
                     )
                     return
-                preflight_errors = clone_preflight_pending_fields(payload, source_account.get("id"), item_ids, edits)
-                job = {
-                    "id": f"clone-{uuid.uuid4().hex[:8]}",
-                    "validation_version": 3,
-                    "source": source_account.get("nickname"),
-                    "target": target_account.get("nickname"),
-                    "source_account_id": source_account.get("id"),
-                    "target_account_id": target_account.get("id"),
-                    "item_ids": item_ids,
-                    "items": len(item_ids),
-                    "status": "review_required" if preflight_errors else "preview_ready",
-                    "edits": edits,
-                    "errors": preflight_errors,
-                    "note": "Preview criado para anúncios específicos. Campos opcionais em branco mantêm as informações originais; o tipo pode ser mantido, Clássico ou Premium.",
-                }
+                combinations = len(target_accounts) * len(variants)
+                if combinations > max(1, int(os.getenv("MELI_CLONE_MAX_COMBINATIONS", "20"))):
+                    self.send_json({"error": "Selecione no máximo 20 combinações de conta e tipo por lote."}, status=400)
+                    return
                 jobs = payload.get("clone_jobs")
                 if not isinstance(jobs, list):
                     jobs = []
                     payload["clone_jobs"] = jobs
-                jobs.insert(0, job)
+                batch_id = f"batch-{uuid.uuid4().hex[:8]}"
+                created_jobs = []
+                validation_cache = {}
+                for target_account in target_accounts:
+                    for variant in variants:
+                        variant = variant if isinstance(variant, dict) else {}
+                        variant_edits = dict(edits)
+                        listing_type = str(variant.get("listing_type_id") or "").strip()
+                        if listing_type:
+                            variant_edits["listing_type_id"] = listing_type
+                        if variant.get("price") not in (None, ""):
+                            variant_edits["price"] = variant.get("price")
+                        validation_key = json.dumps(variant_edits, sort_keys=True, ensure_ascii=False)
+                        if validation_key not in validation_cache:
+                            validation_cache[validation_key] = clone_preflight_pending_fields(
+                                payload,
+                                source_account.get("id"),
+                                item_ids,
+                                variant_edits,
+                            )
+                        preflight_errors = json.loads(json.dumps(validation_cache[validation_key], ensure_ascii=False))
+                        type_label = "Premium" if listing_type == "gold_pro" else "Clássico" if listing_type == "gold_special" else "Mesmo tipo do anúncio"
+                        job = {
+                            "id": f"clone-{uuid.uuid4().hex[:8]}",
+                            "batch_id": batch_id,
+                            "validation_version": 3,
+                            "source": source_account.get("nickname"),
+                            "target": target_account.get("nickname"),
+                            "source_account_id": source_account.get("id"),
+                            "target_account_id": target_account.get("id"),
+                            "item_ids": item_ids,
+                            "items": len(item_ids),
+                            "status": "review_required" if preflight_errors else "preview_ready",
+                            "edits": variant_edits,
+                            "variant_label": type_label,
+                            "errors": preflight_errors,
+                            "note": f"Preview preparado para {target_account.get('nickname')} em {type_label}. Campos opcionais em branco mantêm as informações originais.",
+                        }
+                        created_jobs.append(job)
+                for job in reversed(created_jobs):
+                    jobs.insert(0, job)
                 write_payload(payload)
-                self.send_json(job, status=201)
+                legacy_request = not request.get("targets") and not request.get("variants")
+                self.send_json(created_jobs[0] if legacy_request else {"batch_id": batch_id, "jobs": created_jobs}, status=201)
             except Exception as exc:
                 self.send_json({"error": f"Não foi possível gerar o preview: {exc}"}, status=400)
             return
 
+        if parsed.path == "/api/clone/execute-batch":
+            try:
+                jobs = payload.get("clone_jobs") if isinstance(payload.get("clone_jobs"), list) else []
+                requested_ids = request.get("job_ids") or []
+                batch_id = str(request.get("batch_id") or "")
+                selected = [
+                    job
+                    for job in jobs
+                    if (requested_ids and job.get("id") in requested_ids)
+                    or (batch_id and job.get("batch_id") == batch_id)
+                ]
+                if not selected:
+                    raise RuntimeError("Nenhum preview do lote foi encontrado.")
+                if len(selected) > max(1, int(os.getenv("MELI_CLONE_MAX_COMBINATIONS", "20"))):
+                    raise RuntimeError("O lote excede o limite de combinações permitido.")
+                copied = []
+                for job in selected:
+                    if job.get("status") == "copied":
+                        continue
+                    copied.extend(execute_clone_job(payload, job, (request.get("field_answers") or {}).get(job.get("id"), {})))
+                write_payload(payload)
+                self.send_json({"ok": True, "jobs": selected, "copied": copied})
+            except Exception as exc:
+                self.send_json({"error": f"Não foi possível executar o lote: {exc}"}, status=400)
+            return
+
         if parsed.path == "/api/clone/execute":
             try:
-                job_id = request.get("job_id")
-                jobs = payload.get("clone_jobs")
-                if not isinstance(jobs, list):
-                    jobs = []
-                    payload["clone_jobs"] = jobs
-                job = next((item for item in jobs if item.get("id") == job_id), None)
+                jobs = payload.get("clone_jobs") if isinstance(payload.get("clone_jobs"), list) else []
+                job = next((item for item in jobs if item.get("id") == request.get("job_id")), None)
                 if not job:
                     self.send_json({"error": "Preview não encontrado."}, status=404)
                     return
-                incoming_answers = request.get("field_answers") or {}
-                if isinstance(incoming_answers, dict) and incoming_answers:
-                    saved_answers = job.setdefault("field_answers", {})
-                    for item_id, answers in incoming_answers.items():
-                        if isinstance(answers, dict):
-                            saved_answers.setdefault(item_id, {}).update({key: value for key, value in answers.items() if value not in (None, "")})
-                catalog = payload.setdefault("catalog", [])
-                existing_ids = {item.get("id") for item in catalog if item.get("id")}
-                copied = []
-                errors = []
-                created_details = []
-                edits = job.get("edits") or {}
-                for item_id in job.get("item_ids", []):
-                    source_item = next((item for item in catalog if item.get("id") == item_id), None)
-                    if not source_item:
-                        continue
-                    try:
-                        created, official_source, verified_item = create_official_clone(payload, job, item_id, edits)
-                    except Exception as exc:
-                        pending_fields = getattr(exc, "pending_fields", [])
-                        if pending_fields:
-                            errors.append(
-                                {
-                                    "item_id": item_id,
-                                    "error": str(exc),
-                                    "pending_fields": pending_fields,
-                                    "original_error": getattr(exc, "original_error", ""),
-                                }
-                            )
-                        else:
-                            errors.append({"item_id": item_id, "error": friendly_clone_error(exc)})
-                        continue
-                    new_id = created.get("id") or f"COPY-{uuid.uuid4().hex[:6].upper()}"
-                    if new_id in existing_ids:
-                        continue
-                    existing_ids.add(new_id)
-                    target_account = official_account_by_name(payload, job.get("target_account_id") or job.get("target")) or {}
-                    official_sku = item_sku(official_source)
-                    source_sku = official_sku if official_sku and official_sku != "-" else source_item.get("sku") or source_item.get("id") or "SEM-SKU"
-                    official_created_item = {**official_source, **created, **verified_item}
-                    new_item = synced_catalog_item(target_account, official_created_item)
-                    display_sku = item_sku(official_created_item) or f"{source_sku}{edits.get('sku_suffix') or ''}"
-                    new_item.update(
-                        {
-                            "id": new_id,
-                            "account": job.get("target"),
-                            "account_id": target_account.get("id"),
-                            "sku": display_sku,
-                            "price": official_created_item.get("price") or float(edits.get("price") or source_item.get("price") or 0),
-                            "stock": item_available_quantity(official_created_item) or int(float(edits.get("stock") or item_available_quantity(official_source) or source_item.get("stock") or 0)),
-                            "status": "sharing",
-                            "share": 0,
-                            "clone_source_item_id": item_id,
-                            "description_override": edits.get("description", ""),
-                            "permalink": official_created_item.get("permalink") or created.get("permalink") or "",
-                            "meli_status": official_created_item.get("status") or created.get("status") or new_item.get("meli_status"),
-                            "verification_warning": created.get("_verification_warning", ""),
-                            "action": f"Anúncio criado oficialmente no Mercado Livre a partir de {source_item.get('id')}. Novo código: {new_id}.",
-                        }
-                    )
-                    catalog.append(new_item)
-                    copied.append(new_item)
-                    created_details.append(
-                        {
-                            "source_item_id": item_id,
-                            "item_id": new_id,
-                            "title": new_item.get("title"),
-                            "sku": new_item.get("sku"),
-                            "status": new_item.get("meli_status") or "-",
-                            "permalink": new_item.get("permalink") or "",
-                            "verification_warning": new_item.get("verification_warning") or "",
-                        }
-                    )
-                has_pending = any(row.get("pending_fields") for row in errors)
-                job["validation_version"] = 3
-                job["status"] = "copied" if copied and not errors else "review_required" if has_pending else "partial_error" if copied else "error"
-                job["copied_items"] = [item.get("id") for item in copied]
-                job["created_details"] = created_details
-                job["errors"] = errors
-                created_codes = ", ".join(item.get("item_id") for item in created_details if item.get("item_id"))
-                job["note"] = f"{len(copied)} anúncio(s) criados oficialmente no Mercado Livre para {job.get('target')}."
-                if created_codes:
-                    job["note"] += f" Códigos criados: {created_codes}."
-                if errors:
-                    job["note"] += f" {len(errors)} anúncio(s) falharam; veja erros no job."
+                copied = execute_clone_job(payload, job, request.get("field_answers") or {})
                 write_payload(payload)
                 self.send_json({"ok": True, "job": job, "copied": copied})
             except Exception as exc:
-                self.send_json({"error": f"Não foi possível copiar os anúncios: {exc}"}, status=400)
+                self.send_json({"error": f"Não foi possível copiar o anúncio: {exc}"}, status=400)
             return
 
         self.send_json({"error": "Endpoint não encontrado"}, status=404)

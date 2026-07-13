@@ -16,6 +16,12 @@
   adsFlex: "all",
   stockPeriod: "today",
   stockCustomDate: "",
+  dashboardStockPage: 1,
+  dashboardCatalogPage: 1,
+  dashboardShipmentPage: 1,
+  dashboardSalesPage: 1,
+  dashboardShipmentAccount: "all",
+  dashboardSalesAccount: "all",
   alertType: "all",
   alertPeriod: "today",
   alertCustomDate: "",
@@ -27,6 +33,7 @@
   copySku: "",
   copyCatalog: "all",
   cloneSelectedIds: new Set(),
+  cloneTargetIds: new Set(),
   alertsPage: 1,
   scanPage: 1,
   competitorsPage: 1,
@@ -40,6 +47,8 @@
   statisticsError: "",
   statisticsPage: 1,
   statisticsPageSize: 50,
+  spreadsheetPreview: null,
+  shippingCostsLoading: false,
 };
 
 const PAGE_SIZE = 100;
@@ -63,6 +72,7 @@ const labels = {
   losing: "Perdendo",
   sharing: "Compartilhando",
   paused: "Pausado",
+  internal: "Entre suas contas",
 };
 
 const colors = {
@@ -358,6 +368,7 @@ function renderSummary() {
 function renderDashboard() {
   const ops = state.data.operations || {};
   const stockRows = filterByStockPeriod(ops.attention_stock || []);
+  renderDashboardAccountFilters();
   document.querySelector("#dashboard-revenue").innerHTML = `
     <article class="revenue-total">
       <span>Faturamento real mensal</span>
@@ -374,8 +385,12 @@ function renderDashboard() {
     `).join("")}
   `;
 
-  document.querySelector("#dashboard-stock").innerHTML = opsRows(stockRows, "Sem produtos sem estoque neste período.", "danger");
-  document.querySelector("#dashboard-catalog-loss").innerHTML = opsRows(ops.attention_catalog || [], "Sem perdas de catálogo detectadas.", "danger");
+  const stockPage = paginate(stockRows, state.dashboardStockPage, 10);
+  state.dashboardStockPage = stockPage.current;
+  document.querySelector("#dashboard-stock").innerHTML = opsRows(stockPage.items, "Sem produtos sem estoque neste período.", "danger") + paginationHtml("dashboardStockPage", stockPage);
+  const catalogPage = paginate(ops.attention_catalog || [], state.dashboardCatalogPage, 10);
+  state.dashboardCatalogPage = catalogPage.current;
+  document.querySelector("#dashboard-catalog-loss").innerHTML = opsRows(catalogPage.items, "Sem perdas de catálogo detectadas.", "danger") + paginationHtml("dashboardCatalogPage", catalogPage);
   document.querySelector("#dashboard-claims").innerHTML = (ops.claims || []).map((item) => `
     <details class="ops-item claim-card">
       <summary>
@@ -394,16 +409,22 @@ function renderDashboard() {
       </div>
     </details>
   `).join("") || `<div class="notice">Nenhuma reclamação ativa sincronizada.</div>`;
-  document.querySelector("#dashboard-shipments").innerHTML = (ops.pending_shipments || []).map((item) => `
+  const shipmentRows = (ops.pending_shipments || []).filter((item) => state.dashboardShipmentAccount === "all" || item.account === state.dashboardShipmentAccount);
+  const shipmentPage = paginate(shipmentRows, state.dashboardShipmentPage, 10);
+  state.dashboardShipmentPage = shipmentPage.current;
+  document.querySelector("#dashboard-shipments").innerHTML = shipmentPage.items.map((item) => `
     <article class="ops-item">
       <strong>${item.account}</strong>
       <p>Pedido ${item.order_id} · ${item.buyer}</p>
-      <div class="chip-row">${copyChip("Conta", item.account)}${copyChip("Limite", item.deadline)}${copyChip("Falta", item.time_left)}</div>
+      <div class="chip-row">${copyChip("Conta", item.account)}${copyChip("Envio", item.shipment_id || "-")}${copyChip("Limite", formatDateBR(item.deadline))}${copyChip("Falta", timeLeftBR(item.deadline, item.time_left))}</div>
       ${item.sync_status ? `<small>${escapeText(item.sync_status)}</small>` : ""}
     </article>
-  `).join("") || `<div class="notice">Nenhum envio pendente sincronizado.</div>`;
+  `).join("") + paginationHtml("dashboardShipmentPage", shipmentPage) || `<div class="notice">Nenhum envio pendente sincronizado.</div>`;
 
-  document.querySelector("#dashboard-sales").innerHTML = (state.data.recent_sales || []).slice(0, 12).map((sale) => `
+  const salesRows = (state.data.recent_sales || []).filter((sale) => state.dashboardSalesAccount === "all" || sale.account === state.dashboardSalesAccount);
+  const salesPage = paginate(salesRows, state.dashboardSalesPage, 10);
+  state.dashboardSalesPage = salesPage.current;
+  document.querySelector("#dashboard-sales").innerHTML = salesPage.items.map((sale) => `
     <article class="sale-item">
       ${sale.thumbnail ? `<img class="sale-thumb" src="${sale.thumbnail}" alt="${escapeAttr(sale.product || sale.item_id)}" loading="lazy" />` : `<span class="sale-thumb sale-thumb-empty"></span>`}
       <div>
@@ -423,7 +444,19 @@ function renderDashboard() {
         <small>Pedido ${sale.order_id || "-"}</small>
       </div>
     </article>
-  `).join("") || `<div class="notice">Nenhuma venda recente sincronizada. Sincronize uma conta oficial com permissão de vendas/pedidos para preencher este bloco.</div>`;
+  `).join("") + paginationHtml("dashboardSalesPage", salesPage) || `<div class="notice">Nenhuma venda recente sincronizada. Sincronize uma conta oficial com permissão de vendas/pedidos para preencher este bloco.</div>`;
+
+  document.querySelector("#dashboard-top-skus").innerHTML = (ops.top_skus_today || []).map((item, index) => `
+    <article class="sale-item top-sku-item">
+      <span class="sku-rank">${index + 1}</span>
+      ${item.thumbnail ? `<img class="sale-thumb" src="${item.thumbnail}" alt="${escapeAttr(item.product || item.sku)}" loading="lazy" />` : `<span class="sale-thumb sale-thumb-empty"></span>`}
+      <div>
+        <strong>${escapeText(item.product || item.sku || "SKU vendido")}</strong>
+        <div class="chip-row">${copyChip("Conta", item.account || "-")}${copyChip("SKU", item.sku || "-")}${copyChip("MLB", item.item_id || "-")}</div>
+      </div>
+      <div class="sale-total"><span>Unidades vendidas</span><strong>${Number(item.units || 0)}</strong><small>${money.format(item.revenue || 0)}</small></div>
+    </article>
+  `).join("") || `<div class="notice">Nenhum SKU vendido hoje foi sincronizado.</div>`;
 
   document.querySelector("#dashboard-metrics").innerHTML = state.data.metrics
     .map(
@@ -443,6 +476,17 @@ function renderDashboard() {
       `
     )
     .join("");
+}
+
+function renderDashboardAccountFilters() {
+  const accounts = [...new Set((state.data.accounts || []).filter((account) => account.official).map((account) => account.nickname).filter(Boolean))];
+  const fill = (selector, selected) => {
+    const select = document.querySelector(selector);
+    if (!select) return;
+    select.innerHTML = `<option value="all">Todas as contas</option>${accounts.map((account) => `<option value="${escapeAttr(account)}" ${selected === account ? "selected" : ""}>${escapeText(account)}</option>`).join("")}`;
+  };
+  fill("#dashboard-shipment-account", state.dashboardShipmentAccount);
+  fill("#dashboard-sales-account", state.dashboardSalesAccount);
 }
 
 function filterByStockPeriod(rows) {
@@ -506,7 +550,7 @@ function renderCatalog() {
   const filtered = state.data.catalog.filter((item) => {
     const text = `${item.title} ${item.sku} ${item.id}`.toLowerCase();
     return isCatalogListing(item)
-      && (state.filter === "all" || item.status === state.filter)
+      && (state.filter === "all" || (state.filter === "internal" ? item.internal_competition : item.status === state.filter))
       && (state.catalogAccount === "all" || item.account === state.catalogAccount)
       && (state.catalogMlStatus === "all" || item.meli_status === state.catalogMlStatus)
       && (state.catalogStock === "all" || (state.catalogStock === "zero" ? Number(item.stock) === 0 : Number(item.stock) > 0))
@@ -525,7 +569,7 @@ function renderCatalog() {
             <div class="catalog-title">
               <span class="status-dot status-${item.status}"></span>
               <strong>${item.title}</strong>
-              <span class="badge ${item.status}">${labels[item.status]}</span>
+              <span class="badge ${item.status}">${item.internal_competition ? labels.internal : labels[item.status]}</span>
             </div>
             <div class="item-facts">
               ${fact("Loja", item.account)}
@@ -668,11 +712,13 @@ function renderAds() {
           ${fact("Tipo", listingTypeLabel(item.listing_type_id))}
           ${fact("Modalidade", isCatalogItem(item) ? "Catálogo" : "Tradicional")}
           ${flexStatusBadge(item.shipping_logistic_type)}
+          ${fact("Frete estimado ML", shippingCostLabel(item))}
           ${fact("Status do anúncio", statusLabel(item.meli_status || item.status))}
         </div>
         <div class="inline-edit">
           <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
           <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
+          <label>EAN / UPC / GTIN <input type="text" inputmode="numeric" value="${escapeAttr(item.gtin || "")}" data-original-gtin="${escapeAttr(item.gtin || "")}" data-gtin-input="${item.id}" placeholder="Código universal" /></label>
           <label>Peso <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_weight))}" placeholder="0,6" data-weight-input="${item.id}" /><span>kg</span></span></label>
           <label>Altura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_height))}" placeholder="13" data-height-input="${item.id}" /><span>cm</span></span></label>
           <label>Largura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_width))}" placeholder="18" data-width-input="${item.id}" /><span>cm</span></span></label>
@@ -693,6 +739,46 @@ function renderAds() {
       </div>
     </article>
   `).join("") + paginationHtml("adsPage", pageInfo) : `<div class="notice">Nenhum anúncio encontrado.</div>`;
+  queueShippingCostRefresh(pageInfo.items);
+}
+
+function shippingCostLabel(item) {
+  if (item.shipping_cost !== null && item.shipping_cost !== undefined && item.shipping_cost !== "") {
+    return money.format(Number(item.shipping_cost || 0));
+  }
+  if (item.shipping_cost_status === "error") return "Consulta indisponível";
+  if (item.shipping_cost_status === "not_available") return "Não informado pela API";
+  return "Calculando...";
+}
+
+function shippingCostNeedsRefresh(item) {
+  if (!item.official_source) return false;
+  const raw = String(item.shipping_cost_updated_at || "").replace(" ", "T");
+  const updated = new Date(raw);
+  if (Number.isNaN(updated.getTime())) return true;
+  const age = Date.now() - updated.getTime();
+  const ttl = item.shipping_cost_status === "ok" ? 24 * 60 * 60 * 1000 : 30 * 60 * 1000;
+  return age > ttl;
+}
+
+async function queueShippingCostRefresh(items) {
+  if (state.shippingCostsLoading || state.route !== "anuncios") return;
+  const itemIds = (items || []).filter(shippingCostNeedsRefresh).slice(0, 25).map((item) => item.id);
+  if (!itemIds.length) return;
+  state.shippingCostsLoading = true;
+  try {
+    const result = await api("/api/meli/shipping-costs/refresh", {
+      method: "POST",
+      body: JSON.stringify({ item_ids: itemIds }),
+    });
+    const updates = new Map((result.items || []).map((item) => [item.id, item]));
+    state.data.catalog = state.data.catalog.map((item) => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
+  } catch (error) {
+    showToast(error.message || "Não foi possível consultar o frete dos anúncios.", "error");
+  } finally {
+    state.shippingCostsLoading = false;
+    if (state.route === "anuncios") renderAds();
+  }
 }
 
 function isCatalogListing(item) {
@@ -734,6 +820,7 @@ function formatLogChanges(log) {
   if (changes.stock) parts.push(`Estoque: ${changes.stock.from} -> ${changes.stock.to}`);
   if (changes.status) parts.push(`Status: ${changes.status.from || "-"} -> ${changes.status.to || "-"}`);
   if (changes.title) parts.push("Título alterado");
+  if (changes.gtin) parts.push(`EAN/UPC/GTIN: ${changes.gtin.from || "-"} -> ${changes.gtin.to || "-"}`);
   return parts.join(" · ") || "Alteração registrada.";
 }
 
@@ -1058,7 +1145,8 @@ function renderStatistics() {
     <article><small>Unidades vendidas</small><strong>${Number(summaryData.units || 0).toLocaleString("pt-BR")}</strong></article>
     <article><small>SKUs vendidos</small><strong>${Number(summaryData.skus || 0).toLocaleString("pt-BR")}</strong></article>
     <article><small>Pedidos</small><strong>${Number(summaryData.orders || 0).toLocaleString("pt-BR")}</strong></article>
-    <article class="flex-stat"><small>Unidades via Flex</small><strong>${Number(summaryData.flex_units || 0).toLocaleString("pt-BR")}</strong></article>
+    <article class="flex-stat"><small>Flex confirmado</small><strong>${Number(summaryData.flex_units || 0).toLocaleString("pt-BR")}</strong></article>
+    <article class="unknown-stat"><small>Modalidade pendente</small><strong>${Number(summaryData.unknown_units || 0).toLocaleString("pt-BR")}</strong></article>
     <article><small>Valor dos itens</small><strong>${money.format(summaryData.revenue || 0)}</strong></article>
   `;
   const pageInfo = paginate(data.rows || [], state.statisticsPage, state.statisticsPageSize);
@@ -1070,7 +1158,7 @@ function renderStatistics() {
   results.innerHTML = `${warning}${messages}${paginationHtml("statisticsPage", pageInfo)}${pageInfo.items.length ? `
     <div class="statistics-table" role="table" aria-label="SKUs vendidos">
       <div class="statistics-table-head" role="row">
-        <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Unidades</span><span>Pedidos</span><span>Flex</span><span>Valor</span>
+        <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Unidades</span><span>Pedidos</span><span>Flex confirmado</span><span>Valor</span>
       </div>
       ${pageInfo.items.map((row, index) => `
         <article class="statistics-row" role="row">
@@ -1123,20 +1211,202 @@ async function loadStatistics() {
   }
 }
 
+function currentReportFilters(reportType) {
+  if (reportType === "statistics") {
+    const form = document.querySelector("#statistics-form");
+    return {
+      account: form.elements.account.value,
+      sku: form.elements.sku.value,
+      flex: form.elements.flex.value,
+      ...statisticsDateRange(form),
+    };
+  }
+  if (reportType === "catalog") {
+    return {
+      account: state.catalogAccount,
+      search: state.catalogSearch,
+      status: state.filter,
+      ml_status: state.catalogMlStatus,
+      stock: state.catalogStock,
+    };
+  }
+  return {
+    account: state.adsAccount,
+    product: state.adsProduct,
+    sku: state.adsSku,
+    code: state.adsCode,
+    ml_status: state.adsStatus,
+    catalog: state.adsCatalog,
+    flex: state.adsFlex,
+  };
+}
+
+async function downloadReport(button) {
+  const reportType = button.dataset.exportReport;
+  const format = button.dataset.exportFormat;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "Gerando...";
+  try {
+    const response = await fetch("/api/reports/export", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ report_type: reportType, format, filters: currentReportFilters(reportType) }),
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || "Não foi possível gerar o relatório.");
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || `competidor-${reportType}.${format}`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    showToast(`Relatório ${format === "pdf" ? "PDF" : "Excel"} gerado com os filtros atuais.`);
+  } catch (error) {
+    showToast(error.message || "Não foi possível gerar o relatório.", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+async function downloadBulkSpreadsheet() {
+  const button = document.querySelector("#download-bulk-sheet");
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "Gerando...";
+  try {
+    const response = await fetch("/api/spreadsheet/template", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filters: currentReportFilters("ads") }),
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || "Não foi possível gerar a planilha.");
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || "competidor-edicao-anuncios.xlsx";
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    showToast("Planilha de edição gerada com os filtros atuais.");
+  } catch (error) {
+    showToast(error.message || "Não foi possível gerar a planilha.", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+function fileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+    reader.onerror = () => reject(new Error("Não foi possível ler a planilha selecionada."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function renderSpreadsheetPreview() {
+  const root = document.querySelector("#spreadsheet-preview");
+  if (!root) return;
+  const preview = state.spreadsheetPreview;
+  if (!preview) {
+    root.innerHTML = "";
+    return;
+  }
+  root.innerHTML = `
+    <section class="spreadsheet-review">
+      <div class="spreadsheet-review-head">
+        <div><small>Pré-validação da planilha</small><strong>${Number(preview.ready || 0)} alteração(ões) pronta(s)</strong></div>
+        <span class="badge ${preview.invalid ? "losing" : "winning"}">${Number(preview.invalid || 0)} inválida(s)</span>
+      </div>
+      ${preview.changes?.length ? `<div class="spreadsheet-change-list">${preview.changes.slice(0, 20).map((row) => `
+        <article><strong>${escapeText(row.item_id)}</strong><span>${escapeText(row.account)}</span><small>${Object.keys(row.changes || {}).map((key) => escapeText(key)).join(" · ")}</small></article>
+      `).join("")}</div>` : ""}
+      ${preview.errors?.length ? `<div class="notice danger-notice">${preview.errors.slice(0, 20).map((row) => `<p><strong>Linha ${row.row || "-"}${row.item_id ? ` · ${escapeText(row.item_id)}` : ""}:</strong> ${escapeText(row.error)}</p>`).join("")}</div>` : ""}
+      <div class="form-actions">
+        <button class="mini-button success-button" type="button" data-apply-spreadsheet ${preview.ready ? "" : "disabled"}>Aplicar alterações válidas</button>
+        <button class="mini-button" type="button" data-close-spreadsheet>Cancelar</button>
+      </div>
+    </section>
+  `;
+}
+
+async function importBulkSpreadsheet(file) {
+  if (!file) return;
+  try {
+    showToast("Validando a planilha antes de alterar anúncios.");
+    const result = await api("/api/spreadsheet/import", {
+      method: "POST",
+      body: JSON.stringify({ file: await fileAsBase64(file) }),
+    });
+    state.spreadsheetPreview = result;
+    renderSpreadsheetPreview();
+  } catch (error) {
+    showToast(error.message || "Não foi possível validar a planilha.", "error");
+  }
+}
+
+async function applyBulkSpreadsheet(button) {
+  const preview = state.spreadsheetPreview;
+  if (!preview?.token) return;
+  button.disabled = true;
+  button.textContent = "Aplicando...";
+  try {
+    const result = await api("/api/spreadsheet/apply", {
+      method: "POST",
+      body: JSON.stringify({ token: preview.token }),
+    });
+    const failures = (result.results || []).filter((row) => row.status === "error");
+    state.spreadsheetPreview = failures.length
+      ? { ready: 0, invalid: failures.length, changes: [], errors: failures }
+      : null;
+    showToast(`${result.updated || 0} anúncio(s) atualizados${result.failed ? `; ${result.failed} falharam` : ""}.`, result.failed ? "error" : "success");
+    await load();
+    renderSpreadsheetPreview();
+  } catch (error) {
+    showToast(error.message || "Não foi possível aplicar a planilha.", "error");
+    button.disabled = false;
+    button.textContent = "Aplicar alterações válidas";
+  }
+}
+
 function renderClone() {
   const source = document.querySelector('select[name="source"]');
-  const target = document.querySelector('select[name="target"]');
   const currentSource = source.value;
-  const currentTarget = target.value;
-  const hadTarget = Boolean(currentTarget);
-  const options = connectedAccounts()
+  const accounts = connectedAccounts();
+  const options = accounts
     .map((account) => `<option value="${escapeAttr(account.id || account.seller_id)}">${escapeText(account.nickname)} · Seller ${escapeText(account.seller_id || "-")}</option>`)
     .join("");
   source.innerHTML = options;
-  target.innerHTML = options;
   if ([...source.options].some((option) => option.value === currentSource)) source.value = currentSource;
-  if ([...target.options].some((option) => option.value === currentTarget)) target.value = currentTarget;
-  if (!hadTarget && target.options.length) target.selectedIndex = 0;
+  const validTargetIds = new Set(accounts.map((account) => String(account.id || account.seller_id)));
+  state.cloneTargetIds = new Set([...state.cloneTargetIds].filter((id) => validTargetIds.has(String(id))));
+  if (!state.cloneTargetIds.size && accounts.length) state.cloneTargetIds.add(String(accounts[0].id || accounts[0].seller_id));
+  const targets = document.querySelector("#clone-targets");
+  if (targets) {
+    targets.innerHTML = accounts.map((account) => {
+      const id = String(account.id || account.seller_id);
+      return `<label><input type="checkbox" value="${escapeAttr(id)}" ${state.cloneTargetIds.has(id) ? "checked" : ""} /><span><strong>${escapeText(account.nickname)}</strong><small>Seller ${escapeText(account.seller_id || "-")}</small></span></label>`;
+    }).join("");
+  }
   const copyProduct = document.querySelector("#copy-product-filter");
   const copySku = document.querySelector("#copy-sku-filter");
   const copyCatalog = document.querySelector("#copy-catalog-filter");
@@ -1147,19 +1417,21 @@ function renderClone() {
   if (copyPageSize && Number(copyPageSize.value) !== state.copyPageSize) copyPageSize.value = String(state.copyPageSize);
   renderCopyItems();
 
-  document.querySelector("#clone-jobs").innerHTML = state.data.clone_jobs
+  const latestBatch = state.data.clone_jobs.find((job) => job.batch_id && ["preview_ready", "partial_error", "error"].includes(job.status))?.batch_id;
+  const batchAction = latestBatch ? `<div class="clone-batch-toolbar"><button class="mini-button success-button" type="button" data-execute-clone-batch="${latestBatch}">Copiar todas as combinações prontas</button></div>` : "";
+  document.querySelector("#clone-jobs").innerHTML = batchAction + state.data.clone_jobs
     .map(
       (job) => `
         <article class="clone-job" data-clone-job-card="${job.id}">
           <div>
             <strong>${job.source} -> ${job.target}</strong>
-            <div class="meta-row"><span>${job.items} anúncios</span><span>${(job.item_ids || []).join(", ")}</span></div>
+            <div class="meta-row"><span>${job.items} anúncio(s)</span><span>${escapeText(job.variant_label || "Mesmo tipo")}</span><span>${(job.item_ids || []).join(", ")}</span></div>
             <p>${job.note}</p>
             ${job.created_details?.length ? cloneCreatedHtml(job.created_details) : ""}
             ${job.errors?.length ? cloneErrorsHtml(job.errors, job.validation_version) : ""}
             ${["preview_ready", "review_required", "partial_error", "error"].includes(job.status) ? `<button class="mini-button" data-execute-clone="${job.id}">${!job.validation_version ? "Revalidar e copiar" : job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button>` : ""}
           </div>
-          <span class="badge winning">${job.status}</span>
+          <span class="badge ${cloneJobStatusTone(job.status)}">${cloneJobStatusLabel(job.status)}</span>
         </article>
       `
     )
@@ -1171,7 +1443,7 @@ function cloneCreatedHtml(items) {
     <div class="clone-created-grid">
       ${items.map((item) => `
         <a class="copy-chip clone-created-chip" href="${item.permalink || "#"}" target="_blank" rel="noreferrer">
-          <small>Criado ${escapeText(item.status || "-")}</small>
+          <small>Anúncio criado · ${escapeText(statusLabel(item.status || "-"))}</small>
           <strong>${escapeText(item.item_id || "-")}</strong>
           <span>${escapeText(item.sku || "")}</span>
           ${item.verification_warning ? `<em>${escapeText(item.verification_warning)}</em>` : ""}
@@ -1179,6 +1451,22 @@ function cloneCreatedHtml(items) {
       `).join("")}
     </div>
   `;
+}
+
+function cloneJobStatusLabel(status) {
+  return ({
+    copied: "Copiado",
+    preview_ready: "Pronto para copiar",
+    review_required: "Revisão necessária",
+    partial_error: "Concluído parcialmente",
+    error: "Erro",
+  })[status] || status || "Pendente";
+}
+
+function cloneJobStatusTone(status) {
+  if (status === "copied") return "winning";
+  if (status === "review_required" || status === "preview_ready") return "sharing";
+  return "losing";
 }
 
 function clonePendingInputHtml(row, field) {
@@ -1375,6 +1663,18 @@ function formatDateBR(value) {
   return text;
 }
 
+function timeLeftBR(value, fallback = "-") {
+  const deadline = new Date(value || "");
+  if (Number.isNaN(deadline.getTime())) return fallback || "-";
+  const seconds = Math.floor((deadline.getTime() - Date.now()) / 1000);
+  const absolute = Math.abs(seconds);
+  const days = Math.floor(absolute / 86400);
+  const hours = Math.floor((absolute % 86400) / 3600);
+  const minutes = Math.floor((absolute % 3600) / 60);
+  const duration = days ? `${days}d ${hours}h ${String(minutes).padStart(2, "0")}min` : `${hours}h ${String(minutes).padStart(2, "0")}min`;
+  return seconds < 0 ? `Atrasado ${duration}` : duration;
+}
+
 function copyChip(label, value) {
   return `<button class="copy-chip" type="button" data-copy="${escapeAttr(value)}" title="Copiar ${label}"><small>${label}</small><strong>${value}</strong></button>`;
 }
@@ -1474,6 +1774,7 @@ document.querySelector("#stock-period-filter").addEventListener("click", (event)
   button.classList.add("active");
   state.stockPeriod = button.dataset.stockPeriod;
   state.stockCustomDate = "";
+  state.dashboardStockPage = 1;
   document.querySelector("#stock-custom-date").value = "";
   renderDashboard();
 });
@@ -1481,6 +1782,7 @@ document.querySelector("#stock-period-filter").addEventListener("click", (event)
 document.querySelector("#stock-custom-date").addEventListener("change", (event) => {
   state.stockPeriod = "custom";
   state.stockCustomDate = event.target.value;
+  state.dashboardStockPage = 1;
   document.querySelectorAll("[data-stock-period]").forEach((item) => item.classList.remove("active"));
   renderDashboard();
 });
@@ -1543,6 +1845,34 @@ document.addEventListener("click", (event) => {
   if (key === "scanPage") renderScan();
   if (key === "competitorsPage") renderCompetitors();
   if (key === "statisticsPage") renderStatistics();
+  if (["dashboardStockPage", "dashboardCatalogPage", "dashboardShipmentPage", "dashboardSalesPage"].includes(key)) renderDashboard();
+});
+
+document.querySelector("#dashboard-shipment-account")?.addEventListener("change", (event) => {
+  state.dashboardShipmentAccount = event.target.value;
+  state.dashboardShipmentPage = 1;
+  renderDashboard();
+});
+
+document.querySelector("#dashboard-sales-account")?.addEventListener("change", (event) => {
+  state.dashboardSalesAccount = event.target.value;
+  state.dashboardSalesPage = 1;
+  renderDashboard();
+});
+
+document.querySelector("#download-bulk-sheet")?.addEventListener("click", downloadBulkSpreadsheet);
+document.querySelector("#import-bulk-sheet")?.addEventListener("click", () => document.querySelector("#bulk-sheet-file")?.click());
+document.querySelector("#bulk-sheet-file")?.addEventListener("change", (event) => {
+  importBulkSpreadsheet(event.target.files?.[0]);
+  event.target.value = "";
+});
+document.querySelector("#spreadsheet-preview")?.addEventListener("click", (event) => {
+  const apply = event.target.closest("[data-apply-spreadsheet]");
+  if (apply) applyBulkSpreadsheet(apply);
+  if (event.target.closest("[data-close-spreadsheet]")) {
+    state.spreadsheetPreview = null;
+    renderSpreadsheetPreview();
+  }
 });
 
 document.querySelector("#statistics-form")?.addEventListener("change", (event) => {
@@ -1558,6 +1888,11 @@ document.querySelector("#statistics-form")?.addEventListener("submit", async (ev
   event.preventDefault();
   state.statisticsPage = 1;
   await loadStatistics();
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-export-report]");
+  if (button) downloadReport(button);
 });
 
 [
@@ -1684,6 +2019,10 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
     payload.package_height = withUnit(document.querySelector(`[data-height-input="${id}"]`).value, "cm");
     payload.package_width = withUnit(document.querySelector(`[data-width-input="${id}"]`).value, "cm");
     payload.package_length = withUnit(document.querySelector(`[data-length-input="${id}"]`).value, "cm");
+    const gtinInput = document.querySelector(`[data-gtin-input="${id}"]`);
+    if ((gtinInput?.value || "").trim() !== (gtinInput?.dataset.originalGtin || "").trim()) {
+      payload.gtin = (gtinInput?.value || "").trim();
+    }
   }
   if (button.dataset.pauseAd) payload.status_action = "pause";
   if (button.dataset.activateAd) payload.status_action = "activate";
@@ -1799,6 +2138,8 @@ async function fillCloneFieldsFromItem(itemId) {
   form.elements.price_override.value = item.price || "";
   form.elements.stock_override.value = item.stock || "";
   form.elements.listing_type_override.value = item.listing_type_id || "";
+  if (form.elements.classic_price && !form.elements.classic_price.value) form.elements.classic_price.value = item.price || "";
+  if (form.elements.premium_price && !form.elements.premium_price.value) form.elements.premium_price.value = item.price || "";
   form.elements.sku_suffix.value = item.sku && item.sku !== "-" ? item.sku : "";
   form.elements.gtin_override.value = "";
   form.elements.description_override.value = "Carregando descrição...";
@@ -1846,12 +2187,37 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
     alert("Selecione pelo menos um anúncio específico para copiar.");
     return;
   }
+  const targets = [...state.cloneTargetIds];
+  if (!targets.length) {
+    alert("Selecione ao menos uma conta destino.");
+    return;
+  }
+  const sourceItem = state.data.catalog.find((item) => item.id === itemIds[0]);
+  const variantMap = new Map();
+  if (form.get("variant_same")) {
+    variantMap.set(sourceItem?.listing_type_id || "", {
+      listing_type_id: sourceItem?.listing_type_id || "",
+      price: form.get("price_override"),
+    });
+  }
+  if (form.get("variant_classic")) {
+    variantMap.set("gold_special", { listing_type_id: "gold_special", price: form.get("classic_price") || form.get("price_override") });
+  }
+  if (form.get("variant_premium")) {
+    variantMap.set("gold_pro", { listing_type_id: "gold_pro", price: form.get("premium_price") || form.get("price_override") });
+  }
+  const variants = [...variantMap.values()];
+  if (!variants.length) {
+    alert("Selecione ao menos uma versão para criar.");
+    return;
+  }
   try {
-    const job = await api("/api/clone/preview", {
+    const result = await api("/api/clone/preview", {
       method: "POST",
       body: JSON.stringify({
         source: form.get("source"),
-        target: form.get("target"),
+        targets,
+        variants,
         item_ids: itemIds,
         edits: {
           title: form.get("title_override"),
@@ -1864,9 +2230,10 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
         },
       }),
     });
-    state.data.clone_jobs.unshift(job);
+    const jobs = result.jobs || [result];
+    state.data.clone_jobs.unshift(...jobs);
     state.cloneSelectedIds.clear();
-    showToast("Preview de cópia criado com sucesso.");
+    showToast(`${jobs.length} combinação(ões) preparada(s) para revisão.`);
     renderClone();
   } catch (error) {
     showToast(error.message || "Não foi possível gerar o preview.", "error");
@@ -1875,6 +2242,30 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
 });
 
 document.querySelector("#clone-jobs").addEventListener("click", async (event) => {
+  const batchButton = event.target.closest("[data-execute-clone-batch]");
+  if (batchButton) {
+    const batchId = batchButton.dataset.executeCloneBatch;
+    const jobs = state.data.clone_jobs.filter((job) => job.batch_id === batchId && ["preview_ready", "partial_error", "error"].includes(job.status));
+    batchButton.disabled = true;
+    batchButton.textContent = "Copiando lote...";
+    try {
+      const result = await api("/api/clone/execute-batch", {
+        method: "POST",
+        body: JSON.stringify({ batch_id: batchId, job_ids: jobs.map((job) => job.id) }),
+      });
+      state.data.catalog.push(...(result.copied || []));
+      const updated = new Map((result.jobs || []).map((job) => [job.id, job]));
+      state.data.clone_jobs = state.data.clone_jobs.map((job) => updated.get(job.id) || job);
+      const failed = (result.jobs || []).filter((job) => job.status !== "copied").length;
+      showToast(`${(result.copied || []).length} anúncio(s) criado(s) no lote${failed ? `; ${failed} combinação(ões) precisam de revisão` : ""}.`, failed ? "error" : "success");
+      render();
+    } catch (error) {
+      showToast(error.message || "Não foi possível executar o lote.", "error");
+      batchButton.disabled = false;
+      batchButton.textContent = "Copiar todas as combinações prontas";
+    }
+    return;
+  }
   const button = event.target.closest("[data-execute-clone]");
   if (!button) return;
   const card = button.closest("[data-clone-job-card]");
@@ -1906,6 +2297,13 @@ document.querySelector("#clone-jobs").addEventListener("click", async (event) =>
     button.disabled = false;
     button.textContent = "Copiar agora";
   }
+});
+
+document.querySelector("#clone-targets")?.addEventListener("change", (event) => {
+  const input = event.target.closest('input[type="checkbox"]');
+  if (!input) return;
+  if (input.checked) state.cloneTargetIds.add(input.value);
+  else state.cloneTargetIds.delete(input.value);
 });
 
 document.querySelector("#scan-form").addEventListener("submit", async (event) => {
@@ -2170,6 +2568,15 @@ document.querySelector("#theme-toggle").addEventListener("click", () => {
 window.addEventListener("hashchange", () => {
   if (state.data) render();
 });
+
+const sidebar = document.querySelector(".sidebar");
+sidebar?.querySelectorAll("nav a").forEach((link) => {
+  link.addEventListener("click", () => {
+    sidebar.classList.add("force-collapsed");
+    link.blur();
+  });
+});
+sidebar?.addEventListener("mouseleave", () => sidebar.classList.remove("force-collapsed"));
 
 function fixStaticCopyLabels() {
   const descriptionInput = document.querySelector('input[name="description_override"]');
