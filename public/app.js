@@ -1375,8 +1375,33 @@ async function downloadReport(button) {
       const error = await response.json().catch(() => ({}));
       throw new Error(error.error || "Não foi possível gerar o relatório.");
     }
-    const blob = await response.blob();
-    const disposition = response.headers.get("Content-Disposition") || "";
+    const started = await response.json();
+    let reportJob = started;
+    while (["queued", "processing"].includes(reportJob.status)) {
+      button.textContent = reportJob.row_count
+        ? `Gerando ${Number(reportJob.row_count).toLocaleString("pt-BR")} linhas...`
+        : "Preparando relatório...";
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const progressResponse = await fetch(`/api/reports/jobs/${encodeURIComponent(started.id)}`, {
+        credentials: "same-origin",
+      });
+      const progress = await progressResponse.json().catch(() => ({}));
+      if (!progressResponse.ok) throw new Error(progress.error || "Não foi possível acompanhar a geração do relatório.");
+      reportJob = progress;
+    }
+    if (reportJob.status !== "completed") {
+      throw new Error(reportJob.message || "Não foi possível gerar o relatório.");
+    }
+    button.textContent = "Baixando...";
+    const downloadResponse = await fetch(`/api/reports/jobs/${encodeURIComponent(started.id)}?download=1`, {
+      credentials: "same-origin",
+    });
+    if (!downloadResponse.ok) {
+      const error = await downloadResponse.json().catch(() => ({}));
+      throw new Error(error.error || "Não foi possível baixar o relatório concluído.");
+    }
+    const blob = await downloadResponse.blob();
+    const disposition = downloadResponse.headers.get("Content-Disposition") || "";
     const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || `competidor-${reportType}.${format}`;
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -1588,11 +1613,12 @@ function cloneJobStatusTone(status) {
 
 function clonePendingInputHtml(row, field) {
   const common = `data-clone-answer-item="${escapeAttr(row.item_id)}" data-clone-answer-field="${escapeAttr(field.id)}"`;
+  const defaultValue = field.default_value || "";
   if (field.options?.length) {
     return `
       <select ${common}>
         <option value="">Selecione uma opção</option>
-        ${field.options.map((option) => `<option value="${escapeAttr(option)}">${escapeText(option)}</option>`).join("")}
+        ${field.options.map((option) => `<option value="${escapeAttr(option)}" ${option === defaultValue ? "selected" : ""}>${escapeText(option)}</option>`).join("")}
       </select>
     `;
   }
@@ -1602,7 +1628,8 @@ function clonePendingInputHtml(row, field) {
       type="text"
       ${field.kind === "number" ? 'inputmode="decimal"' : ""}
       ${field.max_length ? `maxlength="${escapeAttr(field.max_length)}"` : ""}
-      placeholder="${escapeAttr(field.message || "Informe o valor exigido pelo Mercado Livre")}"
+      value="${escapeAttr(defaultValue)}"
+      placeholder="${escapeAttr(field.message || "Informe o valor exigido pelo Mercado Livre")}" 
     />
   `;
   if (!field.units?.length) return input;

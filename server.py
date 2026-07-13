@@ -45,6 +45,8 @@ STATISTICS_CACHE_LOCK = threading.RLock()
 STATISTICS_CACHE = {}
 STATISTICS_JOBS_LOCK = threading.RLock()
 STATISTICS_JOBS = {}
+REPORT_JOBS_LOCK = threading.RLock()
+REPORT_JOBS = {}
 SPREADSHEET_JOBS_LOCK = threading.RLock()
 SPREADSHEET_JOBS = {}
 SHIPMENT_MODE_CACHE_LOCK = threading.RLock()
@@ -3803,6 +3805,7 @@ def apply_clone_gtin_override(create_payload, raw_value):
     codes = normalize_clone_identifier_codes(raw_value)
     if not codes:
         return create_payload
+    remove_clone_attributes(create_payload, ["EMPTY_GTIN_REASON"])
     create_payload["attributes"] = remove_clone_product_identifiers(create_payload.get("attributes") or [])
     variations = create_payload.get("variations") or []
     if variations:
@@ -3825,6 +3828,8 @@ def clone_required_attribute_satisfied(create_payload, attr_id):
     if clone_payload_has_attribute(create_payload, attr_id):
         return True
     if attr_id == "GTIN" and clone_payload_has_attribute(create_payload, "EMPTY_GTIN_REASON"):
+        return True
+    if attr_id == "EMPTY_GTIN_REASON" and clone_payload_has_attribute(create_payload, "GTIN"):
         return True
     return False
 
@@ -4436,6 +4441,9 @@ def pending_clone_attribute(attr_id, source_item, category_attributes, item_id="
         message = f"Informe o valor e use uma das unidades aceitas: {', '.join(units)}."
     elif max_length:
         message = f"Informe o valor obrigatório com no máximo {max_length} caracteres."
+    default_value = ""
+    if resolved_id == "GTIN":
+        default_value = ", ".join(source_clone_identifiers(source_item))
     return clone_pending_field(
         f"attribute:{resolved_id}",
         label,
@@ -4446,6 +4454,7 @@ def pending_clone_attribute(attr_id, source_item, category_attributes, item_id="
         units=units,
         max_length=max_length,
         value_type=value_type,
+        default_value=default_value,
     )
 
 
@@ -4543,6 +4552,11 @@ def clone_payload_from_answers(create_payload, answers):
             attr_id = canonical_clone_attribute_id(key.split(":", 1)[1])
             if attr_id == "GTIN":
                 apply_clone_gtin_override(create_payload, value)
+            elif attr_id == "EMPTY_GTIN_REASON":
+                remove_clone_attributes(create_payload, GTIN_IDENTIFIER_ATTRS)
+                for variation in create_payload.get("variations") or []:
+                    variation["attributes"] = remove_clone_product_identifiers(variation.get("attributes") or [])
+                add_or_update_clone_attribute(create_payload, attr_id, value)
             else:
                 add_or_update_clone_attribute(create_payload, attr_id, value)
         elif key == "family_name":
@@ -4649,17 +4663,21 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
         if code in {"item.attributes.ignored", "invalid.item.attribute.values", "item.attribute.invalid_product_identifier"}:
             attrs_to_remove.extend(attribute_ids_from_error_text(message))
         if code == "item.attribute.invalid_product_identifier":
+            source_identifiers = source_clone_identifiers(source_item)
             attrs_to_remove.extend(GTIN_IDENTIFIER_ATTRS)
             gtin_definition = category_attribute_definition(category_attributes or [], "GTIN")
             if gtin_definition and clone_attribute_is_required(gtin_definition):
                 pending = pending_clone_attribute("GTIN", source_item, category_attributes or [], item_id)
                 if pending:
                     pending["message"] = "Informe um GTIN/EAN/UPC válido. Para variações, separe um código por vírgula para cada variação."
+                    if source_identifiers:
+                        pending["default_value"] = ", ".join(source_identifiers)
                     pending_fields.append(pending)
-                empty_reason = pending_clone_attribute("EMPTY_GTIN_REASON", source_item, category_attributes or [], item_id)
-                if empty_reason:
-                    empty_reason["message"] = "Use este campo somente quando o produto realmente não possuir código universal."
-                    pending_fields.append(empty_reason)
+                if not source_identifiers:
+                    empty_reason = pending_clone_attribute("EMPTY_GTIN_REASON", source_item, category_attributes or [], item_id)
+                    if empty_reason:
+                        empty_reason["message"] = "Use este campo somente quando o produto realmente não possuir código universal."
+                        pending_fields.append(empty_reason)
         if code == "item.attribute.invalid":
             attr_ids = attribute_ids_from_error_text(message)
             attr_ids.extend(attribute_id_from_human_name(name) for name in human_attribute_names_from_error_text(message))
@@ -5450,6 +5468,112 @@ def statistics_job_result(job_id, include_result=True):
         return json.loads(json.dumps(public, ensure_ascii=False))
 
 
+def cleanup_report_jobs(now=None):
+    now = now or time.time()
+    maximum_age = max(900, int(os.getenv("MELI_REPORT_JOB_TTL_SECONDS", "21600")))
+    with REPORT_JOBS_LOCK:
+        expired = [
+            job_id
+            for job_id, job in REPORT_JOBS.items()
+            if now - float(job.get("created_epoch") or now) > maximum_age
+        ]
+        for job_id in expired:
+            REPORT_JOBS.pop(job_id, None)
+
+
+def report_job_result(job_id, include_body=False):
+    cleanup_report_jobs()
+    with REPORT_JOBS_LOCK:
+        job = REPORT_JOBS.get(str(job_id or ""))
+        if not job:
+            return None
+        public = {key: value for key, value in job.items() if key not in {"body", "created_epoch"}}
+        if include_body:
+            public["body"] = job.get("body")
+        return public
+
+
+def start_report_job(request):
+    report_type = str((request or {}).get("report_type") or "").lower()
+    output_format = str((request or {}).get("format") or "xlsx").lower()
+    if report_type not in {"statistics", "catalog", "ads"}:
+        raise RuntimeError("Selecione Estatísticas, Catálogo ou Anúncios para exportar.")
+    if output_format not in {"xlsx", "pdf"}:
+        raise RuntimeError("Formato de relatório inválido.")
+    statistics_job_id = str((request or {}).get("statistics_job_id") or "")
+    if report_type == "statistics" and statistics_job_id:
+        statistics_job = statistics_job_result(statistics_job_id)
+        if not statistics_job or statistics_job.get("status") != "completed" or not statistics_job.get("result"):
+            raise RuntimeError("A consulta de estatísticas ainda não foi concluída. Aguarde e tente exportar novamente.")
+
+    cleanup_report_jobs()
+    job_id = uuid.uuid4().hex
+    job = {
+        "id": job_id,
+        "status": "queued",
+        "message": "Relatório adicionado à fila.",
+        "report_type": report_type,
+        "format": output_format,
+        "created_at": now_label(),
+        "created_epoch": time.time(),
+    }
+    with REPORT_JOBS_LOCK:
+        REPORT_JOBS[job_id] = job
+
+    filters = json.loads(json.dumps((request or {}).get("filters") or {}, ensure_ascii=False))
+
+    def worker():
+        try:
+            with REPORT_JOBS_LOCK:
+                REPORT_JOBS[job_id].update({"status": "processing", "message": "Preparando os dados do relatório."})
+            statistics_result = None
+            if report_type == "statistics" and statistics_job_id:
+                statistics_result = statistics_job_result(statistics_job_id).get("result")
+            title, columns, rows, metadata = report_dataset(
+                read_payload(include_catalog=report_type in {"catalog", "ads"}),
+                report_type,
+                filters,
+                statistics_result,
+            )
+            maximum_rows = max(10000, int(os.getenv("MELI_REPORT_MAX_ROWS", "100000")))
+            if len(rows) > maximum_rows:
+                raise RuntimeError(
+                    f"O relatório possui {len(rows)} linhas e excede o limite configurado de {maximum_rows}. Divida-o usando os filtros."
+                )
+            with REPORT_JOBS_LOCK:
+                REPORT_JOBS[job_id].update(
+                    {"message": f"Gerando {output_format.upper()} com {len(rows)} linha(s).", "row_count": len(rows)}
+                )
+            stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M")
+            if output_format == "xlsx":
+                body = build_report_xlsx(title, columns, rows, metadata)
+                content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            else:
+                body = build_report_pdf(title, columns, rows, metadata)
+                content_type = "application/pdf"
+            filename = f"competidor-{report_type}-{stamp}.{output_format}"
+            with REPORT_JOBS_LOCK:
+                REPORT_JOBS[job_id].update(
+                    {
+                        "status": "completed",
+                        "message": "Relatório concluído e pronto para baixar.",
+                        "body": body,
+                        "content_type": content_type,
+                        "filename": filename,
+                        "size": len(body),
+                        "finished_at": now_label(),
+                    }
+                )
+        except Exception as exc:
+            with REPORT_JOBS_LOCK:
+                REPORT_JOBS[job_id].update(
+                    {"status": "error", "message": str(exc), "finished_at": now_label()}
+                )
+
+    threading.Thread(target=worker, daemon=True).start()
+    return report_job_result(job_id)
+
+
 def report_filtered_catalog(payload, report_type, filters):
     account_filter = str(filters.get("account") or "all")
     search = normalized_attribute_label(filters.get("search") or filters.get("product") or "")
@@ -5594,34 +5718,43 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
 
 def build_report_xlsx(title, columns, rows, metadata):
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
 
-    workbook = Workbook()
-    sheet = workbook.active
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet()
     sheet.title = "RELATORIO"
-    sheet.append([label for _, label, _ in columns])
+    sheet.freeze_panes = "A2"
     header_fill = PatternFill("solid", fgColor="FFD600")
-    for cell in sheet[1]:
+    header = []
+    widths = [len(label) for _, label, _ in columns]
+    for _, label, _ in columns:
+        cell = WriteOnlyCell(sheet, value=label)
         cell.fill = header_fill
         cell.font = Font(bold=True, color="111827")
         cell.alignment = Alignment(vertical="center")
+        header.append(cell)
+    sheet.append(header)
     for row in rows:
-        sheet.append([row.get(key, "") if row.get(key, "") is not None else "" for key, _, _ in columns])
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = sheet.dimensions
-    for column_index, (key, label, kind) in enumerate(columns, 1):
-        max_length = len(label)
-        for row_index in range(2, sheet.max_row + 1):
-            cell = sheet.cell(row=row_index, column=column_index)
-            max_length = max(max_length, len(str(cell.value or "")))
+        cells = []
+        for column_index, (key, _, kind) in enumerate(columns):
+            value = row.get(key, "") if row.get(key, "") is not None else ""
+            cell = WriteOnlyCell(sheet, value=value)
             if kind == "currency" and cell.value not in (None, ""):
                 cell.number_format = 'R$ #,##0.00'
             elif kind == "integer" and cell.value not in (None, ""):
                 cell.number_format = '#,##0'
-        sheet.column_dimensions[sheet.cell(row=1, column=column_index).column_letter].width = min(max(max_length + 2, 12), 46)
+            widths[column_index] = max(widths[column_index], len(str(value or "")))
+            cells.append(cell)
+        sheet.append(cells)
+    sheet.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(rows) + 1}"
+    for column_index, width in enumerate(widths, 1):
+        sheet.column_dimensions[get_column_letter(column_index)].width = min(max(width + 2, 12), 46)
     info = workbook.create_sheet("FILTROS")
-    info.append([title])
-    info["A1"].font = Font(size=16, bold=True)
+    title_cell = WriteOnlyCell(info, value=title)
+    title_cell.font = Font(size=16, bold=True)
+    info.append([title_cell])
     info.append(["Filtro", "Valor"])
     for key, value in metadata.items():
         info.append([key, value])
@@ -5638,7 +5771,7 @@ def build_report_pdf(title, columns, rows, metadata):
     from reportlab.lib.pagesizes import A3, A4, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import LongTable, PageBreak, Paragraph, SimpleDocTemplate, Spacer, TableStyle
 
     stream = BytesIO()
     page_size = landscape(A3 if len(columns) > 14 else A4)
@@ -5657,37 +5790,41 @@ def build_report_pdf(title, columns, rows, metadata):
     story = [Paragraph(html.escape(title), styles["Title"])]
     story.append(Paragraph(" · ".join(f"<b>{html.escape(str(key))}:</b> {html.escape(str(value))}" for key, value in metadata.items()), styles["BodyText"]))
     story.append(Spacer(1, 5 * mm))
-    table_rows = [[Paragraph(html.escape(label), header_style) for _, label, _ in columns]]
-    for row in rows[:5000]:
-        values = []
-        for key, _, kind in columns:
-            value = row.get(key, "")
-            if kind == "currency" and value not in (None, ""):
-                value = brl(value)
-            values.append(Paragraph(html.escape(str(value if value not in (None, "") else "-")), cell_style))
-        table_rows.append(values)
     available_width = page_size[0] - 18 * mm
     weights = []
     for key, _, kind in columns:
         weights.append(2.4 if key in {"title", "product"} else 1.7 if key in {"winner_name", "accounts_label"} else 1.0)
     total_weight = sum(weights)
     widths = [available_width * weight / total_weight for weight in weights]
-    table = Table(table_rows, colWidths=widths, repeatRows=1, hAlign="LEFT")
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#FFD600")),
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#9CA3AF")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3F4F6")]),
-                ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ]
-        )
+    table_style = TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#FFD600")),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#9CA3AF")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3F4F6")]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]
     )
-    story.append(table)
+    chunk_size = max(100, int(os.getenv("MELI_REPORT_PDF_CHUNK_ROWS", "1000")))
+    header = [Paragraph(html.escape(label), header_style) for _, label, _ in columns]
+    for chunk_start in range(0, len(rows), chunk_size):
+        table_rows = [header]
+        for row in rows[chunk_start:chunk_start + chunk_size]:
+            values = []
+            for key, _, kind in columns:
+                value = row.get(key, "")
+                if kind == "currency" and value not in (None, ""):
+                    value = brl(value)
+                values.append(Paragraph(html.escape(str(value if value not in (None, "") else "-")), cell_style))
+            table_rows.append(values)
+        table = LongTable(table_rows, colWidths=widths, repeatRows=1, hAlign="LEFT")
+        table.setStyle(table_style)
+        story.append(table)
+        if chunk_start + chunk_size < len(rows):
+            story.append(PageBreak())
     document.build(story)
     return stream.getvalue()
 
@@ -6292,6 +6429,21 @@ class App(BaseHTTPRequestHandler):
             else:
                 self.send_json({"ok": True, **job})
             return
+        if parsed.path.startswith("/api/reports/jobs/"):
+            job_id = parsed.path.rsplit("/", 1)[-1]
+            query = parse_qs(parsed.query)
+            download = query.get("download", ["0"])[0] == "1"
+            job = report_job_result(job_id, include_body=download)
+            if not job:
+                self.send_json({"error": "Relatório não encontrado ou expirado."}, status=404)
+            elif download:
+                if job.get("status") != "completed" or not job.get("body"):
+                    self.send_json({"error": job.get("message") or "O relatório ainda não está pronto."}, status=409)
+                else:
+                    self.send_bytes(job["body"], job["content_type"], job["filename"])
+            else:
+                self.send_json({"ok": True, **job})
+            return
         if parsed.path == "/api/accounts":
             self.send_json([public_account(account) for account in payload["accounts"]])
             return
@@ -6799,31 +6951,8 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/reports/export":
             try:
-                report_type = str(request.get("report_type") or "").lower()
-                output_format = str(request.get("format") or "xlsx").lower()
-                if report_type not in {"statistics", "catalog", "ads"}:
-                    raise RuntimeError("Selecione Estatísticas, Catálogo ou Anúncios para exportar.")
-                if output_format not in {"xlsx", "pdf"}:
-                    raise RuntimeError("Formato de relatório inválido.")
-                statistics_result = None
-                if report_type == "statistics" and request.get("statistics_job_id"):
-                    job = statistics_job_result(request.get("statistics_job_id"))
-                    if not job or job.get("status") != "completed" or not job.get("result"):
-                        raise RuntimeError("A consulta de estatísticas ainda não foi concluída. Aguarde e tente exportar novamente.")
-                    statistics_result = job.get("result")
-                title, columns, rows, metadata = report_dataset(
-                    payload,
-                    report_type,
-                    request.get("filters") or {},
-                    statistics_result,
-                )
-                stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M")
-                if output_format == "xlsx":
-                    body = build_report_xlsx(title, columns, rows, metadata)
-                    self.send_bytes(body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"competidor-{report_type}-{stamp}.xlsx")
-                else:
-                    body = build_report_pdf(title, columns, rows, metadata)
-                    self.send_bytes(body, "application/pdf", f"competidor-{report_type}-{stamp}.pdf")
+                job = start_report_job(request)
+                self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
