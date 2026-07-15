@@ -32,11 +32,17 @@ CERTS = DATA / "certs"
 CERTS.mkdir(exist_ok=True)
 APP_DATA_FILE = "app.json"
 CATALOG_DATA_FILE = "catalog.json"
+SYNC_PROGRESS_FILE = "sync_progress.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
 ACTIVE_SYNC_ACCOUNTS = set()
 SYNC_PROGRESS_LOCK = threading.RLock()
 SYNC_PROGRESS = {}
+SYNC_PROGRESS_DATA_DIR = ""
+SYNC_PROGRESS_LAST_PERSIST = 0.0
+SYNC_WORKER_SEMAPHORE = threading.BoundedSemaphore(
+    max(1, min(2, int(os.getenv("MELI_SYNC_CONCURRENT_ACCOUNTS", "1"))))
+)
 MELI_NOTIFICATION_QUEUE = queue.Queue(maxsize=5000)
 CATEGORY_ATTRIBUTES_LOCK = threading.RLock()
 CATEGORY_ATTRIBUTES_CACHE = {}
@@ -56,6 +62,14 @@ SPREADSHEET_JOBS_LOCK = threading.RLock()
 SPREADSHEET_JOBS = {}
 SHIPMENT_MODE_CACHE_LOCK = threading.RLock()
 SHIPMENT_MODE_CACHE = {}
+CLONE_SOURCE_CACHE_LOCK = threading.RLock()
+CLONE_SOURCE_CACHE = {}
+ASYNC_OPERATION_JOBS_LOCK = threading.RLock()
+ASYNC_OPERATION_JOBS = {}
+ACTIVE_CLONE_OPERATIONS = set()
+CLONE_WORKER_SEMAPHORE = threading.BoundedSemaphore(
+    max(1, min(3, int(os.getenv("MELI_CLONE_CONCURRENT_JOBS", "2"))))
+)
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -134,6 +148,51 @@ def write_json(name, payload):
         os.replace(temporary, path)
 
 
+def ensure_sync_progress_loaded():
+    """Load the small durable sync registry once for the active data directory."""
+    global SYNC_PROGRESS_DATA_DIR
+    data_dir = str(DATA)
+    with SYNC_PROGRESS_LOCK:
+        if SYNC_PROGRESS_DATA_DIR == data_dir:
+            return
+        path = DATA / SYNC_PROGRESS_FILE
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, ValueError, TypeError):
+            stored = {}
+        SYNC_PROGRESS.clear()
+        if isinstance(stored, dict):
+            SYNC_PROGRESS.update(stored)
+        SYNC_PROGRESS_DATA_DIR = data_dir
+
+
+def persist_sync_progress(force=False):
+    global SYNC_PROGRESS_LAST_PERSIST
+    ensure_sync_progress_loaded()
+    now = time.time()
+    with SYNC_PROGRESS_LOCK:
+        if not force and now - SYNC_PROGRESS_LAST_PERSIST < 1.0:
+            return
+        write_json(SYNC_PROGRESS_FILE, SYNC_PROGRESS)
+        SYNC_PROGRESS_LAST_PERSIST = now
+
+
+def set_sync_progress(account_id, values, force=False):
+    account_id = str(account_id or "")
+    ensure_sync_progress_loaded()
+    with SYNC_PROGRESS_LOCK:
+        current = SYNC_PROGRESS.get(account_id, {})
+        SYNC_PROGRESS[account_id] = {**current, **values}
+    persist_sync_progress(force=force)
+    return SYNC_PROGRESS.get(account_id, {})
+
+
+def sync_progress_snapshot():
+    ensure_sync_progress_loaded()
+    with SYNC_PROGRESS_LOCK:
+        return json.loads(json.dumps(SYNC_PROGRESS, ensure_ascii=False))
+
+
 def read_payload(include_catalog=True):
     with DATA_LOCK:
         payload = read_json(APP_DATA_FILE, empty_payload())
@@ -209,8 +268,15 @@ def merge_critical_records(collection, incoming, latest):
         if saved is None:
             merged.append(current)
             continue
-        if collection == "accounts" and int(current.get("token_created_at") or 0) > int(saved.get("token_created_at") or 0):
-            merged.append({**saved, **current})
+        if collection == "accounts":
+            current_sync = str(current.get("last_sync") or current.get("sync_finished_at") or "")
+            saved_sync = str(saved.get("last_sync") or saved.get("sync_finished_at") or "")
+            row = {**current, **saved} if saved_sync >= current_sync else {**saved, **current}
+            token_source = current if int(current.get("token_created_at") or 0) > int(saved.get("token_created_at") or 0) else saved
+            for field in ("access_token", "refresh_token", "expires_in", "token_created_at", "status", "official"):
+                if field in token_source:
+                    row[field] = token_source[field]
+            merged.append(row)
         else:
             merged.append({**current, **saved})
     return merged
@@ -580,8 +646,7 @@ def public_payload(payload, actor=None, include_catalog=True):
     clean["item_logs"] = clean.get("item_logs", [])[:500]
     catalog = clean.get("catalog", [])
     clean["catalog_counts"] = catalog_counts(catalog) if include_catalog else clean.get("catalog_counts_snapshot") or catalog_counts([])
-    with SYNC_PROGRESS_LOCK:
-        live_progress = json.loads(json.dumps(SYNC_PROGRESS, ensure_ascii=False))
+    live_progress = sync_progress_snapshot()
     public_accounts = []
     for account in clean.get("accounts", []):
         account_key = str(account.get("id") or "")
@@ -593,12 +658,12 @@ def public_payload(payload, actor=None, include_catalog=True):
             public["sync_status"] = progress.get("message") or public.get("sync_status")
         elif "andamento" in str(public.get("sync_status") or "").lower():
             public["sync_progress"] = {
-                "status": "interrupted",
-                "stage": "interrupted",
+                "status": "running",
+                "stage": "queued",
                 "completed": 0,
                 "total": int(public.get("sync_total_item_ids") or 0),
                 "percent": 0,
-                "message": "A sincronização anterior foi interrompida ou o servidor reiniciou. Inicie uma nova sincronização.",
+                "message": "O servidor reiniciou; esta sincronização será retomada automaticamente.",
             }
             public["sync_status"] = public["sync_progress"]["message"]
         public_accounts.append(public)
@@ -1849,7 +1914,7 @@ def process_meli_notification(event):
     if topic not in {"items", "orders_v2", "catalog_item_competition_status"}:
         return
     seller_id = str(event.get("user_id") or "")
-    payload = read_payload()
+    payload = read_payload(include_catalog=False)
     account = next(
         (
             row
@@ -1962,6 +2027,16 @@ def auto_scan_loop():
         time.sleep(interval)
 
 
+def account_sync_is_active(account):
+    keys = {
+        str((account or {}).get("id") or ""),
+        str((account or {}).get("seller_id") or ""),
+        str((account or {}).get("nickname") or ""),
+    }
+    with SYNC_LOCK:
+        return bool(keys.intersection(ACTIVE_SYNC_ACCOUNTS))
+
+
 def auto_official_sync_loop():
     interval = max(120, int(os.getenv("AUTO_SYNC_INTERVAL_SECONDS", "300")))
     startup_delay = max(20, int(os.getenv("AUTO_SYNC_STARTUP_DELAY_SECONDS", "45")))
@@ -1970,11 +2045,19 @@ def auto_official_sync_loop():
     time.sleep(startup_delay)
     while True:
         try:
+            with ASYNC_OPERATION_JOBS_LOCK:
+                clone_busy = bool(ACTIVE_CLONE_OPERATIONS)
+            if clone_busy:
+                time.sleep(min(30, interval))
+                continue
             payload = read_payload()
             accounts = [
                 account
                 for account in payload.get("accounts", [])
-                if account.get("official") and account.get("access_token") and account.get("status") == "connected"
+                if account.get("official")
+                and account.get("access_token")
+                and account.get("status") == "connected"
+                and not account_sync_is_active(account)
             ]
             changed = False
             run_count += 1
@@ -1982,10 +2065,11 @@ def auto_official_sync_loop():
                 try:
                     result = refresh_official_account_items(payload, account, include_competition=False)
                     account["auto_sync_status"] = account.get("auto_refresh_status") or f"Atualização automática OK: {result.get('items', 0)} anúncios"
-                    if run_count % operations_every == 0:
+                    if account.get("operations_refresh_requested") or run_count % operations_every == 0:
                         client = account_client(account)
                         sync_recent_sales(payload, account, client)
                         sync_claims(payload, account, client)
+                        account["operations_refresh_requested"] = False
                     account["auto_sync_error"] = ""
                     account["last_auto_sync_at"] = now_label()
                     changed = True
@@ -2009,10 +2093,18 @@ def auto_catalog_competition_loop():
     time.sleep(startup_delay)
     while True:
         try:
+            with ASYNC_OPERATION_JOBS_LOCK:
+                clone_busy = bool(ACTIVE_CLONE_OPERATIONS)
+            if clone_busy:
+                time.sleep(min(15, interval))
+                continue
             payload = read_payload()
             accounts = [
                 account for account in payload.get("accounts", [])
-                if account.get("official") and account.get("access_token") and account.get("status") == "connected"
+                if account.get("official")
+                and account.get("access_token")
+                and account.get("status") == "connected"
+                and not account_sync_is_active(account)
             ]
             jobs = []
             for account in accounts:
@@ -3195,6 +3287,10 @@ def sync_pending_shipments_from_orders(payload, account, orders):
     for order in orders:
         status = str(order.get("status") or "").lower()
         tags = [str(tag).lower() for tag in order.get("tags", []) or []]
+        if status in final_statuses or status not in pending_statuses:
+            continue
+        if any(tag in {"shipped", "delivered", "cancelled", "canceled"} for tag in tags):
+            continue
         shipping = order.get("shipping") or {}
         shipment_id = shipment_id_from_order(order)
         official_shipment = {}
@@ -3208,12 +3304,7 @@ def sync_pending_shipments_from_orders(payload, account, orders):
         else:
             shipping_status = str(shipping.get("status") or first_present(shipping, ["status_history.status"], "") or "").lower()
         shipping_substatus = str(official_shipment.get("substatus") or first_present(shipping, ["substatus", "status_history.substatus"], "") or "").lower()
-        fulfilled = (
-            any(tag in {"shipped", "delivered", "cancelled", "canceled"} for tag in tags)
-            or shipping_status in final_shipping_statuses
-            or shipping_substatus in final_shipping_statuses
-        )
-        if status in final_statuses or status not in pending_statuses or fulfilled:
+        if shipping_status in final_shipping_statuses or shipping_substatus in final_shipping_statuses:
             continue
         deadline = ""
         sla_status = ""
@@ -3346,11 +3437,9 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
     if not account.get("official"):
         raise RuntimeError("Apenas contas com OAuth oficial podem ser sincronizadas.")
 
-    update_progress("preparing", 0, 0, "Validando a conta e sincronizando operações.")
+    update_progress("preparing", 0, 0, "Validando a conta no Mercado Livre.")
     client = account_client(account)
     user_profile = client.user(account["seller_id"])
-    sync_recent_sales(payload, account, client)
-    sync_claims(payload, account, client)
     update_progress("listing", 0, 0, "Listando todos os anúncios da conta no Mercado Livre.")
     item_ids = client.seller_all_items(account["seller_id"], max_items=None if limit in (None, "all") else int(limit))
     update_progress("items", 0, len(item_ids), f"{len(item_ids)} anúncios encontrados; importando os dados oficiais.")
@@ -3366,51 +3455,59 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
 
     def fetch_item_batch(batch):
         batch_start, batch_ids = batch
+        while True:
+            with ASYNC_OPERATION_JOBS_LOCK:
+                clone_busy = bool(ACTIVE_CLONE_OPERATIONS)
+            if not clone_busy:
+                break
+            time.sleep(0.25)
         try:
             batch_items = client.items_bulk(batch_ids)
         except Exception:
             batch_items = []
-            for item_id in batch_ids:
+
+            def fetch_single(item_id):
                 try:
-                    batch_items.append(client.item(item_id))
+                    return client.item(item_id)
                 except Exception:
-                    pass
+                    return None
+
+            fallback_workers = max(1, min(4, int(os.getenv("MELI_SYNC_FALLBACK_WORKERS", "4"))))
+            with ThreadPoolExecutor(max_workers=fallback_workers, thread_name_prefix="meli-item-retry") as fallback:
+                batch_items = [item for item in fallback.map(fetch_single, batch_ids) if item]
         return batch_start, batch_items, len(batch_ids)
 
     batch_workers = max(1, min(8, int(os.getenv("MELI_SYNC_BATCH_WORKERS", "4"))))
-    fetched_batches = []
     fetched_count = 0
     with ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="meli-items") as executor:
         futures = [executor.submit(fetch_item_batch, batch) for batch in batches]
         for future in as_completed(futures):
-            result = future.result()
-            fetched_batches.append(result)
-            fetched_count += result[2]
+            batch_start, batch_items, planned_count = future.result()
+            for batch_offset, item in enumerate(batch_items):
+                item_id = item.get("id")
+                index = batch_start + batch_offset
+                if not item_id:
+                    continue
+                is_catalog = is_catalog_listing(item)
+                if is_catalog and index < competition_inline_limit:
+                    competition = normalize_competition(client, account, item)
+                else:
+                    competition = competition_snapshot(existing_by_id.get(item_id, {}))
+                row = synced_catalog_item(account, item, competition)
+                previous = existing_by_id.get(item_id, {})
+                preserve_shipping_cost_snapshot(row, previous)
+                preserve_identifier_snapshot(row, previous)
+                row["first_seen_at"] = previous.get("first_seen_at") or now_label()
+                imported.append(row)
+            fetched_count += planned_count
             update_progress(
                 "items",
                 min(fetched_count, len(item_ids)),
                 len(item_ids),
-                f"Importando anúncios: {min(fetched_count, len(item_ids))} de {len(item_ids)}.",
+                f"Importando e organizando anúncios: {min(fetched_count, len(item_ids))} de {len(item_ids)}.",
             )
-    update_progress("processing", len(item_ids), len(item_ids), "Organizando os anúncios importados.")
-    for batch_start, batch_items, _ in sorted(fetched_batches, key=lambda row: row[0]):
-        for batch_offset, item in enumerate(batch_items):
-            item_id = item.get("id")
-            index = batch_start + batch_offset
-            if not item_id:
-                continue
-            is_catalog = is_catalog_listing(item)
-            if is_catalog and index < competition_inline_limit:
-                competition = normalize_competition(client, account, item)
-            else:
-                competition = competition_snapshot(existing_by_id.get(item_id, {}))
-            row = synced_catalog_item(account, item, competition)
-            previous = existing_by_id.get(item_id, {})
-            preserve_shipping_cost_snapshot(row, previous)
-            preserve_identifier_snapshot(row, previous)
-            row["first_seen_at"] = previous.get("first_seen_at") or now_label()
-            imported.append(row)
 
+    update_progress("saving", len(imported), len(item_ids), "Salvando os anúncios importados.")
     payload["catalog"] = [
         item
         for item in payload.get("catalog", [])
@@ -3421,7 +3518,6 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
     account["sync_status"] = f"{len(imported)} anúncios importados da API oficial"
     account["sync_total_item_ids"] = len(item_ids)
     upsert_metric(payload, account, user_profile)
-    update_progress("completed", len(imported), len(item_ids), f"Sincronização concluída: {len(imported)} anúncios importados.")
     # Estoque zerado antigo não gera alerta na sincronização completa; alertas vêm de transição no refresh automático.
     return {"account": public_account(account), "items": len(imported), "catalog": imported}
 
@@ -3574,82 +3670,138 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
 
 
 def enqueue_official_sync(account_id, limit=None, reason="manual"):
-    account_id = str(account_id or "")
-    with SYNC_LOCK:
-        if account_id in ACTIVE_SYNC_ACCOUNTS:
-            return {"queued": False, "status": "running", "message": "Sincronização desta conta já está em andamento."}
-        ACTIVE_SYNC_ACCOUNTS.add(account_id)
+    requested_account_id = str(account_id or "")
     payload = read_payload()
     account = next(
         (
             item
             for item in payload.get("accounts", [])
-            if item.get("id") == account_id or str(item.get("seller_id")) == account_id or item.get("nickname") == account_id
+            if item.get("id") == requested_account_id
+            or str(item.get("seller_id")) == requested_account_id
+            or item.get("nickname") == requested_account_id
         ),
         None,
     )
     if not account:
-        with SYNC_LOCK:
-            ACTIVE_SYNC_ACCOUNTS.discard(account_id)
         raise RuntimeError("Conta não encontrada.")
-    account["sync_status"] = "Sincronização em andamento no servidor"
+    account_id = str(account.get("id") or account.get("seller_id") or requested_account_id)
+    with SYNC_LOCK:
+        if account_id in ACTIVE_SYNC_ACCOUNTS:
+            return {"queued": False, "status": "running", "message": "Sincronização desta conta já está em andamento."}
+        ACTIVE_SYNC_ACCOUNTS.add(account_id)
+    account["sync_status"] = "Sincronização aguardando a fila do servidor"
     account["sync_requested_at"] = now_label()
     account["sync_reason"] = reason
-    with SYNC_PROGRESS_LOCK:
-        SYNC_PROGRESS[account_id] = {
+    queued_total = int(account.get("sync_total_item_ids") or 0)
+    set_sync_progress(
+        account_id,
+        {
             "status": "running",
             "stage": "queued",
             "completed": 0,
-            "total": 0,
+            "total": queued_total,
             "percent": 0,
-            "message": "Sincronização adicionada à fila do servidor.",
+            "message": "Sincronização adicionada à fila; aguardando disponibilidade do servidor.",
             "started_at": now_label(),
+            "started_epoch": time.time(),
             "updated_epoch": time.time(),
-        }
+            "limit": limit,
+            "reason": reason,
+        },
+        force=True,
+    )
     write_payload(payload)
 
     def worker():
         def progress(stage, completed=0, total=0, message=""):
             completed = max(0, int(completed or 0))
             total = max(0, int(total or 0))
-            percent = round((completed / total) * 100, 1) if total else 0
-            with SYNC_PROGRESS_LOCK:
-                SYNC_PROGRESS[account_id] = {
-                    **SYNC_PROGRESS.get(account_id, {}),
+            ratio = min(1.0, completed / total) if total else 0
+            if stage == "completed":
+                percent = 100.0
+            elif stage == "operations":
+                percent = 99.0
+            elif stage == "saving":
+                percent = 97.0
+            elif stage == "items":
+                percent = round(5 + ratio * 91, 1)
+            elif stage == "listing":
+                percent = 4.0
+            elif stage == "preparing":
+                percent = 2.0
+            else:
+                percent = 0.0
+            previous = sync_progress_snapshot().get(account_id, {})
+            started_epoch = float(previous.get("started_epoch") or time.time())
+            elapsed = max(0.0, time.time() - started_epoch)
+            eta_seconds = None
+            if 5 <= percent < 97 and elapsed >= 5:
+                eta_seconds = max(0, round((elapsed / (percent / 100.0)) - elapsed))
+            set_sync_progress(
+                account_id,
+                {
+                    **previous,
                     "status": "completed" if stage == "completed" else "running",
                     "stage": stage,
                     "completed": completed,
                     "total": total,
                     "percent": min(100, percent),
                     "message": message,
+                    "eta_seconds": eta_seconds,
                     "updated_epoch": time.time(),
-                }
+                },
+                force=stage in {"completed", "error", "saving", "operations"},
+            )
 
         try:
-            payload_inner = read_payload()
-            result = sync_official_account(payload_inner, account_id, limit, progress=progress)
-            refreshed = next(
-                (
-                    item
-                    for item in payload_inner.get("accounts", [])
-                    if item.get("id") == account_id or str(item.get("seller_id")) == account_id
-                ),
-                None,
-            )
-            if refreshed:
-                refreshed["sync_status"] = f"Sincronização concluída: {result.get('items', 0)} anúncios importados"
-                refreshed["sync_finished_at"] = now_label()
-                refreshed["sync_error"] = ""
-            write_payload(payload_inner)
+            with SYNC_WORKER_SEMAPHORE:
+                set_sync_progress(
+                    account_id,
+                    {
+                        "status": "running",
+                        "stage": "preparing",
+                        "message": "Iniciando a sincronização desta conta.",
+                        "started_at": now_label(),
+                        "started_epoch": time.time(),
+                        "updated_epoch": time.time(),
+                    },
+                    force=True,
+                )
+                payload_inner = read_payload()
+                result = sync_official_account(payload_inner, account_id, limit, progress=progress)
+                refreshed = next(
+                    (
+                        item
+                        for item in payload_inner.get("accounts", [])
+                        if item.get("id") == account_id or str(item.get("seller_id")) == account_id
+                    ),
+                    None,
+                )
+                if refreshed:
+                    refreshed["sync_status"] = f"Sincronização concluída: {result.get('items', 0)} anúncios importados"
+                    refreshed["sync_finished_at"] = now_label()
+                    refreshed["sync_error"] = ""
+                    refreshed["operations_refresh_requested"] = True
+                write_payload(payload_inner)
+                progress(
+                    "completed",
+                    result.get("items", 0),
+                    result.get("items", 0),
+                    f"Sincronização concluída: {result.get('items', 0)} anúncios importados. Vendas e reclamações serão atualizadas na próxima rodada automática.",
+                )
         except Exception as exc:
-            with SYNC_PROGRESS_LOCK:
-                SYNC_PROGRESS[account_id] = {
-                    **SYNC_PROGRESS.get(account_id, {}),
+            previous = sync_progress_snapshot().get(account_id, {})
+            set_sync_progress(
+                account_id,
+                {
+                    **previous,
                     "status": "error",
                     "stage": "error",
                     "message": str(exc),
                     "updated_epoch": time.time(),
-                }
+                },
+                force=True,
+            )
             payload_inner = read_payload()
             failed = next(
                 (
@@ -3669,7 +3821,35 @@ def enqueue_official_sync(account_id, limit=None, reason="manual"):
                 ACTIVE_SYNC_ACCOUNTS.discard(account_id)
 
     threading.Thread(target=worker, daemon=True).start()
-    return {"queued": True, "status": "queued", "message": "Sincronização iniciada em segundo plano."}
+    return {"queued": True, "status": "queued", "message": "Sincronização adicionada à fila persistente do servidor."}
+
+
+def resume_pending_official_syncs():
+    """Resume queued/running jobs after a deploy or unexpected process restart."""
+    time.sleep(max(2, int(os.getenv("MELI_SYNC_RESUME_DELAY_SECONDS", "5"))))
+    payload = read_payload(include_catalog=False)
+    progress_rows = sync_progress_snapshot()
+    pending = []
+    for account in payload.get("accounts", []):
+        account_id = str(account.get("id") or account.get("seller_id") or "")
+        progress = progress_rows.get(account_id) or progress_rows.get(str(account.get("seller_id") or "")) or {}
+        stored_status = str(account.get("sync_status") or "").lower()
+        if progress.get("status") in {"running", "queued"} or "andamento" in stored_status or "aguardando a fila" in stored_status:
+            pending.append((account_id, progress.get("limit"), "retomada após reinício"))
+    for account_id, limit, reason in pending:
+        try:
+            enqueue_official_sync(account_id, limit, reason)
+        except Exception as exc:
+            set_sync_progress(
+                account_id,
+                {
+                    "status": "error",
+                    "stage": "error",
+                    "message": f"Não foi possível retomar automaticamente: {exc}",
+                    "updated_epoch": time.time(),
+                },
+                force=True,
+            )
 
 
 def unlink_official_account(payload, account_id):
@@ -3699,6 +3879,81 @@ def unlink_official_account(payload, account_id):
     ]
     payload["metrics"] = [item for item in payload.get("metrics", []) if item.get("account") != account.get("nickname")]
     return public_account(account)
+
+
+def cleanup_async_operation_jobs():
+    cutoff = time.time() - max(300, int(os.getenv("ASYNC_OPERATION_TTL_SECONDS", "1800")))
+    with ASYNC_OPERATION_JOBS_LOCK:
+        expired = [
+            job_id
+            for job_id, job in ASYNC_OPERATION_JOBS.items()
+            if float(job.get("updated_epoch") or job.get("created_epoch") or 0) < cutoff
+        ]
+        for job_id in expired:
+            ASYNC_OPERATION_JOBS.pop(job_id, None)
+
+
+def async_operation_result(job_id):
+    cleanup_async_operation_jobs()
+    with ASYNC_OPERATION_JOBS_LOCK:
+        job = ASYNC_OPERATION_JOBS.get(str(job_id or ""))
+        return json.loads(json.dumps(job, ensure_ascii=False)) if job else None
+
+
+def start_async_operation(kind, work, message="Processamento adicionado à fila."):
+    cleanup_async_operation_jobs()
+    job_id = f"op-{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    job = {
+        "id": job_id,
+        "kind": kind,
+        "status": "queued",
+        "message": message,
+        "created_epoch": now,
+        "updated_epoch": now,
+    }
+    with ASYNC_OPERATION_JOBS_LOCK:
+        ASYNC_OPERATION_JOBS[job_id] = job
+
+    def worker():
+        with ASYNC_OPERATION_JOBS_LOCK:
+            ACTIVE_CLONE_OPERATIONS.add(job_id)
+        try:
+            with CLONE_WORKER_SEMAPHORE:
+                with ASYNC_OPERATION_JOBS_LOCK:
+                    current = ASYNC_OPERATION_JOBS.get(job_id)
+                    if current:
+                        current.update({"status": "running", "message": "Processando dados oficiais no Mercado Livre.", "updated_epoch": time.time()})
+                try:
+                    result = work()
+                    with ASYNC_OPERATION_JOBS_LOCK:
+                        current = ASYNC_OPERATION_JOBS.get(job_id)
+                        if current:
+                            current.update(
+                                {
+                                    "status": "completed",
+                                    "message": "Processamento concluído.",
+                                    "result": result,
+                                    "updated_epoch": time.time(),
+                                }
+                            )
+                except Exception as exc:
+                    with ASYNC_OPERATION_JOBS_LOCK:
+                        current = ASYNC_OPERATION_JOBS.get(job_id)
+                        if current:
+                            current.update(
+                                {
+                                    "status": "error",
+                                    "message": str(exc),
+                                    "updated_epoch": time.time(),
+                                }
+                            )
+        finally:
+            with ASYNC_OPERATION_JOBS_LOCK:
+                ACTIVE_CLONE_OPERATIONS.discard(job_id)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"job_id": job_id, "status": "queued", "message": message, "poll_url": f"/api/async/jobs/{job_id}"}
 
 
 def official_account_by_name(payload, name):
@@ -3897,6 +4152,68 @@ def clone_source_catalog_product(client, source_item):
         return product if isinstance(product, dict) else {}
     except Exception:
         return {}
+
+
+def clone_source_bundle(payload, account_identifier, item_id, include_description=False, force=False):
+    account = official_account_by_name(payload, account_identifier)
+    if not account or not account.get("official") or not account.get("access_token"):
+        raise RuntimeError("Conta origem oficial não encontrada para ler o anúncio.")
+    item_id = str(item_id or "").strip()
+    cache_key = f"{account.get('id') or account.get('seller_id')}:{item_id}"
+    ttl = max(30, int(os.getenv("MELI_CLONE_SOURCE_CACHE_SECONDS", "300")))
+    now = time.monotonic()
+    with CLONE_SOURCE_CACHE_LOCK:
+        cached = CLONE_SOURCE_CACHE.get(cache_key)
+        cache_valid = cached and not force and now - cached.get("time", 0) < ttl
+        if cache_valid and (not include_description or cached.get("description_loaded")):
+            return json.loads(json.dumps(cached["bundle"], ensure_ascii=False))
+
+    if cache_valid and include_description:
+        client = account_client(account)
+        try:
+            description = client.item_description(item_id) or {}
+            description_text = description.get("plain_text") or description.get("text") or ""
+        except Exception:
+            description_text = ""
+        with CLONE_SOURCE_CACHE_LOCK:
+            cached["bundle"]["description"] = description_text
+            cached["description_loaded"] = True
+            cached["time"] = now
+            return json.loads(json.dumps(cached["bundle"], ensure_ascii=False))
+
+    client = account_client(account)
+    raw_item = clone_source_item(client, item_id)
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="clone-source") as executor:
+        enriched_future = executor.submit(enrich_clone_source_item, client, raw_item)
+        catalog_future = executor.submit(clone_source_catalog_product, client, raw_item)
+        description_future = executor.submit(client.item_description, item_id) if include_description else None
+        source_item = enriched_future.result()
+        catalog_product = catalog_future.result()
+        description_text = ""
+        if description_future:
+            try:
+                description = description_future.result() or {}
+                description_text = description.get("plain_text") or description.get("text") or ""
+            except Exception:
+                description_text = ""
+    if catalog_product:
+        source_item["_clone_catalog_product"] = catalog_product
+    bundle = {
+        "source_item": source_item,
+        "catalog_product": catalog_product,
+        "description": description_text,
+    }
+    with CLONE_SOURCE_CACHE_LOCK:
+        CLONE_SOURCE_CACHE[cache_key] = {
+            "time": now,
+            "description_loaded": bool(include_description),
+            "bundle": json.loads(json.dumps(bundle, ensure_ascii=False)),
+        }
+        if len(CLONE_SOURCE_CACHE) > 500:
+            oldest = sorted(CLONE_SOURCE_CACHE, key=lambda key: CLONE_SOURCE_CACHE[key].get("time", 0))[:100]
+            for key in oldest:
+                CLONE_SOURCE_CACHE.pop(key, None)
+    return bundle
 
 
 def source_clone_attribute(source_item, catalog_product, attr_id):
@@ -5164,7 +5481,8 @@ def create_official_clone(payload, job, source_item_id, edits):
         raise RuntimeError("Conta destino oficial não encontrada para clonar via Mercado Livre.")
     source_client = account_client(source_account)
     target_client = account_client(target_account)
-    source_item = enrich_clone_source_item(source_client, clone_source_item(source_client, source_item_id))
+    bundle = clone_source_bundle(payload, source_account.get("id"), source_item_id, include_description=True)
+    source_item = bundle["source_item"]
     source_seller_id = str(first_present(source_item, ["seller_id", "seller.id"], "") or source_account.get("seller_id") or "")
     target_seller_id = str(target_account.get("seller_id") or "")
     cross_account = bool(source_seller_id and target_seller_id and source_seller_id != target_seller_id)
@@ -5173,7 +5491,7 @@ def create_official_clone(payload, job, source_item_id, edits):
         category_attributes = cached_category_attributes(source_client, source_item.get("category_id"))
     except Exception:
         category_attributes = []
-    catalog_product = clone_source_catalog_product(source_client, source_item)
+    catalog_product = bundle.get("catalog_product") or {}
     if catalog_product:
         source_item["_clone_catalog_product"] = catalog_product
     hydrate_clone_package_attributes(create_payload, source_item)
@@ -5197,11 +5515,7 @@ def create_official_clone(payload, job, source_item_id, edits):
             created["_verification_warning"] = f"Anúncio criado, mas ainda não apareceu na leitura imediata da API: {exc}"
     description_text = (edits.get("description") or "").strip()
     if not description_text:
-        try:
-            description = source_client.item_description(source_item_id)
-            description_text = description.get("plain_text") or description.get("text") or ""
-        except Exception:
-            description_text = ""
+        description_text = bundle.get("description") or ""
     if description_text and created.get("id"):
         try:
             target_client.create_item_description(created["id"], description_text)
@@ -5240,14 +5554,15 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
     category_cache = {}
     for item_id in item_ids:
         try:
-            source_item = enrich_clone_source_item(client, clone_source_item(client, item_id))
+            bundle = clone_source_bundle(payload, source_account.get("id"), item_id)
+            source_item = bundle["source_item"]
             create_payload = build_clone_item_payload(source_item, edits)
             category_id = create_payload.get("category_id")
             if not category_id:
                 continue
             if category_id not in category_cache:
                 category_cache[category_id] = cached_category_attributes(client, category_id)
-            catalog_product = clone_source_catalog_product(client, source_item)
+            catalog_product = bundle.get("catalog_product") or {}
             hydrate_clone_package_attributes(create_payload, source_item)
             hydrate_required_clone_attributes(
                 create_payload,
@@ -5285,19 +5600,11 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
 
 
 def clone_source_snapshot(payload, account_identifier, item_id):
-    account = official_account_by_name(payload, account_identifier)
-    if not account or not account.get("official") or not account.get("access_token"):
-        raise RuntimeError("Conta origem oficial não encontrada para ler o anúncio.")
-    client = account_client(account)
-    source_item = enrich_clone_source_item(client, clone_source_item(client, item_id))
-    catalog_product = clone_source_catalog_product(client, source_item)
+    bundle = clone_source_bundle(payload, account_identifier, item_id, include_description=True)
+    source_item = bundle["source_item"]
+    catalog_product = bundle.get("catalog_product") or {}
     identifiers = source_clone_identifiers(source_item, catalog_product)
-    description_text = ""
-    try:
-        description = client.item_description(item_id)
-        description_text = description.get("plain_text") or description.get("text") or ""
-    except Exception:
-        description_text = ""
+    description_text = bundle.get("description") or ""
     sku = item_sku(source_item)
     return {
         "item_id": source_item.get("id") or item_id,
@@ -6613,6 +6920,141 @@ def execute_clone_job(payload, job, incoming_answers=None):
     return copied
 
 
+def prepare_clone_preview(request):
+    payload = read_payload(include_catalog=False)
+    item_ids = request.get("item_ids") or []
+    edits = request.get("edits") or {}
+    if isinstance(item_ids, str):
+        item_ids = [item.strip() for item in item_ids.split(",") if item.strip()]
+    item_ids = [str(item_id).strip() for item_id in item_ids if str(item_id).strip()]
+    source = str(request.get("source") or "").strip()
+    target_values = request.get("targets") or [request.get("target") or ""]
+    if isinstance(target_values, str):
+        target_values = [target_values]
+    target_values = list(dict.fromkeys(str(value or "").strip() for value in target_values if str(value or "").strip()))
+    variants = request.get("variants") or [{}]
+    if not isinstance(variants, list):
+        variants = [{}]
+    if not source or not target_values:
+        raise RuntimeError("Informe conta origem e ao menos uma conta destino.")
+    source_account = official_account_by_name(payload, source)
+    if not source_account or not source_account.get("official") or not source_account.get("access_token"):
+        raise RuntimeError("A conta origem não está conectada oficialmente. Reautentique a conta e tente novamente.")
+    target_accounts = []
+    for target in target_values:
+        target_account = official_account_by_name(payload, target)
+        if not target_account or not target_account.get("official") or not target_account.get("access_token"):
+            raise RuntimeError(f"A conta destino {target} não está conectada oficialmente. Reautentique-a e tente novamente.")
+        target_accounts.append(target_account)
+    if not item_ids:
+        raise RuntimeError("Selecione ao menos um anúncio específico.")
+    if len(item_ids) > 1:
+        raise RuntimeError("A cópia permite apenas um anúncio por vez.")
+    catalog = read_json(CATALOG_DATA_FILE, [])
+    payload["catalog"] = catalog
+    payload["_catalog_loaded"] = False
+    source_items = [
+        item
+        for item in catalog
+        if (
+            item.get("account_id") == source_account.get("id")
+            or item.get("account") == source_account.get("nickname")
+        )
+        and item.get("id") in item_ids
+    ]
+    found_ids = {item.get("id") for item in source_items}
+    missing_ids = [item_id for item_id in item_ids if item_id not in found_ids]
+    if missing_ids:
+        raise RuntimeError(f"Anúncios não encontrados na conta origem: {', '.join(missing_ids)}.")
+    combinations = len(target_accounts) * len(variants)
+    if combinations > max(1, int(os.getenv("MELI_CLONE_MAX_COMBINATIONS", "20"))):
+        raise RuntimeError("Selecione no máximo 20 combinações de conta e tipo por lote.")
+    jobs = payload.get("clone_jobs")
+    if not isinstance(jobs, list):
+        jobs = []
+        payload["clone_jobs"] = jobs
+    batch_id = f"batch-{uuid.uuid4().hex[:8]}"
+    created_jobs = []
+    validation_cache = {}
+    for target_account in target_accounts:
+        for variant in variants:
+            variant = variant if isinstance(variant, dict) else {}
+            variant_edits = dict(edits)
+            listing_type = str(variant.get("listing_type_id") or "").strip()
+            if listing_type:
+                variant_edits["listing_type_id"] = listing_type
+            if variant.get("price") not in (None, ""):
+                variant_edits["price"] = variant.get("price")
+            validation_key = json.dumps(variant_edits, sort_keys=True, ensure_ascii=False)
+            if validation_key not in validation_cache:
+                validation_cache[validation_key] = clone_preflight_pending_fields(
+                    payload,
+                    source_account.get("id"),
+                    item_ids,
+                    variant_edits,
+                )
+            preflight_errors = json.loads(json.dumps(validation_cache[validation_key], ensure_ascii=False))
+            type_label = "Premium" if listing_type == "gold_pro" else "Clássico" if listing_type == "gold_special" else "Mesmo tipo do anúncio"
+            created_jobs.append(
+                {
+                    "id": f"clone-{uuid.uuid4().hex[:8]}",
+                    "batch_id": batch_id,
+                    "validation_version": 3,
+                    "source": source_account.get("nickname"),
+                    "target": target_account.get("nickname"),
+                    "source_account_id": source_account.get("id"),
+                    "target_account_id": target_account.get("id"),
+                    "item_ids": item_ids,
+                    "items": len(item_ids),
+                    "status": "review_required" if preflight_errors else "preview_ready",
+                    "edits": variant_edits,
+                    "variant_label": type_label,
+                    "errors": preflight_errors,
+                    "note": f"Preview preparado para {target_account.get('nickname')} em {type_label}. Campos opcionais em branco mantêm as informações originais.",
+                }
+            )
+    for job in reversed(created_jobs):
+        jobs.insert(0, job)
+    write_payload(payload)
+    legacy_request = not request.get("targets") and not request.get("variants")
+    return created_jobs[0] if legacy_request else {"batch_id": batch_id, "jobs": created_jobs}
+
+
+def execute_clone_request(request):
+    payload = read_payload()
+    jobs = payload.get("clone_jobs") if isinstance(payload.get("clone_jobs"), list) else []
+    job = next((item for item in jobs if item.get("id") == request.get("job_id")), None)
+    if not job:
+        raise RuntimeError("Preview não encontrado.")
+    copied = execute_clone_job(payload, job, request.get("field_answers") or {})
+    write_payload(payload)
+    return {"ok": True, "job": job, "copied": copied}
+
+
+def execute_clone_batch_request(request):
+    payload = read_payload()
+    jobs = payload.get("clone_jobs") if isinstance(payload.get("clone_jobs"), list) else []
+    requested_ids = request.get("job_ids") or []
+    batch_id = str(request.get("batch_id") or "")
+    selected = [
+        job
+        for job in jobs
+        if (requested_ids and job.get("id") in requested_ids)
+        or (batch_id and job.get("batch_id") == batch_id)
+    ]
+    if not selected:
+        raise RuntimeError("Nenhum preview do lote foi encontrado.")
+    if len(selected) > max(1, int(os.getenv("MELI_CLONE_MAX_COMBINATIONS", "20"))):
+        raise RuntimeError("O lote excede o limite de combinações permitido.")
+    copied = []
+    for job in selected:
+        if job.get("status") == "copied":
+            continue
+        copied.extend(execute_clone_job(payload, job, (request.get("field_answers") or {}).get(job.get("id"), {})))
+    write_payload(payload)
+    return {"ok": True, "jobs": selected, "copied": copied}
+
+
 class App(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
@@ -6818,6 +7260,14 @@ class App(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path.startswith("/api/async/jobs/"):
+            job_id = parsed.path.rsplit("/", 1)[-1]
+            job = async_operation_result(job_id)
+            if not job:
+                self.send_json({"error": "Processamento não encontrado ou expirado."}, status=404)
+            else:
+                self.send_json({"ok": True, **job})
+            return
         if parsed.path.startswith("/api/statistics/jobs/"):
             job_id = parsed.path.rsplit("/", 1)[-1]
             job = statistics_job_result(job_id)
@@ -7014,6 +7464,10 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/config",
             "/api/notifications/config",
             "/api/notifications/test",
+            "/api/meli/item/clone-source",
+            "/api/clone/preview",
+            "/api/clone/execute",
+            "/api/clone/execute-batch",
         }
         payload = read_payload(include_catalog=parsed.path not in lightweight_paths)
 
@@ -7552,12 +8006,17 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/meli/item/clone-source":
             try:
-                snapshot = clone_source_snapshot(
-                    payload,
-                    request.get("account_id") or request.get("account") or "",
-                    request.get("item_id") or "",
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "clone_source",
+                    lambda: clone_source_snapshot(
+                        read_payload(include_catalog=False),
+                        request_copy.get("account_id") or request_copy.get("account") or "",
+                        request_copy.get("item_id") or "",
+                    ),
+                    "Carregando EAN/GTIN, descrição e atributos oficiais.",
                 )
-                self.send_json({"ok": True, **snapshot})
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
@@ -7680,151 +8139,39 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/clone/preview":
             try:
-                item_ids = request.get("item_ids") or []
-                edits = request.get("edits") or {}
-                if isinstance(item_ids, str):
-                    item_ids = [item.strip() for item in item_ids.split(",") if item.strip()]
-                item_ids = [str(item_id).strip() for item_id in item_ids if str(item_id).strip()]
-                source = (request.get("source") or "").strip()
-                target_values = request.get("targets") or [request.get("target") or ""]
-                if isinstance(target_values, str):
-                    target_values = [target_values]
-                target_values = list(dict.fromkeys(str(value or "").strip() for value in target_values if str(value or "").strip()))
-                variants = request.get("variants") or [{}]
-                if not isinstance(variants, list):
-                    variants = [{}]
-                if not source or not target_values:
-                    self.send_json({"error": "Informe conta origem e ao menos uma conta destino."}, status=400)
-                    return
-                source_account = official_account_by_name(payload, source)
-                if not source_account or not source_account.get("official") or not source_account.get("access_token"):
-                    self.send_json({"error": "A conta origem não está conectada oficialmente. Reautentique a conta e tente novamente."}, status=400)
-                    return
-                target_accounts = []
-                for target in target_values:
-                    target_account = official_account_by_name(payload, target)
-                    if not target_account or not target_account.get("official") or not target_account.get("access_token"):
-                        self.send_json({"error": f"A conta destino {target} não está conectada oficialmente. Reautentique-a e tente novamente."}, status=400)
-                        return
-                    target_accounts.append(target_account)
-                if not item_ids:
-                    self.send_json({"error": "Selecione ao menos um anúncio específico."}, status=400)
-                    return
-                if len(item_ids) > 1:
-                    self.send_json({"error": "A cópia permite apenas um anúncio por vez."}, status=400)
-                    return
-                catalog = payload.setdefault("catalog", [])
-                source_items = [
-                    item
-                    for item in catalog
-                    if (
-                        item.get("account_id") == source_account.get("id")
-                        or item.get("account") == source_account.get("nickname")
-                    ) and item.get("id") in item_ids
-                ]
-                found_ids = {item.get("id") for item in source_items}
-                missing_ids = [item_id for item_id in item_ids if item_id not in found_ids]
-                if missing_ids:
-                    self.send_json(
-                        {
-                            "error": "Alguns anúncios selecionados não foram encontrados na conta origem.",
-                            "missing": missing_ids,
-                        },
-                        status=400,
-                    )
-                    return
-                combinations = len(target_accounts) * len(variants)
-                if combinations > max(1, int(os.getenv("MELI_CLONE_MAX_COMBINATIONS", "20"))):
-                    self.send_json({"error": "Selecione no máximo 20 combinações de conta e tipo por lote."}, status=400)
-                    return
-                jobs = payload.get("clone_jobs")
-                if not isinstance(jobs, list):
-                    jobs = []
-                    payload["clone_jobs"] = jobs
-                batch_id = f"batch-{uuid.uuid4().hex[:8]}"
-                created_jobs = []
-                validation_cache = {}
-                for target_account in target_accounts:
-                    for variant in variants:
-                        variant = variant if isinstance(variant, dict) else {}
-                        variant_edits = dict(edits)
-                        listing_type = str(variant.get("listing_type_id") or "").strip()
-                        if listing_type:
-                            variant_edits["listing_type_id"] = listing_type
-                        if variant.get("price") not in (None, ""):
-                            variant_edits["price"] = variant.get("price")
-                        validation_key = json.dumps(variant_edits, sort_keys=True, ensure_ascii=False)
-                        if validation_key not in validation_cache:
-                            validation_cache[validation_key] = clone_preflight_pending_fields(
-                                payload,
-                                source_account.get("id"),
-                                item_ids,
-                                variant_edits,
-                            )
-                        preflight_errors = json.loads(json.dumps(validation_cache[validation_key], ensure_ascii=False))
-                        type_label = "Premium" if listing_type == "gold_pro" else "Clássico" if listing_type == "gold_special" else "Mesmo tipo do anúncio"
-                        job = {
-                            "id": f"clone-{uuid.uuid4().hex[:8]}",
-                            "batch_id": batch_id,
-                            "validation_version": 3,
-                            "source": source_account.get("nickname"),
-                            "target": target_account.get("nickname"),
-                            "source_account_id": source_account.get("id"),
-                            "target_account_id": target_account.get("id"),
-                            "item_ids": item_ids,
-                            "items": len(item_ids),
-                            "status": "review_required" if preflight_errors else "preview_ready",
-                            "edits": variant_edits,
-                            "variant_label": type_label,
-                            "errors": preflight_errors,
-                            "note": f"Preview preparado para {target_account.get('nickname')} em {type_label}. Campos opcionais em branco mantêm as informações originais.",
-                        }
-                        created_jobs.append(job)
-                for job in reversed(created_jobs):
-                    jobs.insert(0, job)
-                write_payload(payload)
-                legacy_request = not request.get("targets") and not request.get("variants")
-                self.send_json(created_jobs[0] if legacy_request else {"batch_id": batch_id, "jobs": created_jobs}, status=201)
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "clone_preview",
+                    lambda: prepare_clone_preview(request_copy),
+                    "Preparando e validando a cópia em segundo plano.",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": f"Não foi possível gerar o preview: {exc}"}, status=400)
             return
 
         if parsed.path == "/api/clone/execute-batch":
             try:
-                jobs = payload.get("clone_jobs") if isinstance(payload.get("clone_jobs"), list) else []
-                requested_ids = request.get("job_ids") or []
-                batch_id = str(request.get("batch_id") or "")
-                selected = [
-                    job
-                    for job in jobs
-                    if (requested_ids and job.get("id") in requested_ids)
-                    or (batch_id and job.get("batch_id") == batch_id)
-                ]
-                if not selected:
-                    raise RuntimeError("Nenhum preview do lote foi encontrado.")
-                if len(selected) > max(1, int(os.getenv("MELI_CLONE_MAX_COMBINATIONS", "20"))):
-                    raise RuntimeError("O lote excede o limite de combinações permitido.")
-                copied = []
-                for job in selected:
-                    if job.get("status") == "copied":
-                        continue
-                    copied.extend(execute_clone_job(payload, job, (request.get("field_answers") or {}).get(job.get("id"), {})))
-                write_payload(payload)
-                self.send_json({"ok": True, "jobs": selected, "copied": copied})
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "clone_execute_batch",
+                    lambda: execute_clone_batch_request(request_copy),
+                    "Cópia adicionada à fila do Mercado Livre.",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": f"Não foi possível executar o lote: {exc}"}, status=400)
             return
 
         if parsed.path == "/api/clone/execute":
             try:
-                jobs = payload.get("clone_jobs") if isinstance(payload.get("clone_jobs"), list) else []
-                job = next((item for item in jobs if item.get("id") == request.get("job_id")), None)
-                if not job:
-                    self.send_json({"error": "Preview não encontrado."}, status=404)
-                    return
-                copied = execute_clone_job(payload, job, request.get("field_answers") or {})
-                write_payload(payload)
-                self.send_json({"ok": True, "job": job, "copied": copied})
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "clone_execute",
+                    lambda: execute_clone_request(request_copy),
+                    "Cópia adicionada à fila do Mercado Livre.",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": f"Não foi possível copiar o anúncio: {exc}"}, status=400)
             return
@@ -7844,6 +8191,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=https_server.serve_forever, daemon=True).start()
     threading.Thread(target=meli_notification_loop, daemon=True).start()
+    threading.Thread(target=resume_pending_official_syncs, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
     threading.Thread(target=auto_official_sync_loop, daemon=True).start()
     threading.Thread(target=auto_catalog_competition_loop, daemon=True).start()

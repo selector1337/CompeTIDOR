@@ -64,6 +64,9 @@
   equalizationPageSize: 20,
   openDescriptions: new Set(),
   itemDescriptions: {},
+  cloneSourceCache: {},
+  cloneSourceRequestToken: 0,
+  cloneSourceLoading: false,
 };
 
 const PAGE_SIZE = 100;
@@ -133,6 +136,21 @@ async function api(path, options) {
     throw error;
   }
   return payload;
+}
+
+async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 1000) {
+  if (!initial?.job_id) return initial;
+  const startedAt = Date.now();
+  const pollUrl = initial.poll_url || `/api/async/jobs/${initial.job_id}`;
+  while (Date.now() - startedAt < timeoutMs) {
+    if (typeof onProgress === "function") onProgress(initial.message || "Processando no servidor...");
+    await new Promise((resolve) => window.setTimeout(resolve, 900));
+    const job = await api(pollUrl);
+    if (typeof onProgress === "function") onProgress(job.message || "Processando no servidor...");
+    if (job.status === "completed") return job.result || {};
+    if (job.status === "error") throw new Error(job.message || "O processamento em segundo plano não foi concluído.");
+  }
+  throw new Error("O processamento continua no servidor, mas excedeu o tempo de acompanhamento desta tela. Atualize a página para consultar o resultado.");
 }
 
 function showToast(message, type = "success") {
@@ -1087,12 +1105,25 @@ function syncProgressHtml(account) {
   const count = progress.total
     ? `${Number(progress.completed || 0).toLocaleString("pt-BR")} de ${Number(progress.total).toLocaleString("pt-BR")} anúncios`
     : "Preparando a contagem de anúncios";
+  const eta = progress.status === "running" && Number.isFinite(Number(progress.eta_seconds)) && Number(progress.eta_seconds) > 0
+    ? ` · estimativa: ${formatDuration(Number(progress.eta_seconds))}`
+    : "";
   const tone = progress.status === "error" || progress.status === "interrupted" ? "error" : progress.status === "completed" ? "completed" : "running";
   return `<div class="sync-progress ${tone}">
     <div><span>${escapeText(progress.message || account.sync_status || "Sincronizando anúncios")}</span><strong>${progress.total ? `${percent.toFixed(percent % 1 ? 1 : 0)}%` : ""}</strong></div>
     <div class="sync-progress-track"><span style="width:${progress.total ? percent : 8}%"></span></div>
-    <small>${escapeText(count)}</small>
+    <small>${escapeText(count + eta)}</small>
   </div>`;
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(seconds || 0));
+  if (total < 60) return `menos de 1 min`;
+  const minutes = Math.round(total / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours}h ${remainder}min` : `${hours}h`;
 }
 
 function metricLine(label, value, max, inverse) {
@@ -2537,32 +2568,60 @@ async function fillCloneFieldsFromItem(itemId) {
   if (form.elements.classic_price && !form.elements.classic_price.value) form.elements.classic_price.value = item.price || "";
   if (form.elements.premium_price && !form.elements.premium_price.value) form.elements.premium_price.value = item.price || "";
   form.elements.sku_suffix.value = item.sku && item.sku !== "-" ? item.sku : "";
-  form.elements.gtin_override.value = "";
-  form.elements.description_override.value = "Carregando descrição...";
+  form.elements.gtin_override.value = item.gtin || "";
+  form.elements.description_override.value = state.itemDescriptions[itemId]?.value || "";
+  const submit = form.querySelector('button[type="submit"]');
+  const cached = state.cloneSourceCache[itemId];
+  const requestToken = ++state.cloneSourceRequestToken;
+  if (cached && Date.now() - Number(cached._cachedAt || 0) < 5 * 60 * 1000) {
+    applyCloneSourceToForm(cached, item, form);
+    return;
+  }
+  state.cloneSourceLoading = true;
+  if (submit) {
+    submit.disabled = true;
+    submit.textContent = "Carregando dados oficiais...";
+  }
   try {
-    const result = await api("/api/meli/item/clone-source", {
+    const queued = await api("/api/meli/item/clone-source", {
       method: "POST",
       body: JSON.stringify({ item_id: item.id, account_id: item.account_id }),
     });
-    form.elements.title_override.value = (result.title || item.title || "").slice(0, 60);
-    form.elements.price_override.value = result.price ?? item.price ?? "";
-    form.elements.stock_override.value = result.stock ?? item.stock ?? "";
-    form.elements.listing_type_override.value = result.listing_type_id || item.listing_type_id || "";
-    form.elements.sku_suffix.value = result.sku || (item.sku !== "-" ? item.sku : "") || "";
-    form.elements.gtin_override.value = result.gtin || "";
-    form.elements.description_override.value = result.description || "";
-    const gtinHint = document.querySelector("#clone-gtin-hint");
-    if (gtinHint) {
-      gtinHint.textContent = result.variation_count > 1
-        ? `Este anúncio possui ${result.variation_count} variações. Use um código por variação separado por vírgula.`
-        : result.gtin
-          ? "Código carregado do anúncio oficial de origem."
-          : "O anúncio de origem não retornou código universal; informe se a categoria exigir.";
+    const result = await waitForAsyncOperation(queued, (message) => {
+      if (submit) submit.textContent = message.includes("fila") ? "Aguardando consulta..." : "Carregando dados oficiais...";
+    });
+    state.cloneSourceCache[itemId] = { ...result, _cachedAt: Date.now() };
+    if (requestToken === state.cloneSourceRequestToken) applyCloneSourceToForm(result, item, form);
+  } catch (error) {
+    if (requestToken === state.cloneSourceRequestToken) showToast(error.message || "Não foi possível carregar todos os dados oficiais do anúncio.", "error");
+  } finally {
+    if (requestToken === state.cloneSourceRequestToken) {
+      state.cloneSourceLoading = false;
+      if (submit) {
+        submit.disabled = false;
+        submit.textContent = "Preparar cópia";
+      }
     }
-    updateCloneTitleCounter();
-  } catch (_) {
-    form.elements.description_override.value = "";
   }
+}
+
+function applyCloneSourceToForm(result, item, form) {
+  form.elements.title_override.value = (result.title || item.title || "").slice(0, 60);
+  form.elements.price_override.value = result.price ?? item.price ?? "";
+  form.elements.stock_override.value = result.stock ?? item.stock ?? "";
+  form.elements.listing_type_override.value = result.listing_type_id || item.listing_type_id || "";
+  form.elements.sku_suffix.value = result.sku || (item.sku !== "-" ? item.sku : "") || "";
+  form.elements.gtin_override.value = result.gtin || item.gtin || "";
+  form.elements.description_override.value = result.description || state.itemDescriptions[item.id]?.value || "";
+  const gtinHint = document.querySelector("#clone-gtin-hint");
+  if (gtinHint) {
+    gtinHint.textContent = result.variation_count > 1
+      ? `Este anúncio possui ${result.variation_count} variações. Use um código por variação separado por vírgula.`
+      : (result.gtin || item.gtin)
+        ? "Código carregado do anúncio oficial de origem."
+        : "O anúncio de origem não retornou código universal; informe se a categoria exigir.";
+  }
+  updateCloneTitleCounter();
 }
 
 function updateCloneTitleCounter() {
@@ -2577,6 +2636,11 @@ document.querySelector('[name="title_override"]')?.addEventListener("input", upd
 
 document.querySelector("#clone-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  const submitButton = event.currentTarget.querySelector('button[type="submit"]');
+  if (state.cloneSourceLoading) {
+    showToast("Aguarde o carregamento dos dados oficiais do anúncio selecionado.", "error");
+    return;
+  }
   const form = new FormData(event.currentTarget);
   const itemIds = [...state.cloneSelectedIds];
   if (!itemIds.length) {
@@ -2608,7 +2672,11 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
     return;
   }
   try {
-    const result = await api("/api/clone/preview", {
+    if (submitButton) {
+      submitButton.disabled = true;
+      submitButton.textContent = "Preparando no servidor...";
+    }
+    const queued = await api("/api/clone/preview", {
       method: "POST",
       body: JSON.stringify({
         source: form.get("source"),
@@ -2626,6 +2694,9 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
         },
       }),
     });
+    const result = await waitForAsyncOperation(queued, (message) => {
+      if (submitButton) submitButton.textContent = message.includes("fila") ? "Aguardando validação..." : "Validando anúncio...";
+    });
     const jobs = result.jobs || [result];
     state.data.clone_jobs.unshift(...jobs);
     state.cloneSelectedIds.clear();
@@ -2634,6 +2705,11 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
   } catch (error) {
     showToast(error.message || "Não foi possível gerar o preview.", "error");
     alert(error.message || "Não foi possível gerar o preview.");
+  } finally {
+    if (submitButton) {
+      submitButton.disabled = false;
+      submitButton.textContent = "Preparar cópia";
+    }
   }
 });
 
@@ -2645,9 +2721,12 @@ document.querySelector("#clone-jobs").addEventListener("click", async (event) =>
     batchButton.disabled = true;
     batchButton.textContent = "Copiando lote...";
     try {
-      const result = await api("/api/clone/execute-batch", {
+      const queued = await api("/api/clone/execute-batch", {
         method: "POST",
         body: JSON.stringify({ batch_id: batchId, job_ids: jobs.map((job) => job.id) }),
+      });
+      const result = await waitForAsyncOperation(queued, (message) => {
+        batchButton.textContent = message.includes("fila") ? "Cópia na fila..." : "Copiando lote...";
       });
       state.data.catalog.push(...(result.copied || []));
       const updated = new Map((result.jobs || []).map((job) => [job.id, job]));
@@ -2679,9 +2758,12 @@ document.querySelector("#clone-jobs").addEventListener("click", async (event) =>
   button.disabled = true;
   button.textContent = "Copiando...";
   try {
-    const result = await api("/api/clone/execute", {
+    const queued = await api("/api/clone/execute", {
       method: "POST",
       body: JSON.stringify({ job_id: button.dataset.executeClone, field_answers: fieldAnswers }),
+    });
+    const result = await waitForAsyncOperation(queued, (message) => {
+      button.textContent = message.includes("fila") ? "Cópia na fila..." : "Copiando...";
     });
     state.data.catalog.push(...(result.copied || []));
     state.data.clone_jobs = state.data.clone_jobs.map((job) => (job.id === result.job.id ? result.job : job));

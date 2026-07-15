@@ -1145,6 +1145,67 @@ h2 {
   background: color-mix(in srgb, var(--panel) 92%, var(--yellow) 8%);
 }
 
+#accounts-list {
+  align-content: start;
+  grid-auto-rows: max-content;
+}
+
+#accounts-list .account-item {
+  min-height: 0;
+  height: auto;
+  padding: 12px 14px;
+  cursor: default;
+  content-visibility: visible;
+  contain-intrinsic-size: auto;
+}
+
+#accounts-list .account-actions {
+  flex: 0 1 520px;
+  width: min(100%, 520px);
+  max-width: 520px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  justify-content: end;
+  align-items: center;
+  align-content: start;
+  gap: 8px;
+}
+
+#accounts-list .sync-progress {
+  grid-column: 1 / -1;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  height: auto;
+  min-height: 0;
+  flex: none;
+  padding: 8px 10px;
+  gap: 5px;
+}
+
+#accounts-list .sync-progress > div:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+#accounts-list .sync-progress-track { height: 6px; }
+
+@media (max-width: 900px) {
+  #accounts-list .account-actions {
+    grid-template-columns: 1fr 1fr;
+    justify-content: stretch;
+    max-width: none;
+  }
+
+  #accounts-list .account-actions > .badge,
+  #accounts-list .account-actions > small,
+  #accounts-list .sync-progress {
+    grid-column: 1 / -1;
+  }
+}
+
 .sync-progress > div:first-child {
   display: flex;
   justify-content: space-between;
