@@ -4892,6 +4892,18 @@ def target_official_store_id(target_client, target_account, source_item):
     ]
     if not available:
         return None
+    source_store_id = str(source_item.get("official_store_id") or "")
+    if source_store_id:
+        shared_store = next(
+            (
+                brand.get("official_store_id")
+                for brand in available
+                if str(brand.get("official_store_id") or "") == source_store_id
+            ),
+            None,
+        )
+        if shared_store not in (None, ""):
+            return shared_store
     source_names = {
         normalized_store_name(source_item.get("official_store_name")),
         normalized_store_name(first_present(source_item, ["official_store.name", "official_store.fantasy_name"], "")),
@@ -4916,8 +4928,47 @@ def target_official_store_id(target_client, target_account, source_item):
 
 def prepare_cross_account_official_store_payload(payload, destination_store_id=None):
     removed = strip_official_store_clone_fields(payload)
-    payload["official_store_id"] = destination_store_id
+    if destination_store_id not in (None, ""):
+        payload["official_store_id"] = destination_store_id
+    else:
+        payload.pop("official_store_id", None)
     return removed
+
+
+def official_store_error_kind(exc):
+    text = meli_error_text(exc).lower()
+    if "body.invalid_official_store_id" in text or (
+        "not allowed" in text and "official_store_id" in text
+    ):
+        return "invalid"
+    if "item.official_store_id.invalid" in text or (
+        "official store id" in text and ("have to provide" in text or "one of this" in text)
+    ):
+        return "required"
+    return ""
+
+
+def official_store_ids_from_error(exc):
+    text = meli_error_text(exc)
+    found = []
+    for match in re.finditer(r"\[([0-9,;\s]+)\]", text):
+        found.extend(re.findall(r"\d+", match.group(1)))
+    return list(dict.fromkeys(found))
+
+
+def official_store_retry_id(exc, source_item, current_store_id=None):
+    allowed_ids = official_store_ids_from_error(exc)
+    if not allowed_ids:
+        return None
+    source_store_id = str(source_item.get("official_store_id") or "")
+    if source_store_id in allowed_ids:
+        return source_item.get("official_store_id")
+    current_store_id = str(current_store_id or "")
+    if current_store_id in allowed_ids:
+        return current_store_id
+    if len(allowed_ids) == 1:
+        return int(allowed_ids[0])
+    return None
 
 
 def required_fields_from_error(exc):
@@ -5658,9 +5709,16 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
 def friendly_clone_error(exc):
     if meli_rate_limited_error(exc):
         return "O Mercado Livre limitou temporariamente as criações. A aplicação tentou novamente com espera progressiva; aguarde alguns instantes e repita se necessário."
-    error_text = meli_error_text(exc).lower()
-    if "official_store_id" in error_text:
-        return "O Mercado Livre recusou o vínculo de loja oficial da origem. A aplicação tentou removê-lo automaticamente neste mesmo processamento."
+    store_error = official_store_error_kind(exc)
+    if store_error == "invalid":
+        detail = meli_error_detail(exc)
+        message = str(detail.get("error") or detail.get("message") or "").strip() if isinstance(detail, dict) else ""
+        suffix = f" Detalhe oficial: {message}" if message else ""
+        return f"A conta destino recusou o ID de Loja Oficial enviado. A aplicação repetiu a criação sem o vínculo recusado.{suffix}"
+    if store_error == "required":
+        allowed = official_store_ids_from_error(exc)
+        choices = f" IDs aceitos informados pela API: {', '.join(allowed)}." if allowed else ""
+        return f"A conta destino exige um ID de Loja Oficial próprio para publicar este anúncio.{choices}"
     causes = meli_error_causes(exc)
     if not causes:
         return str(exc)
@@ -5719,6 +5777,32 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
                 rate_limit_attempts += 1
                 time.sleep(delay)
                 continue
+            if cross_account:
+                store_error = official_store_error_kind(exc)
+                if store_error == "invalid" and (
+                    destination_store_id not in (None, "") or "official_store_id" in payload
+                ):
+                    rejected_store_id = destination_store_id
+                    destination_store_id = None
+                    strip_official_store_clone_fields(payload)
+                    adjustments.append({
+                        "tipo": "loja_oficial_destino_recusada_removida",
+                        "campos": ["official_store_id"],
+                        "valor_recusado": rejected_store_id,
+                    })
+                    validation_attempts += 1
+                    continue
+                if store_error == "required":
+                    retry_store_id = official_store_retry_id(exc, source_item, destination_store_id)
+                    if retry_store_id not in (None, "") and str(retry_store_id) != str(destination_store_id or ""):
+                        destination_store_id = retry_store_id
+                        adjustments.append({
+                            "tipo": "loja_oficial_destino_exigida_aplicada",
+                            "campos": ["official_store_id"],
+                            "destino": retry_store_id,
+                        })
+                        validation_attempts += 1
+                        continue
             validation_attempts += 1
             payload, changed, new_adjustments = clone_retry_adjustments_from_error(
                 exc,
