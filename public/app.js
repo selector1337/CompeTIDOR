@@ -1069,15 +1069,30 @@ function renderAccounts() {
               ${account.official ? "Oficial OAuth" : account.status === "oauth_error" ? "Erro OAuth" : "Demo"}
             </span>
             ${account.official ? `<a class="mini-button button-link" href="/api/oauth/start?switch_account=1">Reautenticar</a>` : ""}
-            ${account.official ? `<button class="mini-button" data-sync-account="${account.id}">Sincronizar anúncios</button>` : ""}
+            ${account.official ? `<button class="mini-button" data-sync-account="${account.id}" ${account.sync_progress?.status === "running" ? "disabled" : ""}>${account.sync_progress?.status === "running" ? "Sincronizando..." : "Sincronizar anúncios"}</button>` : ""}
             ${account.official ? `<button class="mini-button danger-button" data-unlink-account="${account.id}" data-account-name="${account.nickname}">Desvincular</button>` : ""}
-            ${account.sync_status ? `<small>${account.sync_status}</small>` : ""}
+            ${syncProgressHtml(account)}
             ${account.webhook_status ? `<small>${escapeText(account.webhook_status)} · ${formatDateBR(account.last_webhook_at)}</small>` : ""}
           </div>
         </article>
       `
     )
     .join("");
+}
+
+function syncProgressHtml(account) {
+  const progress = account.sync_progress;
+  if (!progress) return account.sync_status ? `<small>${escapeText(account.sync_status)}</small>` : "";
+  const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+  const count = progress.total
+    ? `${Number(progress.completed || 0).toLocaleString("pt-BR")} de ${Number(progress.total).toLocaleString("pt-BR")} anúncios`
+    : "Preparando a contagem de anúncios";
+  const tone = progress.status === "error" || progress.status === "interrupted" ? "error" : progress.status === "completed" ? "completed" : "running";
+  return `<div class="sync-progress ${tone}">
+    <div><span>${escapeText(progress.message || account.sync_status || "Sincronizando anúncios")}</span><strong>${progress.total ? `${percent.toFixed(percent % 1 ? 1 : 0)}%` : ""}</strong></div>
+    <div class="sync-progress-track"><span style="width:${progress.total ? percent : 8}%"></span></div>
+    <small>${escapeText(count)}</small>
+  </div>`;
 }
 
 function metricLine(label, value, max, inverse) {
@@ -1471,6 +1486,13 @@ function currentReportFilters(reportType) {
       status: state.filter,
       ml_status: state.catalogMlStatus,
       stock: state.catalogStock,
+    };
+  }
+  if (reportType === "equalization") {
+    return {
+      report_mode: state.equalizationType,
+      account: state.equalizationAccount,
+      search: state.equalizationSearch,
     };
   }
   return {
@@ -2942,6 +2964,17 @@ document.querySelector("#theme-toggle").addEventListener("click", () => {
 window.addEventListener("hashchange", () => {
   if (state.data) render();
 });
+
+window.setInterval(async () => {
+  if (state.route !== "contas" || !state.data?.accounts?.some((account) => account.sync_progress?.status === "running")) return;
+  try {
+    const dashboard = await api("/api/dashboard");
+    state.data.accounts = dashboard.accounts || state.data.accounts;
+    renderAccounts();
+  } catch (_) {
+    // A próxima rodada tenta novamente sem interromper o uso da página.
+  }
+}, 2500);
 
 const sidebar = document.querySelector(".sidebar");
 sidebar?.querySelectorAll("nav a").forEach((link) => {

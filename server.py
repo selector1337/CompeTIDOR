@@ -35,6 +35,8 @@ CATALOG_DATA_FILE = "catalog.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
 ACTIVE_SYNC_ACCOUNTS = set()
+SYNC_PROGRESS_LOCK = threading.RLock()
+SYNC_PROGRESS = {}
 MELI_NOTIFICATION_QUEUE = queue.Queue(maxsize=5000)
 CATEGORY_ATTRIBUTES_LOCK = threading.RLock()
 CATEGORY_ATTRIBUTES_CACHE = {}
@@ -168,6 +170,32 @@ def record_key(collection, record):
     return str(record.get("id") or "")
 
 
+def merge_clone_jobs(incoming, latest):
+    """Keep previews created while an older background writer was running."""
+    incoming_by_id = {str(row.get("id")): row for row in incoming or [] if row.get("id")}
+    latest_by_id = {str(row.get("id")): row for row in latest or [] if row.get("id")}
+    ordered_ids = [*latest_by_id, *[key for key in incoming_by_id if key not in latest_by_id]]
+    merged = []
+    status_rank = {
+        "preview_ready": 1,
+        "review_required": 2,
+        "partial_error": 3,
+        "error": 3,
+        "copied": 4,
+    }
+    for job_id in ordered_ids:
+        current = incoming_by_id.get(job_id)
+        saved = latest_by_id.get(job_id)
+        if current is None or saved is None:
+            merged.append(current or saved)
+            continue
+        current_rank = status_rank.get(current.get("status"), 0)
+        saved_rank = status_rank.get(saved.get("status"), 0)
+        winner = current if current_rank > saved_rank else saved
+        merged.append({**current, **saved, **winner})
+    return merged[:500]
+
+
 def merge_critical_records(collection, incoming, latest):
     merged = []
     incoming_by_key = {record_key(collection, row): row for row in incoming or [] if record_key(collection, row)}
@@ -251,6 +279,10 @@ def write_payload(payload, replace_collections=None):
                     )
             latest_notifications = latest.get("user_notifications") or {}
             payload["user_notifications"] = {**(payload.get("user_notifications") or {}), **latest_notifications}
+            payload["clone_jobs"] = merge_clone_jobs(
+                payload.get("clone_jobs", []),
+                latest.get("clone_jobs", []),
+            )
             if payload.get("_catalog_loaded", True):
                 payload["catalog"] = merge_catalog_records(
                     payload.get("catalog", []),
@@ -548,7 +580,29 @@ def public_payload(payload, actor=None, include_catalog=True):
     clean["item_logs"] = clean.get("item_logs", [])[:500]
     catalog = clean.get("catalog", [])
     clean["catalog_counts"] = catalog_counts(catalog) if include_catalog else clean.get("catalog_counts_snapshot") or catalog_counts([])
-    clean["accounts"] = [public_account(account) for account in clean.get("accounts", [])]
+    with SYNC_PROGRESS_LOCK:
+        live_progress = json.loads(json.dumps(SYNC_PROGRESS, ensure_ascii=False))
+    public_accounts = []
+    for account in clean.get("accounts", []):
+        account_key = str(account.get("id") or "")
+        seller_key = str(account.get("seller_id") or "")
+        progress = live_progress.get(account_key) or live_progress.get(seller_key)
+        public = public_account(account)
+        if progress:
+            public["sync_progress"] = progress
+            public["sync_status"] = progress.get("message") or public.get("sync_status")
+        elif "andamento" in str(public.get("sync_status") or "").lower():
+            public["sync_progress"] = {
+                "status": "interrupted",
+                "stage": "interrupted",
+                "completed": 0,
+                "total": int(public.get("sync_total_item_ids") or 0),
+                "percent": 0,
+                "message": "A sincronização anterior foi interrompida ou o servidor reiniciou. Inicie uma nova sincronização.",
+            }
+            public["sync_status"] = public["sync_progress"]["message"]
+        public_accounts.append(public)
+    clean["accounts"] = public_accounts
     clean["notifications"] = public_notifications(user_notifications(payload, actor, create=False))
     clean["operations"] = (
         build_operations(clean)
@@ -3274,7 +3328,11 @@ def mark_monthly_revenue_error(payload, account, period, status):
     record["updated_at"] = now_label()
 
 
-def sync_official_account(payload, account_id, limit=None):
+def sync_official_account(payload, account_id, limit=None, progress=None):
+    def update_progress(stage, completed=0, total=0, message=""):
+        if progress:
+            progress(stage, completed, total, message)
+
     account = next(
         (
             item
@@ -3288,11 +3346,14 @@ def sync_official_account(payload, account_id, limit=None):
     if not account.get("official"):
         raise RuntimeError("Apenas contas com OAuth oficial podem ser sincronizadas.")
 
+    update_progress("preparing", 0, 0, "Validando a conta e sincronizando operações.")
     client = account_client(account)
     user_profile = client.user(account["seller_id"])
     sync_recent_sales(payload, account, client)
     sync_claims(payload, account, client)
+    update_progress("listing", 0, 0, "Listando todos os anúncios da conta no Mercado Livre.")
     item_ids = client.seller_all_items(account["seller_id"], max_items=None if limit in (None, "all") else int(limit))
+    update_progress("items", 0, len(item_ids), f"{len(item_ids)} anúncios encontrados; importando os dados oficiais.")
     imported = []
     existing_by_id = {
         item.get("id"): item
@@ -3314,15 +3375,25 @@ def sync_official_account(payload, account_id, limit=None):
                     batch_items.append(client.item(item_id))
                 except Exception:
                     pass
-        return batch_start, batch_items
+        return batch_start, batch_items, len(batch_ids)
 
     batch_workers = max(1, min(8, int(os.getenv("MELI_SYNC_BATCH_WORKERS", "4"))))
     fetched_batches = []
+    fetched_count = 0
     with ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="meli-items") as executor:
         futures = [executor.submit(fetch_item_batch, batch) for batch in batches]
         for future in as_completed(futures):
-            fetched_batches.append(future.result())
-    for batch_start, batch_items in sorted(fetched_batches, key=lambda row: row[0]):
+            result = future.result()
+            fetched_batches.append(result)
+            fetched_count += result[2]
+            update_progress(
+                "items",
+                min(fetched_count, len(item_ids)),
+                len(item_ids),
+                f"Importando anúncios: {min(fetched_count, len(item_ids))} de {len(item_ids)}.",
+            )
+    update_progress("processing", len(item_ids), len(item_ids), "Organizando os anúncios importados.")
+    for batch_start, batch_items, _ in sorted(fetched_batches, key=lambda row: row[0]):
         for batch_offset, item in enumerate(batch_items):
             item_id = item.get("id")
             index = batch_start + batch_offset
@@ -3350,6 +3421,7 @@ def sync_official_account(payload, account_id, limit=None):
     account["sync_status"] = f"{len(imported)} anúncios importados da API oficial"
     account["sync_total_item_ids"] = len(item_ids)
     upsert_metric(payload, account, user_profile)
+    update_progress("completed", len(imported), len(item_ids), f"Sincronização concluída: {len(imported)} anúncios importados.")
     # Estoque zerado antigo não gera alerta na sincronização completa; alertas vêm de transição no refresh automático.
     return {"account": public_account(account), "items": len(imported), "catalog": imported}
 
@@ -3523,12 +3595,39 @@ def enqueue_official_sync(account_id, limit=None, reason="manual"):
     account["sync_status"] = "Sincronização em andamento no servidor"
     account["sync_requested_at"] = now_label()
     account["sync_reason"] = reason
+    with SYNC_PROGRESS_LOCK:
+        SYNC_PROGRESS[account_id] = {
+            "status": "running",
+            "stage": "queued",
+            "completed": 0,
+            "total": 0,
+            "percent": 0,
+            "message": "Sincronização adicionada à fila do servidor.",
+            "started_at": now_label(),
+            "updated_epoch": time.time(),
+        }
     write_payload(payload)
 
     def worker():
+        def progress(stage, completed=0, total=0, message=""):
+            completed = max(0, int(completed or 0))
+            total = max(0, int(total or 0))
+            percent = round((completed / total) * 100, 1) if total else 0
+            with SYNC_PROGRESS_LOCK:
+                SYNC_PROGRESS[account_id] = {
+                    **SYNC_PROGRESS.get(account_id, {}),
+                    "status": "completed" if stage == "completed" else "running",
+                    "stage": stage,
+                    "completed": completed,
+                    "total": total,
+                    "percent": min(100, percent),
+                    "message": message,
+                    "updated_epoch": time.time(),
+                }
+
         try:
             payload_inner = read_payload()
-            result = sync_official_account(payload_inner, account_id, limit)
+            result = sync_official_account(payload_inner, account_id, limit, progress=progress)
             refreshed = next(
                 (
                     item
@@ -3543,6 +3642,14 @@ def enqueue_official_sync(account_id, limit=None, reason="manual"):
                 refreshed["sync_error"] = ""
             write_payload(payload_inner)
         except Exception as exc:
+            with SYNC_PROGRESS_LOCK:
+                SYNC_PROGRESS[account_id] = {
+                    **SYNC_PROGRESS.get(account_id, {}),
+                    "status": "error",
+                    "stage": "error",
+                    "message": str(exc),
+                    "updated_epoch": time.time(),
+                }
             payload_inner = read_payload()
             failed = next(
                 (
@@ -5716,8 +5823,8 @@ def report_job_result(job_id, include_body=False):
 def start_report_job(request):
     report_type = str((request or {}).get("report_type") or "").lower()
     output_format = str((request or {}).get("format") or "xlsx").lower()
-    if report_type not in {"statistics", "catalog", "ads"}:
-        raise RuntimeError("Selecione Estatísticas, Catálogo ou Anúncios para exportar.")
+    if report_type not in {"statistics", "catalog", "ads", "equalization"}:
+        raise RuntimeError("Selecione Estatísticas, Catálogo, Anúncios ou Equalização para exportar.")
     if output_format not in {"xlsx", "pdf"}:
         raise RuntimeError("Formato de relatório inválido.")
     statistics_job_id = str((request or {}).get("statistics_job_id") or "")
@@ -5750,7 +5857,7 @@ def start_report_job(request):
             if report_type == "statistics" and statistics_job_id:
                 statistics_result = statistics_job_result(statistics_job_id).get("result")
             title, columns, rows, metadata = report_dataset(
-                read_payload(include_catalog=report_type in {"catalog", "ads"}),
+                read_payload(include_catalog=report_type in {"catalog", "ads", "equalization"}),
                 report_type,
                 filters,
                 statistics_result,
@@ -5875,6 +5982,70 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             "SKU": filters.get("sku") or "Todos",
         }
         return title, columns, rows, metadata
+
+    if report_type == "equalization":
+        accounts = [str(account.get("nickname") or "") for account in payload.get("accounts") or [] if account.get("official")]
+        matrix = {}
+        for item in payload.get("catalog") or []:
+            sku = str(item.get("sku") or "").strip().upper()
+            account_name = str(item.get("account") or "")
+            if not sku or sku == "-" or account_name not in accounts:
+                continue
+            key = (account_name, sku)
+            row = matrix.setdefault(key, {"account": account_name, "sku": sku, "product": item.get("title") or "", "classic": False, "premium": False})
+            row["classic"] = row["classic"] or item.get("listing_type_id") == "gold_special"
+            row["premium"] = row["premium"] or item.get("listing_type_id") == "gold_pro"
+        report_mode = str(filters.get("report_mode") or "listing_type_gap")
+        account_filter = str(filters.get("account") or "all")
+        search = normalized_attribute_label(filters.get("search") or "")
+        output = []
+        if report_mode == "listing_type_gap":
+            for row in matrix.values():
+                if row["classic"] == row["premium"]:
+                    continue
+                if account_filter != "all" and row["account"] != account_filter:
+                    continue
+                output.append({
+                    **row,
+                    "present": "Clássico" if row["classic"] else "Premium",
+                    "missing": "Premium" if row["classic"] else "Clássico",
+                })
+            columns = [
+                ("sku", "SKU", "text"), ("product", "Produto", "text"),
+                ("account", "Conta", "text"), ("present", "Possui", "text"),
+                ("missing", "Falta criar", "text"),
+            ]
+            title = "Equalização de anúncios Clássicos e Premium"
+        else:
+            by_sku = {}
+            for row in matrix.values():
+                summary = by_sku.setdefault(row["sku"], {"sku": row["sku"], "product": row["product"], "present_accounts": []})
+                if row["account"] not in summary["present_accounts"]:
+                    summary["present_accounts"].append(row["account"])
+            for row in by_sku.values():
+                missing = [account for account in accounts if account not in row["present_accounts"]]
+                if not missing or (account_filter != "all" and account_filter not in row["present_accounts"]):
+                    continue
+                output.append({
+                    **row,
+                    "present_label": ", ".join(row["present_accounts"]),
+                    "missing_label": ", ".join(missing),
+                })
+            columns = [
+                ("sku", "SKU", "text"), ("product", "Produto", "text"),
+                ("present_label", "Presente em", "text"), ("missing_label", "Ausente em", "text"),
+            ]
+            title = "Equalização de SKUs entre contas"
+        if search:
+            output = [row for row in output if search in normalized_attribute_label(" ".join(str(value) for value in row.values()))]
+        output.sort(key=lambda row: str(row.get("sku") or ""))
+        metadata = {
+            "Conta de referência": account_filter if account_filter != "all" else "Todas",
+            "Busca": filters.get("search") or "Todos",
+            "Contas comparadas": len(accounts),
+            "Gerado em": now_label(),
+        }
+        return title, columns, output, metadata
 
     reclassify_internal_competition(payload)
     rows = report_filtered_catalog(payload, report_type, filters)

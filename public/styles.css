@@ -1134,6 +1134,52 @@ h2 {
   text-align: right;
 }
 
+.sync-progress {
+  flex-basis: 100%;
+  display: grid;
+  gap: 6px;
+  min-width: min(100%, 420px);
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--yellow) 45%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 92%, var(--yellow) 8%);
+}
+
+.sync-progress > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text);
+  font-size: .78rem;
+}
+
+.sync-progress > div:first-child span { min-width: 0; overflow-wrap: anywhere; }
+.sync-progress > div:first-child strong { color: var(--yellow); white-space: nowrap; }
+.sync-progress small { text-align: left; }
+
+.sync-progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 22%, transparent);
+}
+
+.sync-progress-track span {
+  display: block;
+  height: 100%;
+  min-width: 0;
+  border-radius: inherit;
+  background: var(--yellow);
+  box-shadow: 0 0 14px color-mix(in srgb, var(--yellow) 70%, transparent);
+  transition: width .35s ease;
+}
+
+.sync-progress.running .sync-progress-track span { animation: sync-pulse 1.4s ease-in-out infinite; }
+.sync-progress.completed .sync-progress-track span { background: var(--green); }
+.sync-progress.error .sync-progress-track span { background: var(--red); }
+
+@keyframes sync-pulse { 50% { filter: brightness(1.35); } }
+
 .error-text {
   color: var(--red);
   font-size: 0.9rem;
