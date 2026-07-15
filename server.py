@@ -48,6 +48,8 @@ CATEGORY_ATTRIBUTES_LOCK = threading.RLock()
 CATEGORY_ATTRIBUTES_CACHE = {}
 SELLER_PROFILE_LOCK = threading.RLock()
 SELLER_PROFILE_CACHE = {}
+OFFICIAL_STORE_CACHE_LOCK = threading.RLock()
+OFFICIAL_STORE_CACHE = {}
 PUBLIC_BUYBOX_CACHE_LOCK = threading.RLock()
 PUBLIC_BUYBOX_CACHE = {}
 CATALOG_OFFERS_CACHE_LOCK = threading.RLock()
@@ -1088,6 +1090,10 @@ class MercadoLivreClient:
 
     def user(self, seller_id):
         return self.get(f"/users/{seller_id}")
+
+    def user_brands(self, seller_id, interactive=False):
+        options = interactive_request_options() if interactive else {}
+        return self.get(f"/users/{seller_id}/brands", **options)
 
     def seller_items(self, seller_id, limit=50, offset=0):
         return self.get(f"/users/{seller_id}/items/search?limit={limit}&offset={offset}")
@@ -4819,18 +4825,98 @@ def apply_target_account_clone_rules(create_payload, source_item, source_account
     return create_payload
 
 
+OFFICIAL_STORE_CLONE_KEYS = {
+    "official_store_id",
+    "official_store_ids",
+    "official_store",
+    "official_store_name",
+}
+
+
+def clone_row_is_official_store_reference(value):
+    if not isinstance(value, dict):
+        return False
+    reference_id = str(value.get("id") or value.get("code") or "").strip().lower()
+    return reference_id in OFFICIAL_STORE_CLONE_KEYS
+
+
 def strip_official_store_clone_fields(value):
     removed = False
     if isinstance(value, dict):
         for key in list(value):
-            if str(key).lower() in {"official_store_id", "official_store", "official_store_name"}:
+            if str(key).strip().lower() in OFFICIAL_STORE_CLONE_KEYS:
                 value.pop(key, None)
                 removed = True
                 continue
             removed = strip_official_store_clone_fields(value.get(key)) or removed
     elif isinstance(value, list):
-        for row in value:
+        for row in list(value):
+            if clone_row_is_official_store_reference(row):
+                value.remove(row)
+                removed = True
+                continue
             removed = strip_official_store_clone_fields(row) or removed
+    return removed
+
+
+def normalized_store_name(value):
+    return re.sub(
+        r"[^a-z0-9]+",
+        "",
+        unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii").lower(),
+    )
+
+
+def target_official_store_id(target_client, target_account, source_item):
+    seller_id = str(target_account.get("seller_id") or "")
+    if not seller_id:
+        return None
+    ttl = max(300, int(os.getenv("MELI_OFFICIAL_STORE_CACHE_SECONDS", "21600")))
+    now = time.time()
+    with OFFICIAL_STORE_CACHE_LOCK:
+        cached = OFFICIAL_STORE_CACHE.get(seller_id)
+    if cached and now - cached.get("time", 0) < ttl:
+        brands = cached.get("brands") or []
+    else:
+        try:
+            response = target_client.user_brands(seller_id, interactive=True)
+            brands = response.get("brands") or [] if isinstance(response, dict) else []
+        except Exception:
+            brands = []
+        with OFFICIAL_STORE_CACHE_LOCK:
+            OFFICIAL_STORE_CACHE[seller_id] = {"time": now, "brands": brands}
+    available = [
+        brand for brand in brands
+        if brand.get("official_store_id") not in (None, "")
+        and str(brand.get("status") or "active").lower() not in {"inactive", "offline", "disabled"}
+    ]
+    if not available:
+        return None
+    source_names = {
+        normalized_store_name(source_item.get("official_store_name")),
+        normalized_store_name(first_present(source_item, ["official_store.name", "official_store.fantasy_name"], "")),
+    }
+    for attribute in source_item.get("attributes") or []:
+        if str(attribute.get("id") or "").upper() == "BRAND":
+            source_names.add(normalized_store_name(clone_attribute_display_value(attribute)))
+    source_names.discard("")
+    for brand in available:
+        target_names = {
+            normalized_store_name(brand.get("name")),
+            normalized_store_name(brand.get("fantasy_name")),
+            normalized_store_name(brand.get("normalized_name")),
+            normalized_store_name(first_present(brand, ["brand_registry.brand_name"], "")),
+        }
+        if source_names.intersection(target_names):
+            return brand.get("official_store_id")
+    if len(available) == 1:
+        return available[0].get("official_store_id")
+    return None
+
+
+def prepare_cross_account_official_store_payload(payload, destination_store_id=None):
+    removed = strip_official_store_clone_fields(payload)
+    payload["official_store_id"] = destination_store_id
     return removed
 
 
@@ -5599,7 +5685,7 @@ def friendly_clone_error(exc):
     return " ".join(dict.fromkeys(messages)) or str(exc)
 
 
-def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id="", category_attributes=None, cross_account=False):
+def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id="", category_attributes=None, cross_account=False, destination_store_id=None):
     payload = json.loads(json.dumps(create_payload, ensure_ascii=False))
     sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [])
     payload = clone_payload_from_answers(payload, sanitize_clone_answers(answers or {}, category_attributes or []))
@@ -5613,8 +5699,14 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
     max_rate_limit_attempts = max(0, int(os.getenv("MELI_CLONE_RATE_LIMIT_RETRIES", "3")))
     while validation_attempts < 5:
         try:
-            if cross_account and strip_official_store_clone_fields(payload):
-                adjustments.append({"tipo": "vinculo_loja_oficial_origem_removido", "campos": ["official_store_id"]})
+            if cross_account:
+                removed_store = prepare_cross_account_official_store_payload(payload, destination_store_id)
+                if removed_store and not any(row.get("tipo") == "vinculo_loja_oficial_origem_substituido" for row in adjustments):
+                    adjustments.append({
+                        "tipo": "vinculo_loja_oficial_origem_substituido",
+                        "campos": ["official_store_id"],
+                        "destino": destination_store_id,
+                    })
             created = target_client.create_item(payload)
             if adjustments and isinstance(created, dict):
                 created["_clone_adjustments"] = adjustments
@@ -5674,6 +5766,7 @@ def create_official_clone(payload, job, source_item_id, edits):
     hydrate_clone_package_attributes(create_payload, source_item)
     hydrate_required_clone_attributes(create_payload, source_item, category_attributes, catalog_product)
     create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
+    destination_store_id = target_official_store_id(target_client, target_account, source_item) if cross_account else None
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
     created = create_item_with_clone_retries(
         target_client,
@@ -5683,6 +5776,7 @@ def create_official_clone(payload, job, source_item_id, edits):
         source_item_id,
         category_attributes,
         cross_account,
+        destination_store_id,
     )
     verified_item = {}
     if created.get("id"):

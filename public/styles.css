@@ -1160,15 +1160,27 @@ h2 {
 }
 
 #accounts-list .account-actions {
-  flex: 0 1 520px;
-  width: min(100%, 520px);
-  max-width: 520px;
+  flex: 0 1 660px;
+  width: min(100%, 660px);
+  max-width: 660px;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  justify-content: end;
-  align-items: center;
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
+  justify-content: center;
+  align-items: stretch;
   align-content: start;
   gap: 8px;
+}
+
+#accounts-list .account-actions > .badge,
+#accounts-list .account-actions > .mini-button,
+#accounts-list .account-actions > .button-link {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  white-space: nowrap;
+  text-align: center;
 }
 
 #accounts-list .sync-progress {
