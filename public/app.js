@@ -2341,10 +2341,11 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
   state.itemDescriptions[itemId] = { loading: true, loaded: false, value: "" };
   renderAds();
   try {
-    const result = await api("/api/meli/item/description", {
+    const queued = await api("/api/meli/item/description", {
       method: "POST",
       body: JSON.stringify({ action: "read", item_id: itemId, account_id: accountId }),
     });
+    const result = await waitForAsyncOperation(queued);
     state.itemDescriptions[itemId] = { loading: false, loaded: true, value: result.description || "" };
   } catch (error) {
     state.itemDescriptions[itemId] = { loading: false, loaded: false, value: "" };
@@ -2362,9 +2363,12 @@ document.querySelector("#ads-list")?.addEventListener("submit", async (event) =>
   const button = form.querySelector('button[type="submit"]');
   button.disabled = true;
   try {
-    await api("/api/meli/item/description", {
+    const queued = await api("/api/meli/item/description", {
       method: "POST",
       body: JSON.stringify({ action: "update", item_id: itemId, account_id: form.dataset.accountId, description }),
+    });
+    await waitForAsyncOperation(queued, (message) => {
+      button.textContent = message || "Salvando descrição...";
     });
     state.itemDescriptions[itemId] = { loading: false, loaded: true, value: description };
     showToast("Descrição alterada com sucesso.", "success");
@@ -2372,6 +2376,7 @@ document.querySelector("#ads-list")?.addEventListener("submit", async (event) =>
     showToast(error.message || "Não foi possível alterar a descrição.", "error");
   } finally {
     button.disabled = false;
+    button.textContent = "Salvar descrição";
   }
 });
 

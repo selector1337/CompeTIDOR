@@ -908,7 +908,7 @@ def build_operations(payload):
     }
 
 
-def request_json(url, method="GET", payload=None, headers=None, retries=None):
+def request_json(url, method="GET", payload=None, headers=None, retries=None, timeout=None):
     body = None
     request_headers = headers or {}
     if payload is not None:
@@ -918,10 +918,11 @@ def request_json(url, method="GET", payload=None, headers=None, retries=None):
     attempts = int(retries if retries is not None else (4 if method in {"GET", "PUT"} else 1))
     transient_statuses = {429, 500, 502, 503, 504}
     last_error = None
+    request_timeout = max(2.0, float(timeout or os.getenv("MELI_REQUEST_TIMEOUT_SECONDS", "20")))
     for attempt in range(max(1, attempts)):
         req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=20) as response:
+            with urllib.request.urlopen(req, timeout=request_timeout) as response:
                 text = response.read().decode("utf-8")
                 return json.loads(text) if text else {}
         except urllib.error.HTTPError as exc:
@@ -940,7 +941,36 @@ def request_json(url, method="GET", payload=None, headers=None, retries=None):
             if attempt + 1 >= attempts:
                 raise last_error from exc
             time.sleep(min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5))
+        except TimeoutError as exc:
+            last_error = RuntimeError(f"A API do Mercado Livre não respondeu em até {request_timeout:g} segundos.")
+            if attempt + 1 >= attempts:
+                raise last_error from exc
+            time.sleep(min(4.0, 0.4 * (2**attempt)) + random.uniform(0.1, 0.3))
     raise last_error or RuntimeError("Não foi possível concluir a chamada à API.")
+
+
+def interactive_request_options():
+    return {
+        "retries": max(1, int(os.getenv("MELI_INTERACTIVE_RETRIES", "2"))),
+        "timeout": max(2.0, float(os.getenv("MELI_INTERACTIVE_TIMEOUT_SECONDS", "8"))),
+    }
+
+
+def meli_background_work_busy():
+    with SYNC_LOCK:
+        sync_busy = bool(ACTIVE_SYNC_ACCOUNTS)
+    with ASYNC_OPERATION_JOBS_LOCK:
+        interactive_busy = bool(ACTIVE_CLONE_OPERATIONS)
+    return sync_busy, interactive_busy
+
+
+def wait_for_interactive_meli_priority():
+    while True:
+        with ASYNC_OPERATION_JOBS_LOCK:
+            interactive_busy = bool(ACTIVE_CLONE_OPERATIONS)
+        if not interactive_busy:
+            return
+        time.sleep(0.2)
 
 
 def validate_meli_path(path):
@@ -1022,13 +1052,15 @@ class MercadoLivreClient:
         }
         return request_form(MELI_TOKEN_URL, payload)
 
-    def get(self, path, extra_headers=None):
+    def get(self, path, extra_headers=None, retries=None, timeout=None):
         validate_meli_path(path)
         headers = {"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"}
         headers.update(extra_headers or {})
         return request_json(
             f"{MELI_API_URL}{path}",
             headers=headers,
+            retries=retries,
+            timeout=timeout,
         )
 
     def post(self, path, payload):
@@ -1040,13 +1072,15 @@ class MercadoLivreClient:
             headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"},
         )
 
-    def put(self, path, payload):
+    def put(self, path, payload, retries=None, timeout=None):
         validate_meli_path(path)
         return request_json(
             f"{MELI_API_URL}{path}",
             method="PUT",
             payload=payload,
             headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"},
+            retries=retries,
+            timeout=timeout,
         )
 
     def me(self):
@@ -1064,39 +1098,61 @@ class MercadoLivreClient:
             params["scroll_id"] = scroll_id
         if status:
             params["status"] = status
-        return self.get(f"/users/{seller_id}/items/search?{urlencode(params)}")
+        return self.get(
+            f"/users/{seller_id}/items/search?{urlencode(params)}",
+            retries=max(1, int(os.getenv("MELI_SYNC_LIST_RETRIES", "3"))),
+            timeout=max(4.0, float(os.getenv("MELI_SYNC_LIST_TIMEOUT_SECONDS", "12"))),
+        )
 
-    def seller_all_items(self, seller_id, max_items=None):
+    def seller_all_items(self, seller_id, max_items=None, progress=None):
         max_items = None if max_items in (None, "all", 0, "0") else int(max_items)
         statuses = [
             status.strip()
             for status in os.getenv("MELI_SYNC_STATUSES", "active,paused,under_review").split(",")
             if status.strip()
         ]
-        results = []
-        seen = set()
-        for status in statuses:
+        progress_lock = threading.Lock()
+        discovered = {status: 0 for status in statuses}
+
+        def scan_status(status):
+            status_results = []
+            status_seen = set()
             scroll_id = ""
             empty_pages = 0
             max_pages = max(1, int(os.getenv("MELI_SCAN_MAX_PAGES", "1000")))
             for _ in range(max_pages):
+                wait_for_interactive_meli_priority()
                 page = self.seller_items_scan(seller_id, limit=100, scroll_id=scroll_id, status=status)
                 batch = page.get("results", []) or []
                 added = 0
                 for item_id in batch:
-                    if item_id and item_id not in seen:
-                        seen.add(item_id)
-                        results.append(item_id)
+                    if item_id and item_id not in status_seen:
+                        status_seen.add(item_id)
+                        status_results.append(item_id)
                         added += 1
-                        if max_items and len(results) >= max_items:
-                            return results[:max_items]
+                with progress_lock:
+                    discovered[status] = len(status_results)
+                    if progress:
+                        progress(sum(discovered.values()), status)
                 scroll_id = page.get("scroll_id") or scroll_id
                 if not batch or added == 0:
                     empty_pages += 1
                 if not scroll_id or empty_pages >= 2:
                     break
-            if max_items and len(results) >= max_items:
-                break
+                if max_items and len(status_results) >= max_items:
+                    break
+            return status_results
+
+        results = []
+        seen = set()
+        list_workers = max(1, min(len(statuses), int(os.getenv("MELI_SYNC_LIST_WORKERS", "3"))))
+        with ThreadPoolExecutor(max_workers=list_workers, thread_name_prefix="meli-list") as executor:
+            futures = [executor.submit(scan_status, status) for status in statuses]
+            for future in futures:
+                for item_id in future.result():
+                    if item_id not in seen:
+                        seen.add(item_id)
+                        results.append(item_id)
         if results:
             return results[:max_items] if max_items else results
 
@@ -1106,6 +1162,7 @@ class MercadoLivreClient:
         offset = 0
         page_size = 50
         while len(results) < fallback_limit:
+            wait_for_interactive_meli_priority()
             page = self.seller_items(seller_id, page_size, offset)
             batch = page.get("results", [])
             results.extend(batch)
@@ -1119,7 +1176,7 @@ class MercadoLivreClient:
         return self.get(f"/items/{item_id}")
 
     def item_for_clone(self, item_id):
-        return self.get(f"/items/{item_id}?include_attributes=all")
+        return self.get(f"/items/{item_id}?include_attributes=all", **interactive_request_options())
 
     def items_bulk(self, item_ids):
         ids = ",".join(item_ids)
@@ -1131,14 +1188,17 @@ class MercadoLivreClient:
                 items.append(body)
         return items
 
-    def item_description(self, item_id):
-        return self.get(f"/items/{item_id}/description")
+    def item_description(self, item_id, interactive=False):
+        options = interactive_request_options() if interactive else {}
+        return self.get(f"/items/{item_id}/description", **options)
 
-    def product(self, catalog_product_id):
-        return self.get(f"/products/{catalog_product_id}")
+    def product(self, catalog_product_id, interactive=False):
+        options = interactive_request_options() if interactive else {}
+        return self.get(f"/products/{catalog_product_id}", **options)
 
-    def user_product(self, user_product_id):
-        return self.get(f"/user-products/{user_product_id}")
+    def user_product(self, user_product_id, interactive=False):
+        options = interactive_request_options() if interactive else {}
+        return self.get(f"/user-products/{user_product_id}", **options)
 
     def item_shipping_cost(self, seller_id, item_id):
         params = {"item_id": item_id, "verbose": "true"}
@@ -1159,8 +1219,9 @@ class MercadoLivreClient:
     def create_item_description(self, item_id, plain_text):
         return self.post(f"/items/{item_id}/description", {"plain_text": plain_text})
 
-    def update_item_description(self, item_id, plain_text):
-        return self.put(f"/items/{item_id}/description", {"plain_text": plain_text})
+    def update_item_description(self, item_id, plain_text, interactive=False):
+        options = interactive_request_options() if interactive else {}
+        return self.put(f"/items/{item_id}/description", {"plain_text": plain_text}, **options)
 
     def update_item(self, item_id, payload):
         return self.put(f"/items/{item_id}", payload)
@@ -2002,6 +2063,10 @@ def auto_scan_loop():
     time.sleep(8)
     while True:
         try:
+            sync_busy, interactive_busy = meli_background_work_busy()
+            if sync_busy or interactive_busy:
+                time.sleep(min(30, interval))
+                continue
             payload = read_payload()
             scans = [item for item in payload.get("scan_items", []) if item.get("status", "active") == "active"]
             changed = False
@@ -2045,9 +2110,8 @@ def auto_official_sync_loop():
     time.sleep(startup_delay)
     while True:
         try:
-            with ASYNC_OPERATION_JOBS_LOCK:
-                clone_busy = bool(ACTIVE_CLONE_OPERATIONS)
-            if clone_busy:
+            sync_busy, interactive_busy = meli_background_work_busy()
+            if sync_busy or interactive_busy:
                 time.sleep(min(30, interval))
                 continue
             payload = read_payload()
@@ -2093,9 +2157,8 @@ def auto_catalog_competition_loop():
     time.sleep(startup_delay)
     while True:
         try:
-            with ASYNC_OPERATION_JOBS_LOCK:
-                clone_busy = bool(ACTIVE_CLONE_OPERATIONS)
-            if clone_busy:
+            sync_busy, interactive_busy = meli_background_work_busy()
+            if sync_busy or interactive_busy:
                 time.sleep(min(15, interval))
                 continue
             payload = read_payload()
@@ -3441,7 +3504,16 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
     client = account_client(account)
     user_profile = client.user(account["seller_id"])
     update_progress("listing", 0, 0, "Listando todos os anúncios da conta no Mercado Livre.")
-    item_ids = client.seller_all_items(account["seller_id"], max_items=None if limit in (None, "all") else int(limit))
+    item_ids = client.seller_all_items(
+        account["seller_id"],
+        max_items=None if limit in (None, "all") else int(limit),
+        progress=lambda found, status: update_progress(
+            "listing",
+            found,
+            0,
+            f"Listando anúncios no Mercado Livre: {found} identificados (status {status}).",
+        ),
+    )
     update_progress("items", 0, len(item_ids), f"{len(item_ids)} anúncios encontrados; importando os dados oficiais.")
     imported = []
     existing_by_id = {
@@ -3956,6 +4028,54 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
     return {"job_id": job_id, "status": "queued", "message": message, "poll_url": f"/api/async/jobs/{job_id}"}
 
 
+def item_description_operation(request, actor=None):
+    metadata = read_payload(include_catalog=False)
+    account_id = str(request.get("account_id") or "")
+    account_name = str(request.get("account") or "")
+    account = next(
+        (
+            item
+            for item in metadata.get("accounts", [])
+            if str(item.get("id") or "") == account_id or item.get("nickname") == account_name
+        ),
+        None,
+    )
+    if not account or not account.get("official") or not account.get("access_token"):
+        raise RuntimeError("Conta oficial não encontrada para acessar a descrição.")
+    item_id = str(request.get("item_id") or "").strip()
+    if not item_id:
+        raise RuntimeError("Informe o código do anúncio.")
+    client = account_client(account)
+    if request.get("action") != "update":
+        description = client.item_description(item_id, interactive=True) or {}
+        return {"ok": True, "description": description.get("plain_text") or description.get("text") or ""}
+
+    text = str(request.get("description") or "").strip()
+    if not text:
+        raise RuntimeError("A descrição não pode ficar vazia.")
+    official = client.update_item_description(item_id, text, interactive=True)
+    payload = read_payload()
+    item = next(
+        (
+            row
+            for row in payload.get("catalog", [])
+            if row.get("id") == item_id and row.get("account_id") == account.get("id")
+        ),
+        None,
+    )
+    if item:
+        item["description_updated_at"] = now_label()
+        append_item_log(
+            payload,
+            item,
+            actor or {},
+            "Descrição alterada",
+            {"description": {"from": "Descrição anterior", "to": "Descrição atualizada"}},
+        )
+        write_payload(payload)
+    return {"ok": True, "description": text, "official": official}
+
+
 def official_account_by_name(payload, name):
     return next(
         (
@@ -4078,13 +4198,22 @@ def clone_source_item(client, item_id):
     return client.item(item_id)
 
 
+def call_interactive_client_method(method, *args):
+    try:
+        return method(*args, interactive=True)
+    except TypeError as exc:
+        if "interactive" not in str(exc):
+            raise
+        return method(*args)
+
+
 def clone_source_user_product(client, source_item):
     user_product_id = (source_item or {}).get("user_product_id")
     method = getattr(client, "user_product", None)
     if not user_product_id or not callable(method):
         return {}
     try:
-        user_product = method(user_product_id)
+        user_product = call_interactive_client_method(method, user_product_id)
         return user_product if isinstance(user_product, dict) else {}
     except Exception:
         return {}
@@ -4148,7 +4277,7 @@ def clone_source_catalog_product(client, source_item):
     if not product_id:
         return {}
     try:
-        product = client.product(product_id)
+        product = call_interactive_client_method(client.product, product_id)
         return product if isinstance(product, dict) else {}
     except Exception:
         return {}
@@ -4171,7 +4300,7 @@ def clone_source_bundle(payload, account_identifier, item_id, include_descriptio
     if cache_valid and include_description:
         client = account_client(account)
         try:
-            description = client.item_description(item_id) or {}
+            description = call_interactive_client_method(client.item_description, item_id) or {}
             description_text = description.get("plain_text") or description.get("text") or ""
         except Exception:
             description_text = ""
@@ -4186,7 +4315,7 @@ def clone_source_bundle(payload, account_identifier, item_id, include_descriptio
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="clone-source") as executor:
         enriched_future = executor.submit(enrich_clone_source_item, client, raw_item)
         catalog_future = executor.submit(clone_source_catalog_product, client, raw_item)
-        description_future = executor.submit(client.item_description, item_id) if include_description else None
+        description_future = executor.submit(call_interactive_client_method, client.item_description, item_id) if include_description else None
         source_item = enriched_future.result()
         catalog_product = catalog_future.result()
         description_text = ""
@@ -7465,6 +7594,7 @@ class App(BaseHTTPRequestHandler):
             "/api/notifications/config",
             "/api/notifications/test",
             "/api/meli/item/clone-source",
+            "/api/meli/item/description",
             "/api/clone/preview",
             "/api/clone/execute",
             "/api/clone/execute-batch",
@@ -8023,27 +8153,15 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/meli/item/description":
             try:
-                item_id = request.get("item_id", "")
-                account_id = request.get("account_id", "")
-                account = next((item for item in payload.get("accounts", []) if item.get("id") == account_id or item.get("nickname") == request.get("account")), None)
-                if not account or not account.get("official"):
-                    raise RuntimeError("Conta oficial não encontrada para acessar a descrição.")
-                client = account_client(account)
-                if request.get("action") == "update":
-                    text = str(request.get("description") or "").strip()
-                    if not text:
-                        raise RuntimeError("A descrição não pode ficar vazia.")
-                    official = client.update_item_description(item_id, text)
-                    item = next((row for row in payload.get("catalog", []) if row.get("id") == item_id and row.get("account_id") == account.get("id")), None)
-                    if item:
-                        item["description_updated_at"] = now_label()
-                        append_item_log(payload, item, self.current_user(payload), "Descrição alterada", {"description": {"from": "Descrição anterior", "to": "Descrição atualizada"}})
-                    write_payload(payload)
-                    self.send_json({"ok": True, "description": text, "official": official})
-                else:
-                    description = client.item_description(item_id)
-                    text = description.get("plain_text") or description.get("text") or ""
-                    self.send_json({"ok": True, "description": text})
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                action_label = "Salvando descrição oficial." if request_copy.get("action") == "update" else "Carregando descrição oficial."
+                operation = start_async_operation(
+                    "item_description",
+                    lambda: item_description_operation(request_copy, actor),
+                    action_label,
+                )
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
