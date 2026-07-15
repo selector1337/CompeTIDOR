@@ -59,6 +59,7 @@
   identifiersLoading: false,
   equalizationType: "listing_type_gap",
   equalizationAccount: "all",
+  equalizationStatus: "all",
   equalizationSearch: "",
   equalizationPage: 1,
   equalizationPageSize: 20,
@@ -836,6 +837,8 @@ function renderEqualizationReports() {
   setOptions("#equalization-account-filter", ["all", ...accounts], state.equalizationAccount, "Todas as contas");
   const matrix = new Map();
   for (const item of state.data.catalog || []) {
+    const mlStatus = String(item.meli_status || "").toLowerCase();
+    if (state.equalizationStatus !== "all" && mlStatus !== state.equalizationStatus) continue;
     const sku = String(item.sku || "").trim().toUpperCase();
     if (!sku || sku === "-") continue;
     const account = item.account || "";
@@ -1090,7 +1093,7 @@ function renderAccounts() {
             ${account.official ? `<button class="mini-button" data-sync-account="${account.id}" ${account.sync_progress?.status === "running" ? "disabled" : ""}>${account.sync_progress?.status === "running" ? "Sincronizando..." : "Sincronizar anúncios"}</button>` : ""}
             ${account.official ? `<button class="mini-button danger-button" data-unlink-account="${account.id}" data-account-name="${account.nickname}">Desvincular</button>` : ""}
             ${syncProgressHtml(account)}
-            ${account.webhook_status ? `<small>${escapeText(account.webhook_status)} · ${formatDateBR(account.last_webhook_at)}</small>` : ""}
+            ${account.webhook_status ? `<small class="account-webhook-line" title="${escapeAttr(`${account.webhook_status} · ${formatDateBR(account.last_webhook_at)}`)}">${escapeText(`Última notificação: ${account.webhook_status.replace(/^Última notificação processada:\s*/i, "")} · ${formatDateBR(account.last_webhook_at)}`)}</small>` : ""}
           </div>
         </article>
       `
@@ -1523,6 +1526,7 @@ function currentReportFilters(reportType) {
     return {
       report_mode: state.equalizationType,
       account: state.equalizationAccount,
+      ml_status: state.equalizationStatus,
       search: state.equalizationSearch,
     };
   }
@@ -2274,6 +2278,7 @@ document.addEventListener("click", (event) => {
   ["#copy-page-size", "copyPageSize"],
   ["#equalization-report-type", "equalizationType"],
   ["#equalization-account-filter", "equalizationAccount"],
+  ["#equalization-status-filter", "equalizationStatus"],
   ["#equalization-search", "equalizationSearch"],
   ["#equalization-page-size", "equalizationPageSize"],
 ].forEach(([selector, key]) => {

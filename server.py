@@ -4283,6 +4283,49 @@ def clone_source_catalog_product(client, source_item):
         return {}
 
 
+def merge_clone_source_local_snapshot(source_item, payload, account, item_id):
+    """Complete seller-owned fields that can be absent from the public item representation."""
+    source_item = json.loads(json.dumps(source_item or {}, ensure_ascii=False))
+    if not source_item.get("seller_id") and account.get("seller_id"):
+        source_item["seller_id"] = account.get("seller_id")
+    local_item = next(
+        (
+            row
+            for row in payload.get("catalog", []) or []
+            if str(row.get("id") or "") == str(item_id or "")
+            and (
+                row.get("account_id") == account.get("id")
+                or row.get("account") == account.get("nickname")
+            )
+        ),
+        None,
+    )
+    if not local_item:
+        return source_item
+    package_map = {
+        "package_height": "SELLER_PACKAGE_HEIGHT",
+        "package_width": "SELLER_PACKAGE_WIDTH",
+        "package_length": "SELLER_PACKAGE_LENGTH",
+        "package_weight": "SELLER_PACKAGE_WEIGHT",
+    }
+    attributes = source_item.setdefault("attributes", [])
+    existing_ids = {canonical_clone_attribute_id(row.get("id")) for row in attributes if row.get("id")}
+    for field, attr_id in package_map.items():
+        value = clean_attribute_value(local_item.get(field))
+        if not value or attr_id in existing_ids:
+            continue
+        try:
+            value = seller_package_api_value(field, value)
+        except Exception:
+            continue
+        attributes.append({"id": attr_id, "value_name": value})
+        existing_ids.add(attr_id)
+    local_gtin = clean_attribute_value(local_item.get("gtin"))
+    if local_gtin and not source_clone_identifiers(source_item):
+        attributes.append({"id": "GTIN", "value_name": local_gtin})
+    return source_item
+
+
 def clone_source_bundle(payload, account_identifier, item_id, include_description=False, force=False):
     account = official_account_by_name(payload, account_identifier)
     if not account or not account.get("official") or not account.get("access_token"):
@@ -4295,7 +4338,9 @@ def clone_source_bundle(payload, account_identifier, item_id, include_descriptio
         cached = CLONE_SOURCE_CACHE.get(cache_key)
         cache_valid = cached and not force and now - cached.get("time", 0) < ttl
         if cache_valid and (not include_description or cached.get("description_loaded")):
-            return json.loads(json.dumps(cached["bundle"], ensure_ascii=False))
+            bundle = json.loads(json.dumps(cached["bundle"], ensure_ascii=False))
+            bundle["source_item"] = merge_clone_source_local_snapshot(bundle.get("source_item"), payload, account, item_id)
+            return bundle
 
     if cache_valid and include_description:
         client = account_client(account)
@@ -4308,7 +4353,9 @@ def clone_source_bundle(payload, account_identifier, item_id, include_descriptio
             cached["bundle"]["description"] = description_text
             cached["description_loaded"] = True
             cached["time"] = now
-            return json.loads(json.dumps(cached["bundle"], ensure_ascii=False))
+            bundle = json.loads(json.dumps(cached["bundle"], ensure_ascii=False))
+            bundle["source_item"] = merge_clone_source_local_snapshot(bundle.get("source_item"), payload, account, item_id)
+            return bundle
 
     client = account_client(account)
     raw_item = clone_source_item(client, item_id)
@@ -4325,6 +4372,7 @@ def clone_source_bundle(payload, account_identifier, item_id, include_descriptio
                 description_text = description.get("plain_text") or description.get("text") or ""
             except Exception:
                 description_text = ""
+    source_item = merge_clone_source_local_snapshot(source_item, payload, account, item_id)
     if catalog_product:
         source_item["_clone_catalog_product"] = catalog_product
     bundle = {
@@ -5347,7 +5395,7 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
     if "official_store_id" in lowered_error and (
         "not allowed" in lowered_error or "invalid_official_store_id" in lowered_error or "invalid official" in lowered_error
     ):
-        if create_payload.pop("official_store_id", None) is not None:
+        if strip_official_store_clone_fields(create_payload):
             changed = True
             adjustments.append({"tipo": "loja_oficial_incompativel_removida", "campos": ["official_store_id"]})
     dropped_attrs = dropped_clone_attributes_from_error(exc)
@@ -5526,7 +5574,7 @@ def friendly_clone_error(exc):
         return "O Mercado Livre limitou temporariamente as criações. A aplicação tentou novamente com espera progressiva; aguarde alguns instantes e repita se necessário."
     error_text = meli_error_text(exc).lower()
     if "official_store_id" in error_text:
-        return "O vínculo de loja oficial pertence à conta de origem e não pode ser usado pela conta destino. A aplicação removerá esse vínculo automaticamente na próxima tentativa."
+        return "O Mercado Livre recusou o vínculo de loja oficial da origem. A aplicação tentou removê-lo automaticamente neste mesmo processamento."
     causes = meli_error_causes(exc)
     if not causes:
         return str(exc)
@@ -5612,9 +5660,9 @@ def create_official_clone(payload, job, source_item_id, edits):
     target_client = account_client(target_account)
     bundle = clone_source_bundle(payload, source_account.get("id"), source_item_id, include_description=True)
     source_item = bundle["source_item"]
-    source_seller_id = str(first_present(source_item, ["seller_id", "seller.id"], "") or source_account.get("seller_id") or "")
-    target_seller_id = str(target_account.get("seller_id") or "")
-    cross_account = bool(source_seller_id and target_seller_id and source_seller_id != target_seller_id)
+    source_account_id = str(source_account.get("id") or source_account.get("seller_id") or "")
+    target_account_id = str(target_account.get("id") or target_account.get("seller_id") or "")
+    cross_account = bool(source_account_id and target_account_id and source_account_id != target_account_id)
     create_payload = build_clone_item_payload(source_item, edits)
     try:
         category_attributes = cached_category_attributes(source_client, source_item.get("category_id"))
@@ -6421,8 +6469,11 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
 
     if report_type == "equalization":
         accounts = [str(account.get("nickname") or "") for account in payload.get("accounts") or [] if account.get("official")]
+        ml_status_filter = str(filters.get("ml_status") or "all").lower()
         matrix = {}
         for item in payload.get("catalog") or []:
+            if ml_status_filter != "all" and str(item.get("meli_status") or "").lower() != ml_status_filter:
+                continue
             sku = str(item.get("sku") or "").strip().upper()
             account_name = str(item.get("account") or "")
             if not sku or sku == "-" or account_name not in accounts:
@@ -6477,6 +6528,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
         output.sort(key=lambda row: str(row.get("sku") or ""))
         metadata = {
             "Conta de referência": account_filter if account_filter != "all" else "Todas",
+            "Status do anúncio": {"active": "Ativos", "paused": "Pausados"}.get(ml_status_filter, "Todos"),
             "Busca": filters.get("search") or "Todos",
             "Contas comparadas": len(accounts),
             "Gerado em": now_label(),

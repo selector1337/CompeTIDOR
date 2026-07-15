@@ -1192,6 +1192,17 @@ h2 {
 
 #accounts-list .sync-progress-track { height: 6px; }
 
+#accounts-list .account-webhook-line {
+  grid-column: 1 / -1;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
 @media (max-width: 900px) {
   #accounts-list .account-actions {
     grid-template-columns: 1fr 1fr;
@@ -2946,7 +2957,7 @@ body {
 
 .ad-description-actions small { color: var(--muted); }
 
-.report-filter-bar { grid-template-columns: 1.3fr 1fr 1.5fr .65fr; }
+.report-filter-bar { grid-template-columns: 1.25fr 1fr .75fr 1.35fr .65fr; }
 .equalization-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
 .equalization-table { width: 100%; border-collapse: collapse; min-width: 760px; }
 .equalization-table th,
