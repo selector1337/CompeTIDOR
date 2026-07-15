@@ -9,13 +9,16 @@
   catalogStock: "all",
   adsAccount: "all",
   adsProduct: "",
+  adsBrand: "",
   adsSku: "",
   adsCode: "",
   adsStatus: "all",
+  adsListingType: "all",
   adsCatalog: "all",
   adsFlex: "all",
   stockPeriod: "today",
   stockCustomDate: "",
+  stockCustomEndDate: "",
   dashboardStockPage: 1,
   dashboardCatalogPage: 1,
   dashboardShipmentPage: 1,
@@ -54,6 +57,13 @@
   spreadsheetPreview: null,
   shippingCostsLoading: false,
   identifiersLoading: false,
+  equalizationType: "listing_type_gap",
+  equalizationAccount: "all",
+  equalizationSearch: "",
+  equalizationPage: 1,
+  equalizationPageSize: 20,
+  openDescriptions: new Set(),
+  itemDescriptions: {},
 };
 
 const PAGE_SIZE = 100;
@@ -62,6 +72,7 @@ const renderTimers = {};
 const pageTitles = {
   dashboard: ["Painel unificado", "Dashboard"],
   estatisticas: ["Vendas oficiais", "Estatísticas por SKU"],
+  relatorios: ["Equalização de contas", "Relatórios por SKU"],
   contas: ["OAuth oficial", "Contas Mercado Livre"],
   catalogo: ["Catálogo Mercado Livre", "Disputa de catálogo"],
   anuncios: ["Gestão operacional", "Anúncios"],
@@ -324,12 +335,13 @@ function render() {
 
 function renderRoute() {
   if (!state.data) return;
-  if (["catalogo", "anuncios", "copiar"].includes(state.route) && !state.catalogLoaded) {
+  if (["catalogo", "anuncios", "copiar", "relatorios"].includes(state.route) && !state.catalogLoaded) {
     loadCatalogInBackground();
   }
   const routeRenderers = {
     dashboard: renderDashboard,
     estatisticas: renderStatistics,
+    relatorios: renderEqualizationReports,
     contas: () => {
       renderAccounts();
       renderMeliConfig();
@@ -497,10 +509,10 @@ function renderDashboardAccountFilters() {
 }
 
 function filterByStockPeriod(rows) {
-  return rows.filter((item) => isDateInPeriod(item.occurred_at, state.stockPeriod, state.stockCustomDate));
+  return rows.filter((item) => isDateInPeriod(item.occurred_at, state.stockPeriod, state.stockCustomDate, state.stockCustomEndDate));
 }
 
-function isDateInPeriod(value, period, customDate) {
+function isDateInPeriod(value, period, customDate, customEndDate = "") {
   const today = new Date();
   const target = customDate ? new Date(`${customDate}T00:00:00`) : today;
   const date = new Date((value || "").replace(" ", "T"));
@@ -511,7 +523,10 @@ function isDateInPeriod(value, period, customDate) {
     yesterday.setDate(today.getDate() - 1);
     return localDateKey(date) === localDateKey(yesterday);
   }
-  if (period === "custom") return localDateKey(date) === localDateKey(target);
+  if (period === "custom") {
+    const end = customEndDate ? new Date(`${customEndDate}T23:59:59.999`) : new Date(`${customDate}T23:59:59.999`);
+    return date >= target && date <= end;
+  }
   const weekAgo = new Date(today);
   weekAgo.setDate(today.getDate() - 7);
   return date >= weekAgo && date <= today;
@@ -590,6 +605,8 @@ function renderCatalog() {
               ${fact("Vencedor", catalogWinnerName(item))}
               ${fact("Preço vencedor", catalogWinnerPrice(item))}
               ${item.winner_confirmed && item.winner_item_id ? fact("Anúncio vencedor", item.winner_item_id) : ""}
+              ${item.status === "winning" && item.runner_up_name ? fact("Próxima oferta", item.runner_up_name) : ""}
+              ${item.status === "winning" && item.runner_up_price ? fact("Preço próxima oferta", money.format(item.runner_up_price)) : ""}
               ${catalogWinnerSourceValue(item) ? fact("Fonte vencedor", catalogWinnerSourceValue(item)) : ""}
               ${fact("Preço p/ ganhar", item.price_to_win ? money.format(item.price_to_win) : "Sem sugestão ML")}
               ${item.competition_checked_at ? fact("Verificado em", formatDateBR(item.competition_checked_at)) : ""}
@@ -686,20 +703,37 @@ function renderAds() {
   if (!list || !state.data) return;
   renderFilterOptions();
   const productTerm = state.adsProduct.toLowerCase();
+  const brandTerm = state.adsBrand.toLowerCase();
   const skuTerm = state.adsSku.toLowerCase();
   const codeTerm = state.adsCode.toLowerCase();
   const filtered = state.data.catalog.filter((item) => {
     const title = `${item.title || ""}`.toLowerCase();
+    const brand = `${item.brand || ""}`.toLowerCase();
     const sku = `${item.sku || ""}`.toLowerCase();
     const code = `${item.id || ""}`.toLowerCase();
     return (state.adsAccount === "all" || item.account === state.adsAccount)
       && (state.adsStatus === "all" || item.meli_status === state.adsStatus)
+      && (state.adsListingType === "all" || item.listing_type_id === state.adsListingType)
       && (state.adsCatalog === "all" || (state.adsCatalog === "catalog" ? isCatalogItem(item) : !isCatalogItem(item)))
       && (state.adsFlex === "all" || (state.adsFlex === "active" ? item.shipping_logistic_type === "self_service" : item.shipping_logistic_type !== "self_service"))
       && (!productTerm || title.includes(productTerm))
+      && (!brandTerm || brand.includes(brandTerm) || title.includes(brandTerm))
       && (!skuTerm || sku.includes(skuTerm))
       && (!codeTerm || code.includes(codeTerm));
   });
+  const inventory = filtered.reduce((summary, item) => {
+    const stock = Math.max(0, Number(item.stock) || 0);
+    const price = Math.max(0, Number(item.price) || 0);
+    summary.units += stock;
+    summary.value += stock * price;
+    return summary;
+  }, { units: 0, value: 0 });
+  const inventorySummary = document.querySelector("#ads-inventory-summary");
+  if (inventorySummary) inventorySummary.innerHTML = `
+    <div><span>Anúncios filtrados</span><strong>${filtered.length.toLocaleString("pt-BR")}</strong></div>
+    <div><span>Unidades em estoque</span><strong>${inventory.units.toLocaleString("pt-BR")}</strong></div>
+    <div class="inventory-value"><span>Estoque a preço de venda</span><strong>${money.format(inventory.value)}</strong></div>
+  `;
   const pageInfo = paginate(filtered, state.adsPage);
   state.adsPage = pageInfo.current;
   list.innerHTML = filtered.length ? paginationHtml("adsPage", pageInfo) + pageInfo.items.map((item) => `
@@ -716,6 +750,7 @@ function renderAds() {
           ${fact("Conta", item.account)}
           ${fact("Código do anúncio", item.id)}
           ${fact("SKU", item.sku || "-")}
+          ${item.brand ? fact("Marca", item.brand) : ""}
           ${fact("Tipo", listingTypeLabel(item.listing_type_id))}
           ${fact("Modalidade", isCatalogItem(item) ? "Catálogo" : "Tradicional")}
           ${flexStatusBadge(item.shipping_logistic_type)}
@@ -742,12 +777,108 @@ function renderAds() {
                 : ""}
           </div>
         </div>
+        ${renderAdDescriptionEditor(item)}
         ${renderItemLog(item)}
       </div>
     </article>
   `).join("") + paginationHtml("adsPage", pageInfo) : `<div class="notice">Nenhum anúncio encontrado.</div>`;
   queueShippingCostRefresh(pageInfo.items);
   queueIdentifierRefresh(pageInfo.items);
+}
+
+function renderAdDescriptionEditor(item) {
+  const itemId = item.id || "";
+  const open = state.openDescriptions.has(itemId);
+  const cached = state.itemDescriptions[itemId];
+  const value = cached?.value || "";
+  const loading = cached?.loading;
+  return `
+    <details class="ad-description" data-description-details="${escapeAttr(itemId)}" ${open ? "open" : ""}>
+      <summary data-load-description="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}">Editar descrição</summary>
+      <form class="ad-description-form" data-description-form="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}">
+        <textarea rows="9" maxlength="50000" data-description-text="${escapeAttr(itemId)}" placeholder="Descrição do anúncio" ${loading ? "disabled" : ""}>${escapeText(value)}</textarea>
+        <div class="ad-description-actions">
+          <small>${loading ? "Carregando descrição oficial..." : cached?.loaded ? "Descrição oficial carregada" : "Abra para carregar somente este anúncio"}</small>
+          <button class="mini-button" type="submit" ${!cached?.loaded || loading ? "disabled" : ""}>Salvar descrição</button>
+        </div>
+      </form>
+    </details>
+  `;
+}
+
+function renderEqualizationReports() {
+  const container = document.querySelector("#equalization-report");
+  if (!container) return;
+  if (!state.catalogLoaded) {
+    container.innerHTML = `<div class="notice">Carregando os anúncios para comparar as contas...</div>`;
+    loadCatalogInBackground();
+    return;
+  }
+  const accounts = connectedAccounts().map((account) => account.nickname).filter(Boolean);
+  setOptions("#equalization-account-filter", ["all", ...accounts], state.equalizationAccount, "Todas as contas");
+  const matrix = new Map();
+  for (const item of state.data.catalog || []) {
+    const sku = String(item.sku || "").trim().toUpperCase();
+    if (!sku || sku === "-") continue;
+    const account = item.account || "";
+    if (!accounts.includes(account)) continue;
+    const key = `${account}\u0000${sku}`;
+    if (!matrix.has(key)) matrix.set(key, { account, sku, title: item.title || "", classic: false, premium: false, items: [] });
+    const row = matrix.get(key);
+    row.classic ||= item.listing_type_id === "gold_special";
+    row.premium ||= item.listing_type_id === "gold_pro";
+    row.items.push(item.id);
+  }
+
+  let rows = [];
+  if (state.equalizationType === "listing_type_gap") {
+    rows = [...matrix.values()]
+      .filter((row) => row.classic !== row.premium)
+      .filter((row) => state.equalizationAccount === "all" || row.account === state.equalizationAccount)
+      .map((row) => ({
+        ...row,
+        present: row.classic ? "Clássico" : "Premium",
+        missing: row.classic ? "Premium" : "Clássico",
+      }));
+  } else {
+    const bySku = new Map();
+    for (const row of matrix.values()) {
+      if (!bySku.has(row.sku)) bySku.set(row.sku, { sku: row.sku, title: row.title, presentAccounts: [], missingAccounts: [] });
+      bySku.get(row.sku).presentAccounts.push(row.account);
+    }
+    rows = [...bySku.values()].map((row) => ({
+      ...row,
+      missingAccounts: accounts.filter((account) => !row.presentAccounts.includes(account)),
+    })).filter((row) => row.missingAccounts.length)
+      .filter((row) => state.equalizationAccount === "all" || row.presentAccounts.includes(state.equalizationAccount));
+  }
+  const search = state.equalizationSearch.trim().toLowerCase();
+  if (search) rows = rows.filter((row) => `${row.sku} ${row.title} ${row.account || ""} ${(row.presentAccounts || []).join(" ")} ${(row.missingAccounts || []).join(" ")}`.toLowerCase().includes(search));
+  rows.sort((a, b) => String(a.sku).localeCompare(String(b.sku), "pt-BR"));
+  const pageInfo = paginate(rows, state.equalizationPage, state.equalizationPageSize);
+  state.equalizationPage = pageInfo.current;
+  const summary = document.querySelector("#equalization-summary");
+  if (summary) summary.innerHTML = `
+    <div><span>Inconsistências encontradas</span><strong>${rows.length.toLocaleString("pt-BR")}</strong></div>
+    <div><span>Contas comparadas</span><strong>${accounts.length}</strong></div>
+    <div class="inventory-value"><span>Objetivo</span><strong>Equalizar anúncios por SKU</strong></div>
+  `;
+  if (!rows.length) {
+    container.innerHTML = `<div class="notice success-notice">Nenhuma diferença encontrada com estes filtros.</div>`;
+    return;
+  }
+  container.innerHTML = `${paginationHtml("equalizationPage", pageInfo)}
+    <div class="equalization-table-wrap"><table class="equalization-table">
+      <thead><tr><th>SKU</th><th>Produto</th>${state.equalizationType === "listing_type_gap" ? "<th>Conta</th><th>Possui</th><th>Falta criar</th>" : "<th>Presente em</th><th>Ausente em</th>"}</tr></thead>
+      <tbody>${pageInfo.items.map((row) => `
+        <tr>
+          <td><strong>${escapeText(row.sku)}</strong></td>
+          <td>${escapeText(row.title || "-")}</td>
+          ${state.equalizationType === "listing_type_gap"
+            ? `<td>${escapeText(row.account)}</td><td><span class="report-ok">${row.present}</span></td><td><span class="report-missing">${row.missing}</span></td>`
+            : `<td>${escapeText(row.presentAccounts.join(", "))}</td><td><span class="report-missing">${escapeText(row.missingAccounts.join(", "))}</span></td>`}
+        </tr>`).join("")}</tbody>
+    </table></div>${paginationHtml("equalizationPage", pageInfo)}`;
 }
 
 function shippingCostLabel(item) {
@@ -1345,9 +1476,11 @@ function currentReportFilters(reportType) {
   return {
     account: state.adsAccount,
     product: state.adsProduct,
+    brand: state.adsBrand,
     sku: state.adsSku,
     code: state.adsCode,
     ml_status: state.adsStatus,
+    listing_type: state.adsListingType,
     catalog: state.adsCatalog,
     flex: state.adsFlex,
   };
@@ -1918,14 +2051,37 @@ document.querySelector("#stock-period-filter").addEventListener("click", (event)
   button.classList.add("active");
   state.stockPeriod = button.dataset.stockPeriod;
   state.stockCustomDate = "";
+  state.stockCustomEndDate = "";
   state.dashboardStockPage = 1;
   document.querySelector("#stock-custom-date").value = "";
+  document.querySelector("#stock-custom-end-date").value = "";
   renderDashboard();
 });
 
 document.querySelector("#stock-custom-date").addEventListener("change", (event) => {
   state.stockPeriod = "custom";
   state.stockCustomDate = event.target.value;
+  if (!state.stockCustomEndDate) state.stockCustomEndDate = event.target.value;
+  state.dashboardStockPage = 1;
+  document.querySelectorAll("[data-stock-period]").forEach((item) => item.classList.remove("active"));
+  renderDashboard();
+});
+
+document.querySelector("#stock-custom-end-date")?.addEventListener("change", (event) => {
+  state.stockPeriod = "custom";
+  state.stockCustomEndDate = event.target.value;
+  state.dashboardStockPage = 1;
+  document.querySelectorAll("[data-stock-period]").forEach((item) => item.classList.remove("active"));
+});
+
+document.querySelector("#stock-apply-period")?.addEventListener("click", () => {
+  const start = document.querySelector("#stock-custom-date")?.value || "";
+  const end = document.querySelector("#stock-custom-end-date")?.value || "";
+  if (!start || !end) return showToast("Informe a data inicial e a data final.", "error");
+  if (end < start) return showToast("A data final não pode ser anterior à data inicial.", "error");
+  state.stockPeriod = "custom";
+  state.stockCustomDate = start;
+  state.stockCustomEndDate = end;
   state.dashboardStockPage = 1;
   document.querySelectorAll("[data-stock-period]").forEach((item) => item.classList.remove("active"));
   renderDashboard();
@@ -1989,6 +2145,7 @@ document.addEventListener("click", (event) => {
   if (key === "scanPage") renderScan();
   if (key === "competitorsPage") renderCompetitors();
   if (key === "statisticsPage") renderStatistics();
+  if (key === "equalizationPage") renderEqualizationReports();
   if (["dashboardStockPage", "dashboardCatalogPage", "dashboardShipmentPage", "dashboardSalesPage", "dashboardTopSkuPage"].includes(key)) renderDashboard();
 });
 
@@ -2051,19 +2208,25 @@ document.addEventListener("click", (event) => {
   ["#catalog-stock-filter", "catalogStock"],
   ["#ads-account-filter", "adsAccount"],
   ["#ads-product-filter", "adsProduct"],
+  ["#ads-brand-filter", "adsBrand"],
   ["#ads-sku-filter", "adsSku"],
   ["#ads-code-filter", "adsCode"],
   ["#ads-status-filter", "adsStatus"],
+  ["#ads-listing-type-filter", "adsListingType"],
   ["#ads-catalog-filter", "adsCatalog"],
   ["#ads-flex-filter", "adsFlex"],
   ["#copy-product-filter", "copySearch"],
   ["#copy-sku-filter", "copySku"],
   ["#copy-catalog-filter", "copyCatalog"],
   ["#copy-page-size", "copyPageSize"],
+  ["#equalization-report-type", "equalizationType"],
+  ["#equalization-account-filter", "equalizationAccount"],
+  ["#equalization-search", "equalizationSearch"],
+  ["#equalization-page-size", "equalizationPageSize"],
 ].forEach(([selector, key]) => {
   document.addEventListener("input", (event) => {
     if (!event.target.matches(selector)) return;
-    state[key] = key === "copyPageSize" ? Number(event.target.value || 20) : event.target.value;
+    state[key] = ["copyPageSize", "equalizationPageSize"].includes(key) ? Number(event.target.value || 20) : event.target.value;
     if (key === "copyPageSize") localStorage.setItem("competidor-copy-page-size", String(state.copyPageSize));
     if (key.startsWith("catalog")) {
       state.catalogPage = 1;
@@ -2077,10 +2240,14 @@ document.addEventListener("click", (event) => {
       state.copyPage = 1;
       scheduleRender("copy", renderCopyItems);
     }
+    if (key.startsWith("equalization")) {
+      state.equalizationPage = 1;
+      scheduleRender("equalization", renderEqualizationReports);
+    }
   });
   document.addEventListener("change", (event) => {
     if (!event.target.matches(selector)) return;
-    state[key] = key === "copyPageSize" ? Number(event.target.value || 20) : event.target.value;
+    state[key] = ["copyPageSize", "equalizationPageSize"].includes(key) ? Number(event.target.value || 20) : event.target.value;
     if (key === "copyPageSize") localStorage.setItem("competidor-copy-page-size", String(state.copyPageSize));
     if (key.startsWith("catalog")) {
       state.catalogPage = 1;
@@ -2094,7 +2261,65 @@ document.addEventListener("click", (event) => {
       state.copyPage = 1;
       renderCopyItems();
     }
+    if (key.startsWith("equalization")) {
+      state.equalizationPage = 1;
+      renderEqualizationReports();
+    }
   });
+});
+
+document.querySelector("#ads-list")?.addEventListener("click", async (event) => {
+  const summary = event.target.closest("[data-load-description]");
+  if (!summary) return;
+  event.preventDefault();
+  const itemId = summary.dataset.loadDescription;
+  const accountId = summary.dataset.accountId;
+  const details = summary.closest("details");
+  if (details?.open) {
+    state.openDescriptions.delete(itemId);
+    details.open = false;
+    return;
+  }
+  state.openDescriptions.add(itemId);
+  if (state.itemDescriptions[itemId]?.loaded || state.itemDescriptions[itemId]?.loading) {
+    details.open = true;
+    return;
+  }
+  state.itemDescriptions[itemId] = { loading: true, loaded: false, value: "" };
+  renderAds();
+  try {
+    const result = await api("/api/meli/item/description", {
+      method: "POST",
+      body: JSON.stringify({ action: "read", item_id: itemId, account_id: accountId }),
+    });
+    state.itemDescriptions[itemId] = { loading: false, loaded: true, value: result.description || "" };
+  } catch (error) {
+    state.itemDescriptions[itemId] = { loading: false, loaded: false, value: "" };
+    showToast(error.message || "Não foi possível carregar a descrição.", "error");
+  }
+  renderAds();
+});
+
+document.querySelector("#ads-list")?.addEventListener("submit", async (event) => {
+  const form = event.target.closest("[data-description-form]");
+  if (!form) return;
+  event.preventDefault();
+  const itemId = form.dataset.descriptionForm;
+  const description = form.querySelector("[data-description-text]")?.value || "";
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
+  try {
+    await api("/api/meli/item/description", {
+      method: "POST",
+      body: JSON.stringify({ action: "update", item_id: itemId, account_id: form.dataset.accountId, description }),
+    });
+    state.itemDescriptions[itemId] = { loading: false, loaded: true, value: description };
+    showToast("Descrição alterada com sucesso.", "success");
+  } catch (error) {
+    showToast(error.message || "Não foi possível alterar a descrição.", "error");
+  } finally {
+    button.disabled = false;
+  }
 });
 
 document.querySelector("#catalog-list").addEventListener("click", async (event) => {

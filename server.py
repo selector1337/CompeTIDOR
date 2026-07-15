@@ -21,6 +21,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 ROOT = Path(__file__).parent
@@ -41,6 +42,8 @@ SELLER_PROFILE_LOCK = threading.RLock()
 SELLER_PROFILE_CACHE = {}
 PUBLIC_BUYBOX_CACHE_LOCK = threading.RLock()
 PUBLIC_BUYBOX_CACHE = {}
+CATALOG_OFFERS_CACHE_LOCK = threading.RLock()
+CATALOG_OFFERS_CACHE = {}
 STATISTICS_CACHE_LOCK = threading.RLock()
 STATISTICS_CACHE = {}
 STATISTICS_JOBS_LOCK = threading.RLock()
@@ -185,6 +188,51 @@ def merge_critical_records(collection, incoming, latest):
     return merged
 
 
+CATALOG_COMPETITION_FIELDS = {
+    "competition_status", "competition_consistent", "competition_checked_at", "competition_reason",
+    "winner_item_id", "winner_seller_id", "winner_name", "winner_price", "winner_confirmed", "winner_source",
+    "catalog_reference_seller_id", "catalog_reference_name", "catalog_reference_price", "price_to_win",
+    "current_price", "visit_share", "competitors_sharing_first_place", "runner_up_item_id",
+    "runner_up_seller_id", "runner_up_name", "runner_up_price", "runner_up_source",
+    "internal_competition", "internal_winner_account_id", "share", "status", "action",
+}
+CATALOG_ITEM_FIELDS = {
+    "title", "thumbnail", "sku", "brand", "gtin", "variation_count", "catalog_product_id",
+    "catalog_listing", "listing_type_id", "shipping_logistic_type", "shipping_mode", "free_shipping",
+    "package_weight", "package_height", "package_width", "package_length", "price", "stock",
+    "meli_status", "permalink", "item_data_checked_at",
+}
+
+
+def merge_catalog_records(incoming, latest):
+    def key(row):
+        return f"{row.get('account_id') or row.get('account') or ''}:{row.get('id') or ''}"
+
+    incoming_by_key = {key(row): row for row in incoming or [] if row.get("id")}
+    latest_by_key = {key(row): row for row in latest or [] if row.get("id")}
+    merged_rows = []
+    for row_key in [*latest_by_key, *[value for value in incoming_by_key if value not in latest_by_key]]:
+        current = incoming_by_key.get(row_key)
+        saved = latest_by_key.get(row_key)
+        if current is None:
+            merged_rows.append(saved)
+            continue
+        if saved is None:
+            merged_rows.append(current)
+            continue
+        merged = {**saved, **current}
+        competition_source = current if str(current.get("competition_checked_at") or "") >= str(saved.get("competition_checked_at") or "") else saved
+        item_source = current if str(current.get("item_data_checked_at") or "") >= str(saved.get("item_data_checked_at") or "") else saved
+        for field in CATALOG_COMPETITION_FIELDS:
+            if field in competition_source:
+                merged[field] = competition_source[field]
+        for field in CATALOG_ITEM_FIELDS:
+            if field in item_source:
+                merged[field] = item_source[field]
+        merged_rows.append(merged)
+    return merged_rows
+
+
 def write_payload(payload, replace_collections=None):
     replace_collections = set(replace_collections or [])
     with DATA_LOCK:
@@ -203,6 +251,11 @@ def write_payload(payload, replace_collections=None):
                     )
             latest_notifications = latest.get("user_notifications") or {}
             payload["user_notifications"] = {**(payload.get("user_notifications") or {}), **latest_notifications}
+            if payload.get("_catalog_loaded", True):
+                payload["catalog"] = merge_catalog_records(
+                    payload.get("catalog", []),
+                    read_json(CATALOG_DATA_FILE, []),
+                )
         payload["_revision"] = latest_revision + 1
         catalog_loaded = bool(payload.get("_catalog_loaded", True))
         if catalog_loaded:
@@ -986,6 +1039,9 @@ class MercadoLivreClient:
 
     def create_item_description(self, item_id, plain_text):
         return self.post(f"/items/{item_id}/description", {"plain_text": plain_text})
+
+    def update_item_description(self, item_id, plain_text):
+        return self.put(f"/items/{item_id}/description", {"plain_text": plain_text})
 
     def update_item(self, item_id, payload):
         return self.put(f"/items/{item_id}", payload)
@@ -1855,7 +1911,6 @@ def auto_scan_loop():
 def auto_official_sync_loop():
     interval = max(120, int(os.getenv("AUTO_SYNC_INTERVAL_SECONDS", "300")))
     startup_delay = max(20, int(os.getenv("AUTO_SYNC_STARTUP_DELAY_SECONDS", "45")))
-    full_every = max(1, int(os.getenv("AUTO_FULL_SYNC_EVERY_N_RUNS", "72")))
     operations_every = max(1, int(os.getenv("AUTO_OPERATIONS_SYNC_EVERY_N_RUNS", "6")))
     run_count = 0
     time.sleep(startup_delay)
@@ -1871,16 +1926,12 @@ def auto_official_sync_loop():
             run_count += 1
             for account in accounts:
                 try:
-                    if run_count % full_every == 0:
-                        result = sync_official_account(payload, account.get("id"), "all")
-                        account["auto_sync_status"] = f"Sincronização completa automática OK: {result.get('items', 0)} anúncios"
-                    else:
-                        result = refresh_official_account_items(payload, account)
-                        account["auto_sync_status"] = account.get("auto_refresh_status") or f"Atualização automática OK: {result.get('items', 0)} anúncios"
-                        if run_count % operations_every == 0:
-                            client = account_client(account)
-                            sync_recent_sales(payload, account, client)
-                            sync_claims(payload, account, client)
+                    result = refresh_official_account_items(payload, account, include_competition=False)
+                    account["auto_sync_status"] = account.get("auto_refresh_status") or f"Atualização automática OK: {result.get('items', 0)} anúncios"
+                    if run_count % operations_every == 0:
+                        client = account_client(account)
+                        sync_recent_sales(payload, account, client)
+                        sync_claims(payload, account, client)
                     account["auto_sync_error"] = ""
                     account["last_auto_sync_at"] = now_label()
                     changed = True
@@ -1890,6 +1941,84 @@ def auto_official_sync_loop():
                     account["last_auto_sync_at"] = now_label()
                     changed = True
             if changed:
+                write_payload(payload)
+        except Exception:
+            pass
+        time.sleep(interval)
+
+
+def auto_catalog_competition_loop():
+    interval = max(30, int(os.getenv("AUTO_COMPETITION_INTERVAL_SECONDS", "60")))
+    startup_delay = max(30, int(os.getenv("AUTO_COMPETITION_STARTUP_DELAY_SECONDS", "75")))
+    batch_size = max(1, int(os.getenv("AUTO_COMPETITION_BATCH_SIZE", "250")))
+    workers = max(1, min(12, int(os.getenv("AUTO_COMPETITION_WORKERS", "8"))))
+    time.sleep(startup_delay)
+    while True:
+        try:
+            payload = read_payload()
+            accounts = [
+                account for account in payload.get("accounts", [])
+                if account.get("official") and account.get("access_token") and account.get("status") == "connected"
+            ]
+            jobs = []
+            for account in accounts:
+                rows = [
+                    item for item in payload.get("catalog", [])
+                    if item.get("official_source")
+                    and item.get("account_id") == account.get("id")
+                    and is_catalog_listing(item)
+                    and item.get("meli_status") != "closed"
+                ]
+                cursor_key = f"competition_refresh_cursor_{account.get('id')}"
+                selected, account[cursor_key] = rotating_batch(rows, account.get(cursor_key) or 0, batch_size)
+                client = account_client(account)
+                for item in selected:
+                    jobs.append((account, client, item, dict(item)))
+
+            completed_by_account = {}
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meli-buybox") as executor:
+                future_jobs = {
+                    executor.submit(normalize_competition, client, account, item): (account, item, before)
+                    for account, client, item, before in jobs
+                }
+                for future in as_completed(future_jobs):
+                    account, item, before = future_jobs[future]
+                    try:
+                        competition = future.result()
+                        item.update(competition)
+                        item["status"], item["action"] = classified_catalog_status(
+                            account, item, int(item.get("stock") or 0), True, competition
+                        )
+                        item["share"] = competition_share(competition.get("competition_status"), competition.get("visit_share"))
+                        item["updated_at"] = now_label()
+                        item.pop("competition_refresh_error", None)
+                        completed_by_account[account.get("id")] = completed_by_account.get(account.get("id"), 0) + 1
+                        if before.get("status") != "losing" and item.get("status") == "losing" and not item.get("internal_competition"):
+                            alert_id = f"catalog-{account.get('id')}-{item.get('id')}-{now_label()[:10]}"
+                            if not any(alert.get("id") == alert_id for alert in payload.get("alerts", [])):
+                                alert = {
+                                    "id": alert_id,
+                                    "type": "catalog",
+                                    "severity": "danger",
+                                    "title": "Produto começou a perder catálogo",
+                                    "message": f"{item.get('title')} perdeu a buybox. Vencedor: {item.get('winner_name') or '-'} por {brl(item.get('winner_price')) if item.get('winner_price') else '-' }.",
+                                    "account": item.get("account"),
+                                    "item_id": item.get("id"),
+                                    "sku": item.get("sku"),
+                                    "product": item.get("title"),
+                                    "created_at": now_label(),
+                                }
+                                payload.setdefault("alerts", []).insert(0, alert)
+                                notify_alert(payload, alert)
+                    except Exception as exc:
+                        item["competition_refresh_error"] = str(exc)
+                        item["competition_checked_at"] = now_label()
+            reclassify_internal_competition(payload)
+            for account in accounts:
+                checked = completed_by_account.get(account.get("id"), 0)
+                account["catalog_refresh_status"] = f"Varredura rotativa: {checked} anúncios de catálogo verificados"
+                account["last_catalog_refresh_at"] = now_label()
+            if accounts:
                 write_payload(payload)
         except Exception:
             pass
@@ -2162,6 +2291,41 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
     return seller_id, seller_name
 
 
+def catalog_next_visible_offer(client, catalog_product_id, winner_item_id):
+    catalog_product_id = str(catalog_product_id or "")
+    if not catalog_product_id:
+        return {}
+    ttl = max(120, int(os.getenv("MELI_CATALOG_OFFERS_CACHE_SECONDS", "900")))
+    now = time.monotonic()
+    with CATALOG_OFFERS_CACHE_LOCK:
+        cached = CATALOG_OFFERS_CACHE.get(catalog_product_id)
+    if cached and now - cached.get("time", 0) < ttl:
+        candidates = cached.get("candidates") or []
+    else:
+        response = client.product_winners(catalog_product_id)
+        rows = response.get("results") if isinstance(response, dict) else response
+        candidates = catalog_offer_candidates(rows or [], sort_by_price=True)
+        with CATALOG_OFFERS_CACHE_LOCK:
+            CATALOG_OFFERS_CACHE[catalog_product_id] = {"time": now, "candidates": candidates}
+    candidate = next((row for row in candidates if str(row.get("item_id") or "") != str(winner_item_id or "")), None)
+    if not candidate:
+        return {}
+    seller_id = str(candidate.get("seller_id") or "")
+    seller = ""
+    if seller_id:
+        try:
+            seller = seller_nickname(client, seller_id)
+        except Exception:
+            seller = f"Vendedor {seller_id}"
+    return {
+        "runner_up_item_id": candidate.get("item_id") or "",
+        "runner_up_seller_id": seller_id,
+        "runner_up_name": seller or (f"Anúncio {candidate.get('item_id')}" if candidate.get("item_id") else ""),
+        "runner_up_price": candidate.get("price"),
+        "runner_up_source": "catalog_visible_offer",
+    }
+
+
 def normalize_competition(client, account, item):
     item_id = item.get("id")
     catalog_product_id = item.get("catalog_product_id")
@@ -2183,6 +2347,11 @@ def normalize_competition(client, account, item):
         "visit_share": None,
         "competition_reason": "",
         "competitors_sharing_first_place": None,
+        "runner_up_item_id": "",
+        "runner_up_seller_id": "",
+        "runner_up_name": "",
+        "runner_up_price": None,
+        "runner_up_source": "",
     }
 
     try:
@@ -2267,6 +2436,11 @@ def normalize_competition(client, account, item):
         data["winner_price"] = None
     if data["competition_status"] == "not_listed" and not data.get("winner_seller_id"):
         data["winner_name"] = "Sem vencedor disponível"
+    if data.get("winner_confirmed") and str(data.get("winner_item_id") or "") == str(item_id or ""):
+        try:
+            data.update(catalog_next_visible_offer(client, catalog_product_id, data.get("winner_item_id")))
+        except Exception:
+            pass
     return data
 
 
@@ -2349,8 +2523,10 @@ def synced_catalog_item(account, item, competition=None):
         "account": account.get("nickname"),
         "account_id": account.get("id"),
         "official_source": True,
+        "item_data_checked_at": now_label(),
         "thumbnail": item_thumbnail(item),
         "sku": item_sku(item),
+        "brand": source_attribute_value(item, ["BRAND"]),
         "gtin": ", ".join(identifier_values),
         "variation_count": len(item.get("variations") or []),
         "catalog_product_id": catalog_product_id,
@@ -3125,8 +3301,10 @@ def sync_official_account(payload, account_id, limit=None):
     }
     competition_inline_limit = max(0, int(os.getenv("MELI_SYNC_COMPETITION_INLINE_LIMIT", "0")))
     batch_size = max(1, min(20, int(os.getenv("MELI_ITEM_BULK_SIZE", "20"))))
-    for batch_start in range(0, len(item_ids), batch_size):
-        batch_ids = item_ids[batch_start : batch_start + batch_size]
+    batches = [(start, item_ids[start : start + batch_size]) for start in range(0, len(item_ids), batch_size)]
+
+    def fetch_item_batch(batch):
+        batch_start, batch_ids = batch
         try:
             batch_items = client.items_bulk(batch_ids)
         except Exception:
@@ -3136,6 +3314,15 @@ def sync_official_account(payload, account_id, limit=None):
                     batch_items.append(client.item(item_id))
                 except Exception:
                     pass
+        return batch_start, batch_items
+
+    batch_workers = max(1, min(8, int(os.getenv("MELI_SYNC_BATCH_WORKERS", "4"))))
+    fetched_batches = []
+    with ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="meli-items") as executor:
+        futures = [executor.submit(fetch_item_batch, batch) for batch in batches]
+        for future in as_completed(futures):
+            fetched_batches.append(future.result())
+    for batch_start, batch_items in sorted(fetched_batches, key=lambda row: row[0]):
         for batch_offset, item in enumerate(batch_items):
             item_id = item.get("id")
             index = batch_start + batch_offset
@@ -3181,8 +3368,8 @@ def rotating_batch(rows, cursor, batch_size):
     return selected, next_cursor
 
 
-def refresh_official_account_items(payload, account, batch_size=None):
-    batch_size = max(1, int(batch_size or os.getenv("AUTO_REFRESH_BATCH_SIZE", "400")))
+def refresh_official_account_items(payload, account, batch_size=None, include_competition=True):
+    batch_size = max(1, int(batch_size or os.getenv("AUTO_REFRESH_BATCH_SIZE", "1000")))
     rows = [
         item
         for item in payload.get("catalog", [])
@@ -3195,7 +3382,7 @@ def refresh_official_account_items(payload, account, batch_size=None):
     selected, account[cursor_key] = rotating_batch(rows, cursor, batch_size)
 
     catalog_rows = [item for item in rows if is_catalog_listing(item) and item.get("meli_status") != "closed"]
-    competition_limit = max(0, int(os.getenv("AUTO_COMPETITION_BATCH_SIZE", "200")))
+    competition_limit = max(0, int(os.getenv("AUTO_COMPETITION_BATCH_SIZE", "200"))) if include_competition else 0
     competition_cursor_key = f"competition_refresh_cursor_{account.get('id')}"
     competition_cursor = int(account.get(competition_cursor_key) or 0)
     competition_selected, account[competition_cursor_key] = rotating_batch(
@@ -3898,10 +4085,15 @@ def restore_clone_attribute_from_source(create_payload, source_item, category_at
 
 
 def clone_sale_terms_payload(item):
+    non_modifiable = {
+        term.strip().upper()
+        for term in os.getenv("MELI_CLONE_EXCLUDED_SALE_TERMS", "SUBSCRIBABLE").split(",")
+        if term.strip()
+    }
     terms = []
     for term in item.get("sale_terms") or []:
         term_id = term.get("id")
-        if not term_id:
+        if not term_id or str(term_id).upper() in non_modifiable:
             continue
         row = {"id": term_id}
         if term.get("value_id"):
@@ -3911,6 +4103,26 @@ def clone_sale_terms_payload(item):
         if len(row) > 1:
             terms.append(row)
     return terms
+
+
+def remove_clone_sale_terms(create_payload, term_ids):
+    wanted = {str(term_id or "").upper() for term_id in term_ids if term_id}
+    if not wanted:
+        return []
+    removed = []
+    for section in [create_payload, *(create_payload.get("variations") or [])]:
+        kept = []
+        for term in section.get("sale_terms") or []:
+            term_id = str(term.get("id") or "").upper()
+            if term_id in wanted:
+                removed.append(term_id)
+            else:
+                kept.append(term)
+        if kept:
+            section["sale_terms"] = kept
+        else:
+            section.pop("sale_terms", None)
+    return list(dict.fromkeys(removed))
 
 
 def clone_shipping_payload(item):
@@ -4463,7 +4675,7 @@ def required_clone_attributes_from_error(exc, source_item, category_attributes):
     found = []
 
     for match in re.finditer(
-        r"(?:attributes?|atributos?)\s*\[([^\]]+)\]\s*(?:are|is|são|sao)\s+required",
+        r"(?:attributes?|atributos?)\s*\[([^\]]+)\]\s*(?:are|is|são|sao)\s+(?:all\s+)?required",
         text,
         flags=re.I,
     ):
@@ -4571,6 +4783,14 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
     adjustments = []
     error_text = meli_error_text(exc)
     lowered_error = error_text.lower()
+    immutable_terms = [
+        match.group(1).upper()
+        for match in re.finditer(r"(?:not allowed to modify sale term|não é permitido alterar o termo de venda)\s+([A-Z0-9_]+)", error_text, flags=re.I)
+    ]
+    removed_terms = remove_clone_sale_terms(create_payload, immutable_terms)
+    if removed_terms:
+        changed = True
+        adjustments.append({"tipo": "termos_de_venda_imutaveis_removidos", "campos": removed_terms})
     if "official_store_id" in lowered_error and (
         "not allowed" in lowered_error or "invalid_official_store_id" in lowered_error or "invalid official" in lowered_error
     ):
@@ -5577,10 +5797,12 @@ def start_report_job(request):
 def report_filtered_catalog(payload, report_type, filters):
     account_filter = str(filters.get("account") or "all")
     search = normalized_attribute_label(filters.get("search") or filters.get("product") or "")
+    brand_search = normalized_attribute_label(filters.get("brand") or "")
     sku_search = normalized_attribute_label(filters.get("sku") or "")
     code_search = normalized_attribute_label(filters.get("code") or "")
     status_filter = str(filters.get("status") or "all")
     ml_status_filter = str(filters.get("ml_status") or "all")
+    listing_type_filter = str(filters.get("listing_type") or "all")
     stock_filter = str(filters.get("stock") or "all")
     catalog_filter = str(filters.get("catalog") or "all")
     flex_filter = str(filters.get("flex") or "all")
@@ -5600,6 +5822,8 @@ def report_filtered_catalog(payload, report_type, filters):
                 continue
         if ml_status_filter != "all" and item.get("meli_status") != ml_status_filter:
             continue
+        if listing_type_filter != "all" and item.get("listing_type_id") != listing_type_filter:
+            continue
         if stock_filter == "zero" and int(float(item.get("stock") or 0)) != 0:
             continue
         if stock_filter == "available" and int(float(item.get("stock") or 0)) <= 0:
@@ -5615,6 +5839,8 @@ def report_filtered_catalog(payload, report_type, filters):
             continue
         haystack = normalized_attribute_label(f"{item.get('title', '')} {item.get('sku', '')} {item.get('id', '')}")
         if search and search not in haystack:
+            continue
+        if brand_search and brand_search not in normalized_attribute_label(f"{item.get('brand', '')} {item.get('title', '')}"):
             continue
         if sku_search and sku_search not in normalized_attribute_label(item.get("sku") or ""):
             continue
@@ -7171,10 +7397,23 @@ class App(BaseHTTPRequestHandler):
                 account_id = request.get("account_id", "")
                 account = next((item for item in payload.get("accounts", []) if item.get("id") == account_id or item.get("nickname") == request.get("account")), None)
                 if not account or not account.get("official"):
-                    raise RuntimeError("Conta oficial não encontrada para ler a descrição.")
-                description = account_client(account).item_description(item_id)
-                text = description.get("plain_text") or description.get("text") or ""
-                self.send_json({"ok": True, "description": text})
+                    raise RuntimeError("Conta oficial não encontrada para acessar a descrição.")
+                client = account_client(account)
+                if request.get("action") == "update":
+                    text = str(request.get("description") or "").strip()
+                    if not text:
+                        raise RuntimeError("A descrição não pode ficar vazia.")
+                    official = client.update_item_description(item_id, text)
+                    item = next((row for row in payload.get("catalog", []) if row.get("id") == item_id and row.get("account_id") == account.get("id")), None)
+                    if item:
+                        item["description_updated_at"] = now_label()
+                        append_item_log(payload, item, self.current_user(payload), "Descrição alterada", {"description": {"from": "Descrição anterior", "to": "Descrição atualizada"}})
+                    write_payload(payload)
+                    self.send_json({"ok": True, "description": text, "official": official})
+                else:
+                    description = client.item_description(item_id)
+                    text = description.get("plain_text") or description.get("text") or ""
+                    self.send_json({"ok": True, "description": text})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
@@ -7436,6 +7675,7 @@ if __name__ == "__main__":
     threading.Thread(target=meli_notification_loop, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
     threading.Thread(target=auto_official_sync_loop, daemon=True).start()
+    threading.Thread(target=auto_catalog_competition_loop, daemon=True).start()
     print(f"CompeTIDOR rodando em http://127.0.0.1:{port}")
     print(f"Callback HTTPS em https://127.0.0.1:{https_port()}/api/oauth/callback")
     http_server.serve_forever()

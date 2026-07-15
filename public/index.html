@@ -35,6 +35,7 @@
       <nav aria-label="Menu principal">
         <a class="active" href="#/dashboard" data-route="dashboard" aria-label="Dashboard" title="Dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/></svg></span><strong>Dashboard</strong></a>
         <a href="#/estatisticas" data-route="estatisticas" aria-label="Estatísticas" title="Estatísticas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19h16v2H2V3h2v16Zm3-2H5v-6h2v6Zm4 0H9V7h2v10Zm4 0h-2V4h2v13Zm4 0h-2V9h2v8Z"/></svg></span><strong>Estatísticas</strong></a>
+        <a href="#/relatorios" data-route="relatorios" aria-label="Relatórios" title="Relatórios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 3h10l4 4v14H5V3Zm9 1.8V8h3.2L14 4.8ZM8 12h8v-2H8v2Zm0 4h8v-2H8v2Zm0 3h6v-2H8v2Z"/></svg></span><strong>Relatórios</strong></a>
         <a href="#/contas" data-route="contas" aria-label="Contas" title="Contas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8-6h5v2h-5V5Zm0 4h5v2h-5V9ZM3 21v-2a5 5 0 0 1 10 0v2H3Zm12-6h6v2h-6v-2Zm0 4h6v2h-6v-2Z"/></svg></span><strong>Contas</strong></a>
         <a href="#/catalogo" data-route="catalogo" aria-label="Catálogo" title="Catálogo"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8ZM7.5 8.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/></svg></span><strong>Catálogo</strong></a>
         <a href="#/anuncios" data-route="anuncios" aria-label="Anúncios" title="Anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16v4H4V5Zm0 6h16v8H4v-8Zm3 2v2h7v-2H7Zm0 3v1h10v-1H7Z"/></svg></span><strong>Anúncios</strong></a>
@@ -108,7 +109,9 @@
               <button class="active" data-stock-period="today">Hoje</button>
               <button data-stock-period="yesterday">Ontem</button>
               <button data-stock-period="week">Semana</button>
-              <label>Data <input id="stock-custom-date" type="date" /></label>
+              <label>De <input id="stock-custom-date" type="date" /></label>
+              <label>Até <input id="stock-custom-end-date" type="date" /></label>
+              <button type="button" id="stock-apply-period">Aplicar período</button>
             </div>
             <div id="dashboard-stock" class="ops-list"></div>
           </div>
@@ -333,6 +336,32 @@
         </div>
       </section>
 
+      <section class="page" id="page-relatorios">
+        <div class="panel catalog-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Equalização de contas</p>
+              <h2>Relatórios de cobertura por SKU</h2>
+            </div>
+          </div>
+          <div class="filter-bar report-filter-bar">
+            <label>Relatório
+              <select id="equalization-report-type">
+                <option value="listing_type_gap">Clássico sem Premium e vice-versa</option>
+                <option value="account_gap">SKU ausente em outras contas</option>
+              </select>
+            </label>
+            <label>Conta de referência <select id="equalization-account-filter"></select></label>
+            <label>SKU ou produto <input id="equalization-search" type="search" placeholder="Filtrar o relatório" /></label>
+            <label>Por página
+              <select id="equalization-page-size"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>
+            </label>
+          </div>
+          <div id="equalization-summary" class="inventory-summary"></div>
+          <div id="equalization-report" class="equalization-report"></div>
+        </div>
+      </section>
+
       <section class="page" id="page-anuncios">
         <div class="panel catalog-panel">
           <div class="panel-heading">
@@ -351,9 +380,17 @@
           <div class="filter-bar">
             <label>Conta <select id="ads-account-filter"></select></label>
             <label>Produto <input id="ads-product-filter" placeholder="Nome do produto" /></label>
+            <label>Marca <input id="ads-brand-filter" placeholder="Marca" /></label>
             <label>SKU <input id="ads-sku-filter" placeholder="SKU" /></label>
             <label>Código ML <input id="ads-code-filter" placeholder="MLB..." /></label>
             <label>Status <select id="ads-status-filter"></select></label>
+            <label>Tipo de anúncio
+              <select id="ads-listing-type-filter">
+                <option value="all">Clássico e Premium</option>
+                <option value="gold_special">Clássico</option>
+                <option value="gold_pro">Premium</option>
+              </select>
+            </label>
             <label>Modalidade
               <select id="ads-catalog-filter">
                 <option value="all">Todas</option>
@@ -369,6 +406,7 @@
               </select>
             </label>
           </div>
+          <div id="ads-inventory-summary" class="inventory-summary" aria-live="polite"></div>
           <div id="spreadsheet-preview"></div>
           <div id="ads-list" class="ads-list"></div>
         </div>
