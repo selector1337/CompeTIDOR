@@ -2732,6 +2732,7 @@ def synced_catalog_item(account, item, competition=None):
     status, action = classified_catalog_status(account, item, stock, is_catalog, competition)
     package_values = package_values_from_item(item)
     identifier_values = source_clone_identifiers(item, {})
+    official_store = item.get("official_store") if isinstance(item.get("official_store"), dict) else {}
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
@@ -2742,6 +2743,12 @@ def synced_catalog_item(account, item, competition=None):
         "thumbnail": item_thumbnail(item),
         "sku": item_sku(item),
         "brand": source_attribute_value(item, ["BRAND"]),
+        "official_store_id": item.get("official_store_id") or official_store.get("id"),
+        "official_store_name": clean_attribute_value(
+            item.get("official_store_name")
+            or official_store.get("fantasy_name")
+            or official_store.get("name")
+        ),
         "gtin": ", ".join(identifier_values),
         "variation_count": len(item.get("variations") or []),
         "catalog_product_id": catalog_product_id,
@@ -4867,8 +4874,103 @@ def normalized_store_name(value):
     )
 
 
-def target_official_stores(target_client, target_account):
-    seller_id = str(target_account.get("seller_id") or "")
+def merge_official_stores(*groups):
+    merged = {}
+    for group in groups:
+        for store in group or []:
+            if not isinstance(store, dict):
+                continue
+            store_id = store.get("official_store_id") or store.get("id")
+            if store_id in (None, ""):
+                continue
+            key = str(store_id)
+            normalized = {
+                **store,
+                "official_store_id": store_id,
+                "status": store.get("status") or "active",
+            }
+            current = merged.get(key) or {}
+            # Preserve the richest name returned by any official source.
+            if current and not any(normalized.get(name) for name in ("fantasy_name", "name", "normalized_name")):
+                normalized.update({
+                    name: current.get(name)
+                    for name in ("fantasy_name", "name", "normalized_name")
+                    if current.get(name)
+                })
+            merged[key] = {**current, **normalized}
+    return list(merged.values())
+
+
+def catalog_official_stores(catalog, target_account):
+    account_ids = {
+        str(value)
+        for value in (target_account.get("id"), target_account.get("seller_id"))
+        if value not in (None, "")
+    }
+    nickname = str(target_account.get("nickname") or "")
+    stores = []
+    for item in catalog or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("account_id") or "") not in account_ids and str(item.get("account") or "") != nickname:
+            continue
+        store_id = item.get("official_store_id") or first_present(item, ["official_store.id"], None)
+        if store_id in (None, ""):
+            continue
+        store_name = clean_attribute_value(
+            item.get("official_store_name")
+            or first_present(item, ["official_store.fantasy_name", "official_store.name"], "")
+        )
+        stores.append({
+            "official_store_id": store_id,
+            "name": store_name or f"Loja Oficial {store_id}",
+            "status": "active",
+        })
+    return merge_official_stores(stores)
+
+
+def discover_official_stores_from_items(target_client, target_account, catalog):
+    seller_ids = {
+        str(value)
+        for value in (target_account.get("id"), target_account.get("seller_id"))
+        if value not in (None, "")
+    }
+    nickname = str(target_account.get("nickname") or "")
+    item_ids = [
+        str(item.get("id"))
+        for item in catalog or []
+        if isinstance(item, dict)
+        and item.get("id")
+        and (
+            str(item.get("account_id") or "") in seller_ids
+            or str(item.get("account") or "") == nickname
+        )
+    ]
+    limit = max(20, min(200, int(os.getenv("MELI_OFFICIAL_STORE_DISCOVERY_ITEMS", "100"))))
+    stores = []
+    for start in range(0, min(len(item_ids), limit), 20):
+        try:
+            items = target_client.items_bulk(item_ids[start:start + 20])
+        except Exception:
+            break
+        for item in items or []:
+            store_id = item.get("official_store_id") or first_present(item, ["official_store.id"], None)
+            if store_id in (None, ""):
+                continue
+            store_name = clean_attribute_value(
+                item.get("official_store_name")
+                or first_present(item, ["official_store.fantasy_name", "official_store.name"], "")
+            )
+            stores.append({
+                "official_store_id": store_id,
+                "name": store_name or f"Loja Oficial {store_id}",
+                "status": "active",
+            })
+    return merge_official_stores(stores)
+
+
+def target_official_stores(target_client, target_account, catalog=None):
+    seller_id = str(target_account.get("seller_id") or target_account.get("id") or "")
     if not seller_id:
         return []
     ttl = max(300, int(os.getenv("MELI_OFFICIAL_STORE_CACHE_SECONDS", "21600")))
@@ -4890,6 +4992,18 @@ def target_official_stores(target_client, target_account):
         if brand.get("official_store_id") not in (None, "")
         and str(brand.get("status") or "active").lower() not in {"inactive", "offline", "disabled"}
     ]
+    local_stores = catalog_official_stores(catalog or [], target_account)
+    available = merge_official_stores(available, local_stores)
+    if len(available) < 2 and catalog:
+        discovered = discover_official_stores_from_items(target_client, target_account, catalog)
+        available = merge_official_stores(available, discovered)
+        if discovered:
+            with OFFICIAL_STORE_CACHE_LOCK:
+                cached_brands = (OFFICIAL_STORE_CACHE.get(seller_id) or {}).get("brands") or []
+                OFFICIAL_STORE_CACHE[seller_id] = {
+                    "time": now,
+                    "brands": merge_official_stores(cached_brands, discovered),
+                }
     return available
 
 
@@ -4944,6 +5058,15 @@ def official_store_option(brand):
 
 
 def official_store_pending_field(item_id, stores):
+    stores = merge_official_stores(stores)
+    if not stores:
+        return clone_pending_field(
+            "official_store_id",
+            "ID da Loja Oficial da conta destino",
+            "number",
+            "O Mercado Livre exige uma Loja Oficial, mas não retornou a lista de lojas desta conta. Informe o ID exibido no painel da Loja Oficial.",
+            item_id,
+        )
     return clone_pending_field(
         "official_store_id",
         "Loja Oficial da conta destino",
@@ -4952,6 +5075,17 @@ def official_store_pending_field(item_id, stores):
         item_id,
         [official_store_option(store) for store in stores],
     )
+
+
+def official_stores_from_error(exc):
+    return [
+        {
+            "official_store_id": store_id,
+            "name": f"Loja Oficial {store_id}",
+            "status": "active",
+        }
+        for store_id in official_store_ids_from_error(exc)
+    ]
 
 
 def prepare_cross_account_official_store_payload(payload, destination_store_id=None):
@@ -5821,6 +5955,10 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
                     validation_attempts += 1
                     continue
                 if store_error == "required":
+                    destination_stores = merge_official_stores(
+                        destination_stores,
+                        official_stores_from_error(exc),
+                    )
                     retry_store_id = official_store_retry_id(exc, source_item, destination_store_id)
                     if retry_store_id not in (None, "") and str(retry_store_id) != str(destination_store_id or ""):
                         destination_store_id = retry_store_id
@@ -5831,10 +5969,9 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
                         })
                         validation_attempts += 1
                         continue
-                    if destination_stores:
-                        pending_fields.append(official_store_pending_field(item_id, destination_stores))
-                        validation_attempts += 1
-                        break
+                    pending_fields.append(official_store_pending_field(item_id, destination_stores))
+                    validation_attempts += 1
+                    break
             validation_attempts += 1
             payload, changed, new_adjustments = clone_retry_adjustments_from_error(
                 exc,
@@ -5883,7 +6020,11 @@ def create_official_clone(payload, job, source_item_id, edits):
     hydrate_required_clone_attributes(create_payload, source_item, category_attributes, catalog_product)
     create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
-    destination_stores = target_official_stores(target_client, target_account) if cross_account else []
+    destination_stores = target_official_stores(
+        target_client,
+        target_account,
+        payload.get("catalog") or [],
+    ) if cross_account else []
     allowed_store_ids = {
         str(store.get("official_store_id") or "")
         for store in destination_stores
@@ -7388,7 +7529,7 @@ def prepare_clone_preview(request):
     validation_cache = {}
     for target_account in target_accounts:
         target_client = account_client(target_account)
-        target_stores = target_official_stores(target_client, target_account)
+        target_stores = target_official_stores(target_client, target_account, catalog)
         suggested_store_id = target_official_store_id(
             target_client,
             target_account,
