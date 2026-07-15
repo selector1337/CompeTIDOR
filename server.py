@@ -4867,10 +4867,10 @@ def normalized_store_name(value):
     )
 
 
-def target_official_store_id(target_client, target_account, source_item):
+def target_official_stores(target_client, target_account):
     seller_id = str(target_account.get("seller_id") or "")
     if not seller_id:
-        return None
+        return []
     ttl = max(300, int(os.getenv("MELI_OFFICIAL_STORE_CACHE_SECONDS", "21600")))
     now = time.time()
     with OFFICIAL_STORE_CACHE_LOCK:
@@ -4890,6 +4890,12 @@ def target_official_store_id(target_client, target_account, source_item):
         if brand.get("official_store_id") not in (None, "")
         and str(brand.get("status") or "active").lower() not in {"inactive", "offline", "disabled"}
     ]
+    return available
+
+
+def target_official_store_id(target_client, target_account, source_item, available=None):
+    if available is None:
+        available = target_official_stores(target_client, target_account)
     if not available:
         return None
     source_store_id = str(source_item.get("official_store_id") or "")
@@ -4924,6 +4930,28 @@ def target_official_store_id(target_client, target_account, source_item):
     if len(available) == 1:
         return available[0].get("official_store_id")
     return None
+
+
+def official_store_option(brand):
+    store_id = str(brand.get("official_store_id") or "")
+    name = clean_attribute_value(
+        brand.get("fantasy_name")
+        or brand.get("name")
+        or brand.get("normalized_name")
+        or f"Loja Oficial {store_id}"
+    )
+    return {"value": store_id, "label": f"{name} · ID {store_id}"}
+
+
+def official_store_pending_field(item_id, stores):
+    return clone_pending_field(
+        "official_store_id",
+        "Loja Oficial da conta destino",
+        "select",
+        "Esta conta possui mais de uma Loja Oficial. Selecione em qual delas o anúncio será publicado.",
+        item_id,
+        [official_store_option(store) for store in stores],
+    )
 
 
 def prepare_cross_account_official_store_payload(payload, destination_store_id=None):
@@ -5743,7 +5771,7 @@ def friendly_clone_error(exc):
     return " ".join(dict.fromkeys(messages)) or str(exc)
 
 
-def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id="", category_attributes=None, cross_account=False, destination_store_id=None):
+def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id="", category_attributes=None, cross_account=False, destination_store_id=None, destination_stores=None):
     payload = json.loads(json.dumps(create_payload, ensure_ascii=False))
     sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [])
     payload = clone_payload_from_answers(payload, sanitize_clone_answers(answers or {}, category_attributes or []))
@@ -5803,6 +5831,10 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
                         })
                         validation_attempts += 1
                         continue
+                    if destination_stores:
+                        pending_fields.append(official_store_pending_field(item_id, destination_stores))
+                        validation_attempts += 1
+                        break
             validation_attempts += 1
             payload, changed, new_adjustments = clone_retry_adjustments_from_error(
                 exc,
@@ -5850,8 +5882,26 @@ def create_official_clone(payload, job, source_item_id, edits):
     hydrate_clone_package_attributes(create_payload, source_item)
     hydrate_required_clone_attributes(create_payload, source_item, category_attributes, catalog_product)
     create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
-    destination_store_id = target_official_store_id(target_client, target_account, source_item) if cross_account else None
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
+    destination_stores = target_official_stores(target_client, target_account) if cross_account else []
+    allowed_store_ids = {
+        str(store.get("official_store_id") or "")
+        for store in destination_stores
+        if store.get("official_store_id") not in (None, "")
+    }
+    requested_store_id = clean_attribute_value(answers.get("official_store_id") or job.get("official_store_id"))
+    if requested_store_id and allowed_store_ids and requested_store_id not in allowed_store_ids:
+        error = RuntimeError("Selecione uma Loja Oficial autorizada para a conta destino.")
+        error.pending_fields = [official_store_pending_field(source_item_id, destination_stores)]
+        raise error
+    destination_store_id = (
+        requested_store_id
+        or (target_official_store_id(target_client, target_account, source_item, destination_stores) if cross_account else None)
+    )
+    if cross_account and len(destination_stores) > 1 and destination_store_id in (None, ""):
+        error = RuntimeError("Selecione a Loja Oficial da conta destino antes de copiar este anúncio.")
+        error.pending_fields = [official_store_pending_field(source_item_id, destination_stores)]
+        raise error
     created = create_item_with_clone_retries(
         target_client,
         create_payload,
@@ -5861,6 +5911,7 @@ def create_official_clone(payload, job, source_item_id, edits):
         category_attributes,
         cross_account,
         destination_store_id,
+        destination_stores,
     )
     verified_item = {}
     if created.get("id"):
@@ -7336,6 +7387,14 @@ def prepare_clone_preview(request):
     created_jobs = []
     validation_cache = {}
     for target_account in target_accounts:
+        target_client = account_client(target_account)
+        target_stores = target_official_stores(target_client, target_account)
+        suggested_store_id = target_official_store_id(
+            target_client,
+            target_account,
+            source_items[0],
+            target_stores,
+        ) if target_stores else None
         for variant in variants:
             variant = variant if isinstance(variant, dict) else {}
             variant_edits = dict(edits)
@@ -7353,6 +7412,14 @@ def prepare_clone_preview(request):
                     variant_edits,
                 )
             preflight_errors = json.loads(json.dumps(validation_cache[validation_key], ensure_ascii=False))
+            if len(target_stores) > 1 and suggested_store_id in (None, ""):
+                preflight_errors.append(
+                    {
+                        "item_id": item_ids[0],
+                        "error": "Selecione a Loja Oficial da conta destino antes de copiar este anúncio.",
+                        "pending_fields": [official_store_pending_field(item_ids[0], target_stores)],
+                    }
+                )
             type_label = "Premium" if listing_type == "gold_pro" else "Clássico" if listing_type == "gold_special" else "Mesmo tipo do anúncio"
             created_jobs.append(
                 {
@@ -7363,6 +7430,8 @@ def prepare_clone_preview(request):
                     "target": target_account.get("nickname"),
                     "source_account_id": source_account.get("id"),
                     "target_account_id": target_account.get("id"),
+                    "official_store_id": suggested_store_id,
+                    "official_store_options": [official_store_option(store) for store in target_stores],
                     "item_ids": item_ids,
                     "items": len(item_ids),
                     "status": "review_required" if preflight_errors else "preview_ready",

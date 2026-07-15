@@ -1808,7 +1808,11 @@ function clonePendingInputHtml(row, field) {
     return `
       <select ${common}>
         <option value="">Selecione uma opção</option>
-        ${field.options.map((option) => `<option value="${escapeAttr(option)}" ${option === defaultValue ? "selected" : ""}>${escapeText(option)}</option>`).join("")}
+        ${field.options.map((option) => {
+          const value = typeof option === "object" ? option.value : option;
+          const label = typeof option === "object" ? option.label : option;
+          return `<option value="${escapeAttr(value)}" ${String(value) === String(defaultValue) ? "selected" : ""}>${escapeText(label)}</option>`;
+        }).join("")}
       </select>
     `;
   }
