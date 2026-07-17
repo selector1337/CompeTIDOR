@@ -744,14 +744,18 @@ function renderAds() {
     const stock = Math.max(0, Number(item.stock) || 0);
     const price = Math.max(0, Number(item.price) || 0);
     summary.units += stock;
-    summary.value += stock * price;
+    if (!String(item.sku || "").toUpperCase().includes("KIT")) {
+      summary.value += stock * price;
+    } else {
+      summary.excludedKitSkus += 1;
+    }
     return summary;
-  }, { units: 0, value: 0 });
+  }, { units: 0, value: 0, excludedKitSkus: 0 });
   const inventorySummary = document.querySelector("#ads-inventory-summary");
   if (inventorySummary) inventorySummary.innerHTML = `
     <div><span>Anúncios filtrados</span><strong>${filtered.length.toLocaleString("pt-BR")}</strong></div>
     <div><span>Unidades em estoque</span><strong>${inventory.units.toLocaleString("pt-BR")}</strong></div>
-    <div class="inventory-value"><span>Estoque a preço de venda</span><strong>${money.format(inventory.value)}</strong></div>
+    <div class="inventory-value"><span>Estoque a preço de venda <small>SKUs com KIT não entram no valor</small></span><strong>${money.format(inventory.value)}</strong></div>
   `;
   const pageInfo = paginate(filtered, state.adsPage);
   state.adsPage = pageInfo.current;

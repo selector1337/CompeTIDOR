@@ -78,7 +78,7 @@ MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 MELI_API_URL = "https://api.mercadolibre.com"
 TELEGRAM_API_URL = "https://api.telegram.org"
 APP_TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "America/Sao_Paulo"))
-SESSION_SECONDS = 60 * 60 * 12
+SESSION_SECONDS = max(60 * 60 * 12, int(os.getenv("SESSION_SECONDS", str(60 * 60 * 24 * 30))))
 SENSITIVE_MELI_PATH_TERMS = (
     "mercadopago",
     "mercado_pago",
@@ -126,11 +126,20 @@ def is_catalog_listing(item):
 
 
 def read_json(name, fallback):
-    with DATA_LOCK:
-        path = DATA / name
-        if not path.exists():
-            write_json(name, fallback)
-        return json.loads(path.read_text(encoding="utf-8"))
+    path = DATA / name
+    if not path.exists():
+        with DATA_LOCK:
+            if not path.exists():
+                write_json(name, fallback)
+    # Files are published with os.replace(), so readers can safely consume the
+    # previous complete snapshot while a large catalog is being serialized.
+    for attempt in range(3):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            if attempt == 2:
+                raise
+            time.sleep(0.02 * (attempt + 1))
 
 
 def write_json(name, payload):
@@ -1098,6 +1107,15 @@ class MercadoLivreClient:
     def seller_items(self, seller_id, limit=50, offset=0):
         return self.get(f"/users/{seller_id}/items/search?limit={limit}&offset={offset}")
 
+    def seller_recent_items(self, seller_id, limit=50, status=""):
+        params = {"limit": min(max(1, int(limit or 50)), 100), "offset": 0, "orders": "start_time_desc"}
+        if status:
+            params["status"] = status
+        return self.get(
+            f"/users/{seller_id}/items/search?{urlencode(params)}",
+            **interactive_request_options(),
+        )
+
     def seller_items_scan(self, seller_id, limit=100, scroll_id="", status=""):
         params = {"search_type": "scan", "limit": min(int(limit or 100), 100)}
         if scroll_id:
@@ -1230,7 +1248,7 @@ class MercadoLivreClient:
         return self.put(f"/items/{item_id}/description", {"plain_text": plain_text}, **options)
 
     def update_item(self, item_id, payload):
-        return self.put(f"/items/{item_id}", payload)
+        return self.put(f"/items/{item_id}", payload, **interactive_request_options())
 
     def seller_orders(self, seller_id, limit=50, offset=0, date_from=None, date_to=None):
         params = {
@@ -1981,7 +1999,9 @@ def process_meli_notification(event):
     if topic not in {"items", "orders_v2", "catalog_item_competition_status"}:
         return
     seller_id = str(event.get("user_id") or "")
-    payload = read_payload(include_catalog=False)
+    # Item notifications must load the catalog so new/changed listings are
+    # actually persisted. Atomic snapshot reads keep this inexpensive for HTTP.
+    payload = read_payload(include_catalog=True)
     account = next(
         (
             row
@@ -2133,10 +2153,14 @@ def auto_official_sync_loop():
             run_count += 1
             for account in accounts:
                 try:
+                    client = account_client(account)
+                    discovered = discover_recent_official_items(payload, account, client)
                     result = refresh_official_account_items(payload, account, include_competition=False)
-                    account["auto_sync_status"] = account.get("auto_refresh_status") or f"Atualização automática OK: {result.get('items', 0)} anúncios"
+                    account["auto_sync_status"] = (
+                        f"Atualização automática OK: {result.get('items', 0)} anúncios revisados; "
+                        f"{len(discovered)} novos importados"
+                    )
                     if account.get("operations_refresh_requested") or run_count % operations_every == 0:
-                        client = account_client(account)
                         sync_recent_sales(payload, account, client)
                         sync_claims(payload, account, client)
                         account["operations_refresh_requested"] = False
@@ -3211,6 +3235,32 @@ def enrich_product_alerts(payload):
     return changed
 
 
+def hydrate_sale_thumbnails(rows, client):
+    missing_ids = list(dict.fromkeys(
+        str(row.get("item_id") or "")
+        for row in rows or []
+        if row.get("item_id") and not row.get("thumbnail")
+    ))
+    if not missing_ids:
+        return 0
+    thumbnails = {}
+    for start in range(0, len(missing_ids), 20):
+        try:
+            official_items = client.items_bulk(missing_ids[start:start + 20])
+        except Exception:
+            official_items = []
+        for item in official_items or []:
+            if item.get("id"):
+                thumbnails[str(item["id"])] = item_thumbnail(item)
+    hydrated = 0
+    for row in rows or []:
+        thumbnail = thumbnails.get(str(row.get("item_id") or ""))
+        if thumbnail and not row.get("thumbnail"):
+            row["thumbnail"] = thumbnail
+            hydrated += 1
+    return hydrated
+
+
 def sync_recent_sales(payload, account, client):
     period, date_from, date_to = current_month_window()
     try:
@@ -3264,6 +3314,7 @@ def sync_recent_sales(payload, account, client):
                 "date": order.get("date_created") or order.get("last_updated") or now_label(),
             }
             rows.append(sale)
+    hydrate_sale_thumbnails(rows, client)
     existing = [
         item
         for item in payload.get("recent_sales", [])
@@ -3619,6 +3670,58 @@ def rotating_batch(rows, cursor, batch_size):
         selected = [*rows[cursor:], *rows[: end - len(rows)]]
     next_cursor = 0 if count >= len(rows) else end % len(rows)
     return selected, next_cursor
+
+
+def discover_recent_official_items(payload, account, client, per_status=None):
+    """Import newly published items quickly without running a full account scan."""
+    per_status = max(10, min(100, int(per_status or os.getenv("AUTO_DISCOVERY_ITEMS_PER_STATUS", "50"))))
+    statuses = [
+        status.strip()
+        for status in os.getenv("AUTO_DISCOVERY_STATUSES", "active,paused,under_review").split(",")
+        if status.strip()
+    ]
+    known_ids = {
+        str(item.get("id"))
+        for item in payload.get("catalog", [])
+        if item.get("official_source")
+        and item.get("account_id") == account.get("id")
+        and item.get("id")
+    }
+    recent_ids = []
+    for status in statuses:
+        try:
+            response = client.seller_recent_items(account.get("seller_id"), per_status, status)
+        except Exception:
+            continue
+        for item_id in response.get("results", []) if isinstance(response, dict) else []:
+            item_id = str(item_id or "")
+            if item_id and item_id not in known_ids and item_id not in recent_ids:
+                recent_ids.append(item_id)
+    if not recent_ids:
+        return []
+
+    imported = []
+    bulk_size = max(1, min(20, int(os.getenv("MELI_ITEM_BULK_SIZE", "20"))))
+    for start in range(0, len(recent_ids), bulk_size):
+        batch_ids = recent_ids[start:start + bulk_size]
+        try:
+            official_items = client.items_bulk(batch_ids)
+        except Exception:
+            official_items = []
+            for item_id in batch_ids:
+                try:
+                    official_items.append(client.item(item_id))
+                except Exception:
+                    continue
+        for official in official_items:
+            if not official.get("id"):
+                continue
+            row = synced_catalog_item(account, official, {})
+            row["first_seen_at"] = now_label()
+            row["updated_at"] = now_label()
+            imported.append(row)
+    payload.setdefault("catalog", []).extend(imported)
+    return imported
 
 
 def refresh_official_account_items(payload, account, batch_size=None, include_competition=True):
@@ -7633,7 +7736,16 @@ class App(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_security_headers()
-        for key, value in (headers or {}).items():
+        response_headers = headers or {}
+        if "Set-Cookie" not in response_headers:
+            session_token = self.cookie_value("competidor_session")
+            if session_token:
+                secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+                self.send_header(
+                    "Set-Cookie",
+                    f"competidor_session={session_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_SECONDS}{secure}",
+                )
+        for key, value in response_headers.items():
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -7696,6 +7808,9 @@ class App(BaseHTTPRequestHandler):
         session = next((item for item in sessions if item.get("token") == token and item.get("expires_at", 0) > now), None)
         if not session:
             return None
+        if int(session.get("expires_at") or 0) - now < SESSION_SECONDS // 2:
+            session["expires_at"] = now + SESSION_SECONDS
+            write_json("sessions.json", sessions[-50:])
         payload = payload or read_payload()
         users = ensure_users(payload)
         return next((public_user(user) for user in users if user.get("id") == session.get("user_id")), None)
@@ -8569,7 +8684,8 @@ class App(BaseHTTPRequestHandler):
                     payload.setdefault("alerts", []).insert(0, alert)
                     notify_alert(payload, alert)
                 write_payload(payload)
-                self.send_json({"ok": True, "official": official, "catalog": public_payload(payload, user)["catalog"]})
+                updated_item = next((item for item in payload.get("catalog", []) if item.get("id") == item_id), None)
+                self.send_json({"ok": True, "official": official, "item": updated_item})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
