@@ -28,6 +28,8 @@ ROOT = Path(__file__).parent
 PUBLIC = ROOT / "public"
 DATA = Path(os.getenv("COMPETIDOR_DATA_DIR", str(ROOT / "data"))).expanduser().resolve()
 DATA.mkdir(parents=True, exist_ok=True)
+EXPORTS = DATA / "exports"
+EXPORTS.mkdir(exist_ok=True)
 CERTS = DATA / "certs"
 CERTS.mkdir(exist_ok=True)
 APP_DATA_FILE = "app.json"
@@ -64,6 +66,8 @@ SPREADSHEET_JOBS_LOCK = threading.RLock()
 SPREADSHEET_JOBS = {}
 SHIPMENT_MODE_CACHE_LOCK = threading.RLock()
 SHIPMENT_MODE_CACHE = {}
+SALE_FEE_CACHE_LOCK = threading.RLock()
+SALE_FEE_CACHE = {}
 CLONE_SOURCE_CACHE_LOCK = threading.RLock()
 CLONE_SOURCE_CACHE = {}
 ASYNC_OPERATION_JOBS_LOCK = threading.RLock()
@@ -73,6 +77,9 @@ DASHBOARD_THUMBNAIL_REFRESH_LOCK = threading.Lock()
 DASHBOARD_THUMBNAIL_REFRESH_ACTIVE = False
 CLONE_WORKER_SEMAPHORE = threading.BoundedSemaphore(
     max(1, min(3, int(os.getenv("MELI_CLONE_CONCURRENT_JOBS", "2"))))
+)
+HEAVY_WORKER_SEMAPHORE = threading.BoundedSemaphore(
+    max(1, min(2, int(os.getenv("COMPETIDOR_HEAVY_CONCURRENT_JOBS", "1"))))
 )
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
@@ -753,6 +760,7 @@ def enqueue_dashboard_thumbnail_refresh():
 
             thumbnails = {}
             accounts = snapshot.get("accounts", [])
+            all_missing = set().union(*missing_by_account.values()) if missing_by_account else set()
             for account_name, item_ids in missing_by_account.items():
                 account = next(
                     (
@@ -774,6 +782,30 @@ def enqueue_dashboard_thumbnail_refresh():
                         thumbnail = item_thumbnail(item)
                         if item.get("id") and thumbnail:
                             thumbnails[str(item.get("id"))] = thumbnail
+            unresolved = list(all_missing.difference(thumbnails))[:100]
+            clients = [account_client(row) for row in accounts if row.get("official") and row.get("access_token")]
+            for client in clients:
+                if not unresolved:
+                    break
+                for start in range(0, len(unresolved), 20):
+                    try:
+                        official_items = client.items_bulk(unresolved[start:start + 20])
+                    except Exception:
+                        official_items = []
+                    for item in official_items or []:
+                        thumbnail = item_thumbnail(item)
+                        if item.get("id") and thumbnail:
+                            thumbnails[str(item.get("id"))] = thumbnail
+                unresolved = [item_id for item_id in unresolved if item_id not in thumbnails]
+            if clients:
+                for item_id in unresolved[:30]:
+                    try:
+                        item = clients[0].item(item_id)
+                        thumbnail = item_thumbnail(item)
+                        if thumbnail:
+                            thumbnails[item_id] = thumbnail
+                    except Exception:
+                        continue
             if not thumbnails:
                 return
 
@@ -1299,6 +1331,15 @@ class MercadoLivreClient:
     def item_shipping_cost(self, seller_id, item_id):
         params = {"item_id": item_id, "verbose": "true"}
         return self.get(f"/users/{seller_id}/shipping_options/free?{urlencode(params)}")
+
+    def listing_prices(self, site_id, price, listing_type_id, category_id=""):
+        params = {
+            "price": f"{float(price):.2f}",
+            "listing_type_id": listing_type_id,
+        }
+        if category_id:
+            params["category_id"] = category_id
+        return self.get(f"/sites/{site_id or 'MLB'}/listing_prices?{urlencode(params)}")
 
     def price_to_win(self, item_id):
         return self.get(f"/items/{item_id}/price_to_win?version=v2")
@@ -2066,14 +2107,14 @@ def scan_competitor_profile(payload, seller_id, limit=50):
     return competitor
 
 
-def process_meli_notification(event):
+def process_meli_notification(event, payload=None, persist=True):
     topic = str(event.get("topic") or "")
     if topic not in {"items", "orders_v2", "catalog_item_competition_status"}:
         return
     seller_id = str(event.get("user_id") or "")
     # Item notifications must load the catalog so new/changed listings are
     # actually persisted. Atomic snapshot reads keep this inexpensive for HTTP.
-    payload = read_payload(include_catalog=True)
+    payload = payload if payload is not None else read_payload(include_catalog=True)
     account = next(
         (
             row
@@ -2088,7 +2129,8 @@ def process_meli_notification(event):
     if topic == "orders_v2":
         sync_recent_sales(payload, account, client)
         account["last_webhook_at"] = now_label()
-        write_payload(payload)
+        if persist:
+            write_payload(payload)
         return
 
     resource = str(event.get("resource") or "")
@@ -2153,18 +2195,57 @@ def process_meli_notification(event):
         notify_alert(payload, alert)
     account["last_webhook_at"] = now_label()
     account["webhook_status"] = f"Última notificação processada: {topic} {item_id}"
-    write_payload(payload)
+    if persist:
+        write_payload(payload)
+
+
+def notification_dedupe_key(event):
+    topic = str(event.get("topic") or "")
+    seller_id = str(event.get("user_id") or "")
+    resource = str(event.get("resource") or "")
+    if topic == "orders_v2":
+        return topic, seller_id
+    match = re.search(r"MLB\d+", resource, flags=re.I)
+    return topic, seller_id, (match.group(0).upper() if match else resource)
+
+
+def process_meli_notification_batch(events):
+    unique = {}
+    for event in events:
+        if isinstance(event, dict):
+            unique[notification_dedupe_key(event)] = event
+    if not unique:
+        return
+    payload = read_payload(include_catalog=True)
+    changed = False
+    for event in unique.values():
+        try:
+            process_meli_notification(event, payload=payload, persist=False)
+            changed = True
+        except Exception:
+            continue
+    if changed:
+        write_payload(payload)
 
 
 def meli_notification_loop():
     while True:
-        event = MELI_NOTIFICATION_QUEUE.get()
+        first = MELI_NOTIFICATION_QUEUE.get()
+        batch = [first]
         try:
-            process_meli_notification(event)
+            time.sleep(max(0.05, float(os.getenv("MELI_NOTIFICATION_DEBOUNCE_SECONDS", "0.75"))))
+            maximum = max(1, int(os.getenv("MELI_NOTIFICATION_BATCH_SIZE", "100")))
+            while len(batch) < maximum:
+                try:
+                    batch.append(MELI_NOTIFICATION_QUEUE.get_nowait())
+                except queue.Empty:
+                    break
+            process_meli_notification_batch(batch)
         except Exception:
             pass
         finally:
-            MELI_NOTIFICATION_QUEUE.task_done()
+            for _ in batch:
+                MELI_NOTIFICATION_QUEUE.task_done()
 
 
 def auto_scan_loop():
@@ -2880,6 +2961,8 @@ def synced_catalog_item(account, item, competition=None):
         "catalog_product_id": catalog_product_id,
         "catalog_listing": is_catalog,
         "listing_type_id": listing_type_id,
+        "category_id": item.get("category_id") or "",
+        "currency_id": item.get("currency_id") or "BRL",
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
         "free_shipping": bool(first_present(item, ["shipping.free_shipping"], False)),
@@ -2922,6 +3005,86 @@ def shipping_quote_values(response):
     return {"cost": cost, "currency": currency, "billable_weight": billable_weight}
 
 
+def apply_item_net_values(item):
+    price = max(0.0, float(item.get("price") or 0))
+    fee = max(0.0, float(item.get("sale_fee_amount") or 0))
+    shipping = max(0.0, float(item.get("shipping_cost") or 0))
+    net = round(max(0.0, price - fee - shipping), 2)
+    item["net_sale_amount"] = net
+    if "KIT" in str(item.get("sku") or "").upper():
+        item["net_stock_value"] = 0
+        item["net_stock_excluded"] = True
+    else:
+        item["net_stock_value"] = round(net * max(0, int(float(item.get("stock") or 0))), 2)
+        item["net_stock_excluded"] = False
+    return item
+
+
+def sale_fee_values(response, listing_type_id):
+    rows = response if isinstance(response, list) else [response]
+    row = next(
+        (entry for entry in rows if isinstance(entry, dict) and entry.get("listing_type_id") == listing_type_id),
+        next((entry for entry in rows if isinstance(entry, dict)), {}),
+    )
+    amount = row.get("sale_fee_amount")
+    try:
+        amount = round(float(amount), 2)
+    except (TypeError, ValueError):
+        amount = None
+    return amount, row
+
+
+def refresh_account_sale_fees(payload, account, item_ids=None, limit=None):
+    maximum = max(1, int(limit or os.getenv("AUTO_SALE_FEE_BATCH_SIZE", "20")))
+    requested = {str(item_id) for item_id in (item_ids or []) if item_id}
+    rows = [
+        item for item in payload.get("catalog", [])
+        if item.get("official_source") and item.get("account_id") == account.get("id")
+        and item.get("id") and item.get("listing_type_id") and (not requested or item.get("id") in requested)
+    ]
+    if not rows:
+        return []
+    if requested:
+        selected = rows[:maximum]
+    else:
+        cursor_key = f"sale_fee_cursor_{account.get('id')}"
+        selected, account[cursor_key] = rotating_batch(rows, account.get(cursor_key) or 0, maximum)
+    client = account_client(account)
+    results = []
+    for item in selected:
+        cache_key = (
+            account.get("site_id") or "MLB",
+            round(float(item.get("price") or 0), 2),
+            item.get("listing_type_id") or "",
+            item.get("category_id") or "",
+        )
+        try:
+            with SALE_FEE_CACHE_LOCK:
+                cached = SALE_FEE_CACHE.get(cache_key)
+            if cached and time.monotonic() - cached.get("created", 0) < 21600:
+                amount, details = cached.get("amount"), cached.get("details") or {}
+            else:
+                response = client.listing_prices(*cache_key[:3], category_id=cache_key[3])
+                amount, details = sale_fee_values(response, item.get("listing_type_id"))
+                with SALE_FEE_CACHE_LOCK:
+                    SALE_FEE_CACHE[cache_key] = {
+                        "amount": amount, "details": details, "created": time.monotonic()
+                    }
+            item["sale_fee_amount"] = amount
+            item["sale_fee_status"] = "ok" if amount is not None else "not_available"
+            item["sale_fee_error"] = "" if amount is not None else "A API não informou a tarifa para este anúncio."
+        except Exception as exc:
+            item["sale_fee_status"] = "error"
+            item["sale_fee_error"] = policy_error_message(exc, "a tarifa de venda do anúncio")
+        item["sale_fee_updated_at"] = now_label()
+        apply_item_net_values(item)
+        results.append({key: item.get(key) for key in (
+            "id", "account_id", "sale_fee_amount", "sale_fee_status", "sale_fee_error",
+            "sale_fee_updated_at", "net_sale_amount", "net_stock_value", "net_stock_excluded"
+        )})
+    return results
+
+
 def refresh_account_shipping_costs(payload, account, item_ids=None, limit=None):
     maximum = max(1, int(limit or os.getenv("AUTO_SHIPPING_COST_BATCH_SIZE", "20")))
     requested = {str(item_id) for item_id in (item_ids or []) if item_id}
@@ -2956,6 +3119,7 @@ def refresh_account_shipping_costs(payload, account, item_ids=None, limit=None):
             item["shipping_cost_status"] = "error"
             item["shipping_cost_error"] = policy_error_message(exc, "a cotação de frete do anúncio")
         item["shipping_cost_updated_at"] = now_label()
+        apply_item_net_values(item)
         results.append(
             {
                 "id": item.get("id"),
@@ -2983,6 +3147,17 @@ def preserve_shipping_cost_snapshot(target, previous):
     ):
         if key in (previous or {}):
             target[key] = previous[key]
+    return target
+
+
+def preserve_sale_fee_snapshot(target, previous):
+    for key in (
+        "sale_fee_amount", "sale_fee_status", "sale_fee_error", "sale_fee_updated_at",
+        "net_sale_amount", "net_stock_value", "net_stock_excluded",
+    ):
+        if key in (previous or {}):
+            target[key] = previous[key]
+    apply_item_net_values(target)
     return target
 
 
@@ -3052,6 +3227,37 @@ def refresh_shipping_costs_for_items(payload, item_ids):
         if account:
             results.extend(refresh_account_shipping_costs(payload, account, ids, len(ids)))
     return results
+
+
+def refresh_sale_fees_for_items(payload, item_ids):
+    maximum = max(1, int(os.getenv("MELI_SALE_FEE_ON_DEMAND_LIMIT", "25")))
+    requested = list(dict.fromkeys(str(item_id) for item_id in (item_ids or []) if item_id))[:maximum]
+    catalog_by_id = {item.get("id"): item for item in payload.get("catalog", []) if item.get("id") in requested}
+    by_account = {}
+    for item_id in requested:
+        item = catalog_by_id.get(item_id)
+        if item and item.get("account_id"):
+            by_account.setdefault(item.get("account_id"), []).append(item_id)
+    results = []
+    for account_id, ids in by_account.items():
+        account = next((row for row in payload.get("accounts", []) if row.get("id") == account_id and row.get("official") and row.get("access_token")), None)
+        if account:
+            results.extend(refresh_account_sale_fees(payload, account, ids, len(ids)))
+    return results
+
+
+def refresh_item_metadata_operation(kind, item_ids):
+    payload = read_payload(include_catalog=True)
+    if kind == "shipping":
+        results = refresh_shipping_costs_for_items(payload, item_ids)
+    elif kind == "fees":
+        results = refresh_sale_fees_for_items(payload, item_ids)
+    elif kind == "identifiers":
+        results = refresh_identifiers_for_items(payload, item_ids)
+    else:
+        raise RuntimeError("Tipo de atualização de anúncio inválido.")
+    write_payload(payload)
+    return {"items": results}
 
 
 def normalized_account_name(value):
@@ -3787,6 +3993,7 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
                 row = synced_catalog_item(account, item, competition)
                 previous = existing_by_id.get(item_id, {})
                 preserve_shipping_cost_snapshot(row, previous)
+                preserve_sale_fee_snapshot(row, previous)
                 preserve_identifier_snapshot(row, previous)
                 row["first_seen_at"] = previous.get("first_seen_at") or now_label()
                 imported.append(row)
@@ -3929,6 +4136,7 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
             updated = synced_catalog_item(account, official, competition)
             preserve_identifier_snapshot(updated, current)
             preserve_shipping_cost_snapshot(updated, current)
+            preserve_sale_fee_snapshot(updated, current)
             current.update(updated)
             current["updated_at"] = now_label()
             refreshed += 1
@@ -4007,13 +4215,20 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
                 alerts_created += 1
 
     shipping_quotes = refresh_account_shipping_costs(payload, account)
+    sale_fees = refresh_account_sale_fees(payload, account)
     account["auto_refresh_status"] = (
         f"Atualização automática OK: {refreshed}/{len(rows)} anúncios revisados; "
         f"{competition_checked} disputas de catálogo recalculadas; "
-        f"{len(shipping_quotes)} cotações de frete atualizadas"
+        f"{len(shipping_quotes)} cotações de frete e {len(sale_fees)} tarifas atualizadas"
     )
     account["last_auto_refresh_at"] = now_label()
-    return {"items": refreshed, "total": len(rows), "alerts": alerts_created, "shipping_quotes": len(shipping_quotes)}
+    return {
+        "items": refreshed,
+        "total": len(rows),
+        "alerts": alerts_created,
+        "shipping_quotes": len(shipping_quotes),
+        "sale_fees": len(sale_fees),
+    }
 
 
 def enqueue_official_sync(account_id, limit=None, reason="manual"):
@@ -4247,7 +4462,7 @@ def async_operation_result(job_id):
         return json.loads(json.dumps(job, ensure_ascii=False)) if job else None
 
 
-def start_async_operation(kind, work, message="Processamento adicionado à fila."):
+def start_async_operation(kind, work, message="Processamento adicionado à fila.", heavy=False):
     cleanup_async_operation_jobs()
     job_id = f"op-{uuid.uuid4().hex[:12]}"
     now = time.time()
@@ -4266,7 +4481,8 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
         with ASYNC_OPERATION_JOBS_LOCK:
             ACTIVE_CLONE_OPERATIONS.add(job_id)
         try:
-            with CLONE_WORKER_SEMAPHORE:
+            semaphore = HEAVY_WORKER_SEMAPHORE if heavy else CLONE_WORKER_SEMAPHORE
+            with semaphore:
                 with ASYNC_OPERATION_JOBS_LOCK:
                     current = ASYNC_OPERATION_JOBS.get(job_id)
                     if current:
@@ -4349,6 +4565,61 @@ def item_description_operation(request, actor=None):
         )
         write_payload(payload)
     return {"ok": True, "description": text, "official": official}
+
+
+def bulk_price_operation(request, actor=None):
+    item_ids = list(dict.fromkeys(str(value or "").strip() for value in request.get("item_ids") or [] if value))
+    maximum = max(1, int(os.getenv("MELI_BULK_PRICE_MAX_ITEMS", "500")))
+    if not item_ids:
+        raise RuntimeError("Selecione ao menos um anúncio.")
+    if len(item_ids) > maximum:
+        raise RuntimeError(f"Altere no máximo {maximum} anúncios por operação.")
+    mode = str(request.get("mode") or "fixed")
+    value = float(request.get("value") or 0)
+    if value <= 0:
+        raise RuntimeError("Informe um valor maior que zero.")
+    payload = read_payload(include_catalog=True)
+    catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
+    accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
+    results = []
+    for item_id in item_ids:
+        item = catalog.get(item_id)
+        account = accounts.get(str((item or {}).get("account_id") or ""))
+        if not item or not account:
+            results.append({"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."})
+            continue
+        current = max(0.0, float(item.get("price") or 0))
+        target = {
+            "fixed": lambda: value,
+            "increase_amount": lambda: current + value,
+            "decrease_amount": lambda: current - value,
+            "increase_percent": lambda: current * (1 + value / 100),
+            "decrease_percent": lambda: current * (1 - value / 100),
+        }.get(mode)
+        if not target:
+            results.append({"item_id": item_id, "status": "error", "error": "Modo de alteração inválido."})
+            continue
+        target_price = round(target(), 2)
+        if target_price <= 0:
+            results.append({"item_id": item_id, "status": "error", "error": "O preço calculado precisa ser maior que zero."})
+            continue
+        try:
+            account_client(account).update_item(item_id, {"price": target_price})
+            item["price"] = target_price
+            item["sale_fee_status"] = "pending"
+            item["sale_fee_updated_at"] = ""
+            item["updated_at"] = now_label()
+            apply_item_net_values(item)
+            append_item_log(payload, item, actor or {}, "Alteração de preço em massa", {"price": {"from": current, "to": target_price}})
+            results.append({"item_id": item_id, "status": "updated", "price": target_price})
+        except Exception as exc:
+            results.append({"item_id": item_id, "status": "error", "error": str(exc)})
+    write_payload(payload)
+    return {
+        "updated": sum(row.get("status") == "updated" for row in results),
+        "failed": sum(row.get("status") == "error" for row in results),
+        "results": results,
+    }
 
 
 def official_account_by_name(payload, name):
@@ -7180,6 +7451,9 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
         ("stock", "Estoque", "integer"),
         ("price", "Preço", "currency"),
         ("shipping_cost", "Frete estimado ML", "currency"),
+        ("sale_fee_amount", "Tarifa de venda", "currency"),
+        ("net_sale_amount", "Valor líquido por venda", "currency"),
+        ("net_stock_value", "Estoque a valor líquido", "currency"),
         ("shipping_cost_status_label", "Situação do frete", "text"),
         ("shipping_cost_updated_at", "Frete consultado em", "text"),
     ]
@@ -7387,19 +7661,31 @@ def measure_sheet_value(value):
 
 def build_bulk_spreadsheet(payload, filters):
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Alignment, Font, PatternFill, Protection
     from openpyxl.worksheet.datavalidation import DataValidation
 
     rows = report_filtered_catalog(payload, "ads", filters)
-    workbook = Workbook()
-    sheet = workbook.active
+    streaming = len(rows) > max(1000, int(os.getenv("MELI_SPREADSHEET_STREAMING_ROWS", "5000")))
+    workbook = Workbook(write_only=streaming)
+    sheet = workbook.create_sheet("ANUNCIOS") if streaming else workbook.active
     sheet.title = "ANUNCIOS"
-    sheet.append(BULK_SHEET_HEADERS)
-    for cell in sheet[1]:
-        cell.fill = PatternFill("solid", fgColor="FFD600")
-        cell.font = Font(bold=True, color="111827")
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
-        cell.protection = Protection(locked=True)
+    if streaming:
+        header = []
+        for value in BULK_SHEET_HEADERS:
+            cell = WriteOnlyCell(sheet, value=value)
+            cell.fill = PatternFill("solid", fgColor="FFD600")
+            cell.font = Font(bold=True, color="111827")
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+            header.append(cell)
+        sheet.append(header)
+    else:
+        sheet.append(BULK_SHEET_HEADERS)
+        for cell in sheet[1]:
+            cell.fill = PatternFill("solid", fgColor="FFD600")
+            cell.font = Font(bold=True, color="111827")
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+            cell.protection = Protection(locked=True)
     for item in rows:
         sheet.append(
             [
@@ -7420,7 +7706,7 @@ def build_bulk_spreadsheet(payload, filters):
             ]
         )
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = sheet.dimensions
+    sheet.auto_filter.ref = f"A1:N{len(rows) + 1}"
     sheet.column_dimensions["A"].width = 14
     sheet.column_dimensions["B"].width = 24
     sheet.column_dimensions["C"].width = 18
@@ -7428,22 +7714,23 @@ def build_bulk_spreadsheet(payload, filters):
     sheet.column_dimensions["E"].width = 58
     for letter in "FGHIJKLMN":
         sheet.column_dimensions[letter].width = 18
-    for row_index in range(2, sheet.max_row + 1):
-        sheet.cell(row_index, 3).number_format = "@"
-        sheet.cell(row_index, 4).number_format = "@"
-        sheet.cell(row_index, 9).number_format = "@"
-        sheet.cell(row_index, 6).number_format = 'R$ #,##0.00'
-        sheet.cell(row_index, 7).number_format = '#,##0'
-    action_validation = DataValidation(type="list", formula1='"ATUALIZAR"', allow_blank=True)
-    status_validation = DataValidation(type="list", formula1='"ATIVO,PAUSADO"', allow_blank=True)
-    flex_validation = DataValidation(type="list", formula1='"ATIVO,INATIVO"', allow_blank=True)
-    sheet.add_data_validation(action_validation)
-    sheet.add_data_validation(status_validation)
-    sheet.add_data_validation(flex_validation)
-    if sheet.max_row >= 2:
-        action_validation.add(f"A2:A{sheet.max_row}")
-        status_validation.add(f"H2:H{sheet.max_row}")
-        flex_validation.add(f"J2:J{sheet.max_row}")
+    if not streaming:
+        for row_index in range(2, sheet.max_row + 1):
+            sheet.cell(row_index, 3).number_format = "@"
+            sheet.cell(row_index, 4).number_format = "@"
+            sheet.cell(row_index, 9).number_format = "@"
+            sheet.cell(row_index, 6).number_format = 'R$ #,##0.00'
+            sheet.cell(row_index, 7).number_format = '#,##0'
+        action_validation = DataValidation(type="list", formula1='"ATUALIZAR"', allow_blank=True)
+        status_validation = DataValidation(type="list", formula1='"ATIVO,PAUSADO"', allow_blank=True)
+        flex_validation = DataValidation(type="list", formula1='"ATIVO,INATIVO"', allow_blank=True)
+        sheet.add_data_validation(action_validation)
+        sheet.add_data_validation(status_validation)
+        sheet.add_data_validation(flex_validation)
+        if sheet.max_row >= 2:
+            action_validation.add(f"A2:A{sheet.max_row}")
+            status_validation.add(f"H2:H{sheet.max_row}")
+            flex_validation.add(f"J2:J{sheet.max_row}")
     instructions = workbook.create_sheet("INSTRUCOES")
     instructions.append(["Edição em massa CompeTIDOR / Mercado Livre"])
     instructions["A1"].font = Font(size=16, bold=True)
@@ -7457,6 +7744,55 @@ def build_bulk_spreadsheet(payload, filters):
     stream = BytesIO()
     workbook.save(stream)
     return stream.getvalue()
+
+
+def spreadsheet_job_result(job_id):
+    with SPREADSHEET_JOBS_LOCK:
+        job = SPREADSHEET_JOBS.get(str(job_id or ""))
+        if not job:
+            return None
+        return {key: value for key, value in job.items() if key != "path"}
+
+
+def start_spreadsheet_template_job(filters, actor=None):
+    job_id = f"sheet-{uuid.uuid4().hex[:12]}"
+    stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M")
+    target = EXPORTS / f"competidor-edicao-anuncios-{stamp}-{job_id[-6:]}.xlsx"
+    with SPREADSHEET_JOBS_LOCK:
+        SPREADSHEET_JOBS[job_id] = {
+            "id": job_id,
+            "kind": "template",
+            "status": "queued",
+            "progress": 0,
+            "message": "Planilha adicionada à fila.",
+            "created": time.monotonic(),
+            "user_id": (actor or {}).get("id"),
+            "path": str(target),
+            "filename": target.name,
+        }
+
+    def worker():
+        try:
+            with HEAVY_WORKER_SEMAPHORE:
+                with SPREADSHEET_JOBS_LOCK:
+                    SPREADSHEET_JOBS[job_id].update({"status": "running", "progress": 10, "message": "Organizando anúncios filtrados."})
+                payload = read_payload(include_catalog=True)
+                with SPREADSHEET_JOBS_LOCK:
+                    SPREADSHEET_JOBS[job_id].update({"progress": 35, "message": "Gerando linhas e validações da planilha."})
+                body = build_bulk_spreadsheet(payload, filters or {})
+                target.write_bytes(body)
+                with SPREADSHEET_JOBS_LOCK:
+                    SPREADSHEET_JOBS[job_id].update({
+                        "status": "completed", "progress": 100,
+                        "message": "Planilha pronta para baixar.", "size": len(body),
+                        "download_url": f"/api/spreadsheet/jobs/{job_id}?download=1",
+                    })
+        except Exception as exc:
+            with SPREADSHEET_JOBS_LOCK:
+                SPREADSHEET_JOBS[job_id].update({"status": "error", "message": str(exc)})
+
+    threading.Thread(target=worker, daemon=True).start()
+    return spreadsheet_job_result(job_id)
 
 
 def parse_bulk_spreadsheet(payload, encoded_file, actor):
@@ -7480,7 +7816,7 @@ def parse_bulk_spreadsheet(payload, encoded_file, actor):
     accounts = payload.get("accounts") or []
     changes = []
     errors = []
-    maximum_rows = max(1, int(os.getenv("MELI_SPREADSHEET_MAX_ROWS", "10000")))
+    maximum_rows = max(1, int(os.getenv("MELI_SPREADSHEET_MAX_ROWS", "50000")))
     for row_index, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2):
         if row_index > maximum_rows + 1:
             errors.append({"row": row_index, "error": f"A planilha ultrapassou o limite de {maximum_rows} anúncios."})
@@ -7639,6 +7975,31 @@ def apply_spreadsheet_change(payload, row, actor):
     item["updated_at"] = now_label()
     append_item_log(payload, item, actor, "Atualização por planilha", local_changes)
     return {"item_id": item_id, "status": "updated", "changes": list(local_changes)}
+
+
+def apply_spreadsheet_job(token, actor):
+    with SPREADSHEET_JOBS_LOCK:
+        job = SPREADSHEET_JOBS.get(str(token or ""))
+    if not job or job.get("user_id") != (actor or {}).get("id") or time.monotonic() - job.get("created", 0) > 3600:
+        raise RuntimeError("A prévia da planilha expirou. Importe o arquivo novamente.")
+    maximum = max(1, int(os.getenv("MELI_SPREADSHEET_MAX_CHANGES", "50000")))
+    if len(job.get("changes") or []) > maximum:
+        raise RuntimeError(f"Aplique no máximo {maximum} alterações por planilha.")
+    payload = read_payload(include_catalog=True)
+    results = []
+    for row in job.get("changes") or []:
+        try:
+            results.append(apply_spreadsheet_change(payload, row, actor))
+        except Exception as exc:
+            results.append({"item_id": row.get("item_id"), "row": row.get("row"), "status": "error", "error": str(exc)})
+    write_payload(payload)
+    with SPREADSHEET_JOBS_LOCK:
+        SPREADSHEET_JOBS.pop(str(token or ""), None)
+    return {
+        "updated": sum(row.get("status") == "updated" for row in results),
+        "failed": sum(row.get("status") == "error" for row in results),
+        "results": results[:500],
+    }
 
 
 def execute_clone_job(payload, job, incoming_answers=None):
@@ -7890,6 +8251,13 @@ class App(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
+    def write_response_body(self, body):
+        try:
+            self.wfile.write(body)
+            return True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return False
+
     def send_json(self, payload, status=200, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -7908,7 +8276,7 @@ class App(BaseHTTPRequestHandler):
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.write_response_body(body)
 
     def send_bytes(self, body, content_type, filename, status=200):
         self.send_response(status)
@@ -7917,7 +8285,27 @@ class App(BaseHTTPRequestHandler):
         self.send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.write_response_body(body)
+
+    def send_file_download(self, path, content_type, filename):
+        target = Path(path)
+        if not target.exists() or not target.is_file():
+            self.send_json({"error": "Arquivo concluído não encontrado."}, status=404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_security_headers()
+        self.send_header("Content-Length", str(target.stat().st_size))
+        self.end_headers()
+        try:
+            with target.open("rb") as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk or not self.write_response_body(chunk):
+                        break
+        except OSError:
+            return
 
     def send_security_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -8031,7 +8419,7 @@ class App(BaseHTTPRequestHandler):
         self.send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.write_response_body(body)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -8133,6 +8521,27 @@ class App(BaseHTTPRequestHandler):
                 else:
                     self.send_bytes(job["body"], job["content_type"], job["filename"])
             else:
+                self.send_json({"ok": True, **job})
+            return
+        if parsed.path.startswith("/api/spreadsheet/jobs/"):
+            job_id = parsed.path.rsplit("/", 1)[-1]
+            query = parse_qs(parsed.query)
+            with SPREADSHEET_JOBS_LOCK:
+                stored = SPREADSHEET_JOBS.get(job_id)
+                job = dict(stored) if stored else None
+            if not job:
+                self.send_json({"error": "Processamento de planilha não encontrado ou expirado."}, status=404)
+            elif query.get("download", ["0"])[0] == "1":
+                if job.get("status") != "completed":
+                    self.send_json({"error": job.get("message") or "A planilha ainda não está pronta."}, status=409)
+                else:
+                    self.send_file_download(
+                        job.get("path"),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        job.get("filename") or "competidor-edicao-anuncios.xlsx",
+                    )
+            else:
+                job.pop("path", None)
                 self.send_json({"ok": True, **job})
             return
         if parsed.path == "/api/accounts":
@@ -8313,6 +8722,13 @@ class App(BaseHTTPRequestHandler):
             "/api/clone/preview",
             "/api/clone/execute",
             "/api/clone/execute-batch",
+            "/api/meli/items/bulk-price",
+            "/api/meli/shipping-costs/refresh",
+            "/api/meli/sale-fees/refresh",
+            "/api/meli/identifiers/refresh",
+            "/api/spreadsheet/template",
+            "/api/spreadsheet/import",
+            "/api/spreadsheet/apply",
         }
         payload = read_payload(include_catalog=parsed.path not in lightweight_paths)
 
@@ -8655,17 +9071,23 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/spreadsheet/template":
             try:
-                body = build_bulk_spreadsheet(payload, request.get("filters") or {})
-                stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M")
-                self.send_bytes(body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"competidor-edicao-anuncios-{stamp}.xlsx")
+                job = start_spreadsheet_template_job(request.get("filters") or {}, self.current_user(payload))
+                self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
 
         if parsed.path == "/api/spreadsheet/import":
             try:
-                result = parse_bulk_spreadsheet(payload, request.get("file") or "", self.current_user(payload))
-                self.send_json({"ok": True, **result})
+                encoded = str(request.get("file") or "")
+                actor = self.current_user(payload)
+                operation = start_async_operation(
+                    "spreadsheet_import",
+                    lambda: parse_bulk_spreadsheet(read_payload(include_catalog=True), encoded, actor),
+                    "Planilha adicionada à fila de validação.",
+                    heavy=True,
+                )
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
@@ -8674,30 +9096,13 @@ class App(BaseHTTPRequestHandler):
             try:
                 actor = self.current_user(payload)
                 token = str(request.get("token") or "")
-                with SPREADSHEET_JOBS_LOCK:
-                    job = SPREADSHEET_JOBS.get(token)
-                if not job or job.get("user_id") != (actor or {}).get("id") or time.monotonic() - job.get("created", 0) > 1800:
-                    raise RuntimeError("A prévia da planilha expirou. Importe o arquivo novamente.")
-                maximum = max(1, int(os.getenv("MELI_SPREADSHEET_MAX_CHANGES", "500")))
-                if len(job.get("changes") or []) > maximum:
-                    raise RuntimeError(f"Aplique no máximo {maximum} alterações por planilha para respeitar os limites da API.")
-                results = []
-                for row in job.get("changes") or []:
-                    try:
-                        results.append(apply_spreadsheet_change(payload, row, actor))
-                    except Exception as exc:
-                        results.append({"item_id": row.get("item_id"), "row": row.get("row"), "status": "error", "error": str(exc)})
-                write_payload(payload)
-                with SPREADSHEET_JOBS_LOCK:
-                    SPREADSHEET_JOBS.pop(token, None)
-                self.send_json(
-                    {
-                        "ok": not any(row.get("status") == "error" for row in results),
-                        "updated": sum(row.get("status") == "updated" for row in results),
-                        "failed": sum(row.get("status") == "error" for row in results),
-                        "results": results,
-                    }
+                operation = start_async_operation(
+                    "spreadsheet_apply",
+                    lambda: apply_spreadsheet_job(token, actor),
+                    "Alterações da planilha adicionadas à fila.",
+                    heavy=True,
                 )
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
@@ -8735,18 +9140,41 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/meli/shipping-costs/refresh":
             try:
-                results = refresh_shipping_costs_for_items(payload, request.get("item_ids") or [])
-                write_payload(payload)
-                self.send_json({"ok": True, "items": results})
+                item_ids = list(request.get("item_ids") or [])
+                operation = start_async_operation("shipping_costs", lambda: refresh_item_metadata_operation("shipping", item_ids), "Atualizando fretes em segundo plano.")
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/sale-fees/refresh":
+            try:
+                item_ids = list(request.get("item_ids") or [])
+                operation = start_async_operation("sale_fees", lambda: refresh_item_metadata_operation("fees", item_ids), "Atualizando tarifas em segundo plano.")
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
 
         if parsed.path == "/api/meli/identifiers/refresh":
             try:
-                results = refresh_identifiers_for_items(payload, request.get("item_ids") or [])
-                write_payload(payload)
-                self.send_json({"ok": True, "items": results})
+                item_ids = list(request.get("item_ids") or [])
+                operation = start_async_operation("identifiers", lambda: refresh_item_metadata_operation("identifiers", item_ids), "Atualizando códigos universais em segundo plano.")
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/items/bulk-price":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                operation = start_async_operation(
+                    "bulk_price",
+                    lambda: bulk_price_operation(request_copy, actor),
+                    "Alteração de preços adicionada à fila.",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
@@ -8809,6 +9237,8 @@ class App(BaseHTTPRequestHandler):
                         if "price" in update:
                             changes["price"] = {"from": item.get("price"), "to": update["price"]}
                             item["price"] = update["price"]
+                            item["sale_fee_status"] = "pending"
+                            item["sale_fee_updated_at"] = ""
                         if "available_quantity" in update:
                             changes["stock"] = {"from": item.get("stock"), "to": update["available_quantity"]}
                             stock_transition = (int(item.get("stock") or 0), int(update["available_quantity"] or 0), item)
@@ -8836,6 +9266,7 @@ class App(BaseHTTPRequestHandler):
                             item["status"] = "sharing" if is_catalog_listing(item) else "winning"
                             item["meli_status"] = "active"
                         item["updated_at"] = now_label()
+                        apply_item_net_values(item)
                         append_item_log(payload, item, user, "Atualização manual", changes)
                 if stock_transition and stock_transition[0] > 0 and stock_transition[1] == 0:
                     old_stock, new_stock, changed_item = stock_transition

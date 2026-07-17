@@ -16,6 +16,7 @@
   adsListingType: "all",
   adsCatalog: "all",
   adsFlex: "all",
+  adsSelectedIds: new Set(),
   stockPeriod: "today",
   stockCustomDate: "",
   stockCustomEndDate: "",
@@ -55,7 +56,9 @@
   statisticsPage: 1,
   statisticsPageSize: 50,
   spreadsheetPreview: null,
+  spreadsheetProgress: null,
   shippingCostsLoading: false,
+  saleFeesLoading: false,
   identifiersLoading: false,
   equalizationType: "listing_type_gap",
   equalizationAccount: "all",
@@ -72,6 +75,15 @@
 
 const PAGE_SIZE = 100;
 const renderTimers = {};
+
+document.addEventListener("error", (event) => {
+  const image = event.target;
+  if (!(image instanceof HTMLImageElement) || !image.matches(".sale-thumb")) return;
+  const fallback = document.createElement("span");
+  fallback.className = "sale-thumb sale-thumb-empty";
+  fallback.setAttribute("aria-label", "Imagem indisponível");
+  image.replaceWith(fallback);
+}, true);
 
 const pageTitles = {
   dashboard: ["Painel unificado", "Dashboard"],
@@ -746,21 +758,25 @@ function renderAds() {
     summary.units += stock;
     if (!String(item.sku || "").toUpperCase().includes("KIT")) {
       summary.value += stock * price;
+      if (item.sale_fee_status === "ok") summary.netValue += Math.max(0, Number(item.net_stock_value) || 0);
+      else summary.pendingFees += 1;
     } else {
       summary.excludedKitSkus += 1;
     }
     return summary;
-  }, { units: 0, value: 0, excludedKitSkus: 0 });
+  }, { units: 0, value: 0, netValue: 0, pendingFees: 0, excludedKitSkus: 0 });
   const inventorySummary = document.querySelector("#ads-inventory-summary");
   if (inventorySummary) inventorySummary.innerHTML = `
     <div><span>Anúncios filtrados</span><strong>${filtered.length.toLocaleString("pt-BR")}</strong></div>
     <div><span>Unidades em estoque</span><strong>${inventory.units.toLocaleString("pt-BR")}</strong></div>
     <div class="inventory-value"><span>Estoque a preço de venda <small>SKUs com KIT não entram no valor</small></span><strong>${money.format(inventory.value)}</strong></div>
+    <div class="inventory-value net"><span>Estoque a valor líquido <small>Venda - tarifa - frete; sem SKUs com KIT${inventory.pendingFees ? ` · ${inventory.pendingFees} tarifa(s) calculando` : ""}</small></span><strong>${money.format(inventory.netValue)}</strong></div>
   `;
   const pageInfo = paginate(filtered, state.adsPage);
   state.adsPage = pageInfo.current;
   list.innerHTML = filtered.length ? paginationHtml("adsPage", pageInfo) + pageInfo.items.map((item) => `
-    <article class="ad-item">
+    <article class="ad-item ${state.adsSelectedIds.has(item.id) ? "selected" : ""}">
+      <label class="ad-select" title="Selecionar anúncio para alteração em massa"><input type="checkbox" data-select-ad="${item.id}" ${state.adsSelectedIds.has(item.id) ? "checked" : ""} /><span></span></label>
       <a class="product-media" href="${item.permalink || "#"}" target="_blank" rel="noreferrer">
         ${item.thumbnail ? `<img src="${item.thumbnail}" alt="${item.title}" loading="lazy" />` : `<span>${(item.title || item.id).slice(0, 2).toUpperCase()}</span>`}
       </a>
@@ -778,6 +794,8 @@ function renderAds() {
           ${fact("Modalidade", isCatalogItem(item) ? "Catálogo" : "Tradicional")}
           ${flexStatusBadge(item.shipping_logistic_type)}
           ${fact("Frete estimado ML", shippingCostLabel(item))}
+          ${fact("Tarifa de venda", saleFeeLabel(item))}
+          ${fact("Valor líquido por venda", netSaleLabel(item))}
           ${fact("Status do anúncio", statusLabel(item.meli_status || item.status))}
         </div>
         <div class="inline-edit">
@@ -806,7 +824,9 @@ function renderAds() {
     </article>
   `).join("") + paginationHtml("adsPage", pageInfo) : `<div class="notice">Nenhum anúncio encontrado.</div>`;
   queueShippingCostRefresh(pageInfo.items);
+  queueSaleFeeRefresh(pageInfo.items);
   queueIdentifierRefresh(pageInfo.items);
+  updateBulkPriceBar();
 }
 
 function renderAdDescriptionEditor(item) {
@@ -915,6 +935,60 @@ function shippingCostLabel(item) {
   return "Calculando...";
 }
 
+function saleFeeLabel(item) {
+  if (item.sale_fee_status === "ok" && item.sale_fee_amount !== null && item.sale_fee_amount !== undefined) {
+    return money.format(Number(item.sale_fee_amount || 0));
+  }
+  if (item.sale_fee_status === "error") return "Consulta indisponível";
+  if (item.sale_fee_status === "not_available") return "Não informada pela API";
+  return "Calculando...";
+}
+
+function netSaleLabel(item) {
+  if (item.sale_fee_status !== "ok") return "Aguardando tarifa";
+  return money.format(Number(item.net_sale_amount || 0));
+}
+
+function saleFeeNeedsRefresh(item) {
+  if (!item.official_source || !item.listing_type_id) return false;
+  const raw = String(item.sale_fee_updated_at || "").replace(" ", "T");
+  const updated = new Date(raw);
+  if (Number.isNaN(updated.getTime())) return true;
+  const ttl = item.sale_fee_status === "ok" ? 6 * 60 * 60 * 1000 : 30 * 60 * 1000;
+  return Date.now() - updated.getTime() > ttl;
+}
+
+async function queueSaleFeeRefresh(items) {
+  if (state.saleFeesLoading || state.route !== "anuncios") return;
+  const itemIds = (items || []).filter(saleFeeNeedsRefresh).slice(0, 15).map((item) => item.id);
+  if (!itemIds.length) return;
+  state.saleFeesLoading = true;
+  try {
+    const queued = await api("/api/meli/sale-fees/refresh", {
+      method: "POST",
+      body: JSON.stringify({ item_ids: itemIds }),
+    });
+    const result = await waitForAsyncOperation(queued);
+    const updates = new Map((result.items || []).map((item) => [item.id, item]));
+    state.data.catalog = state.data.catalog.map((item) => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
+  } catch (error) {
+    showToast(error.message || "Não foi possível consultar as tarifas de venda.", "error");
+  } finally {
+    state.saleFeesLoading = false;
+    if (state.route === "anuncios") renderAds();
+  }
+}
+
+function updateBulkPriceBar() {
+  const root = document.querySelector("#ads-bulk-price");
+  if (!root) return;
+  const count = state.adsSelectedIds.size;
+  const label = root.querySelector("[data-bulk-selected-count]");
+  const button = root.querySelector("[data-apply-bulk-price]");
+  if (label) label.textContent = count;
+  if (button) button.disabled = count === 0;
+}
+
 function shippingCostNeedsRefresh(item) {
   if (!item.official_source) return false;
   const raw = String(item.shipping_cost_updated_at || "").replace(" ", "T");
@@ -931,10 +1005,11 @@ async function queueShippingCostRefresh(items) {
   if (!itemIds.length) return;
   state.shippingCostsLoading = true;
   try {
-    const result = await api("/api/meli/shipping-costs/refresh", {
+    const queued = await api("/api/meli/shipping-costs/refresh", {
       method: "POST",
       body: JSON.stringify({ item_ids: itemIds }),
     });
+    const result = await waitForAsyncOperation(queued);
     const updates = new Map((result.items || []).map((item) => [item.id, item]));
     state.data.catalog = state.data.catalog.map((item) => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
   } catch (error) {
@@ -960,10 +1035,11 @@ async function queueIdentifierRefresh(items) {
   if (!itemIds.length) return;
   state.identifiersLoading = true;
   try {
-    const result = await api("/api/meli/identifiers/refresh", {
+    const queued = await api("/api/meli/identifiers/refresh", {
       method: "POST",
       body: JSON.stringify({ item_ids: itemIds }),
     });
+    const result = await waitForAsyncOperation(queued);
     const updates = new Map((result.items || []).map((item) => [item.id, item]));
     state.data.catalog = state.data.catalog.map((item) => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
   } catch (_) {
@@ -1630,9 +1706,25 @@ async function downloadBulkSpreadsheet() {
       const error = await response.json().catch(() => ({}));
       throw new Error(error.error || "Não foi possível gerar a planilha.");
     }
-    const blob = await response.blob();
-    const disposition = response.headers.get("Content-Disposition") || "";
-    const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || "competidor-edicao-anuncios.xlsx";
+    const initial = await response.json();
+    if (!response.ok) throw new Error(initial.error || "Não foi possível gerar a planilha.");
+    let job = initial;
+    while (!["completed", "error"].includes(job.status)) {
+      state.spreadsheetProgress = { progress: Number(job.progress || 0), message: job.message || "Gerando planilha..." };
+      renderSpreadsheetPreview();
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const poll = await fetch(`/api/spreadsheet/jobs/${encodeURIComponent(job.id)}`, { credentials: "same-origin" });
+      job = await poll.json();
+      if (!poll.ok) throw new Error(job.error || "Não foi possível acompanhar a planilha.");
+    }
+    if (job.status === "error") throw new Error(job.message || "Não foi possível gerar a planilha.");
+    state.spreadsheetProgress = { progress: 100, message: "Planilha pronta para baixar." };
+    renderSpreadsheetPreview();
+    const downloadResponse = await fetch(job.download_url, { credentials: "same-origin" });
+    if (!downloadResponse.ok) throw new Error("Não foi possível baixar a planilha concluída.");
+    const blob = await downloadResponse.blob();
+    const disposition = downloadResponse.headers.get("Content-Disposition") || "";
+    const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || job.filename || "competidor-edicao-anuncios.xlsx";
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -1645,6 +1737,8 @@ async function downloadBulkSpreadsheet() {
   } catch (error) {
     showToast(error.message || "Não foi possível gerar a planilha.", "error");
   } finally {
+    state.spreadsheetProgress = null;
+    renderSpreadsheetPreview();
     button.disabled = false;
     button.textContent = original;
   }
@@ -1663,6 +1757,11 @@ function renderSpreadsheetPreview() {
   const root = document.querySelector("#spreadsheet-preview");
   if (!root) return;
   const preview = state.spreadsheetPreview;
+  if (state.spreadsheetProgress) {
+    const progress = Math.max(0, Math.min(100, Number(state.spreadsheetProgress.progress || 0)));
+    root.innerHTML = `<section class="spreadsheet-review spreadsheet-progress"><div class="spreadsheet-review-head"><div><small>Processamento em segundo plano</small><strong>${escapeText(state.spreadsheetProgress.message || "Processando planilha...")}</strong></div><span>${progress}%</span></div><div class="job-progress-track"><span style="width:${progress}%"></span></div><small>Você pode continuar usando a aplicação enquanto este trabalho é concluído.</small></section>`;
+    return;
+  }
   if (!preview) {
     root.innerHTML = "";
     return;
@@ -1689,13 +1788,21 @@ async function importBulkSpreadsheet(file) {
   if (!file) return;
   try {
     showToast("Validando a planilha antes de alterar anúncios.");
-    const result = await api("/api/spreadsheet/import", {
+    const queued = await api("/api/spreadsheet/import", {
       method: "POST",
       body: JSON.stringify({ file: await fileAsBase64(file) }),
     });
+    state.spreadsheetProgress = { progress: 15, message: "Validando a planilha em segundo plano." };
+    renderSpreadsheetPreview();
+    const result = await waitForAsyncOperation(queued, (message) => {
+      state.spreadsheetProgress = { progress: 60, message: message || "Validando linhas da planilha." };
+      renderSpreadsheetPreview();
+    });
+    state.spreadsheetProgress = null;
     state.spreadsheetPreview = result;
     renderSpreadsheetPreview();
   } catch (error) {
+    state.spreadsheetProgress = null;
     showToast(error.message || "Não foi possível validar a planilha.", "error");
   }
 }
@@ -1706,10 +1813,17 @@ async function applyBulkSpreadsheet(button) {
   button.disabled = true;
   button.textContent = "Aplicando...";
   try {
-    const result = await api("/api/spreadsheet/apply", {
+    const queued = await api("/api/spreadsheet/apply", {
       method: "POST",
       body: JSON.stringify({ token: preview.token }),
     });
+    state.spreadsheetProgress = { progress: 10, message: "Aplicando alterações em segundo plano." };
+    renderSpreadsheetPreview();
+    const result = await waitForAsyncOperation(queued, (message) => {
+      state.spreadsheetProgress = { progress: 55, message: message || "Atualizando anúncios no Mercado Livre." };
+      renderSpreadsheetPreview();
+    });
+    state.spreadsheetProgress = null;
     const failures = (result.results || []).filter((row) => row.status === "error");
     state.spreadsheetPreview = failures.length
       ? { ready: 0, invalid: failures.length, changes: [], errors: failures }
@@ -1718,6 +1832,7 @@ async function applyBulkSpreadsheet(button) {
     await load();
     renderSpreadsheetPreview();
   } catch (error) {
+    state.spreadsheetProgress = null;
     showToast(error.message || "Não foi possível aplicar a planilha.", "error");
     button.disabled = false;
     button.textContent = "Aplicar alterações válidas";
@@ -2367,6 +2482,57 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
   renderAds();
 });
 
+document.querySelector("#ads-list")?.addEventListener("change", (event) => {
+  const checkbox = event.target.closest("[data-select-ad]");
+  if (!checkbox) return;
+  if (checkbox.checked) state.adsSelectedIds.add(checkbox.dataset.selectAd);
+  else state.adsSelectedIds.delete(checkbox.dataset.selectAd);
+  checkbox.closest(".ad-item")?.classList.toggle("selected", checkbox.checked);
+  updateBulkPriceBar();
+});
+
+document.querySelector("#ads-bulk-price")?.addEventListener("click", async (event) => {
+  if (event.target.closest("[data-clear-selected-ads]")) {
+    state.adsSelectedIds.clear();
+    renderAds();
+    return;
+  }
+  if (event.target.closest("[data-select-visible-ads]")) {
+    document.querySelectorAll("#ads-list [data-select-ad]").forEach((input) => state.adsSelectedIds.add(input.dataset.selectAd));
+    renderAds();
+    return;
+  }
+  const button = event.target.closest("[data-apply-bulk-price]");
+  if (!button) return;
+  const root = button.closest("#ads-bulk-price");
+  const mode = root.querySelector("[data-bulk-price-mode]")?.value || "fixed";
+  const value = Number(root.querySelector("[data-bulk-price-value]")?.value || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    showToast("Informe um valor maior que zero.", "error");
+    return;
+  }
+  button.disabled = true;
+  const original = button.textContent;
+  try {
+    const queued = await api("/api/meli/items/bulk-price", {
+      method: "POST",
+      body: JSON.stringify({ item_ids: [...state.adsSelectedIds], mode, value }),
+    });
+    const result = await waitForAsyncOperation(queued, (message) => { button.textContent = message || "Atualizando preços..."; });
+    const updates = new Map((result.results || []).filter((row) => row.status === "updated").map((row) => [row.item_id, row.price]));
+    state.data.catalog = state.data.catalog.map((item) => updates.has(item.id)
+      ? { ...item, price: updates.get(item.id), sale_fee_status: "pending", sale_fee_updated_at: "" }
+      : item);
+    showToast(`${result.updated || 0} preço(s) alterado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`, result.failed ? "error" : "success");
+    renderAds();
+  } catch (error) {
+    showToast(error.message || "Não foi possível alterar os preços selecionados.", "error");
+  } finally {
+    button.disabled = state.adsSelectedIds.size === 0;
+    button.textContent = original;
+  }
+});
+
 document.querySelector("#ads-list")?.addEventListener("submit", async (event) => {
   const form = event.target.closest("[data-description-form]");
   if (!form) return;
@@ -2717,7 +2883,6 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
     });
     const jobs = result.jobs || [result];
     state.data.clone_jobs.unshift(...jobs);
-    state.cloneSelectedIds.clear();
     showToast(`${jobs.length} combinação(ões) preparada(s) para revisão.`);
     renderClone();
   } catch (error) {

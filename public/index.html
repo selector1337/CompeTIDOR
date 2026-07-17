@@ -417,6 +417,20 @@
               </select>
             </label>
           </div>
+          <div id="ads-bulk-price" class="bulk-price-bar" aria-live="polite">
+            <div class="bulk-price-selection"><strong><span data-bulk-selected-count>0</span> selecionado(s)</strong><button class="mini-button" type="button" data-select-visible-ads>Selecionar página</button><button class="mini-button" type="button" data-clear-selected-ads>Limpar</button></div>
+            <label>Alteração
+              <select data-bulk-price-mode>
+                <option value="fixed">Definir valor</option>
+                <option value="increase_amount">Aumentar em R$</option>
+                <option value="decrease_amount">Diminuir em R$</option>
+                <option value="increase_percent">Aumentar em %</option>
+                <option value="decrease_percent">Diminuir em %</option>
+              </select>
+            </label>
+            <label>Valor <input data-bulk-price-value type="number" min="0.01" step="0.01" placeholder="0,00" /></label>
+            <button class="mini-button success-button" type="button" data-apply-bulk-price disabled>Aplicar preços</button>
+          </div>
           <div id="ads-inventory-summary" class="inventory-summary" aria-live="polite"></div>
           <div id="spreadsheet-preview"></div>
           <div id="ads-list" class="ads-list"></div>
