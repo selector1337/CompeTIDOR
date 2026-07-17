@@ -951,10 +951,12 @@ function netSaleLabel(item) {
 
 function saleFeeNeedsRefresh(item) {
   if (!item.official_source || !item.listing_type_id) return false;
+  if (item.sale_fee_basis && ["ok", "not_available", "error"].includes(item.sale_fee_status)) return false;
+  if (!item.sale_fee_basis) return true;
   const raw = String(item.sale_fee_updated_at || "").replace(" ", "T");
   const updated = new Date(raw);
   if (Number.isNaN(updated.getTime())) return true;
-  const ttl = item.sale_fee_status === "ok" ? 6 * 60 * 60 * 1000 : 30 * 60 * 1000;
+  const ttl = 30 * 60 * 1000;
   return Date.now() - updated.getTime() > ttl;
 }
 
@@ -991,11 +993,13 @@ function updateBulkPriceBar() {
 
 function shippingCostNeedsRefresh(item) {
   if (!item.official_source) return false;
+  if (item.shipping_cost_basis && ["ok", "not_available", "error"].includes(item.shipping_cost_status)) return false;
+  if (!item.shipping_cost_basis) return true;
   const raw = String(item.shipping_cost_updated_at || "").replace(" ", "T");
   const updated = new Date(raw);
   if (Number.isNaN(updated.getTime())) return true;
   const age = Date.now() - updated.getTime();
-  const ttl = item.shipping_cost_status === "ok" ? 24 * 60 * 60 * 1000 : 30 * 60 * 1000;
+  const ttl = 30 * 60 * 1000;
   return age > ttl;
 }
 
@@ -1173,6 +1177,7 @@ function renderAccounts() {
             ${account.official ? `<button class="mini-button" data-sync-account="${account.id}" ${account.sync_progress?.status === "running" ? "disabled" : ""}>${account.sync_progress?.status === "running" ? "Sincronizando..." : "Sincronizar anúncios"}</button>` : ""}
             ${account.official ? `<button class="mini-button danger-button" data-unlink-account="${account.id}" data-account-name="${account.nickname}">Desvincular</button>` : ""}
             ${syncProgressHtml(account)}
+            ${account.last_catalog_refresh_at ? `<small class="account-catalog-line" title="${escapeAttr(account.catalog_refresh_status || "Última varredura de catálogo")}">${escapeText(`Catálogo: ${formatDateBR(account.last_catalog_refresh_at)} · ${account.catalog_refresh_status || "varredura concluída"}`)}</small>` : ""}
             ${account.webhook_status ? `<small class="account-webhook-line" title="${escapeAttr(`${account.webhook_status} · ${formatDateBR(account.last_webhook_at)}`)}">${escapeText(`Última notificação: ${account.webhook_status.replace(/^Última notificação processada:\s*/i, "")} · ${formatDateBR(account.last_webhook_at)}`)}</small>` : ""}
           </div>
         </article>
@@ -2521,7 +2526,7 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
     const result = await waitForAsyncOperation(queued, (message) => { button.textContent = message || "Atualizando preços..."; });
     const updates = new Map((result.results || []).filter((row) => row.status === "updated").map((row) => [row.item_id, row.price]));
     state.data.catalog = state.data.catalog.map((item) => updates.has(item.id)
-      ? { ...item, price: updates.get(item.id), sale_fee_status: "pending", sale_fee_updated_at: "" }
+      ? { ...item, price: updates.get(item.id), sale_fee_status: "pending", sale_fee_updated_at: "", sale_fee_basis: "" }
       : item);
     showToast(`${result.updated || 0} preço(s) alterado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`, result.failed ? "error" : "success");
     renderAds();

@@ -81,6 +81,13 @@ CLONE_WORKER_SEMAPHORE = threading.BoundedSemaphore(
 HEAVY_WORKER_SEMAPHORE = threading.BoundedSemaphore(
     max(1, min(2, int(os.getenv("COMPETIDOR_HEAVY_CONCURRENT_JOBS", "1"))))
 )
+BACKGROUND_WORKER_SEMAPHORE = threading.BoundedSemaphore(
+    max(1, min(2, int(os.getenv("COMPETIDOR_BACKGROUND_CONCURRENT_JOBS", "1"))))
+)
+BACKGROUND_MELI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(
+    max(1, min(8, int(os.getenv("MELI_BACKGROUND_MAX_IN_FLIGHT", "4"))))
+)
+MELI_WORK_CONTEXT = threading.local()
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -120,6 +127,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/v1/claims/search(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/search(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/[^/]+/detail(\?|$)"),
+    re.compile(r"^/sites/[^/]+/listing_prices(\?|$)"),
 )
 
 
@@ -315,6 +323,10 @@ CATALOG_ITEM_FIELDS = {
     "catalog_listing", "listing_type_id", "shipping_logistic_type", "shipping_mode", "free_shipping",
     "package_weight", "package_height", "package_width", "package_length", "price", "stock",
     "meli_status", "permalink", "item_data_checked_at",
+    "shipping_cost", "shipping_cost_currency", "shipping_billable_weight", "shipping_cost_source",
+    "shipping_cost_status", "shipping_cost_error", "shipping_cost_updated_at", "shipping_cost_basis",
+    "sale_fee_amount", "sale_fee_status", "sale_fee_error", "sale_fee_updated_at", "sale_fee_basis",
+    "net_sale_amount", "net_stock_value", "net_stock_excluded",
 }
 
 
@@ -747,6 +759,7 @@ def enqueue_dashboard_thumbnail_refresh():
 
     def worker():
         global DASHBOARD_THUMBNAIL_REFRESH_ACTIVE
+        MELI_WORK_CONTEXT.priority = "background"
         try:
             snapshot = read_payload(include_catalog=False)
             rows = [*snapshot.get("recent_sales", []), *snapshot.get("daily_sku_sales", [])]
@@ -1035,11 +1048,19 @@ def request_json(url, method="GET", payload=None, headers=None, retries=None, ti
     last_error = None
     request_timeout = max(2.0, float(timeout or os.getenv("MELI_REQUEST_TIMEOUT_SECONDS", "20")))
     for attempt in range(max(1, attempts)):
+        background_request = getattr(MELI_WORK_CONTEXT, "priority", "interactive") == "background"
+        if background_request:
+            wait_for_interactive_meli_priority()
         req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=request_timeout) as response:
-                text = response.read().decode("utf-8")
-                return json.loads(text) if text else {}
+            if background_request:
+                with BACKGROUND_MELI_REQUEST_SEMAPHORE:
+                    with urllib.request.urlopen(req, timeout=request_timeout) as response:
+                        text = response.read().decode("utf-8")
+            else:
+                with urllib.request.urlopen(req, timeout=request_timeout) as response:
+                    text = response.read().decode("utf-8")
+            return json.loads(text) if text else {}
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
@@ -1086,6 +1107,32 @@ def wait_for_interactive_meli_priority():
         if not interactive_busy:
             return
         time.sleep(0.2)
+
+
+def run_meli_work(priority, work, *args, **kwargs):
+    previous = getattr(MELI_WORK_CONTEXT, "priority", None)
+    MELI_WORK_CONTEXT.priority = priority
+    try:
+        return work(*args, **kwargs)
+    finally:
+        if previous is None:
+            try:
+                del MELI_WORK_CONTEXT.priority
+            except AttributeError:
+                pass
+        else:
+            MELI_WORK_CONTEXT.priority = previous
+
+
+def run_interactive_meli_call(work, *args, **kwargs):
+    token = f"manual-{uuid.uuid4().hex[:10]}"
+    with ASYNC_OPERATION_JOBS_LOCK:
+        ACTIVE_CLONE_OPERATIONS.add(token)
+    try:
+        return run_meli_work("interactive", work, *args, **kwargs)
+    finally:
+        with ASYNC_OPERATION_JOBS_LOCK:
+            ACTIVE_CLONE_OPERATIONS.discard(token)
 
 
 def validate_meli_path(path):
@@ -1275,7 +1322,7 @@ class MercadoLivreClient:
         seen = set()
         list_workers = max(1, min(len(statuses), int(os.getenv("MELI_SYNC_LIST_WORKERS", "3"))))
         with ThreadPoolExecutor(max_workers=list_workers, thread_name_prefix="meli-list") as executor:
-            futures = [executor.submit(scan_status, status) for status in statuses]
+            futures = [executor.submit(run_meli_work, "background", scan_status, status) for status in statuses]
             for future in futures:
                 for item_id in future.result():
                     if item_id not in seen:
@@ -1655,7 +1702,10 @@ def item_thumbnail(item):
     pictures = item.get("pictures") or []
     if pictures:
         thumbnail = pictures[0].get("secure_url") or pictures[0].get("url") or thumbnail
-    return thumbnail.replace("http://", "https://") if thumbnail else ""
+    if thumbnail:
+        return thumbnail.replace("http://", "https://")
+    thumbnail_id = clean_attribute_value(item.get("thumbnail_id"))
+    return f"https://http2.mlstatic.com/D_NQ_NP_{thumbnail_id}-O.webp" if thumbnail_id else ""
 
 
 def product_thumbnail(product):
@@ -2229,6 +2279,7 @@ def process_meli_notification_batch(events):
 
 
 def meli_notification_loop():
+    MELI_WORK_CONTEXT.priority = "background"
     while True:
         first = MELI_NOTIFICATION_QUEUE.get()
         batch = [first]
@@ -2249,12 +2300,13 @@ def meli_notification_loop():
 
 
 def auto_scan_loop():
+    MELI_WORK_CONTEXT.priority = "background"
     interval = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "300")))
     time.sleep(8)
     while True:
         try:
             sync_busy, interactive_busy = meli_background_work_busy()
-            if sync_busy or interactive_busy:
+            if interactive_busy:
                 time.sleep(min(30, interval))
                 continue
             payload = read_payload()
@@ -2293,6 +2345,7 @@ def account_sync_is_active(account):
 
 
 def auto_official_sync_loop():
+    MELI_WORK_CONTEXT.priority = "background"
     interval = max(120, int(os.getenv("AUTO_SYNC_INTERVAL_SECONDS", "300")))
     startup_delay = max(20, int(os.getenv("AUTO_SYNC_STARTUP_DELAY_SECONDS", "45")))
     operations_every = max(1, int(os.getenv("AUTO_OPERATIONS_SYNC_EVERY_N_RUNS", "6")))
@@ -2301,7 +2354,7 @@ def auto_official_sync_loop():
     while True:
         try:
             sync_busy, interactive_busy = meli_background_work_busy()
-            if sync_busy or interactive_busy:
+            if interactive_busy:
                 time.sleep(min(30, interval))
                 continue
             payload = read_payload()
@@ -2344,6 +2397,7 @@ def auto_official_sync_loop():
 
 
 def auto_catalog_competition_loop():
+    MELI_WORK_CONTEXT.priority = "background"
     interval = max(30, int(os.getenv("AUTO_COMPETITION_INTERVAL_SECONDS", "60")))
     startup_delay = max(30, int(os.getenv("AUTO_COMPETITION_STARTUP_DELAY_SECONDS", "75")))
     batch_size = max(1, int(os.getenv("AUTO_COMPETITION_BATCH_SIZE", "250")))
@@ -2352,7 +2406,7 @@ def auto_catalog_competition_loop():
     while True:
         try:
             sync_busy, interactive_busy = meli_background_work_busy()
-            if sync_busy or interactive_busy:
+            if interactive_busy:
                 time.sleep(min(15, interval))
                 continue
             payload = read_payload()
@@ -2382,7 +2436,7 @@ def auto_catalog_competition_loop():
             completed_jobs = []
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meli-buybox") as executor:
                 future_jobs = {
-                    executor.submit(normalize_competition, client, account, item): (account, item, before)
+                    executor.submit(run_meli_work, "background", normalize_competition, client, account, item): (account, item, before)
                     for account, client, item, before in jobs
                 }
                 for future in as_completed(future_jobs):
@@ -2945,6 +2999,7 @@ def synced_catalog_item(account, item, competition=None):
         "title": item.get("title") or item.get("id"),
         "account": account.get("nickname"),
         "account_id": account.get("id"),
+        "site_id": account.get("site_id") or "MLB",
         "official_source": True,
         "item_data_checked_at": now_label(),
         "thumbnail": item_thumbnail(item),
@@ -3020,6 +3075,49 @@ def apply_item_net_values(item):
     return item
 
 
+def sale_fee_basis(item, account=None):
+    return "|".join(
+        (
+            str((account or {}).get("site_id") or item.get("site_id") or "MLB"),
+            f"{max(0.0, float(item.get('price') or 0)):.2f}",
+            str(item.get("listing_type_id") or ""),
+            str(item.get("category_id") or ""),
+        )
+    )
+
+
+def shipping_cost_basis(item, account=None):
+    dimensions = (
+        item.get("package_weight"), item.get("package_height"),
+        item.get("package_width"), item.get("package_length"),
+    )
+    return "|".join(
+        (
+            str((account or {}).get("seller_id") or item.get("seller_id") or ""),
+            str(item.get("shipping_mode") or ""),
+            str(item.get("shipping_logistic_type") or ""),
+            "1" if item.get("free_shipping") else "0",
+            *(clean_attribute_value(value) for value in dimensions),
+        )
+    )
+
+
+def sale_fee_snapshot_valid(item, account=None):
+    return bool(
+        item.get("sale_fee_basis")
+        and item.get("sale_fee_basis") == sale_fee_basis(item, account)
+        and item.get("sale_fee_status") in {"ok", "not_available", "error"}
+    )
+
+
+def shipping_cost_snapshot_valid(item, account=None):
+    return bool(
+        item.get("shipping_cost_basis")
+        and item.get("shipping_cost_basis") == shipping_cost_basis(item, account)
+        and item.get("shipping_cost_status") in {"ok", "not_available", "error"}
+    )
+
+
 def sale_fee_values(response, listing_type_id):
     rows = response if isinstance(response, list) else [response]
     row = next(
@@ -3041,6 +3139,7 @@ def refresh_account_sale_fees(payload, account, item_ids=None, limit=None):
         item for item in payload.get("catalog", [])
         if item.get("official_source") and item.get("account_id") == account.get("id")
         and item.get("id") and item.get("listing_type_id") and (not requested or item.get("id") in requested)
+        and not sale_fee_snapshot_valid(item, account)
     ]
     if not rows:
         return []
@@ -3076,11 +3175,12 @@ def refresh_account_sale_fees(payload, account, item_ids=None, limit=None):
         except Exception as exc:
             item["sale_fee_status"] = "error"
             item["sale_fee_error"] = policy_error_message(exc, "a tarifa de venda do anúncio")
+        item["sale_fee_basis"] = sale_fee_basis(item, account)
         item["sale_fee_updated_at"] = now_label()
         apply_item_net_values(item)
         results.append({key: item.get(key) for key in (
             "id", "account_id", "sale_fee_amount", "sale_fee_status", "sale_fee_error",
-            "sale_fee_updated_at", "net_sale_amount", "net_stock_value", "net_stock_excluded"
+            "sale_fee_updated_at", "sale_fee_basis", "net_sale_amount", "net_stock_value", "net_stock_excluded"
         )})
     return results
 
@@ -3095,6 +3195,7 @@ def refresh_account_shipping_costs(payload, account, item_ids=None, limit=None):
         and item.get("account_id") == account.get("id")
         and item.get("id")
         and (not requested or item.get("id") in requested)
+        and not shipping_cost_snapshot_valid(item, account)
     ]
     if not rows:
         return []
@@ -3118,6 +3219,7 @@ def refresh_account_shipping_costs(payload, account, item_ids=None, limit=None):
         except Exception as exc:
             item["shipping_cost_status"] = "error"
             item["shipping_cost_error"] = policy_error_message(exc, "a cotação de frete do anúncio")
+        item["shipping_cost_basis"] = shipping_cost_basis(item, account)
         item["shipping_cost_updated_at"] = now_label()
         apply_item_net_values(item)
         results.append(
@@ -3130,12 +3232,30 @@ def refresh_account_shipping_costs(payload, account, item_ids=None, limit=None):
                 "shipping_cost_status": item.get("shipping_cost_status"),
                 "shipping_cost_error": item.get("shipping_cost_error") or "",
                 "shipping_cost_updated_at": item.get("shipping_cost_updated_at"),
+                "shipping_cost_basis": item.get("shipping_cost_basis"),
+                "net_sale_amount": item.get("net_sale_amount"),
+                "net_stock_value": item.get("net_stock_value"),
+                "net_stock_excluded": item.get("net_stock_excluded"),
             }
         )
     return results
 
 
 def preserve_shipping_cost_snapshot(target, previous):
+    previous = previous or {}
+    legacy_snapshot = (
+        not previous.get("shipping_cost_basis")
+        and previous.get("shipping_cost_status") in {"ok", "not_available"}
+        and "shipping_cost" in previous
+    )
+    if not legacy_snapshot and (
+        not shipping_cost_snapshot_valid(previous)
+        or shipping_cost_basis(target) != previous.get("shipping_cost_basis")
+    ):
+        target["shipping_cost_status"] = "pending"
+        target["shipping_cost_updated_at"] = ""
+        target["shipping_cost_basis"] = ""
+        return target
     for key in (
         "shipping_cost",
         "shipping_cost_currency",
@@ -3144,19 +3264,37 @@ def preserve_shipping_cost_snapshot(target, previous):
         "shipping_cost_status",
         "shipping_cost_error",
         "shipping_cost_updated_at",
+        "shipping_cost_basis",
     ):
-        if key in (previous or {}):
+        if key in previous:
             target[key] = previous[key]
+    target["shipping_cost_basis"] = shipping_cost_basis(target)
     return target
 
 
 def preserve_sale_fee_snapshot(target, previous):
+    previous = previous or {}
+    legacy_snapshot = (
+        not previous.get("sale_fee_basis")
+        and previous.get("sale_fee_status") in {"ok", "not_available"}
+        and "sale_fee_amount" in previous
+    )
+    if not legacy_snapshot and (
+        not sale_fee_snapshot_valid(previous)
+        or sale_fee_basis(target) != previous.get("sale_fee_basis")
+    ):
+        target["sale_fee_status"] = "pending"
+        target["sale_fee_updated_at"] = ""
+        target["sale_fee_basis"] = ""
+        apply_item_net_values(target)
+        return target
     for key in (
         "sale_fee_amount", "sale_fee_status", "sale_fee_error", "sale_fee_updated_at",
-        "net_sale_amount", "net_stock_value", "net_stock_excluded",
+        "sale_fee_basis", "net_sale_amount", "net_stock_value", "net_stock_excluded",
     ):
-        if key in (previous or {}):
+        if key in previous:
             target[key] = previous[key]
+    target["sale_fee_basis"] = sale_fee_basis(target)
     apply_item_net_values(target)
     return target
 
@@ -3256,7 +3394,8 @@ def refresh_item_metadata_operation(kind, item_ids):
         results = refresh_identifiers_for_items(payload, item_ids)
     else:
         raise RuntimeError("Tipo de atualização de anúncio inválido.")
-    write_payload(payload)
+    if results:
+        write_payload(payload)
     return {"items": results}
 
 
@@ -3971,13 +4110,17 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
 
             fallback_workers = max(1, min(4, int(os.getenv("MELI_SYNC_FALLBACK_WORKERS", "4"))))
             with ThreadPoolExecutor(max_workers=fallback_workers, thread_name_prefix="meli-item-retry") as fallback:
-                batch_items = [item for item in fallback.map(fetch_single, batch_ids) if item]
+                batch_items = [
+                    item for item in fallback.map(
+                        lambda item_id: run_meli_work("background", fetch_single, item_id), batch_ids
+                    ) if item
+                ]
         return batch_start, batch_items, len(batch_ids)
 
     batch_workers = max(1, min(8, int(os.getenv("MELI_SYNC_BATCH_WORKERS", "4"))))
     fetched_count = 0
     with ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="meli-items") as executor:
-        futures = [executor.submit(fetch_item_batch, batch) for batch in batches]
+        futures = [executor.submit(run_meli_work, "background", fetch_item_batch, batch) for batch in batches]
         for future in as_completed(futures):
             batch_start, batch_items, planned_count = future.result()
             for batch_offset, item in enumerate(batch_items):
@@ -4275,6 +4418,7 @@ def enqueue_official_sync(account_id, limit=None, reason="manual"):
     write_payload(payload)
 
     def worker():
+        MELI_WORK_CONTEXT.priority = "background"
         def progress(stage, completed=0, total=0, message=""):
             completed = max(0, int(completed or 0))
             total = max(0, int(total or 0))
@@ -4462,7 +4606,7 @@ def async_operation_result(job_id):
         return json.loads(json.dumps(job, ensure_ascii=False)) if job else None
 
 
-def start_async_operation(kind, work, message="Processamento adicionado à fila.", heavy=False):
+def start_async_operation(kind, work, message="Processamento adicionado à fila.", heavy=False, priority="interactive"):
     cleanup_async_operation_jobs()
     job_id = f"op-{uuid.uuid4().hex[:12]}"
     now = time.time()
@@ -4471,6 +4615,7 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
         "kind": kind,
         "status": "queued",
         "message": message,
+        "priority": "heavy" if heavy else priority,
         "created_epoch": now,
         "updated_epoch": now,
     }
@@ -4478,17 +4623,23 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
         ASYNC_OPERATION_JOBS[job_id] = job
 
     def worker():
-        with ASYNC_OPERATION_JOBS_LOCK:
-            ACTIVE_CLONE_OPERATIONS.add(job_id)
+        interactive = not heavy and priority == "interactive"
+        if interactive:
+            with ASYNC_OPERATION_JOBS_LOCK:
+                ACTIVE_CLONE_OPERATIONS.add(job_id)
         try:
-            semaphore = HEAVY_WORKER_SEMAPHORE if heavy else CLONE_WORKER_SEMAPHORE
+            semaphore = (
+                HEAVY_WORKER_SEMAPHORE if heavy
+                else BACKGROUND_WORKER_SEMAPHORE if priority == "background"
+                else CLONE_WORKER_SEMAPHORE
+            )
             with semaphore:
                 with ASYNC_OPERATION_JOBS_LOCK:
                     current = ASYNC_OPERATION_JOBS.get(job_id)
                     if current:
                         current.update({"status": "running", "message": "Processando dados oficiais no Mercado Livre.", "updated_epoch": time.time()})
                 try:
-                    result = work()
+                    result = run_meli_work("background" if priority == "background" or heavy else "interactive", work)
                     with ASYNC_OPERATION_JOBS_LOCK:
                         current = ASYNC_OPERATION_JOBS.get(job_id)
                         if current:
@@ -4512,8 +4663,9 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
                                 }
                             )
         finally:
-            with ASYNC_OPERATION_JOBS_LOCK:
-                ACTIVE_CLONE_OPERATIONS.discard(job_id)
+            if interactive:
+                with ASYNC_OPERATION_JOBS_LOCK:
+                    ACTIVE_CLONE_OPERATIONS.discard(job_id)
 
     threading.Thread(target=worker, daemon=True).start()
     return {"job_id": job_id, "status": "queued", "message": message, "poll_url": f"/api/async/jobs/{job_id}"}
@@ -4608,6 +4760,7 @@ def bulk_price_operation(request, actor=None):
             item["price"] = target_price
             item["sale_fee_status"] = "pending"
             item["sale_fee_updated_at"] = ""
+            item["sale_fee_basis"] = ""
             item["updated_at"] = now_label()
             apply_item_net_values(item)
             append_item_log(payload, item, actor or {}, "Alteração de preço em massa", {"price": {"from": current, "to": target_price}})
@@ -9141,7 +9294,7 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/meli/shipping-costs/refresh":
             try:
                 item_ids = list(request.get("item_ids") or [])
-                operation = start_async_operation("shipping_costs", lambda: refresh_item_metadata_operation("shipping", item_ids), "Atualizando fretes em segundo plano.")
+                operation = start_async_operation("shipping_costs", lambda: refresh_item_metadata_operation("shipping", item_ids), "Atualizando fretes em segundo plano.", priority="background")
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
@@ -9150,7 +9303,7 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/meli/sale-fees/refresh":
             try:
                 item_ids = list(request.get("item_ids") or [])
-                operation = start_async_operation("sale_fees", lambda: refresh_item_metadata_operation("fees", item_ids), "Atualizando tarifas em segundo plano.")
+                operation = start_async_operation("sale_fees", lambda: refresh_item_metadata_operation("fees", item_ids), "Atualizando tarifas em segundo plano.", priority="background")
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
@@ -9159,7 +9312,7 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/meli/identifiers/refresh":
             try:
                 item_ids = list(request.get("item_ids") or [])
-                operation = start_async_operation("identifiers", lambda: refresh_item_metadata_operation("identifiers", item_ids), "Atualizando códigos universais em segundo plano.")
+                operation = start_async_operation("identifiers", lambda: refresh_item_metadata_operation("identifiers", item_ids), "Atualizando códigos universais em segundo plano.", priority="background")
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
@@ -9213,7 +9366,9 @@ class App(BaseHTTPRequestHandler):
                     update["attributes"] = dimension_attrs
                 expected_gtin_codes = []
                 if clean_attribute_value(request.get("gtin")):
-                    gtin_fragment, expected_gtin_codes = item_gtin_update_fragment(client, item_id, request.get("gtin"))
+                    gtin_fragment, expected_gtin_codes = run_interactive_meli_call(
+                        item_gtin_update_fragment, client, item_id, request.get("gtin")
+                    )
                     if gtin_fragment.get("attributes"):
                         update["attributes"] = [
                             *(update.get("attributes") or []),
@@ -9223,10 +9378,14 @@ class App(BaseHTTPRequestHandler):
                         update["variations"] = gtin_fragment["variations"]
                 if not update:
                     raise RuntimeError("Nenhum campo informado para atualizar.")
-                official = client.update_item(item_id, update)
-                verified_item = verify_package_update(client, item_id, expected_package_values) if expected_package_values else {}
+                official = run_interactive_meli_call(client.update_item, item_id, update)
+                verified_item = run_interactive_meli_call(
+                    verify_package_update, client, item_id, expected_package_values
+                ) if expected_package_values else {}
                 if expected_gtin_codes:
-                    verified_gtin_item = verify_gtin_update(client, item_id, expected_gtin_codes)
+                    verified_gtin_item = run_interactive_meli_call(
+                        verify_gtin_update, client, item_id, expected_gtin_codes
+                    )
                     if not verified_item:
                         verified_item = verified_gtin_item
                 verified_package_values = package_values_from_item(verified_item) if verified_item else {}
@@ -9239,6 +9398,7 @@ class App(BaseHTTPRequestHandler):
                             item["price"] = update["price"]
                             item["sale_fee_status"] = "pending"
                             item["sale_fee_updated_at"] = ""
+                            item["sale_fee_basis"] = ""
                         if "available_quantity" in update:
                             changes["stock"] = {"from": item.get("stock"), "to": update["available_quantity"]}
                             stock_transition = (int(item.get("stock") or 0), int(update["available_quantity"] or 0), item)
@@ -9253,6 +9413,10 @@ class App(BaseHTTPRequestHandler):
                                 )
                                 changes[request_key] = {"from": item.get(request_key), "to": normalized_value}
                                 item[request_key] = normalized_value
+                        if expected_package_values:
+                            item["shipping_cost_status"] = "pending"
+                            item["shipping_cost_updated_at"] = ""
+                            item["shipping_cost_basis"] = ""
                         if expected_gtin_codes:
                             new_gtin = ", ".join(expected_gtin_codes)
                             changes["gtin"] = {"from": item.get("gtin") or "", "to": new_gtin}
@@ -9325,7 +9489,9 @@ class App(BaseHTTPRequestHandler):
                 account = next((row for row in payload.get("accounts", []) if row.get("id") == item.get("account_id")), None)
                 if not account:
                     raise RuntimeError("Conta oficial não encontrada.")
-                official = account_client(account).update_item(item_id, {"price": item["price_to_win"]})
+                official = run_interactive_meli_call(
+                    account_client(account).update_item, item_id, {"price": item["price_to_win"]}
+                )
                 old_price = item.get("price")
                 item["price"] = item["price_to_win"]
                 item["updated_at"] = now_label()
@@ -9351,7 +9517,7 @@ class App(BaseHTTPRequestHandler):
                 if not account or not account.get("official"):
                     raise RuntimeError("Conta oficial não encontrada para remover o Mercado Envios Flex.")
                 update = {"shipping": {"mode": item.get("shipping_mode") or "me2", "logistic_type": "drop_off"}}
-                official = account_client(account).update_item(item_id, update)
+                official = run_interactive_meli_call(account_client(account).update_item, item_id, update)
                 old_logistic_type = item.get("shipping_logistic_type") or ""
                 item["shipping_mode"] = update["shipping"]["mode"]
                 item["shipping_logistic_type"] = update["shipping"]["logistic_type"]
@@ -9384,7 +9550,7 @@ class App(BaseHTTPRequestHandler):
                 if not account or not account.get("official"):
                     raise RuntimeError("Conta oficial não encontrada para ativar o Mercado Envios Flex.")
                 update = {"shipping": {"mode": item.get("shipping_mode") or "me2", "logistic_type": "self_service"}}
-                official = account_client(account).update_item(item_id, update)
+                official = run_interactive_meli_call(account_client(account).update_item, item_id, update)
                 old_logistic_type = item.get("shipping_logistic_type") or ""
                 item["shipping_mode"] = update["shipping"]["mode"]
                 item["shipping_logistic_type"] = update["shipping"]["logistic_type"]
