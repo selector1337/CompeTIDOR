@@ -69,6 +69,8 @@ CLONE_SOURCE_CACHE = {}
 ASYNC_OPERATION_JOBS_LOCK = threading.RLock()
 ASYNC_OPERATION_JOBS = {}
 ACTIVE_CLONE_OPERATIONS = set()
+DASHBOARD_THUMBNAIL_REFRESH_LOCK = threading.Lock()
+DASHBOARD_THUMBNAIL_REFRESH_ACTIVE = False
 CLONE_WORKER_SEMAPHORE = threading.BoundedSemaphore(
     max(1, min(3, int(os.getenv("MELI_CLONE_CONCURRENT_JOBS", "2"))))
 )
@@ -637,6 +639,7 @@ def telegram_type_enabled(config, alert_type):
 def public_payload(payload, actor=None, include_catalog=True):
     if include_catalog:
         reclassify_internal_competition(payload)
+        remove_internal_catalog_alerts(payload)
     if payload.get("catalog"):
         enrich_recent_sale_thumbnails(payload)
     if include_catalog:
@@ -711,15 +714,84 @@ def enrich_recent_sale_thumbnails(payload):
         if item.get("id") and item.get("thumbnail")
     }
     changed = False
-    for sale in payload.get("recent_sales", []):
+    rows = [*payload.get("recent_sales", []), *payload.get("daily_sku_sales", [])]
+    known_by_item = {
+        str(row.get("item_id")): row.get("thumbnail")
+        for row in rows
+        if row.get("item_id") and row.get("thumbnail")
+    }
+    for sale in rows:
         if sale.get("thumbnail"):
             continue
         catalog_item = catalog_by_id.get(sale.get("item_id")) or {}
-        thumbnail = catalog_item.get("thumbnail") or ""
+        thumbnail = known_by_item.get(str(sale.get("item_id") or "")) or catalog_item.get("thumbnail") or ""
         if thumbnail:
             sale["thumbnail"] = thumbnail
             changed = True
     return changed
+
+
+def enqueue_dashboard_thumbnail_refresh():
+    global DASHBOARD_THUMBNAIL_REFRESH_ACTIVE
+    with DASHBOARD_THUMBNAIL_REFRESH_LOCK:
+        if DASHBOARD_THUMBNAIL_REFRESH_ACTIVE:
+            return False
+        DASHBOARD_THUMBNAIL_REFRESH_ACTIVE = True
+
+    def worker():
+        global DASHBOARD_THUMBNAIL_REFRESH_ACTIVE
+        try:
+            snapshot = read_payload(include_catalog=False)
+            rows = [*snapshot.get("recent_sales", []), *snapshot.get("daily_sku_sales", [])]
+            missing_by_account = {}
+            for row in rows:
+                if row.get("thumbnail") or not row.get("item_id") or not row.get("account"):
+                    continue
+                missing_by_account.setdefault(row.get("account"), set()).add(str(row.get("item_id")))
+            if not missing_by_account:
+                return
+
+            thumbnails = {}
+            accounts = snapshot.get("accounts", [])
+            for account_name, item_ids in missing_by_account.items():
+                account = next(
+                    (
+                        row for row in accounts
+                        if row.get("official") and row.get("nickname") == account_name and row.get("access_token")
+                    ),
+                    None,
+                )
+                if not account:
+                    continue
+                client = account_client(account)
+                ids = list(item_ids)[:100]
+                for start in range(0, len(ids), 20):
+                    try:
+                        official_items = client.items_bulk(ids[start:start + 20])
+                    except Exception:
+                        official_items = []
+                    for item in official_items or []:
+                        thumbnail = item_thumbnail(item)
+                        if item.get("id") and thumbnail:
+                            thumbnails[str(item.get("id"))] = thumbnail
+            if not thumbnails:
+                return
+
+            latest = read_payload(include_catalog=False)
+            changed = False
+            for row in [*latest.get("recent_sales", []), *latest.get("daily_sku_sales", [])]:
+                thumbnail = thumbnails.get(str(row.get("item_id") or ""))
+                if thumbnail and not row.get("thumbnail"):
+                    row["thumbnail"] = thumbnail
+                    changed = True
+            if changed:
+                write_payload(latest)
+        finally:
+            with DASHBOARD_THUMBNAIL_REFRESH_LOCK:
+                DASHBOARD_THUMBNAIL_REFRESH_ACTIVE = False
+
+    threading.Thread(target=worker, name="dashboard-thumbnails", daemon=True).start()
+    return True
 
 
 def percent_rate(value):
@@ -2049,7 +2121,15 @@ def process_meli_notification(event):
         alert = stock_alert(f"stock-{account.get('id')}-{item_id}-{uuid.uuid4().hex[:8]}", account, updated)
         payload.setdefault("alerts", []).insert(0, alert)
         notify_alert(payload, alert)
-    if before and before.get("status") != "losing" and updated.get("status") == "losing":
+    reclassify_internal_competition(payload)
+    remove_internal_catalog_alerts(payload)
+    final_item = existing if existing is not None else updated
+    if (
+        before
+        and before.get("status") != "losing"
+        and final_item.get("status") == "losing"
+        and not final_item.get("internal_competition")
+    ):
         alert = {
             "id": f"catalog-{account.get('id')}-{item_id}-{uuid.uuid4().hex[:8]}",
             "type": "catalog",
@@ -2063,6 +2143,9 @@ def process_meli_notification(event):
             "item_id": item_id,
             "sku": updated.get("sku"),
             "product": updated.get("title"),
+            "winner_item_id": updated.get("winner_item_id"),
+            "winner_seller_id": updated.get("winner_seller_id"),
+            "winner_name": updated.get("winner_name"),
             "created_at": now_label(),
             "read": False,
         }
@@ -2215,6 +2298,7 @@ def auto_catalog_competition_loop():
                     jobs.append((account, client, item, dict(item)))
 
             completed_by_account = {}
+            completed_jobs = []
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meli-buybox") as executor:
                 future_jobs = {
                     executor.submit(normalize_competition, client, account, item): (account, item, before)
@@ -2232,27 +2316,37 @@ def auto_catalog_competition_loop():
                         item["updated_at"] = now_label()
                         item.pop("competition_refresh_error", None)
                         completed_by_account[account.get("id")] = completed_by_account.get(account.get("id"), 0) + 1
-                        if before.get("status") != "losing" and item.get("status") == "losing" and not item.get("internal_competition"):
-                            alert_id = f"catalog-{account.get('id')}-{item.get('id')}-{now_label()[:10]}"
-                            if not any(alert.get("id") == alert_id for alert in payload.get("alerts", [])):
-                                alert = {
-                                    "id": alert_id,
-                                    "type": "catalog",
-                                    "severity": "danger",
-                                    "title": "Produto começou a perder catálogo",
-                                    "message": f"{item.get('title')} perdeu a buybox. Vencedor: {item.get('winner_name') or '-'} por {brl(item.get('winner_price')) if item.get('winner_price') else '-' }.",
-                                    "account": item.get("account"),
-                                    "item_id": item.get("id"),
-                                    "sku": item.get("sku"),
-                                    "product": item.get("title"),
-                                    "created_at": now_label(),
-                                }
-                                payload.setdefault("alerts", []).insert(0, alert)
-                                notify_alert(payload, alert)
+                        completed_jobs.append((account, item, before))
+                        # Internal winners are resolved after all concurrent API
+                        # responses have been merged into the shared catalog.
                     except Exception as exc:
                         item["competition_refresh_error"] = str(exc)
                         item["competition_checked_at"] = now_label()
             reclassify_internal_competition(payload)
+            remove_internal_catalog_alerts(payload)
+            for account, item, before in completed_jobs:
+                if before.get("status") == "losing" or item.get("status") != "losing" or item.get("internal_competition"):
+                    continue
+                alert_id = f"catalog-{account.get('id')}-{item.get('id')}-{now_label()[:10]}"
+                if any(alert.get("id") == alert_id for alert in payload.get("alerts", [])):
+                    continue
+                alert = {
+                    "id": alert_id,
+                    "type": "catalog",
+                    "severity": "danger",
+                    "title": "Produto começou a perder catálogo",
+                    "message": f"{item.get('title')} perdeu a buybox. Vencedor: {item.get('winner_name') or '-'} por {brl(item.get('winner_price')) if item.get('winner_price') else '-'}.",
+                    "account": item.get("account"),
+                    "item_id": item.get("id"),
+                    "sku": item.get("sku"),
+                    "product": item.get("title"),
+                    "winner_item_id": item.get("winner_item_id"),
+                    "winner_seller_id": item.get("winner_seller_id"),
+                    "winner_name": item.get("winner_name"),
+                    "created_at": now_label(),
+                }
+                payload.setdefault("alerts", []).insert(0, alert)
+                notify_alert(payload, alert)
             for account in accounts:
                 checked = completed_by_account.get(account.get("id"), 0)
                 account["catalog_refresh_status"] = f"Varredura rotativa: {checked} anúncios de catálogo verificados"
@@ -2499,6 +2593,14 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
             seller_name = seller_name or winner_embedded_name(winner_item)
         except Exception:
             winner_item = {}
+        if not seller_id or not seller_name:
+            try:
+                bulk_rows = client.items_bulk([str(winner_item_id)])
+                bulk_item = next((row for row in bulk_rows or [] if str(row.get("id") or "") == str(winner_item_id)), {})
+                seller_id = seller_id or str(bulk_item.get("seller_id") or first_present(bulk_item, ["seller.id"], "") or "")
+                seller_name = seller_name or winner_embedded_name(bulk_item)
+            except Exception:
+                pass
     if catalog_product_id and (not seller_id or not seller_name):
         try:
             offers = client.product_winners(catalog_product_id)
@@ -3008,6 +3110,50 @@ def reclassify_internal_competition(payload):
     return changed
 
 
+def connected_winner_account(payload, item):
+    accounts = [account for account in payload.get("accounts") or [] if account.get("official")]
+    seller_id = str((item or {}).get("winner_seller_id") or "")
+    winner_item_id = str((item or {}).get("winner_item_id") or "")
+    winner_name = normalized_account_name((item or {}).get("winner_name"))
+    account = next((row for row in accounts if seller_id and str(row.get("seller_id") or "") == seller_id), None)
+    if not account and winner_item_id:
+        local_item = next((row for row in payload.get("catalog") or [] if str(row.get("id") or "") == winner_item_id), None)
+        if local_item:
+            account = next(
+                (
+                    row for row in accounts
+                    if row.get("id") == local_item.get("account_id") or row.get("nickname") == local_item.get("account")
+                ),
+                None,
+            )
+    if not account and winner_name:
+        account = next((row for row in accounts if normalized_account_name(row.get("nickname")) == winner_name), None)
+    return account
+
+
+def remove_internal_catalog_alerts(payload):
+    catalog_by_id = {
+        str(item.get("id")): item
+        for item in payload.get("catalog") or []
+        if item.get("id")
+    }
+    kept = []
+    removed = 0
+    for alert in payload.get("alerts") or []:
+        if alert.get("type") != "catalog":
+            kept.append(alert)
+            continue
+        catalog_item = catalog_by_id.get(str(alert.get("item_id") or "")) or {}
+        context = {**alert, **catalog_item}
+        if catalog_item.get("internal_competition") or connected_winner_account(payload, context):
+            removed += 1
+            continue
+        kept.append(alert)
+    if removed:
+        payload["alerts"] = kept
+    return removed
+
+
 def append_item_log(payload, item, user, action, changes=None, sale_id=None):
     logs = payload.setdefault("item_logs", [])
     logs.insert(
@@ -3143,6 +3289,15 @@ def telegram_alert_text(payload, alert):
 
 
 def notify_alert(payload, alert):
+    if alert.get("type") == "catalog":
+        catalog_item = next(
+            (row for row in payload.get("catalog") or [] if row.get("id") == alert.get("item_id")),
+            {},
+        )
+        context = {**catalog_item, **alert}
+        if catalog_item.get("internal_competition") or connected_winner_account(payload, context):
+            alert["telegram_suppressed"] = "Vencedor pertence a uma conta conectada."
+            return None
     results = {}
     for user_id, config in notification_targets(payload):
         telegram = config.get("telegram") or {}
@@ -3808,6 +3963,7 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
             time.sleep(request_delay)
 
     reclassify_internal_competition(payload)
+    remove_internal_catalog_alerts(payload)
     alerts_created = 0
     existing_alert_ids = {alert.get("id") for alert in payload.get("alerts", [])}
     for item in selected:
@@ -3841,6 +3997,9 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
                     "item_id": item.get("id"),
                     "sku": item.get("sku"),
                     "product": item.get("title"),
+                    "winner_item_id": item.get("winner_item_id"),
+                    "winner_seller_id": item.get("winner_seller_id"),
+                    "winner_name": item.get("winner_name"),
                     "created_at": now_label(),
                 }
                 payload.setdefault("alerts", []).insert(0, alert)
@@ -7925,6 +8084,7 @@ class App(BaseHTTPRequestHandler):
             alerts_enriched = enrich_product_alerts(payload)
             if notifications_migrated or alerts_enriched:
                 write_payload(payload)
+            enqueue_dashboard_thumbnail_refresh()
             self.send_json(public_payload(payload, self.current_user(payload), include_catalog=False))
             return
         if parsed.path == "/api/catalog":
