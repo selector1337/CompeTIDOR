@@ -240,6 +240,7 @@ async function loadCatalogInBackground(force = false) {
       state.data.catalog = result.catalog || [];
       state.data.item_logs = logs.item_logs || [];
       state.data.catalog_counts = result.catalog_counts || state.data.catalog_counts || {};
+      state.data.sale_fee_progress = result.sale_fee_progress || state.data.sale_fee_progress || {};
       state.catalogLoaded = true;
       render();
     })
@@ -757,12 +758,12 @@ function renderAds() {
   renderFilterOptions();
   const productTerm = state.adsProduct.toLowerCase();
   const brandTerm = state.adsBrand.toLowerCase();
-  const skuTerm = state.adsSku.toLowerCase();
+  const skuTerm = state.adsSku.trim().toLowerCase();
   const codeTerm = state.adsCode.toLowerCase();
   const filtered = state.data.catalog.filter((item) => {
     const title = `${item.title || ""}`.toLowerCase();
     const brand = `${item.brand || ""}`.toLowerCase();
-    const sku = `${item.sku || ""}`.toLowerCase();
+    const sku = `${item.sku || ""}`.trim().toLowerCase();
     const code = `${item.id || ""}`.toLowerCase();
     return (state.adsAccount === "all" || item.account === state.adsAccount)
       && (state.adsStatus === "all" || item.meli_status === state.adsStatus)
@@ -771,7 +772,7 @@ function renderAds() {
       && (state.adsFlex === "all" || (state.adsFlex === "active" ? item.shipping_logistic_type === "self_service" : item.shipping_logistic_type !== "self_service"))
       && (!productTerm || title.includes(productTerm))
       && (!brandTerm || brand.includes(brandTerm) || title.includes(brandTerm))
-      && (!skuTerm || sku.includes(skuTerm))
+      && (!skuTerm || sku === skuTerm)
       && (!codeTerm || code.includes(codeTerm));
   });
   const inventory = filtered.reduce((summary, item) => {
@@ -788,11 +789,16 @@ function renderAds() {
     return summary;
   }, { units: 0, value: 0, netValue: 0, pendingFees: 0, excludedKitSkus: 0 });
   const inventorySummary = document.querySelector("#ads-inventory-summary");
+  const feeCompleted = filtered.filter((item) => item.sale_fee_status === "ok").length;
+  const feePending = Math.max(0, filtered.length - feeCompleted);
+  const feePercent = filtered.length ? (feeCompleted / filtered.length * 100) : 100;
+  const globalFeeProgress = state.data.sale_fee_progress || {};
   if (inventorySummary) inventorySummary.innerHTML = `
     <div><span>Anúncios filtrados</span><strong>${filtered.length.toLocaleString("pt-BR")}</strong></div>
     <div><span>Unidades em estoque</span><strong>${inventory.units.toLocaleString("pt-BR")}</strong></div>
     <div class="inventory-value"><span>Estoque a preço de venda <small>SKUs com KIT não entram no valor</small></span><strong>${money.format(inventory.value)}</strong></div>
     <div class="inventory-value net"><span>Estoque a valor líquido <small>Venda - tarifa - frete; sem SKUs com KIT${inventory.pendingFees ? ` · ${inventory.pendingFees} tarifa(s) calculando` : ""}</small></span><strong>${money.format(inventory.netValue)}</strong></div>
+    <div class="fee-progress-card"><span>Tarifas dos anúncios filtrados <small>${feeCompleted.toLocaleString("pt-BR")} concluídas · ${feePending.toLocaleString("pt-BR")} pendentes${globalFeeProgress.estimated_label ? ` · previsão geral: ${escapeText(globalFeeProgress.estimated_label)}` : ""}</small></span><strong>${feePercent.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</strong><i><b style="width:${Math.max(0, Math.min(100, feePercent))}%"></b></i></div>
   `;
   const pageInfo = paginate(filtered, state.adsPage);
   state.adsPage = pageInfo.current;
@@ -961,8 +967,8 @@ function saleFeeLabel(item) {
   if (item.sale_fee_status === "ok" && item.sale_fee_amount !== null && item.sale_fee_amount !== undefined) {
     return money.format(Number(item.sale_fee_amount || 0));
   }
-  if (item.sale_fee_status === "error") return "Consulta indisponível";
-  if (item.sale_fee_status === "not_available") return "Não informada pela API";
+  if (item.sale_fee_status === "error") return "Reconsulta automática agendada";
+  if (item.sale_fee_status === "not_available") return "Nova consulta programada";
   return "Calculando...";
 }
 
@@ -973,12 +979,14 @@ function netSaleLabel(item) {
 
 function saleFeeNeedsRefresh(item) {
   if (!item.official_source || !item.listing_type_id) return false;
-  if (item.sale_fee_basis && ["ok", "not_available", "error"].includes(item.sale_fee_status)) return false;
+  if (item.sale_fee_basis && item.sale_fee_status === "ok") return false;
   if (!item.sale_fee_basis) return true;
   const raw = String(item.sale_fee_updated_at || "").replace(" ", "T");
   const updated = new Date(raw);
   if (Number.isNaN(updated.getTime())) return true;
-  const ttl = 30 * 60 * 1000;
+  const ttl = item.sale_fee_status === "error" ? 15 * 60 * 1000
+    : item.sale_fee_status === "not_available" ? 6 * 60 * 60 * 1000
+      : 30 * 60 * 1000;
   return Date.now() - updated.getTime() > ttl;
 }
 
@@ -1011,6 +1019,14 @@ function updateBulkPriceBar() {
   const button = root.querySelector("[data-apply-bulk-price]");
   if (label) label.textContent = count;
   if (button) button.disabled = count === 0;
+}
+
+function resetBulkPriceControls(root) {
+  const mode = root?.querySelector("[data-bulk-price-mode]");
+  const value = root?.querySelector("[data-bulk-price-value]");
+  if (mode) mode.value = "fixed";
+  if (value) value.value = "";
+  state.adsSelectedIds.clear();
 }
 
 function shippingCostNeedsRefresh(item) {
@@ -2551,6 +2567,7 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
       ? { ...item, price: updates.get(item.id), sale_fee_status: "pending", sale_fee_updated_at: "", sale_fee_basis: "" }
       : item);
     showToast(`${result.updated || 0} preço(s) alterado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`, result.failed ? "error" : "success");
+    if (!result.failed) resetBulkPriceControls(root);
     renderAds();
   } catch (error) {
     showToast(error.message || "Não foi possível alterar os preços selecionados.", "error");

@@ -457,10 +457,17 @@ CATALOG_ITEM_FIELDS = {
     "catalog_listing", "listing_type_id", "shipping_logistic_type", "shipping_mode", "free_shipping",
     "package_weight", "package_height", "package_width", "package_length", "price", "stock",
     "meli_status", "permalink", "item_data_checked_at",
+}
+CATALOG_SHIPPING_FIELDS = {
     "shipping_cost", "shipping_cost_currency", "shipping_billable_weight", "shipping_cost_source",
     "shipping_cost_status", "shipping_cost_error", "shipping_cost_updated_at", "shipping_cost_basis",
+}
+CATALOG_SALE_FEE_FIELDS = {
     "sale_fee_amount", "sale_fee_status", "sale_fee_error", "sale_fee_updated_at", "sale_fee_basis",
-    "net_sale_amount", "net_stock_value", "net_stock_excluded",
+    "sale_fee_attempts", "net_sale_amount", "net_stock_value", "net_stock_excluded",
+}
+CATALOG_IDENTIFIER_FIELDS = {
+    "gtin", "gtin_status", "gtin_error", "gtin_updated_at",
 }
 
 
@@ -483,12 +490,23 @@ def merge_catalog_records(incoming, latest):
         merged = {**saved, **current}
         competition_source = current if str(current.get("competition_checked_at") or "") >= str(saved.get("competition_checked_at") or "") else saved
         item_source = current if str(current.get("item_data_checked_at") or "") >= str(saved.get("item_data_checked_at") or "") else saved
+        shipping_source = current if str(current.get("shipping_cost_updated_at") or "") >= str(saved.get("shipping_cost_updated_at") or "") else saved
+        sale_fee_source = current if str(current.get("sale_fee_updated_at") or "") >= str(saved.get("sale_fee_updated_at") or "") else saved
+        identifier_source = current if str(current.get("gtin_updated_at") or "") >= str(saved.get("gtin_updated_at") or "") else saved
         for field in CATALOG_COMPETITION_FIELDS:
             if field in competition_source:
                 merged[field] = competition_source[field]
         for field in CATALOG_ITEM_FIELDS:
             if field in item_source:
                 merged[field] = item_source[field]
+        for fields, source in (
+            (CATALOG_SHIPPING_FIELDS, shipping_source),
+            (CATALOG_SALE_FEE_FIELDS, sale_fee_source),
+            (CATALOG_IDENTIFIER_FIELDS, identifier_source),
+        ):
+            for field in fields:
+                if field in source:
+                    merged[field] = source[field]
         merged_rows.append(merged)
     return merged_rows
 
@@ -2448,6 +2466,9 @@ def process_meli_notification(event, payload=None, persist=True):
             "winner_item_id": updated.get("winner_item_id"),
             "winner_seller_id": updated.get("winner_seller_id"),
             "winner_name": updated.get("winner_name"),
+            "winner_price": updated.get("winner_price"),
+            "current_price": updated.get("price"),
+            "price_to_win": updated.get("price_to_win"),
             "created_at": now_label(),
             "read": False,
         }
@@ -2606,6 +2627,44 @@ def auto_official_sync_loop():
         time.sleep(interval)
 
 
+def auto_sale_fee_loop():
+    """Finish the fee backlog independently without delaying item/catalog sync."""
+    MELI_WORK_CONTEXT.priority = "background"
+    interval = max(30, int(os.getenv("AUTO_SALE_FEE_INTERVAL_SECONDS", "60")))
+    startup_delay = max(20, int(os.getenv("AUTO_SALE_FEE_STARTUP_DELAY_SECONDS", "50")))
+    batch_size = max(1, int(os.getenv("AUTO_SALE_FEE_BACKFILL_BATCH_SIZE", "30")))
+    time.sleep(startup_delay)
+    while True:
+        try:
+            _, interactive_busy = meli_background_work_busy()
+            if interactive_busy:
+                time.sleep(min(10, interval))
+                continue
+            payload = read_payload()
+            accounts = [
+                account for account in payload.get("accounts", [])
+                if account.get("official")
+                and account.get("access_token")
+                and account.get("status") == "connected"
+                and not account_sync_is_active(account)
+            ]
+            updated = 0
+            for account in accounts:
+                if meli_background_work_busy()[1]:
+                    break
+                updated += len(refresh_account_sale_fees(payload, account, limit=batch_size))
+            if updated:
+                payload["sale_fee_backfill"] = {
+                    **sale_fee_progress(payload.get("catalog", [])),
+                    "updated_at": now_label(),
+                    "last_batch": updated,
+                }
+                write_payload(payload)
+        except Exception:
+            pass
+        time.sleep(interval)
+
+
 def auto_catalog_competition_loop():
     MELI_WORK_CONTEXT.priority = "background"
     interval = max(30, int(os.getenv("AUTO_COMPETITION_INTERVAL_SECONDS", "60")))
@@ -2688,6 +2747,9 @@ def auto_catalog_competition_loop():
                     "winner_item_id": item.get("winner_item_id"),
                     "winner_seller_id": item.get("winner_seller_id"),
                     "winner_name": item.get("winner_name"),
+                    "winner_price": item.get("winner_price"),
+                    "current_price": item.get("price"),
+                    "price_to_win": item.get("price_to_win"),
                     "created_at": now_label(),
                 }
                 payload.setdefault("alerts", []).insert(0, alert)
@@ -3313,11 +3375,20 @@ def shipping_cost_basis(item, account=None):
 
 
 def sale_fee_snapshot_valid(item, account=None):
-    return bool(
-        item.get("sale_fee_basis")
-        and item.get("sale_fee_basis") == sale_fee_basis(item, account)
-        and item.get("sale_fee_status") in {"ok", "not_available", "error"}
-    )
+    if not item.get("sale_fee_basis") or item.get("sale_fee_basis") != sale_fee_basis(item, account):
+        return False
+    status = item.get("sale_fee_status")
+    if status == "ok":
+        return True
+    updated = parse_meli_datetime(item.get("sale_fee_updated_at"))
+    if not updated:
+        return False
+    age = max(0, (datetime.now(APP_TZ) - updated).total_seconds())
+    if status == "error":
+        return age < max(60, int(os.getenv("MELI_SALE_FEE_ERROR_RETRY_SECONDS", "900")))
+    if status == "not_available":
+        return age < max(900, int(os.getenv("MELI_SALE_FEE_NOT_AVAILABLE_RETRY_SECONDS", "21600")))
+    return False
 
 
 def shipping_cost_snapshot_valid(item, account=None):
@@ -3359,8 +3430,9 @@ def refresh_account_sale_fees(payload, account, item_ids=None, limit=None):
         cursor_key = f"sale_fee_cursor_{account.get('id')}"
         selected, account[cursor_key] = rotating_batch(rows, account.get(cursor_key) or 0, maximum)
     client = account_client(account)
-    results = []
-    for item in selected:
+    priority = getattr(MELI_WORK_CONTEXT, "priority", "interactive")
+
+    def refresh_one(item):
         cache_key = (
             account.get("site_id") or "MLB",
             round(float(item.get("price") or 0), 2),
@@ -3373,7 +3445,15 @@ def refresh_account_sale_fees(payload, account, item_ids=None, limit=None):
             if cached and time.monotonic() - cached.get("created", 0) < 21600:
                 amount, details = cached.get("amount"), cached.get("details") or {}
             else:
-                response = client.listing_prices(*cache_key[:3], category_id=cache_key[3])
+                try:
+                    response = client.listing_prices(*cache_key[:3], category_id=cache_key[3])
+                except Exception as exc:
+                    # Some categories reject the optional category_id even
+                    # though the same official endpoint works without it.
+                    if cache_key[3] and any(token in str(exc).lower() for token in ("http 400", "invalid", "category")):
+                        response = client.listing_prices(*cache_key[:3])
+                    else:
+                        raise
                 amount, details = sale_fee_values(response, item.get("listing_type_id"))
                 with SALE_FEE_CACHE_LOCK:
                     SALE_FEE_CACHE[cache_key] = {
@@ -3382,17 +3462,74 @@ def refresh_account_sale_fees(payload, account, item_ids=None, limit=None):
             item["sale_fee_amount"] = amount
             item["sale_fee_status"] = "ok" if amount is not None else "not_available"
             item["sale_fee_error"] = "" if amount is not None else "A API não informou a tarifa para este anúncio."
+            item["sale_fee_attempts"] = 0
         except Exception as exc:
             item["sale_fee_status"] = "error"
             item["sale_fee_error"] = policy_error_message(exc, "a tarifa de venda do anúncio")
+            item["sale_fee_attempts"] = int(item.get("sale_fee_attempts") or 0) + 1
         item["sale_fee_basis"] = sale_fee_basis(item, account)
         item["sale_fee_updated_at"] = now_label()
         apply_item_net_values(item)
-        results.append({key: item.get(key) for key in (
+        return {key: item.get(key) for key in (
             "id", "account_id", "sale_fee_amount", "sale_fee_status", "sale_fee_error",
-            "sale_fee_updated_at", "sale_fee_basis", "net_sale_amount", "net_stock_value", "net_stock_excluded"
-        )})
+            "sale_fee_updated_at", "sale_fee_basis", "sale_fee_attempts", "net_sale_amount",
+            "net_stock_value", "net_stock_excluded"
+        )}
+
+    worker_count = max(1, min(
+        len(selected),
+        min(8, int(os.getenv("AUTO_SALE_FEE_WORKERS", str(min(6, BACKGROUND_MELI_MAX_IN_FLIGHT))))),
+    ))
+    results = []
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="meli-sale-fee") as executor:
+        futures = [executor.submit(run_meli_work, priority, refresh_one, item) for item in selected]
+        for future in as_completed(futures):
+            results.append(future.result())
     return results
+
+
+def sale_fee_progress(catalog):
+    eligible = [
+        item for item in (catalog or [])
+        if item.get("official_source") and item.get("id") and item.get("listing_type_id")
+    ]
+    completed = [item for item in eligible if item.get("sale_fee_status") == "ok" and item.get("sale_fee_basis")]
+    errors = [item for item in eligible if item.get("sale_fee_status") == "error"]
+    unavailable = [item for item in eligible if item.get("sale_fee_status") == "not_available"]
+    pending = max(0, len(eligible) - len(completed))
+    now = datetime.now(APP_TZ)
+    lookback_hours = 2
+    recent_updates = []
+    for item in completed:
+        updated = parse_meli_datetime(item.get("sale_fee_updated_at"))
+        if updated and 0 <= (now - updated).total_seconds() <= lookback_hours * 3600:
+            recent_updates.append(updated)
+    observed_seconds = max(60, (now - min(recent_updates)).total_seconds()) if recent_updates else 0
+    recent_per_hour = round(len(recent_updates) * 3600 / observed_seconds, 1) if recent_updates else 0
+    accounts = {item.get("account_id") for item in eligible if item.get("account_id")}
+    interval = max(30, int(os.getenv("AUTO_SALE_FEE_INTERVAL_SECONDS", "60")))
+    batch = max(1, int(os.getenv("AUTO_SALE_FEE_BACKFILL_BATCH_SIZE", "30")))
+    theoretical_per_hour = max(1.0, len(accounts) * batch * 3600 / interval)
+    throughput = recent_per_hour or theoretical_per_hour
+    estimated_seconds = int(pending / throughput * 3600) if pending else 0
+    if not pending:
+        estimate = "Concluído"
+    elif estimated_seconds < 3600:
+        estimate = f"aproximadamente {max(1, round(estimated_seconds / 60))} min"
+    else:
+        hours = estimated_seconds / 3600
+        estimate = f"aproximadamente {hours:.1f} h".replace(".", ",")
+    return {
+        "total": len(eligible),
+        "completed": len(completed),
+        "pending": pending,
+        "errors_retrying": len(errors),
+        "temporarily_unavailable": len(unavailable),
+        "percent": round((len(completed) / len(eligible) * 100), 1) if eligible else 100.0,
+        "recent_per_hour": recent_per_hour,
+        "estimated_seconds": estimated_seconds,
+        "estimated_label": estimate,
+    }
 
 
 def refresh_account_shipping_costs(payload, account, item_ids=None, limit=None):
@@ -3800,6 +3937,10 @@ def product_context_for_alert(payload, alert):
             "item_id": alert.get("item_id") or "",
             "sku": alert.get("sku") or "",
             "product": alert.get("product") or "",
+            "price": alert.get("current_price"),
+            "winner_name": alert.get("winner_name") or "",
+            "winner_price": alert.get("winner_price"),
+            "price_to_win": alert.get("price_to_win"),
         }
     alert.setdefault("item_id", match.get("id") or "")
     alert.setdefault("sku", match.get("sku") or "")
@@ -3809,6 +3950,10 @@ def product_context_for_alert(payload, alert):
         "item_id": match.get("id") or alert.get("item_id") or "",
         "sku": match.get("sku") or alert.get("sku") or "",
         "product": match.get("title") or alert.get("product") or "",
+        "price": alert.get("current_price") if alert.get("current_price") is not None else match.get("price"),
+        "winner_name": alert.get("winner_name") or match.get("winner_name") or "",
+        "winner_price": alert.get("winner_price") if alert.get("winner_price") is not None else match.get("winner_price"),
+        "price_to_win": alert.get("price_to_win") if alert.get("price_to_win") is not None else match.get("price_to_win"),
     }
 
 
@@ -3828,6 +3973,14 @@ def telegram_alert_text(payload, alert):
             lines.append(f"MLB: {context['item_id']}")
         if context.get("sku"):
             lines.append(f"SKU: {context['sku']}")
+        if alert.get("type") == "catalog":
+            lines.append(f"Preço praticado: {brl_label(context.get('price'))}")
+            if context.get("winner_name"):
+                lines.append(f"Vencedor: {context['winner_name']}")
+            if context.get("winner_price") not in (None, ""):
+                lines.append(f"Preço vencedor: {brl_label(context.get('winner_price'))}")
+            if context.get("price_to_win") not in (None, ""):
+                lines.append(f"Preço para ganhar: {brl_label(context.get('price_to_win'))}")
         lines.append("")
     elif alert.get("account"):
         lines.append(f"Conta: {alert.get('account')}")
@@ -4569,7 +4722,7 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
                     "type": "catalog",
                     "severity": "danger",
                     "title": "Produto começou a perder catálogo",
-                    "message": f"{item.get('title')} perdeu a buybox. Vencedor: {item.get('winner_name') or '-'} por {item.get('winner_price') or '-'}.",
+                    "message": f"{item.get('title')} perdeu a buybox. Vencedor: {item.get('winner_name') or '-'} por {brl_label(item.get('winner_price'))}.",
                     "account": item.get("account"),
                     "item_id": item.get("id"),
                     "sku": item.get("sku"),
@@ -4577,6 +4730,9 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
                     "winner_item_id": item.get("winner_item_id"),
                     "winner_seller_id": item.get("winner_seller_id"),
                     "winner_name": item.get("winner_name"),
+                    "winner_price": item.get("winner_price"),
+                    "current_price": item.get("price"),
+                    "price_to_win": item.get("price_to_win"),
                     "created_at": now_label(),
                 }
                 payload.setdefault("alerts", []).insert(0, alert)
@@ -8855,6 +9011,7 @@ def catalog_api_response(payload=None):
     response = {
         "catalog": catalog,
         "catalog_counts": catalog_counts(catalog),
+        "sale_fee_progress": sale_fee_progress(catalog),
     }
     body = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     signature_text = repr(signatures).encode("utf-8")
@@ -10268,6 +10425,7 @@ if __name__ == "__main__":
     threading.Thread(target=resume_pending_official_syncs, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
     threading.Thread(target=auto_official_sync_loop, daemon=True).start()
+    threading.Thread(target=auto_sale_fee_loop, daemon=True).start()
     threading.Thread(target=auto_catalog_competition_loop, daemon=True).start()
     print(
         f"CompeTIDOR rodando em http://127.0.0.1:{port} "

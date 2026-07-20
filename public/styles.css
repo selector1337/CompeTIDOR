@@ -2937,6 +2937,10 @@ body {
 .inventory-summary .inventory-value strong { color: var(--green); }
 .inventory-summary .inventory-value.net { border-color: color-mix(in srgb, #38bdf8 60%, var(--line)); }
 .inventory-summary .inventory-value.net strong { color: #38bdf8; }
+.inventory-summary .fee-progress-card { border-color: color-mix(in srgb, var(--brand) 58%, var(--line)); }
+.inventory-summary .fee-progress-card strong { color: var(--brand); }
+.fee-progress-card i { display: block; height: 5px; overflow: hidden; border-radius: 999px; background: var(--line); }
+.fee-progress-card i b { display: block; height: 100%; border-radius: inherit; background: var(--brand); box-shadow: 0 0 12px color-mix(in srgb, var(--brand) 55%, transparent); transition: width .25s ease; }
 
 .bulk-price-bar {
   display: grid;
