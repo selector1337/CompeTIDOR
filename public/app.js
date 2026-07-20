@@ -166,6 +166,28 @@ async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 
   throw new Error("O processamento continua no servidor, mas excedeu o tempo de acompanhamento desta tela. Atualize a página para consultar o resultado.");
 }
 
+async function runManualItemOperation(path, payload, button, progressLabel = "Processando...") {
+  const originalLabel = button?.textContent || "";
+  const originalTitle = button?.getAttribute("title") || "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = progressLabel;
+  }
+  try {
+    const queued = await api(path, { method: "POST", body: JSON.stringify(payload) });
+    return await waitForAsyncOperation(queued, (message) => {
+      if (button) button.title = message || progressLabel;
+    });
+  } finally {
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = originalLabel;
+      if (originalTitle) button.title = originalTitle;
+      else button.removeAttribute("title");
+    }
+  }
+}
+
 function showToast(message, type = "success") {
   const stack = document.querySelector("#toast-stack");
   if (!stack) return;
@@ -213,10 +235,10 @@ async function load() {
 async function loadCatalogInBackground(force = false) {
   if (!state.data || (state.catalogLoaded && !force)) return;
   if (state.catalogLoading) return state.catalogLoading;
-  state.catalogLoading = api("/api/catalog")
-    .then((result) => {
+  state.catalogLoading = Promise.all([api("/api/catalog"), api("/api/item-logs")])
+    .then(([result, logs]) => {
       state.data.catalog = result.catalog || [];
-      state.data.item_logs = result.item_logs || [];
+      state.data.item_logs = logs.item_logs || [];
       state.data.catalog_counts = result.catalog_counts || state.data.catalog_counts || {};
       state.catalogLoaded = true;
       render();
@@ -2572,7 +2594,12 @@ document.querySelector("#catalog-list").addEventListener("click", async (event) 
   const item = state.data.catalog.find((row) => row.id === id);
   try {
     if (win) {
-      await api("/api/meli/item/win_catalog", { method: "POST", body: JSON.stringify({ item_id: id }) });
+      await runManualItemOperation(
+        "/api/meli/item/win_catalog",
+        { item_id: id },
+        win,
+        "Ajustando...",
+      );
       showToast("Preço ajustado para tentar ganhar o catálogo.");
     } else {
       const input = document.querySelector(`[data-catalog-price-input="${id}"]`);
@@ -2581,10 +2608,12 @@ document.querySelector("#catalog-list").addEventListener("click", async (event) 
         alert("Informe um preço válido para atualizar o anúncio.");
         return;
       }
-      await api("/api/meli/item/update", {
-        method: "POST",
-        body: JSON.stringify({ item_id: id, account_id: item.account_id, price: value }),
-      });
+      await runManualItemOperation(
+        "/api/meli/item/update",
+        { item_id: id, account_id: item.account_id, price: value },
+        price,
+        "Salvando...",
+      );
       showToast("Preço do anúncio alterado com sucesso.");
     }
     await load();
@@ -2601,10 +2630,12 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   const item = state.data.catalog.find((row) => row.id === id);
   if (button.dataset.removeFlex) {
     try {
-      await api("/api/meli/item/remove_flex", {
-        method: "POST",
-        body: JSON.stringify({ item_id: id, account_id: item.account_id }),
-      });
+      await runManualItemOperation(
+        "/api/meli/item/remove_flex",
+        { item_id: id, account_id: item.account_id },
+        button,
+        "Desativando...",
+      );
       showToast("Mercado Envios Flex desativado com sucesso.");
       await load();
     } catch (error) {
@@ -2615,10 +2646,12 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   }
   if (button.dataset.activateFlex) {
     try {
-      await api("/api/meli/item/activate_flex", {
-        method: "POST",
-        body: JSON.stringify({ item_id: id, account_id: item.account_id }),
-      });
+      await runManualItemOperation(
+        "/api/meli/item/activate_flex",
+        { item_id: id, account_id: item.account_id },
+        button,
+        "Ativando...",
+      );
       showToast("Mercado Envios Flex ativado com sucesso.");
       await load();
     } catch (error) {
@@ -2643,7 +2676,12 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   if (button.dataset.pauseAd) payload.status_action = "pause";
   if (button.dataset.activateAd) payload.status_action = "activate";
   try {
-    await api("/api/meli/item/update", { method: "POST", body: JSON.stringify(payload) });
+    await runManualItemOperation(
+      "/api/meli/item/update",
+      payload,
+      button,
+      button.dataset.pauseAd ? "Pausando..." : button.dataset.activateAd ? "Ativando..." : "Salvando...",
+    );
     if (button.dataset.pauseAd) showToast("Anúncio pausado com sucesso.");
     else if (button.dataset.activateAd) showToast("Anúncio ativado com sucesso.");
     else showToast("Anúncio atualizado com sucesso.");

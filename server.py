@@ -5,10 +5,14 @@ from zoneinfo import ZoneInfo
 from urllib.parse import parse_qs, urlencode, urlparse
 from io import BytesIO
 import base64
+import copy
+import gc
+import gzip
 import json
 import html
 import hashlib
 import hmac
+import http.client
 import os
 import random
 import queue
@@ -22,6 +26,65 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+PERFORMANCE_PROFILE = (os.getenv("COMPETIDOR_PERFORMANCE_PROFILE", "shared-8gb") or "shared-8gb").strip().lower()
+PERFORMANCE_DEFAULTS = {
+    "shared-8gb": {
+        "http_max_concurrent_requests": 64,
+        "http_request_queue": 128,
+        "interactive_meli_max_in_flight": 8,
+        "background_meli_max_in_flight": 6,
+        "sync_concurrent_accounts": 2,
+        "sync_batch_workers": 6,
+        "manual_concurrent_jobs": 4,
+        "clone_concurrent_jobs": 4,
+        "background_concurrent_jobs": 2,
+        "competition_workers": 10,
+        "gzip_threshold_bytes": 2048,
+    },
+    "small-2gb": {
+        "http_max_concurrent_requests": 24,
+        "http_request_queue": 64,
+        "interactive_meli_max_in_flight": 4,
+        "background_meli_max_in_flight": 3,
+        "sync_concurrent_accounts": 1,
+        "sync_batch_workers": 3,
+        "manual_concurrent_jobs": 2,
+        "clone_concurrent_jobs": 2,
+        "background_concurrent_jobs": 1,
+        "competition_workers": 5,
+        "gzip_threshold_bytes": 2048,
+    },
+}
+PROFILE_DEFAULTS = PERFORMANCE_DEFAULTS.get(PERFORMANCE_PROFILE, PERFORMANCE_DEFAULTS["shared-8gb"])
+GC_GENERATION0_THRESHOLD = max(
+    700,
+    min(
+        200000,
+        int(os.getenv("COMPETIDOR_GC_GENERATION0_THRESHOLD", "50000" if PERFORMANCE_PROFILE == "shared-8gb" else "10000")),
+    ),
+)
+gc.set_threshold(GC_GENERATION0_THRESHOLD, 10, 10)
+
+
+def configured_int(name, profile_key, minimum=1, maximum=None):
+    value = int(os.getenv(name, str(PROFILE_DEFAULTS[profile_key])))
+    value = max(minimum, value)
+    return min(maximum, value) if maximum is not None else value
+
+
+def configured_bool(name, default=False):
+    value = str(os.getenv(name, "1" if default else "0") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+HTTP_MAX_CONCURRENT_REQUESTS = configured_int(
+    "COMPETIDOR_HTTP_MAX_CONCURRENT_REQUESTS", "http_max_concurrent_requests", maximum=128
+)
+HTTP_REQUEST_QUEUE = configured_int("COMPETIDOR_HTTP_REQUEST_QUEUE", "http_request_queue", maximum=256)
+HTTP_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_MAX_CONCURRENT_REQUESTS)
+RUNTIME_STARTED_AT = time.time()
 
 
 ROOT = Path(__file__).parent
@@ -43,7 +106,7 @@ SYNC_PROGRESS = {}
 SYNC_PROGRESS_DATA_DIR = ""
 SYNC_PROGRESS_LAST_PERSIST = 0.0
 SYNC_WORKER_SEMAPHORE = threading.BoundedSemaphore(
-    max(1, min(2, int(os.getenv("MELI_SYNC_CONCURRENT_ACCOUNTS", "1"))))
+    configured_int("MELI_SYNC_CONCURRENT_ACCOUNTS", "sync_concurrent_accounts", maximum=4)
 )
 MELI_NOTIFICATION_QUEUE = queue.Queue(maxsize=5000)
 CATEGORY_ATTRIBUTES_LOCK = threading.RLock()
@@ -70,23 +133,41 @@ SALE_FEE_CACHE_LOCK = threading.RLock()
 SALE_FEE_CACHE = {}
 CLONE_SOURCE_CACHE_LOCK = threading.RLock()
 CLONE_SOURCE_CACHE = {}
+JSON_CACHE_LOCK = threading.RLock()
+JSON_CACHE = {}
+STATIC_FILE_CACHE_LOCK = threading.RLock()
+STATIC_FILE_CACHE = {}
+RESPONSE_CACHE_LOCK = threading.RLock()
+RESPONSE_CACHE = {}
 ASYNC_OPERATION_JOBS_LOCK = threading.RLock()
 ASYNC_OPERATION_JOBS = {}
 ACTIVE_CLONE_OPERATIONS = set()
 DASHBOARD_THUMBNAIL_REFRESH_LOCK = threading.Lock()
 DASHBOARD_THUMBNAIL_REFRESH_ACTIVE = False
-CLONE_WORKER_SEMAPHORE = threading.BoundedSemaphore(
-    max(1, min(3, int(os.getenv("MELI_CLONE_CONCURRENT_JOBS", "2"))))
+CLONE_CONCURRENT_JOBS = configured_int("MELI_CLONE_CONCURRENT_JOBS", "clone_concurrent_jobs", maximum=6)
+MANUAL_CONCURRENT_JOBS = configured_int(
+    "COMPETIDOR_MANUAL_CONCURRENT_JOBS", "manual_concurrent_jobs", maximum=8
 )
-HEAVY_WORKER_SEMAPHORE = threading.BoundedSemaphore(
-    max(1, min(2, int(os.getenv("COMPETIDOR_HEAVY_CONCURRENT_JOBS", "1"))))
+HEAVY_CONCURRENT_JOBS = max(1, min(2, int(os.getenv("COMPETIDOR_HEAVY_CONCURRENT_JOBS", "1"))))
+BACKGROUND_CONCURRENT_JOBS = configured_int(
+    "COMPETIDOR_BACKGROUND_CONCURRENT_JOBS", "background_concurrent_jobs", maximum=3
 )
-BACKGROUND_WORKER_SEMAPHORE = threading.BoundedSemaphore(
-    max(1, min(2, int(os.getenv("COMPETIDOR_BACKGROUND_CONCURRENT_JOBS", "1"))))
+CLONE_WORKER_SEMAPHORE = threading.BoundedSemaphore(CLONE_CONCURRENT_JOBS)
+MANUAL_WORKER_SEMAPHORE = threading.BoundedSemaphore(MANUAL_CONCURRENT_JOBS)
+HEAVY_WORKER_SEMAPHORE = threading.BoundedSemaphore(HEAVY_CONCURRENT_JOBS)
+BACKGROUND_WORKER_SEMAPHORE = threading.BoundedSemaphore(BACKGROUND_CONCURRENT_JOBS)
+INTERACTIVE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=CLONE_CONCURRENT_JOBS, thread_name_prefix="interactive-job")
+MANUAL_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=MANUAL_CONCURRENT_JOBS, thread_name_prefix="manual-job")
+BACKGROUND_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=BACKGROUND_CONCURRENT_JOBS, thread_name_prefix="background-job")
+HEAVY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=HEAVY_CONCURRENT_JOBS, thread_name_prefix="heavy-job")
+INTERACTIVE_MELI_MAX_IN_FLIGHT = configured_int(
+    "MELI_INTERACTIVE_MAX_IN_FLIGHT", "interactive_meli_max_in_flight", maximum=12
 )
-BACKGROUND_MELI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(
-    max(1, min(8, int(os.getenv("MELI_BACKGROUND_MAX_IN_FLIGHT", "4"))))
+BACKGROUND_MELI_MAX_IN_FLIGHT = configured_int(
+    "MELI_BACKGROUND_MAX_IN_FLIGHT", "background_meli_max_in_flight", maximum=10
 )
+INTERACTIVE_MELI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(INTERACTIVE_MELI_MAX_IN_FLIGHT)
+BACKGROUND_MELI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(BACKGROUND_MELI_MAX_IN_FLIGHT)
 MELI_WORK_CONTEXT = threading.local()
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
@@ -142,17 +223,57 @@ def is_catalog_listing(item):
     return meli_flag((item or {}).get("catalog_listing"))
 
 
+def file_signature(path):
+    try:
+        stat = path.stat()
+        return stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return None
+
+
+def invalidate_response_cache(name=""):
+    if name not in {APP_DATA_FILE, CATALOG_DATA_FILE, ""}:
+        return
+    with RESPONSE_CACHE_LOCK:
+        if name in {CATALOG_DATA_FILE, ""}:
+            RESPONSE_CACHE.pop("catalog-api", None)
+        if not name:
+            RESPONSE_CACHE.clear()
+
+
 def read_json(name, fallback):
     path = DATA / name
     if not path.exists():
         with DATA_LOCK:
             if not path.exists():
                 write_json(name, fallback)
+    cache_key = str(path.resolve())
+    signature = file_signature(path)
+    with JSON_CACHE_LOCK:
+        cached = JSON_CACHE.get(cache_key)
+        if cached and cached.get("signature") == signature:
+            cached_value = cached["value"]
+        else:
+            cached_value = None
+    if cached_value is not None:
+        return copy.deepcopy(cached_value)
     # Files are published with os.replace(), so readers can safely consume the
     # previous complete snapshot while a large catalog is being serialized.
     for attempt in range(3):
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            value = json.loads(path.read_text(encoding="utf-8"))
+            cached_value = copy.deepcopy(value)
+            with JSON_CACHE_LOCK:
+                JSON_CACHE[cache_key] = {
+                    "signature": file_signature(path),
+                    "value": cached_value,
+                    "loaded_at": time.monotonic(),
+                }
+                if len(JSON_CACHE) > 32:
+                    oldest = sorted(JSON_CACHE, key=lambda key: JSON_CACHE[key].get("loaded_at", 0))[:8]
+                    for key in oldest:
+                        JSON_CACHE.pop(key, None)
+            return value
         except (OSError, ValueError):
             if attempt == 2:
                 raise
@@ -164,16 +285,22 @@ def write_json(name, payload):
         path = DATA / name
         temporary = DATA / f".{name}.{uuid.uuid4().hex}.tmp"
         compact = name == CATALOG_DATA_FILE
-        temporary.write_text(
-            json.dumps(
-                payload,
-                indent=None if compact else 2,
-                separators=(",", ":") if compact else None,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
+        serialized = json.dumps(
+            payload,
+            indent=None if compact else 2,
+            separators=(",", ":") if compact else None,
+            ensure_ascii=False,
         )
+        temporary.write_text(serialized, encoding="utf-8")
         os.replace(temporary, path)
+        cached_value = copy.deepcopy(payload)
+        with JSON_CACHE_LOCK:
+            JSON_CACHE[str(path.resolve())] = {
+                "signature": file_signature(path),
+                "value": cached_value,
+                "loaded_at": time.monotonic(),
+            }
+        invalidate_response_cache(name)
 
 
 def ensure_sync_progress_loaded():
@@ -222,31 +349,38 @@ def sync_progress_snapshot():
 
 
 def read_payload(include_catalog=True):
-    with DATA_LOCK:
-        payload = read_json(APP_DATA_FILE, empty_payload())
-        embedded_catalog = payload.pop("catalog", None)
-        catalog_path = DATA / CATALOG_DATA_FILE
-        if embedded_catalog is not None:
+    # JSON files are committed with os.replace(), so readers never observe a
+    # partially written document. Keeping reads outside DATA_LOCK prevents a
+    # large catalog serialization from freezing dashboards and job polling.
+    payload = read_json(APP_DATA_FILE, empty_payload())
+    embedded_catalog = payload.pop("catalog", None)
+    catalog_path = DATA / CATALOG_DATA_FILE
+    if embedded_catalog is not None:
+        with DATA_LOCK:
+            payload = read_json(APP_DATA_FILE, empty_payload())
+            embedded_catalog = payload.pop("catalog", None)
+            if embedded_catalog is None:
+                embedded_catalog = []
             if embedded_catalog or not catalog_path.exists():
                 write_json(CATALOG_DATA_FILE, embedded_catalog)
             migration_payload = {**payload, "catalog": embedded_catalog}
             payload["catalog_counts_snapshot"] = catalog_counts(embedded_catalog)
             payload["operations_snapshot"] = build_operations(migration_payload)
             write_json(APP_DATA_FILE, payload)
-        payload["catalog"] = read_json(CATALOG_DATA_FILE, []) if include_catalog else []
-        if include_catalog:
-            for item in payload["catalog"]:
-                if item.get("winner_source") in {
-                    "catalog_lowest_active_offer",
-                    "catalog_reference",
-                    "products_items_winner_marker",
-                    "public_purchase_options",
-                    "public_product_page",
-                }:
-                    item.update(competition_snapshot(item))
-        payload["_catalog_loaded"] = bool(include_catalog)
-        payload.setdefault("_revision", 0)
-        return payload
+    payload["catalog"] = read_json(CATALOG_DATA_FILE, []) if include_catalog else []
+    if include_catalog:
+        for item in payload["catalog"]:
+            if item.get("winner_source") in {
+                "catalog_lowest_active_offer",
+                "catalog_reference",
+                "products_items_winner_marker",
+                "public_purchase_options",
+                "public_product_page",
+            }:
+                item.update(competition_snapshot(item))
+    payload["_catalog_loaded"] = bool(include_catalog)
+    payload.setdefault("_revision", 0)
+    return payload
 
 
 def record_key(collection, record):
@@ -1036,12 +1170,86 @@ def build_operations(payload):
     }
 
 
+class PersistentHttpTransport:
+    """Small thread-safe HTTP/1.1 pool for the Mercado Livre and Telegram APIs."""
+
+    def __init__(self, max_idle_per_host=16):
+        self.max_idle_per_host = max(2, int(max_idle_per_host))
+        self._idle = {}
+        self._lock = threading.RLock()
+        self._ssl_context = ssl.create_default_context()
+
+    def _connection_key(self, parsed):
+        default_port = 443 if parsed.scheme == "https" else 80
+        return parsed.scheme, parsed.hostname, parsed.port or default_port
+
+    def _new_connection(self, key, timeout):
+        scheme, hostname, port = key
+        if scheme == "https":
+            return http.client.HTTPSConnection(
+                hostname,
+                port,
+                timeout=timeout,
+                context=self._ssl_context,
+            )
+        return http.client.HTTPConnection(hostname, port, timeout=timeout)
+
+    def _acquire(self, key, timeout):
+        with self._lock:
+            connections = self._idle.get(key)
+            connection = connections.pop() if connections else None
+        if connection is None:
+            return self._new_connection(key, timeout)
+        connection.timeout = timeout
+        if connection.sock is not None:
+            connection.sock.settimeout(timeout)
+        return connection
+
+    def _release(self, key, connection):
+        with self._lock:
+            connections = self._idle.setdefault(key, [])
+            if len(connections) < self.max_idle_per_host:
+                connections.append(connection)
+                return
+        connection.close()
+
+    def request(self, url, method="GET", body=None, headers=None, timeout=20):
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("URL HTTP inválida")
+        key = self._connection_key(parsed)
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        connection = self._acquire(key, timeout)
+        try:
+            connection.request(method, target, body=body, headers=headers or {})
+            response = connection.getresponse()
+            response_body = response.read()
+            response_headers = {name.lower(): value for name, value in response.getheaders()}
+            reusable = not response.will_close and response_headers.get("connection", "").lower() != "close"
+            if reusable:
+                self._release(key, connection)
+            else:
+                connection.close()
+            return response.status, response_body, response_headers
+        except Exception:
+            connection.close()
+            raise
+
+
+HTTP_TRANSPORT = PersistentHttpTransport(
+    max_idle_per_host=max(4, min(32, int(os.getenv("COMPETIDOR_HTTP_POOL_IDLE_PER_HOST", "16"))))
+)
+
+
 def request_json(url, method="GET", payload=None, headers=None, retries=None, timeout=None):
     body = None
-    request_headers = headers or {}
+    request_headers = dict(headers or {})
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
         request_headers.setdefault("Content-Type", "application/json")
+    request_headers.setdefault("Accept", "application/json")
     method = method.upper()
     attempts = int(retries if retries is not None else (4 if method in {"GET", "PUT"} else 1))
     transient_statuses = {429, 500, 502, 503, 504}
@@ -1051,37 +1259,39 @@ def request_json(url, method="GET", payload=None, headers=None, retries=None, ti
         background_request = getattr(MELI_WORK_CONTEXT, "priority", "interactive") == "background"
         if background_request:
             wait_for_interactive_meli_priority()
-        req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
         try:
             if background_request:
                 with BACKGROUND_MELI_REQUEST_SEMAPHORE:
-                    with urllib.request.urlopen(req, timeout=request_timeout) as response:
-                        text = response.read().decode("utf-8")
+                    status, response_body, response_headers = HTTP_TRANSPORT.request(
+                        url, method=method, body=body, headers=request_headers, timeout=request_timeout
+                    )
             else:
-                with urllib.request.urlopen(req, timeout=request_timeout) as response:
-                    text = response.read().decode("utf-8")
-            return json.loads(text) if text else {}
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
-            if exc.code not in transient_statuses or attempt + 1 >= attempts:
-                raise last_error from exc
-            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                with INTERACTIVE_MELI_REQUEST_SEMAPHORE:
+                    status, response_body, response_headers = HTTP_TRANSPORT.request(
+                        url, method=method, body=body, headers=request_headers, timeout=request_timeout
+                    )
+            text = response_body.decode("utf-8", errors="replace")
+            if 200 <= status < 300:
+                return json.loads(text) if text else {}
+            last_error = RuntimeError(f"HTTP {status}: {text}")
+            if status not in transient_statuses or attempt + 1 >= attempts:
+                raise last_error
+            retry_after = response_headers.get("retry-after")
             try:
                 delay = float(retry_after) if retry_after else min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5)
             except (TypeError, ValueError):
                 delay = min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5)
             time.sleep(delay)
-        except urllib.error.URLError as exc:
-            last_error = RuntimeError(f"Falha temporária de conexão com a API: {exc.reason}")
-            if attempt + 1 >= attempts:
-                raise last_error from exc
-            time.sleep(min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5))
         except TimeoutError as exc:
             last_error = RuntimeError(f"A API do Mercado Livre não respondeu em até {request_timeout:g} segundos.")
             if attempt + 1 >= attempts:
                 raise last_error from exc
             time.sleep(min(4.0, 0.4 * (2**attempt)) + random.uniform(0.1, 0.3))
+        except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
+            last_error = RuntimeError(f"Falha temporária de conexão com a API: {exc}")
+            if attempt + 1 >= attempts:
+                raise last_error from exc
+            time.sleep(min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5))
     raise last_error or RuntimeError("Não foi possível concluir a chamada à API.")
 
 
@@ -2401,7 +2611,7 @@ def auto_catalog_competition_loop():
     interval = max(30, int(os.getenv("AUTO_COMPETITION_INTERVAL_SECONDS", "60")))
     startup_delay = max(30, int(os.getenv("AUTO_COMPETITION_STARTUP_DELAY_SECONDS", "75")))
     batch_size = max(1, int(os.getenv("AUTO_COMPETITION_BATCH_SIZE", "250")))
-    workers = max(1, min(12, int(os.getenv("AUTO_COMPETITION_WORKERS", "8"))))
+    workers = configured_int("AUTO_COMPETITION_WORKERS", "competition_workers", maximum=12)
     time.sleep(startup_delay)
     while True:
         try:
@@ -4117,7 +4327,7 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
                 ]
         return batch_start, batch_items, len(batch_ids)
 
-    batch_workers = max(1, min(8, int(os.getenv("MELI_SYNC_BATCH_WORKERS", "4"))))
+    batch_workers = configured_int("MELI_SYNC_BATCH_WORKERS", "sync_batch_workers", maximum=8)
     fetched_count = 0
     with ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="meli-items") as executor:
         futures = [executor.submit(run_meli_work, "background", fetch_item_batch, batch) for batch in batches]
@@ -4177,6 +4387,45 @@ def rotating_batch(rows, cursor, batch_size):
     return selected, next_cursor
 
 
+def fetch_official_items_by_id(client, item_ids, workers=None):
+    """Fetch item batches concurrently while the global API lane remains bounded."""
+    item_ids = [str(item_id) for item_id in item_ids or [] if item_id]
+    if not item_ids:
+        return {}
+    bulk_size = max(1, min(20, int(os.getenv("MELI_ITEM_BULK_SIZE", "20"))))
+    batches = [item_ids[start:start + bulk_size] for start in range(0, len(item_ids), bulk_size)]
+    worker_count = max(
+        1,
+        min(
+            len(batches),
+            int(workers or configured_int("AUTO_REFRESH_BATCH_WORKERS", "sync_batch_workers", maximum=8)),
+        ),
+    )
+
+    def fetch_batch(batch_ids):
+        try:
+            return client.items_bulk(batch_ids) or []
+        except Exception:
+            recovered = []
+            for item_id in batch_ids:
+                try:
+                    official = client.item(item_id)
+                    if official:
+                        recovered.append(official)
+                except Exception:
+                    continue
+            return recovered
+
+    official_by_id = {}
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="meli-refresh") as executor:
+        futures = [executor.submit(run_meli_work, "background", fetch_batch, batch) for batch in batches]
+        for future in as_completed(futures):
+            for official in future.result() or []:
+                if official.get("id"):
+                    official_by_id[str(official["id"])] = official
+    return official_by_id
+
+
 def discover_recent_official_items(payload, account, client, per_status=None):
     """Import newly published items quickly without running a full account scan."""
     per_status = max(10, min(100, int(per_status or os.getenv("AUTO_DISCOVERY_ITEMS_PER_STATUS", "50"))))
@@ -4206,25 +4455,15 @@ def discover_recent_official_items(payload, account, client, per_status=None):
         return []
 
     imported = []
-    bulk_size = max(1, min(20, int(os.getenv("MELI_ITEM_BULK_SIZE", "20"))))
-    for start in range(0, len(recent_ids), bulk_size):
-        batch_ids = recent_ids[start:start + bulk_size]
-        try:
-            official_items = client.items_bulk(batch_ids)
-        except Exception:
-            official_items = []
-            for item_id in batch_ids:
-                try:
-                    official_items.append(client.item(item_id))
-                except Exception:
-                    continue
-        for official in official_items:
-            if not official.get("id"):
-                continue
-            row = synced_catalog_item(account, official, {})
-            row["first_seen_at"] = now_label()
-            row["updated_at"] = now_label()
-            imported.append(row)
+    official_by_id = fetch_official_items_by_id(client, recent_ids)
+    for item_id in recent_ids:
+        official = official_by_id.get(str(item_id))
+        if not official:
+            continue
+        row = synced_catalog_item(account, official, {})
+        row["first_seen_at"] = now_label()
+        row["updated_at"] = now_label()
+        imported.append(row)
     payload.setdefault("catalog", []).extend(imported)
     return imported
 
@@ -4255,21 +4494,8 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
     client = account_client(account)
     refreshed = 0
     prior_by_id = {item.get("id"): dict(item) for item in [*selected, *competition_selected]}
-    official_by_id = {}
-    bulk_size = max(1, min(20, int(os.getenv("MELI_ITEM_BULK_SIZE", "20"))))
     selected_ids = [item.get("id") for item in selected if item.get("id")]
-    for start in range(0, len(selected_ids), bulk_size):
-        batch_ids = selected_ids[start : start + bulk_size]
-        try:
-            for official in client.items_bulk(batch_ids):
-                if official.get("id"):
-                    official_by_id[official["id"]] = official
-        except Exception:
-            for item_id in batch_ids:
-                try:
-                    official_by_id[item_id] = client.item(item_id)
-                except Exception:
-                    pass
+    official_by_id = fetch_official_items_by_id(client, selected_ids)
     for current in selected:
         try:
             official = official_by_id.get(current.get("id"))
@@ -4623,7 +4849,7 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
         ASYNC_OPERATION_JOBS[job_id] = job
 
     def worker():
-        interactive = not heavy and priority == "interactive"
+        interactive = not heavy and priority in {"interactive", "manual"}
         if interactive:
             with ASYNC_OPERATION_JOBS_LOCK:
                 ACTIVE_CLONE_OPERATIONS.add(job_id)
@@ -4631,6 +4857,7 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
             semaphore = (
                 HEAVY_WORKER_SEMAPHORE if heavy
                 else BACKGROUND_WORKER_SEMAPHORE if priority == "background"
+                else MANUAL_WORKER_SEMAPHORE if priority == "manual"
                 else CLONE_WORKER_SEMAPHORE
             )
             with semaphore:
@@ -4667,7 +4894,13 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
                 with ASYNC_OPERATION_JOBS_LOCK:
                     ACTIVE_CLONE_OPERATIONS.discard(job_id)
 
-    threading.Thread(target=worker, daemon=True).start()
+    executor = (
+        HEAVY_JOB_EXECUTOR if heavy
+        else BACKGROUND_JOB_EXECUTOR if priority == "background"
+        else MANUAL_JOB_EXECUTOR if priority == "manual"
+        else INTERACTIVE_JOB_EXECUTOR
+    )
+    executor.submit(worker)
     return {"job_id": job_id, "status": "queued", "message": message, "poll_url": f"/api/async/jobs/{job_id}"}
 
 
@@ -4717,6 +4950,190 @@ def item_description_operation(request, actor=None):
         )
         write_payload(payload)
     return {"ok": True, "description": text, "official": official}
+
+
+def update_item_operation(request, actor=None):
+    payload = read_payload()
+    item_id = str(request.get("item_id") or "")
+    account_id = str(request.get("account_id") or "")
+    account = next(
+        (
+            item for item in payload.get("accounts", [])
+            if str(item.get("id") or "") == account_id or item.get("nickname") == request.get("account")
+        ),
+        None,
+    )
+    if not account or not account.get("official"):
+        raise RuntimeError("Conta oficial não encontrada para atualizar o anúncio.")
+    client = account_client(account)
+    update = {}
+    for key in ("price", "available_quantity", "title"):
+        if key in request and request[key] not in ("", None):
+            update[key] = request[key]
+    if request.get("status_action") == "pause":
+        update["status"] = "paused"
+    if request.get("status_action") == "activate":
+        update["status"] = "active"
+
+    dimension_attrs = []
+    expected_package_values = {}
+    dimension_map = {
+        "package_weight": "SELLER_PACKAGE_WEIGHT",
+        "package_height": "SELLER_PACKAGE_HEIGHT",
+        "package_width": "SELLER_PACKAGE_WIDTH",
+        "package_length": "SELLER_PACKAGE_LENGTH",
+    }
+    for request_key, attr_id in dimension_map.items():
+        if clean_attribute_value(request.get(request_key)):
+            api_value = seller_package_api_value(request_key, request.get(request_key))
+            expected_package_values[request_key] = api_value
+            dimension_attrs.append({"id": attr_id, "value_name": api_value})
+    if dimension_attrs:
+        update["attributes"] = dimension_attrs
+
+    expected_gtin_codes = []
+    if clean_attribute_value(request.get("gtin")):
+        gtin_fragment, expected_gtin_codes = run_interactive_meli_call(
+            item_gtin_update_fragment, client, item_id, request.get("gtin")
+        )
+        if gtin_fragment.get("attributes"):
+            update["attributes"] = [*(update.get("attributes") or []), *gtin_fragment["attributes"]]
+        if gtin_fragment.get("variations"):
+            update["variations"] = gtin_fragment["variations"]
+    if not update:
+        raise RuntimeError("Nenhum campo informado para atualizar.")
+
+    official = run_interactive_meli_call(client.update_item, item_id, update)
+    verified_item = run_interactive_meli_call(
+        verify_package_update, client, item_id, expected_package_values
+    ) if expected_package_values else {}
+    if expected_gtin_codes:
+        verified_gtin_item = run_interactive_meli_call(verify_gtin_update, client, item_id, expected_gtin_codes)
+        if not verified_item:
+            verified_item = verified_gtin_item
+    verified_package_values = package_values_from_item(verified_item) if verified_item else {}
+    stock_transition = None
+    updated_item = None
+    for item in payload.get("catalog", []):
+        if item.get("id") != item_id or (
+            account_id and item.get("account_id") not in {account_id, account.get("id")}
+        ):
+            continue
+        changes = {}
+        if "price" in update:
+            changes["price"] = {"from": item.get("price"), "to": update["price"]}
+            item["price"] = update["price"]
+            item["sale_fee_status"] = "pending"
+            item["sale_fee_updated_at"] = ""
+            item["sale_fee_basis"] = ""
+        if "available_quantity" in update:
+            changes["stock"] = {"from": item.get("stock"), "to": update["available_quantity"]}
+            stock_transition = (int(item.get("stock") or 0), int(update["available_quantity"] or 0), item)
+            item["stock"] = update["available_quantity"]
+        if "title" in update:
+            changes["title"] = {"from": item.get("title"), "to": update["title"]}
+            item["title"] = update["title"]
+        for request_key in dimension_map:
+            if clean_attribute_value(request.get(request_key)):
+                normalized_value = verified_package_values.get(request_key) or normalize_package_value(
+                    expected_package_values[request_key], [dimension_map[request_key]]
+                )
+                changes[request_key] = {"from": item.get(request_key), "to": normalized_value}
+                item[request_key] = normalized_value
+        if expected_package_values:
+            item["shipping_cost_status"] = "pending"
+            item["shipping_cost_updated_at"] = ""
+            item["shipping_cost_basis"] = ""
+        if expected_gtin_codes:
+            new_gtin = ", ".join(expected_gtin_codes)
+            changes["gtin"] = {"from": item.get("gtin") or "", "to": new_gtin}
+            item["gtin"] = new_gtin
+        if update.get("status") == "paused":
+            changes["status"] = {"from": item.get("meli_status"), "to": "paused"}
+            item["status"] = "paused"
+            item["meli_status"] = "paused"
+        if update.get("status") == "active":
+            changes["status"] = {"from": item.get("meli_status"), "to": "active"}
+            item["status"] = "sharing" if is_catalog_listing(item) else "winning"
+            item["meli_status"] = "active"
+        item["item_data_checked_at"] = now_label()
+        item["updated_at"] = now_label()
+        apply_item_net_values(item)
+        append_item_log(payload, item, actor or {}, "Atualização manual", changes)
+        updated_item = item
+        break
+    if not updated_item:
+        raise RuntimeError("Anúncio não encontrado na conta informada.")
+    if stock_transition and stock_transition[0] > 0 and stock_transition[1] == 0:
+        alert_id = f"stock-{account.get('id')}-{item_id}-{uuid.uuid4().hex[:8]}"
+        alert = stock_alert(alert_id, account, stock_transition[2])
+        payload.setdefault("alerts", []).insert(0, alert)
+        notify_alert(payload, alert)
+    write_payload(payload)
+    return {"ok": True, "official": official, "item": updated_item}
+
+
+def win_catalog_operation(request, actor=None):
+    payload = read_payload()
+    item_id = str(request.get("item_id") or "")
+    item = next((row for row in payload.get("catalog", []) if row.get("id") == item_id), None)
+    if not item:
+        raise RuntimeError("Anúncio não encontrado.")
+    if not item.get("price_to_win"):
+        raise RuntimeError("O Mercado Livre não retornou preço sugerido para ganhar este catálogo.")
+    account = next((row for row in payload.get("accounts", []) if row.get("id") == item.get("account_id")), None)
+    if not account:
+        raise RuntimeError("Conta oficial não encontrada.")
+    official = run_interactive_meli_call(
+        account_client(account).update_item, item_id, {"price": item["price_to_win"]}
+    )
+    old_price = item.get("price")
+    item["price"] = item["price_to_win"]
+    item["sale_fee_status"] = "pending"
+    item["sale_fee_updated_at"] = ""
+    item["sale_fee_basis"] = ""
+    item["item_data_checked_at"] = now_label()
+    item["updated_at"] = now_label()
+    apply_item_net_values(item)
+    append_item_log(payload, item, actor or {}, "Ganhar catálogo", {"price": {"from": old_price, "to": item["price_to_win"]}})
+    write_payload(payload)
+    return {"ok": True, "official": official, "item": item}
+
+
+def flex_item_operation(request, actor=None, activate=False):
+    payload = read_payload()
+    item_id = str(request.get("item_id") or "")
+    account_id = str(request.get("account_id") or "")
+    item = next((row for row in payload.get("catalog", []) if row.get("id") == item_id), None)
+    if not item:
+        raise RuntimeError("Anúncio não encontrado.")
+    account = next(
+        (
+            row for row in payload.get("accounts", [])
+            if row.get("id") == account_id or row.get("id") == item.get("account_id")
+        ),
+        None,
+    )
+    action = "ativar" if activate else "remover"
+    if not account or not account.get("official"):
+        raise RuntimeError(f"Conta oficial não encontrada para {action} o Mercado Envios Flex.")
+    logistic_type = "self_service" if activate else "drop_off"
+    update = {"shipping": {"mode": item.get("shipping_mode") or "me2", "logistic_type": logistic_type}}
+    official = run_interactive_meli_call(account_client(account).update_item, item_id, update)
+    old_logistic_type = item.get("shipping_logistic_type") or ""
+    item["shipping_mode"] = update["shipping"]["mode"]
+    item["shipping_logistic_type"] = logistic_type
+    item["item_data_checked_at"] = now_label()
+    item["updated_at"] = now_label()
+    append_item_log(
+        payload,
+        item,
+        actor or {},
+        "Ativação Mercado Envios Flex" if activate else "Remoção Mercado Envios Flex",
+        {"shipping_logistic_type": {"from": old_logistic_type, "to": logistic_type}},
+    )
+    write_payload(payload)
+    return {"ok": True, "official": official, "item": item}
 
 
 def bulk_price_operation(request, actor=None):
@@ -7319,7 +7736,7 @@ def start_statistics_job(request):
                         }
                     )
 
-    threading.Thread(target=worker, daemon=True).start()
+    HEAVY_JOB_EXECUTOR.submit(worker)
     return {key: value for key, value in job.items() if key not in {"result", "signature", "created_epoch"}}
 
 
@@ -7345,7 +7762,13 @@ def cleanup_report_jobs(now=None):
             if now - float(job.get("created_epoch") or now) > maximum_age
         ]
         for job_id in expired:
-            REPORT_JOBS.pop(job_id, None)
+            job = REPORT_JOBS.pop(job_id, None) or {}
+            try:
+                report_path = Path(job.get("path") or "")
+                if report_path.is_file() and report_path.parent.resolve() == EXPORTS.resolve():
+                    report_path.unlink()
+            except (OSError, ValueError):
+                pass
 
 
 def report_job_result(job_id, include_body=False):
@@ -7354,9 +7777,10 @@ def report_job_result(job_id, include_body=False):
         job = REPORT_JOBS.get(str(job_id or ""))
         if not job:
             return None
-        public = {key: value for key, value in job.items() if key not in {"body", "created_epoch"}}
+        public = {key: value for key, value in job.items() if key not in {"body", "path", "created_epoch"}}
         if include_body:
             public["body"] = job.get("body")
+            public["path"] = job.get("path")
         return public
 
 
@@ -7419,15 +7843,19 @@ def start_report_job(request):
                 body = build_report_pdf(title, columns, rows, metadata)
                 content_type = "application/pdf"
             filename = f"competidor-{report_type}-{stamp}.{output_format}"
+            target = EXPORTS / f"{job_id}-{filename}"
+            target.write_bytes(body)
+            body_size = len(body)
+            del body
             with REPORT_JOBS_LOCK:
                 REPORT_JOBS[job_id].update(
                     {
                         "status": "completed",
                         "message": "Relatório concluído e pronto para baixar.",
-                        "body": body,
+                        "path": str(target),
                         "content_type": content_type,
                         "filename": filename,
-                        "size": len(body),
+                        "size": body_size,
                         "finished_at": now_label(),
                     }
                 )
@@ -7437,7 +7865,7 @@ def start_report_job(request):
                     {"status": "error", "message": str(exc), "finished_at": now_label()}
                 )
 
-    threading.Thread(target=worker, daemon=True).start()
+    HEAVY_JOB_EXECUTOR.submit(worker)
     return report_job_result(job_id)
 
 
@@ -7899,7 +8327,22 @@ def build_bulk_spreadsheet(payload, filters):
     return stream.getvalue()
 
 
+def cleanup_spreadsheet_jobs():
+    cutoff = time.monotonic() - max(900, int(os.getenv("MELI_SPREADSHEET_JOB_TTL_SECONDS", "21600")))
+    with SPREADSHEET_JOBS_LOCK:
+        expired = [key for key, value in SPREADSHEET_JOBS.items() if value.get("created", 0) < cutoff]
+        jobs = [SPREADSHEET_JOBS.pop(key, {}) for key in expired]
+    for job in jobs:
+        try:
+            target = Path(job.get("path") or "")
+            if target.is_file() and target.parent.resolve() == EXPORTS.resolve():
+                target.unlink()
+        except (OSError, ValueError):
+            pass
+
+
 def spreadsheet_job_result(job_id):
+    cleanup_spreadsheet_jobs()
     with SPREADSHEET_JOBS_LOCK:
         job = SPREADSHEET_JOBS.get(str(job_id or ""))
         if not job:
@@ -7908,6 +8351,7 @@ def spreadsheet_job_result(job_id):
 
 
 def start_spreadsheet_template_job(filters, actor=None):
+    cleanup_spreadsheet_jobs()
     job_id = f"sheet-{uuid.uuid4().hex[:12]}"
     stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M")
     target = EXPORTS / f"competidor-edicao-anuncios-{stamp}-{job_id[-6:]}.xlsx"
@@ -7944,7 +8388,7 @@ def start_spreadsheet_template_job(filters, actor=None):
             with SPREADSHEET_JOBS_LOCK:
                 SPREADSHEET_JOBS[job_id].update({"status": "error", "message": str(exc)})
 
-    threading.Thread(target=worker, daemon=True).start()
+    HEAVY_JOB_EXECUTOR.submit(worker)
     return spreadsheet_job_result(job_id)
 
 
@@ -8049,9 +8493,7 @@ def parse_bulk_spreadsheet(payload, encoded_file, actor):
             "changes": changes,
             "errors": errors,
         }
-        expired = [key for key, value in SPREADSHEET_JOBS.items() if time.monotonic() - value.get("created", 0) > 1800]
-        for key in expired:
-            SPREADSHEET_JOBS.pop(key, None)
+    cleanup_spreadsheet_jobs()
     return {"token": token, "changes": changes, "errors": errors, "ready": len(changes), "invalid": len(errors)}
 
 
@@ -8400,7 +8842,85 @@ def execute_clone_batch_request(request):
     return {"ok": True, "jobs": selected, "copied": copied}
 
 
+def catalog_api_response(payload=None):
+    signatures = (file_signature(DATA / CATALOG_DATA_FILE),)
+    with RESPONSE_CACHE_LOCK:
+        cached = RESPONSE_CACHE.get("catalog-api")
+        if cached and cached.get("signatures") == signatures:
+            return cached["body"], cached["etag"]
+
+    payload = payload or read_payload(include_catalog=True)
+    reclassify_internal_competition(payload)
+    catalog = payload.get("catalog", [])
+    response = {
+        "catalog": catalog,
+        "catalog_counts": catalog_counts(catalog),
+    }
+    body = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    signature_text = repr(signatures).encode("utf-8")
+    etag = f'"catalog-{hashlib.sha256(signature_text).hexdigest()[:20]}"'
+    with RESPONSE_CACHE_LOCK:
+        RESPONSE_CACHE["catalog-api"] = {
+            "signatures": signatures,
+            "body": body,
+            "etag": etag,
+        }
+    return body, etag
+
+
+def dashboard_api_response(payload, actor):
+    signatures = (
+        file_signature(DATA / APP_DATA_FILE),
+        file_signature(DATA / SYNC_PROGRESS_FILE),
+    )
+    actor_key = str((actor or {}).get("id") or "anonymous")
+    cache_key = f"dashboard-api:{actor_key}"
+    with RESPONSE_CACHE_LOCK:
+        cached = RESPONSE_CACHE.get(cache_key)
+        if cached and cached.get("signatures") == signatures:
+            return cached["body"], cached["etag"]
+
+    response = public_payload(payload, actor, include_catalog=False)
+    body = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    etag_source = f"{actor_key}:{signatures!r}".encode("utf-8")
+    etag = f'"dashboard-{hashlib.sha256(etag_source).hexdigest()[:20]}"'
+    with RESPONSE_CACHE_LOCK:
+        RESPONSE_CACHE[cache_key] = {
+            "signatures": signatures,
+            "body": body,
+            "etag": etag,
+        }
+    return body, etag
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = HTTP_REQUEST_QUEUE
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        request.settimeout(max(5, int(os.getenv("COMPETIDOR_HTTP_KEEPALIVE_TIMEOUT_SECONDS", "30"))))
+        return request, client_address
+
+    def process_request(self, request, client_address):
+        HTTP_REQUEST_SEMAPHORE.acquire()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            HTTP_REQUEST_SEMAPHORE.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            HTTP_REQUEST_SEMAPHORE.release()
+
+
 class App(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         return
 
@@ -8411,10 +8931,21 @@ class App(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return False
 
-    def send_json(self, payload, status=200, headers=None):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    def response_body(self, body, content_type):
+        accepts_gzip = "gzip" in str(self.headers.get("Accept-Encoding") or "").lower()
+        threshold = configured_int("COMPETIDOR_GZIP_THRESHOLD_BYTES", "gzip_threshold_bytes")
+        compressible = content_type.startswith(("application/json", "application/javascript", "text/"))
+        if accepts_gzip and compressible and len(body) >= threshold:
+            return gzip.compress(body, compresslevel=1), "gzip"
+        return body, ""
+
+    def send_json_body(self, body, status=200, headers=None):
+        body, encoding = self.response_body(body, "application/json")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.send_security_headers()
         response_headers = headers or {}
         if "Set-Cookie" not in response_headers:
@@ -8430,6 +8961,25 @@ class App(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.write_response_body(body)
+
+    def send_json(self, payload, status=200, headers=None):
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_json_body(body, status=status, headers=headers)
+
+    def send_not_modified(self, headers=None):
+        self.send_response(304)
+        self.send_security_headers()
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+
+    def send_redirect(self, location, headers=None):
+        self.send_response(302)
+        self.send_header("Location", location)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def send_bytes(self, body, content_type, filename, status=200):
         self.send_response(status)
@@ -8566,9 +9116,29 @@ class App(BaseHTTPRequestHandler):
             ".jpeg": "image/jpeg",
             ".webp": "image/webp",
         }
-        body = target.read_bytes()
+        signature = file_signature(target)
+        cache_key = str(target)
+        with STATIC_FILE_CACHE_LOCK:
+            cached = STATIC_FILE_CACHE.get(cache_key)
+            if not cached or cached.get("signature") != signature:
+                cached = {"signature": signature, "body": target.read_bytes()}
+                STATIC_FILE_CACHE[cache_key] = cached
+        body = cached["body"]
+        etag_source = f"{signature}:{target.name}".encode("utf-8")
+        etag = f'"static-{hashlib.sha256(etag_source).hexdigest()[:18]}"'
+        cache_control = "no-cache" if target.suffix == ".html" else "public, max-age=300, must-revalidate"
+        if self.headers.get("If-None-Match") == etag:
+            self.send_not_modified({"ETag": etag, "Cache-Control": cache_control})
+            return
+        content_type = content_types.get(target.suffix, "application/octet-stream")
+        body, encoding = self.response_body(body, content_type)
         self.send_response(200)
-        self.send_header("Content-Type", content_types.get(target.suffix, "application/octet-stream"))
+        self.send_header("Content-Type", content_type)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", cache_control)
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -8576,7 +9146,58 @@ class App(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        payload = read_payload(include_catalog=parsed.path == "/api/catalog")
+        if not parsed.path.startswith("/api/"):
+            self.serve_file(parsed.path if "." in Path(parsed.path).name else "/")
+            return
+        if parsed.path == "/api/health":
+            with SYNC_LOCK:
+                active_syncs = len(ACTIVE_SYNC_ACCOUNTS)
+            with ASYNC_OPERATION_JOBS_LOCK:
+                active_interactive = len(ACTIVE_CLONE_OPERATIONS)
+                job_counts = {}
+                for job in ASYNC_OPERATION_JOBS.values():
+                    key = f"{job.get('priority') or 'interactive'}_{job.get('status') or 'unknown'}"
+                    job_counts[key] = job_counts.get(key, 0) + 1
+            self.send_json(
+                {
+                    "ok": True,
+                    "service": "CompeTIDOR",
+                    "profile": PERFORMANCE_PROFILE,
+                    "uptime_seconds": int(time.time() - RUNTIME_STARTED_AT),
+                    "active_sync_accounts": active_syncs,
+                    "active_interactive_operations": active_interactive,
+                    "operation_jobs": job_counts,
+                    "notification_queue": MELI_NOTIFICATION_QUEUE.qsize(),
+                    "http_max_concurrent_requests": HTTP_MAX_CONCURRENT_REQUESTS,
+                    "http_pool_idle_per_host": HTTP_TRANSPORT.max_idle_per_host,
+                    "manual_concurrent_jobs": MANUAL_CONCURRENT_JOBS,
+                    "clone_concurrent_jobs": CLONE_CONCURRENT_JOBS,
+                    "background_concurrent_jobs": BACKGROUND_CONCURRENT_JOBS,
+                    "heavy_concurrent_jobs": HEAVY_CONCURRENT_JOBS,
+                    "interactive_meli_max_in_flight": INTERACTIVE_MELI_MAX_IN_FLIGHT,
+                    "background_meli_max_in_flight": BACKGROUND_MELI_MAX_IN_FLIGHT,
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+            return
+        if parsed.path in {"/api/catalog", "/api/item-logs"}:
+            metadata = read_payload(include_catalog=False)
+            if not self.require_auth(metadata):
+                return
+            if parsed.path == "/api/item-logs":
+                self.send_json(
+                    {"item_logs": metadata.get("item_logs", [])[:500]},
+                    headers={"Cache-Control": "private, no-cache"},
+                )
+                return
+            body, etag = catalog_api_response()
+            headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+            if self.headers.get("If-None-Match") == etag:
+                self.send_not_modified(headers)
+            else:
+                self.send_json_body(body, headers=headers)
+            return
+        payload = read_payload(include_catalog=False)
 
         if parsed.path == "/api/auth/me":
             user = self.current_user(payload)
@@ -8585,10 +9206,10 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/auth/logout":
             self.clear_session()
-            self.send_response(302)
-            self.send_header("Set-Cookie", "competidor_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
-            self.send_header("Location", "/#/dashboard")
-            self.end_headers()
+            self.send_redirect(
+                "/#/dashboard",
+                {"Set-Cookie": "competidor_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"},
+            )
             return
 
         if parsed.path.startswith("/api/") and parsed.path not in {"/api/oauth/callback"}:
@@ -8626,24 +9247,12 @@ class App(BaseHTTPRequestHandler):
             if notifications_migrated or alerts_enriched:
                 write_payload(payload)
             enqueue_dashboard_thumbnail_refresh()
-            self.send_json(public_payload(payload, self.current_user(payload), include_catalog=False))
-            return
-        if parsed.path == "/api/catalog":
-            reclassify_internal_competition(payload)
-            catalog = payload.get("catalog", [])
-            self.send_json(
-                {
-                    "catalog": catalog,
-                    "item_logs": payload.get("item_logs", [])[:500],
-                    "catalog_counts": {
-                        "total": len(catalog),
-                        "winning": len([item for item in catalog if item.get("status") == "winning"]),
-                        "losing": len([item for item in catalog if item.get("status") == "losing"]),
-                        "sharing": len([item for item in catalog if item.get("status") == "sharing"]),
-                        "paused": len([item for item in catalog if item.get("status") == "paused" or item.get("meli_status") == "paused"]),
-                    },
-                }
-            )
+            body, etag = dashboard_api_response(payload, self.current_user(payload))
+            headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+            if self.headers.get("If-None-Match") == etag:
+                self.send_not_modified(headers)
+            else:
+                self.send_json_body(body, headers=headers)
             return
         if parsed.path.startswith("/api/async/jobs/"):
             job_id = parsed.path.rsplit("/", 1)[-1]
@@ -8669,10 +9278,10 @@ class App(BaseHTTPRequestHandler):
             if not job:
                 self.send_json({"error": "Relatório não encontrado ou expirado."}, status=404)
             elif download:
-                if job.get("status") != "completed" or not job.get("body"):
+                if job.get("status") != "completed" or not job.get("path"):
                     self.send_json({"error": job.get("message") or "O relatório ainda não está pronto."}, status=409)
                 else:
-                    self.send_bytes(job["body"], job["content_type"], job["filename"])
+                    self.send_file_download(job["path"], job["content_type"], job["filename"])
             else:
                 self.send_json({"ok": True, **job})
             return
@@ -8755,17 +9364,13 @@ class App(BaseHTTPRequestHandler):
             switch_account = query.get("switch_account", ["0"])[0] == "1"
             issues = oauth_issues()
             if issues:
-                self.send_response(302)
-                self.send_header("Location", "/#/contas?oauth=config")
-                self.end_headers()
+                self.send_redirect("/#/contas?oauth=config")
                 return
             state = str(uuid.uuid4())
             states = read_json("oauth_states.json", [])
             states.append({"state": state, "created_at": int(time.time())})
             write_json("oauth_states.json", states[-20:])
-            self.send_response(302)
-            self.send_header("Location", MercadoLivreClient().auth_url(state, self.redirect_uri(), switch_account))
-            self.end_headers()
+            self.send_redirect(MercadoLivreClient().auth_url(state, self.redirect_uri(), switch_account))
             return
         if parsed.path == "/api/oauth/callback":
             query = parse_qs(parsed.query)
@@ -8774,9 +9379,7 @@ class App(BaseHTTPRequestHandler):
             states = read_json("oauth_states.json", [])
             valid_state = any(item.get("state") == state for item in states)
             if not code or not valid_state:
-                self.send_response(302)
-                self.send_header("Location", "/#/contas?oauth=erro")
-                self.end_headers()
+                self.send_redirect("/#/contas?oauth=erro")
                 return
             try:
                 token = MercadoLivreClient().exchange_code(code, self.redirect_uri())
@@ -8821,17 +9424,12 @@ class App(BaseHTTPRequestHandler):
                     },
                 )
             write_payload(payload)
-            self.send_response(302)
-            self.send_header("Location", f"/#/contas?oauth={oauth_status}")
-            self.end_headers()
+            self.send_redirect(f"/#/contas?oauth={oauth_status}")
             return
         if parsed.path == "/api/notifications/meli":
             self.send_json({"ok": True})
             return
-        if not parsed.path.startswith("/api/") and "." not in Path(parsed.path).name:
-            self.serve_file("/")
-            return
-        self.serve_file(parsed.path)
+        self.send_json({"error": "Endpoint não encontrado"}, status=404)
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -8872,6 +9470,10 @@ class App(BaseHTTPRequestHandler):
             "/api/notifications/test",
             "/api/meli/item/clone-source",
             "/api/meli/item/description",
+            "/api/meli/item/update",
+            "/api/meli/item/win_catalog",
+            "/api/meli/item/remove_flex",
+            "/api/meli/item/activate_flex",
             "/api/clone/preview",
             "/api/clone/execute",
             "/api/clone/execute-batch",
@@ -9326,6 +9928,45 @@ class App(BaseHTTPRequestHandler):
                     "bulk_price",
                     lambda: bulk_price_operation(request_copy, actor),
                     "Alteração de preços adicionada à fila.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        manual_item_operations = {
+            "/api/meli/item/update": (
+                "item_update",
+                lambda request_copy, actor: update_item_operation(request_copy, actor),
+                "Atualização do anúncio adicionada à fila prioritária.",
+            ),
+            "/api/meli/item/win_catalog": (
+                "win_catalog",
+                lambda request_copy, actor: win_catalog_operation(request_copy, actor),
+                "Ajuste para ganhar o catálogo adicionado à fila prioritária.",
+            ),
+            "/api/meli/item/remove_flex": (
+                "remove_flex",
+                lambda request_copy, actor: flex_item_operation(request_copy, actor, activate=False),
+                "Remoção do Mercado Envios Flex adicionada à fila prioritária.",
+            ),
+            "/api/meli/item/activate_flex": (
+                "activate_flex",
+                lambda request_copy, actor: flex_item_operation(request_copy, actor, activate=True),
+                "Ativação do Mercado Envios Flex adicionada à fila prioritária.",
+            ),
+        }
+        if parsed.path in manual_item_operations:
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                kind, work, message = manual_item_operations[parsed.path]
+                operation = start_async_operation(
+                    kind,
+                    lambda: work(request_copy, actor),
+                    message,
+                    priority="manual",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -9612,22 +10253,32 @@ class App(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8765"))
-    http_server = ThreadingHTTPServer(("127.0.0.1", port), App)
+    http_server = BoundedThreadingHTTPServer(("127.0.0.1", port), App)
 
-    cert_file, key_file = ensure_dev_certificate()
-    tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    tls_context.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
-    https_server = ThreadingHTTPServer(("127.0.0.1", https_port()), App)
-    https_server.socket = tls_context.wrap_socket(https_server.socket, server_side=True)
+    dev_https_enabled = configured_bool("COMPETIDOR_ENABLE_DEV_HTTPS", True)
+    if dev_https_enabled:
+        cert_file, key_file = ensure_dev_certificate()
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
+        https_server = BoundedThreadingHTTPServer(("127.0.0.1", https_port()), App)
+        https_server.socket = tls_context.wrap_socket(https_server.socket, server_side=True)
+        threading.Thread(target=https_server.serve_forever, daemon=True).start()
 
-    threading.Thread(target=https_server.serve_forever, daemon=True).start()
     threading.Thread(target=meli_notification_loop, daemon=True).start()
     threading.Thread(target=resume_pending_official_syncs, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
     threading.Thread(target=auto_official_sync_loop, daemon=True).start()
     threading.Thread(target=auto_catalog_competition_loop, daemon=True).start()
-    print(f"CompeTIDOR rodando em http://127.0.0.1:{port}")
-    print(f"Callback HTTPS em https://127.0.0.1:{https_port()}/api/oauth/callback")
+    print(
+        f"CompeTIDOR rodando em http://127.0.0.1:{port} "
+        f"[perfil={PERFORMANCE_PROFILE}, http={HTTP_MAX_CONCURRENT_REQUESTS}, "
+        f"manual={MANUAL_CONCURRENT_JOBS}, api={INTERACTIVE_MELI_MAX_IN_FLIGHT}/"
+        f"{BACKGROUND_MELI_MAX_IN_FLIGHT}]"
+    )
+    if dev_https_enabled:
+        print(f"Callback HTTPS local em https://127.0.0.1:{https_port()}/api/oauth/callback")
+    else:
+        print("HTTPS local desativado; TLS deve terminar no proxy reverso.")
     http_server.serve_forever()
 
 
