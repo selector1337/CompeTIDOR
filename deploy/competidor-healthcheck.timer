@@ -1,0 +1,12 @@
+[Unit]
+Description=Verifica o CompeTIDOR a cada 30 segundos
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=competidor-healthcheck.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,40 @@
+[Unit]
+Description=CompeTIDOR Mercado Livre
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/competidor
+EnvironmentFile=/etc/competidor.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/competidor/.venv/bin/python /opt/competidor/server.py
+Restart=always
+RestartSec=5
+OOMPolicy=stop
+TimeoutStopSec=30
+User=www-data
+Group=www-data
+UMask=0077
+
+# O host tem 8 GB, mas e compartilhado com outras aplicacoes. Estes limites
+# deixam folga para Nginx, sistema operacional e os demais servicos.
+MemoryHigh=4G
+MemoryMax=5G
+MemorySwapMax=1G
+CPUQuota=500%
+CPUWeight=700
+IOWeight=500
+TasksMax=512
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/competidor
+
+[Install]
+WantedBy=multi-user.target
