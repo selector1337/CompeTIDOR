@@ -16,6 +16,7 @@
   adsListingType: "all",
   adsCatalog: "all",
   adsFlex: "all",
+  adsProfit: "all",
   adsSelectedIds: new Set(),
   stockPeriod: "today",
   stockCustomDate: "",
@@ -60,6 +61,11 @@
   shippingCostsLoading: false,
   saleFeesLoading: false,
   identifiersLoading: false,
+  pricesLoading: false,
+  bulkPriceProgress: null,
+  costsSearch: "",
+  costsPage: 1,
+  costsPageSize: 50,
   equalizationType: "listing_type_gap",
   equalizationAccount: "all",
   equalizationStatus: "all",
@@ -88,6 +94,7 @@ document.addEventListener("error", (event) => {
 const pageTitles = {
   dashboard: ["Painel unificado", "Dashboard"],
   estatisticas: ["Vendas oficiais", "Estatísticas por SKU"],
+  custos: ["Rentabilidade", "Custos por SKU"],
   relatorios: ["Equalização de contas", "Relatórios por SKU"],
   contas: ["OAuth oficial", "Contas Mercado Livre"],
   catalogo: ["Catálogo Mercado Livre", "Disputa de catálogo"],
@@ -156,10 +163,10 @@ async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 
   const startedAt = Date.now();
   const pollUrl = initial.poll_url || `/api/async/jobs/${initial.job_id}`;
   while (Date.now() - startedAt < timeoutMs) {
-    if (typeof onProgress === "function") onProgress(initial.message || "Processando no servidor...");
+    if (typeof onProgress === "function") onProgress(initial.message || "Processando no servidor...", initial);
     await new Promise((resolve) => window.setTimeout(resolve, 900));
     const job = await api(pollUrl);
-    if (typeof onProgress === "function") onProgress(job.message || "Processando no servidor...");
+    if (typeof onProgress === "function") onProgress(job.message || "Processando no servidor...", job);
     if (job.status === "completed") return job.result || {};
     if (job.status === "error") throw new Error(job.message || "O processamento em segundo plano não foi concluído.");
   }
@@ -186,6 +193,17 @@ async function runManualItemOperation(path, payload, button, progressLabel = "Pr
       else button.removeAttribute("title");
     }
   }
+}
+
+function mergeCatalogItem(updatedItem) {
+  if (!updatedItem?.id || !Array.isArray(state.data?.catalog)) return false;
+  let found = false;
+  state.data.catalog = state.data.catalog.map((item) => {
+    if (String(item.id) !== String(updatedItem.id)) return item;
+    found = true;
+    return { ...item, ...updatedItem };
+  });
+  return found;
 }
 
 function showToast(message, type = "success") {
@@ -241,6 +259,8 @@ async function loadCatalogInBackground(force = false) {
       state.data.item_logs = logs.item_logs || [];
       state.data.catalog_counts = result.catalog_counts || state.data.catalog_counts || {};
       state.data.sale_fee_progress = result.sale_fee_progress || state.data.sale_fee_progress || {};
+      state.data.sku_costs = result.sku_costs || state.data.sku_costs || {};
+      state.data.sku_last_sales = result.sku_last_sales || state.data.sku_last_sales || {};
       state.catalogLoaded = true;
       render();
     })
@@ -389,12 +409,13 @@ function render() {
 
 function renderRoute() {
   if (!state.data) return;
-  if (["catalogo", "anuncios", "copiar", "relatorios"].includes(state.route) && !state.catalogLoaded) {
+  if (["catalogo", "anuncios", "copiar", "relatorios", "custos"].includes(state.route) && !state.catalogLoaded) {
     loadCatalogInBackground();
   }
   const routeRenderers = {
     dashboard: renderDashboard,
     estatisticas: renderStatistics,
+    custos: renderCosts,
     relatorios: renderEqualizationReports,
     contas: () => {
       renderAccounts();
@@ -614,6 +635,115 @@ function opsRows(rows, empty, tone = "") {
     .join("") || `<div class="notice">${empty}</div>`;
 }
 
+function normalizedSkuKey(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function itemCommercialValues(item) {
+  const sku = normalizedSkuKey(item?.sku);
+  const costRecord = state.data?.sku_costs?.[sku];
+  const cost = costRecord && costRecord.cost !== null && costRecord.cost !== undefined
+    ? Number(costRecord.cost)
+    : null;
+  const feeKnown = item?.sale_fee_status === "ok"
+    && item?.sale_fee_amount !== null
+    && item?.sale_fee_amount !== undefined;
+  const price = Math.max(0, Number(item?.price) || 0);
+  const shipping = Math.max(0, Number(item?.shipping_cost) || 0);
+  const fee = feeKnown ? Math.max(0, Number(item?.sale_fee_amount) || 0) : null;
+  const net = feeKnown ? Math.max(0, price - fee - shipping) : null;
+  const profit = cost !== null && net !== null ? net - cost : null;
+  const lastSale = state.data?.sku_last_sales?.[sku] || {};
+  return {
+    sku,
+    cost,
+    fee,
+    shipping,
+    net,
+    profit,
+    profitStatus: profit === null ? "missing" : profit >= 0 ? "profit" : "loss",
+    lastSale,
+  };
+}
+
+function costLabel(item) {
+  const value = itemCommercialValues(item).cost;
+  return value === null ? "Sem custo cadastrado" : money.format(value);
+}
+
+function profitLabel(item) {
+  const commercial = itemCommercialValues(item);
+  if (commercial.cost === null) return "Sem custo cadastrado";
+  if (commercial.net === null) return "Aguardando tarifa";
+  return money.format(commercial.profit);
+}
+
+function profitFact(item) {
+  const commercial = itemCommercialValues(item);
+  const tone = commercial.profitStatus === "profit" ? "profit-positive"
+    : commercial.profitStatus === "loss" ? "profit-negative" : "profit-missing";
+  return `<div class="fact ${tone}"><small>Lucro / prejuízo</small><strong>${profitLabel(item)}</strong></div>`;
+}
+
+function renderCosts() {
+  const list = document.querySelector("#costs-list");
+  if (!list || !state.data) return;
+  if (!state.catalogLoaded) {
+    list.innerHTML = `<div class="notice">Carregando os SKUs das contas conectadas...</div>`;
+    loadCatalogInBackground();
+    return;
+  }
+  const grouped = new Map();
+  for (const item of state.data.catalog || []) {
+    const sku = normalizedSkuKey(item.sku);
+    if (!sku || sku === "-") continue;
+    if (!grouped.has(sku)) {
+      grouped.set(sku, {
+        sku,
+        title: item.title || "",
+        thumbnail: item.thumbnail || "",
+        accounts: new Set(),
+        listings: 0,
+        stock: 0,
+      });
+    }
+    const row = grouped.get(sku);
+    if (!row.thumbnail && item.thumbnail) row.thumbnail = item.thumbnail;
+    if (item.account) row.accounts.add(item.account);
+    row.listings += 1;
+    row.stock += Math.max(0, Number(item.stock) || 0);
+  }
+  const term = state.costsSearch.trim().toLowerCase();
+  const rows = [...grouped.values()]
+    .filter((row) => !term || `${row.sku} ${row.title}`.toLowerCase().includes(term))
+    .sort((a, b) => a.sku.localeCompare(b.sku, "pt-BR"));
+  const costs = state.data.sku_costs || {};
+  const configured = rows.filter((row) => costs[row.sku]?.cost !== undefined).length;
+  const summary = document.querySelector("#costs-summary");
+  if (summary) summary.innerHTML = `
+    <div><span>SKUs encontrados</span><strong>${rows.length.toLocaleString("pt-BR")}</strong></div>
+    <div class="inventory-value"><span>Com custo cadastrado</span><strong>${configured.toLocaleString("pt-BR")}</strong></div>
+    <div class="profit-negative"><span>Sem custo cadastrado</span><strong>${Math.max(0, rows.length - configured).toLocaleString("pt-BR")}</strong></div>
+  `;
+  const pageInfo = paginate(rows, state.costsPage, state.costsPageSize);
+  state.costsPage = pageInfo.current;
+  list.innerHTML = rows.length ? `${paginationHtml("costsPage", pageInfo)}
+    ${pageInfo.items.map((row) => {
+      const record = costs[row.sku] || {};
+      return `
+        <article class="cost-item" data-cost-row="${escapeAttr(row.sku)}">
+          ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="${escapeAttr(row.title || row.sku)}" loading="lazy" />` : `<span class="cost-thumb-empty">${escapeText(row.sku.slice(0, 2))}</span>`}
+          <div class="cost-product"><strong>${escapeText(row.sku)}</strong><span>${escapeText(row.title || "Produto sem título")}</span><small>${row.accounts.size} conta(s) · ${row.listings} anúncio(s) · estoque ${row.stock}</small></div>
+          <label>Custo unitário <span class="money-field"><input type="text" inputmode="decimal" data-cost-value="${escapeAttr(row.sku)}" value="${record.cost ?? ""}" placeholder="0,00" /></span></label>
+          <div class="cost-actions">
+            <button class="mini-button success-button" type="button" data-save-cost="${escapeAttr(row.sku)}">Salvar</button>
+            <button class="mini-button danger-button" type="button" data-delete-cost="${escapeAttr(row.sku)}" ${record.cost === undefined ? "disabled" : ""}>Remover</button>
+          </div>
+        </article>`;
+    }).join("")}
+    ${paginationHtml("costsPage", pageInfo)}` : `<div class="notice">Nenhum SKU encontrado com essa pesquisa.</div>`;
+}
+
 function renderCatalog() {
   const list = document.querySelector("#catalog-list");
   if (!state.catalogLoaded) {
@@ -665,7 +795,15 @@ function renderCatalog() {
               ${fact("Preço p/ ganhar", item.price_to_win ? money.format(item.price_to_win) : "Sem sugestão ML")}
               ${item.competition_checked_at ? fact("Verificado em", formatDateBR(item.competition_checked_at)) : ""}
             </div>
-            <div class="progress"><span style="width:${item.share}%; background:${colors[item.status]}; color:${colors[item.status]}"></span></div>
+            <div class="commercial-strip">
+              ${fact("Frete estimado ML", shippingCostLabel(item))}
+              ${fact("Tarifa de venda", saleFeeLabel(item))}
+              ${fact("Valor líquido", netSaleLabel(item))}
+              ${fact("Custo do SKU", costLabel(item))}
+              ${profitFact(item)}
+              ${fact("Última venda do SKU", itemCommercialValues(item).lastSale.date ? formatDateBR(itemCommercialValues(item).lastSale.date) : "Sem venda sincronizada")}
+            </div>
+            <div class="progress"><span style="width:${Math.max(0, Math.min(100, Number(item.share) || 0))}%; background:${colors[item.status] || colors.paused}; color:${colors[item.status] || colors.paused}"></span></div>
             <p class="catalog-action">${item.action}</p>
             ${item.competition_reason ? `<p class="catalog-action subtle-action">Competição: ${competitionReasonLabel(item.competition_reason)}</p>` : ""}
             ${item.official_source ? `
@@ -682,13 +820,16 @@ function renderCatalog() {
           </div>
           <div class="score">
             <small>Participação estimada</small>
-            <strong>${item.share}%</strong>
+            <strong>${Math.max(0, Math.min(100, Number(item.share) || 0))}%</strong>
             <small>Vencedor: ${catalogWinnerName(item)}</small>
           </div>
         </article>
       `
     )
     .join("") + paginationHtml("catalogPage", pageInfo) : `<div class="notice">Nenhum anúncio de catálogo encontrado.</div>`;
+  queueOfficialPriceRefresh(pageInfo.items);
+  queueShippingCostRefresh(pageInfo.items);
+  queueSaleFeeRefresh(pageInfo.items);
 }
 
 function catalogWinnerName(item) {
@@ -770,6 +911,7 @@ function renderAds() {
       && (state.adsListingType === "all" || item.listing_type_id === state.adsListingType)
       && (state.adsCatalog === "all" || (state.adsCatalog === "catalog" ? isCatalogItem(item) : !isCatalogItem(item)))
       && (state.adsFlex === "all" || (state.adsFlex === "active" ? item.shipping_logistic_type === "self_service" : item.shipping_logistic_type !== "self_service"))
+      && (state.adsProfit === "all" || itemCommercialValues(item).profitStatus === state.adsProfit)
       && (!productTerm || title.includes(productTerm))
       && (!brandTerm || brand.includes(brandTerm) || title.includes(brandTerm))
       && (!skuTerm || sku === skuTerm)
@@ -781,13 +923,16 @@ function renderAds() {
     summary.units += stock;
     if (!String(item.sku || "").toUpperCase().includes("KIT")) {
       summary.value += stock * price;
-      if (item.sale_fee_status === "ok") summary.netValue += Math.max(0, Number(item.net_stock_value) || 0);
+      const commercial = itemCommercialValues(item);
+      if (commercial.net !== null) summary.netValue += commercial.net * stock;
       else summary.pendingFees += 1;
+      if (commercial.profit !== null) summary.profitValue += commercial.profit * stock;
+      else summary.pendingCosts += 1;
     } else {
       summary.excludedKitSkus += 1;
     }
     return summary;
-  }, { units: 0, value: 0, netValue: 0, pendingFees: 0, excludedKitSkus: 0 });
+  }, { units: 0, value: 0, netValue: 0, profitValue: 0, pendingFees: 0, pendingCosts: 0, excludedKitSkus: 0 });
   const inventorySummary = document.querySelector("#ads-inventory-summary");
   const feeCompleted = filtered.filter((item) => item.sale_fee_status === "ok").length;
   const feePending = Math.max(0, filtered.length - feeCompleted);
@@ -798,6 +943,7 @@ function renderAds() {
     <div><span>Unidades em estoque</span><strong>${inventory.units.toLocaleString("pt-BR")}</strong></div>
     <div class="inventory-value"><span>Estoque a preço de venda <small>SKUs com KIT não entram no valor</small></span><strong>${money.format(inventory.value)}</strong></div>
     <div class="inventory-value net"><span>Estoque a valor líquido <small>Venda - tarifa - frete; sem SKUs com KIT${inventory.pendingFees ? ` · ${inventory.pendingFees} tarifa(s) calculando` : ""}</small></span><strong>${money.format(inventory.netValue)}</strong></div>
+    <div class="${inventory.profitValue >= 0 ? "inventory-value profit-positive" : "profit-negative"}"><span>Resultado potencial do estoque <small>Valor líquido - custo; sem SKUs com KIT${inventory.pendingCosts ? ` · ${inventory.pendingCosts} item(ns) sem cálculo completo` : ""}</small></span><strong>${money.format(inventory.profitValue)}</strong></div>
     <div class="fee-progress-card"><span>Tarifas dos anúncios filtrados <small>${feeCompleted.toLocaleString("pt-BR")} concluídas · ${feePending.toLocaleString("pt-BR")} pendentes${globalFeeProgress.estimated_label ? ` · previsão geral: ${escapeText(globalFeeProgress.estimated_label)}` : ""}</small></span><strong>${feePercent.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</strong><i><b style="width:${Math.max(0, Math.min(100, feePercent))}%"></b></i></div>
   `;
   const pageInfo = paginate(filtered, state.adsPage);
@@ -824,6 +970,8 @@ function renderAds() {
           ${fact("Frete estimado ML", shippingCostLabel(item))}
           ${fact("Tarifa de venda", saleFeeLabel(item))}
           ${fact("Valor líquido por venda", netSaleLabel(item))}
+          ${fact("Custo do SKU", costLabel(item))}
+          ${profitFact(item)}
           ${fact("Status do anúncio", statusLabel(item.meli_status || item.status))}
         </div>
         <div class="inline-edit">
@@ -851,6 +999,7 @@ function renderAds() {
       </div>
     </article>
   `).join("") + paginationHtml("adsPage", pageInfo) : `<div class="notice">Nenhum anúncio encontrado.</div>`;
+  queueOfficialPriceRefresh(pageInfo.items);
   queueShippingCostRefresh(pageInfo.items);
   queueSaleFeeRefresh(pageInfo.items);
   queueIdentifierRefresh(pageInfo.items);
@@ -973,8 +1122,47 @@ function saleFeeLabel(item) {
 }
 
 function netSaleLabel(item) {
-  if (item.sale_fee_status !== "ok") return "Aguardando tarifa";
-  return money.format(Number(item.net_sale_amount || 0));
+  const value = itemCommercialValues(item).net;
+  return value === null ? "Aguardando tarifa" : money.format(value);
+}
+
+function officialPriceNeedsRefresh(item) {
+  if (!item?.official_source || !item?.id) return false;
+  if (item.price_source === "manual_update") {
+    const manuallyUpdated = new Date(String(item.item_data_checked_at || item.updated_at || "").replace(" ", "T"));
+    if (!Number.isNaN(manuallyUpdated.getTime()) && Date.now() - manuallyUpdated.getTime() < 5 * 60 * 1000) {
+      return false;
+    }
+  }
+  const checked = new Date(String(item.sale_price_checked_at || "").replace(" ", "T"));
+  if (Number.isNaN(checked.getTime())) return true;
+  return Date.now() - checked.getTime() > 5 * 60 * 1000;
+}
+
+async function queueOfficialPriceRefresh(items) {
+  if (state.pricesLoading || !["anuncios", "catalogo"].includes(state.route)) return;
+  const itemIds = (items || []).filter(officialPriceNeedsRefresh).slice(0, 100).map((item) => item.id);
+  if (!itemIds.length) return;
+  state.pricesLoading = true;
+  try {
+    const queued = await api("/api/meli/prices/refresh", {
+      method: "POST",
+      body: JSON.stringify({ item_ids: itemIds }),
+    });
+    const result = await waitForAsyncOperation(queued);
+    const updates = new Map((result.items || [])
+      .filter((item) => item.result_status === "updated" && item.id)
+      .map((item) => [item.id, item]));
+    state.data.catalog = state.data.catalog.map((item) => updates.has(item.id)
+      ? { ...item, ...updates.get(item.id) }
+      : item);
+  } catch (_) {
+    // A varredura automática fará uma nova tentativa sem interromper a operação manual.
+  } finally {
+    state.pricesLoading = false;
+    if (state.route === "anuncios") renderAds();
+    if (state.route === "catalogo") renderCatalog();
+  }
 }
 
 function saleFeeNeedsRefresh(item) {
@@ -991,7 +1179,7 @@ function saleFeeNeedsRefresh(item) {
 }
 
 async function queueSaleFeeRefresh(items) {
-  if (state.saleFeesLoading || state.route !== "anuncios") return;
+  if (state.saleFeesLoading || state.pricesLoading || !["anuncios", "catalogo"].includes(state.route)) return;
   const itemIds = (items || []).filter(saleFeeNeedsRefresh).slice(0, 15).map((item) => item.id);
   if (!itemIds.length) return;
   state.saleFeesLoading = true;
@@ -1008,6 +1196,7 @@ async function queueSaleFeeRefresh(items) {
   } finally {
     state.saleFeesLoading = false;
     if (state.route === "anuncios") renderAds();
+    if (state.route === "catalogo") renderCatalog();
   }
 }
 
@@ -1019,6 +1208,7 @@ function updateBulkPriceBar() {
   const button = root.querySelector("[data-apply-bulk-price]");
   if (label) label.textContent = count;
   if (button) button.disabled = count === 0;
+  renderBulkPriceProgress();
 }
 
 function resetBulkPriceControls(root) {
@@ -1026,7 +1216,36 @@ function resetBulkPriceControls(root) {
   const value = root?.querySelector("[data-bulk-price-value]");
   if (mode) mode.value = "fixed";
   if (value) value.value = "";
-  state.adsSelectedIds.clear();
+}
+
+function renderBulkPriceProgress() {
+  const root = document.querySelector("[data-bulk-price-progress]");
+  if (!root) return;
+  const progress = state.bulkPriceProgress;
+  root.hidden = !progress;
+  if (!progress) return;
+  const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+  const completed = Number(progress.completed || 0);
+  const total = Number(progress.total || 0);
+  const title = root.querySelector("[data-bulk-progress-title]");
+  const count = root.querySelector("[data-bulk-progress-count]");
+  const bar = root.querySelector("[data-bulk-progress-bar]");
+  const message = root.querySelector("[data-bulk-progress-message]");
+  const results = root.querySelector("[data-bulk-result-list]");
+  root.dataset.status = progress.status || "running";
+  if (title) title.textContent = progress.status === "completed"
+    ? progress.failed ? "Alteração concluída com pendências" : "Alteração concluída com sucesso"
+    : progress.status === "error" ? "Alteração interrompida" : "Atualizando preços";
+  if (count) count.textContent = total ? `${completed} de ${total} · ${percent.toLocaleString("pt-BR")}%` : "";
+  if (bar) bar.style.width = `${percent}%`;
+  if (message) message.textContent = progress.message || "";
+  if (results) {
+    results.innerHTML = (progress.results || []).slice(0, 30).map((item) => `
+      <span class="${item.status === "updated" ? "bulk-result-ok" : "bulk-result-error"}">
+        <b>${item.status === "updated" ? "✓" : "!"}</b>
+        ${escapeText(item.item_id || "Anúncio")}${item.status === "updated" ? ` · ${money.format(item.price)}` : ` · ${escapeText(item.error || "Falhou")}`}
+      </span>`).join("");
+  }
 }
 
 function shippingCostNeedsRefresh(item) {
@@ -1042,7 +1261,7 @@ function shippingCostNeedsRefresh(item) {
 }
 
 async function queueShippingCostRefresh(items) {
-  if (state.shippingCostsLoading || state.route !== "anuncios") return;
+  if (state.shippingCostsLoading || state.pricesLoading || !["anuncios", "catalogo"].includes(state.route)) return;
   const itemIds = (items || []).filter(shippingCostNeedsRefresh).slice(0, 25).map((item) => item.id);
   if (!itemIds.length) return;
   state.shippingCostsLoading = true;
@@ -1059,6 +1278,7 @@ async function queueShippingCostRefresh(items) {
   } finally {
     state.shippingCostsLoading = false;
     if (state.route === "anuncios") renderAds();
+    if (state.route === "catalogo") renderCatalog();
   }
 }
 
@@ -1663,6 +1883,7 @@ function currentReportFilters(reportType) {
     listing_type: state.adsListingType,
     catalog: state.adsCatalog,
     flex: state.adsFlex,
+    profit: state.adsProfit,
   };
 }
 
@@ -2369,6 +2590,7 @@ document.addEventListener("click", (event) => {
   if (key === "competitorsPage") renderCompetitors();
   if (key === "statisticsPage") renderStatistics();
   if (key === "equalizationPage") renderEqualizationReports();
+  if (key === "costsPage") renderCosts();
   if (["dashboardStockPage", "dashboardCatalogPage", "dashboardShipmentPage", "dashboardSalesPage", "dashboardTopSkuPage"].includes(key)) renderDashboard();
 });
 
@@ -2438,6 +2660,9 @@ document.addEventListener("click", (event) => {
   ["#ads-listing-type-filter", "adsListingType"],
   ["#ads-catalog-filter", "adsCatalog"],
   ["#ads-flex-filter", "adsFlex"],
+  ["#ads-profit-filter", "adsProfit"],
+  ["#costs-search", "costsSearch"],
+  ["#costs-page-size", "costsPageSize"],
   ["#copy-product-filter", "copySearch"],
   ["#copy-sku-filter", "copySku"],
   ["#copy-catalog-filter", "copyCatalog"],
@@ -2450,7 +2675,7 @@ document.addEventListener("click", (event) => {
 ].forEach(([selector, key]) => {
   document.addEventListener("input", (event) => {
     if (!event.target.matches(selector)) return;
-    state[key] = ["copyPageSize", "equalizationPageSize"].includes(key) ? Number(event.target.value || 20) : event.target.value;
+    state[key] = ["copyPageSize", "equalizationPageSize", "costsPageSize"].includes(key) ? Number(event.target.value || 20) : event.target.value;
     if (key === "copyPageSize") localStorage.setItem("competidor-copy-page-size", String(state.copyPageSize));
     if (key.startsWith("catalog")) {
       state.catalogPage = 1;
@@ -2468,10 +2693,14 @@ document.addEventListener("click", (event) => {
       state.equalizationPage = 1;
       scheduleRender("equalization", renderEqualizationReports);
     }
+    if (key.startsWith("costs")) {
+      state.costsPage = 1;
+      scheduleRender("costs", renderCosts);
+    }
   });
   document.addEventListener("change", (event) => {
     if (!event.target.matches(selector)) return;
-    state[key] = ["copyPageSize", "equalizationPageSize"].includes(key) ? Number(event.target.value || 20) : event.target.value;
+    state[key] = ["copyPageSize", "equalizationPageSize", "costsPageSize"].includes(key) ? Number(event.target.value || 20) : event.target.value;
     if (key === "copyPageSize") localStorage.setItem("competidor-copy-page-size", String(state.copyPageSize));
     if (key.startsWith("catalog")) {
       state.catalogPage = 1;
@@ -2489,7 +2718,104 @@ document.addEventListener("click", (event) => {
       state.equalizationPage = 1;
       renderEqualizationReports();
     }
+    if (key.startsWith("costs")) {
+      state.costsPage = 1;
+      renderCosts();
+    }
   });
+});
+
+function parseLocalizedNumber(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return NaN;
+  return Number(text.includes(",") ? text.replace(/\./g, "").replace(",", ".") : text);
+}
+
+async function persistSkuCost(sku, cost, remove = false) {
+  const result = await api("/api/costs/save", {
+    method: "POST",
+    body: JSON.stringify({ sku, cost, delete: remove }),
+  });
+  state.data.sku_costs = result.sku_costs || {};
+  renderCosts();
+  if (remove) showToast(`Custo do SKU ${sku} removido.`);
+  else showToast(`Custo do SKU ${sku} salvo com sucesso.`);
+}
+
+document.querySelector("#cost-quick-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const sku = normalizedSkuKey(form.elements.sku.value);
+  const cost = parseLocalizedNumber(form.elements.cost.value);
+  if (!sku || !Number.isFinite(cost) || cost < 0) {
+    showToast("Informe um SKU e um custo válido.", "error");
+    return;
+  }
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
+  try {
+    await persistSkuCost(sku, cost);
+    form.reset();
+  } catch (error) {
+    showToast(error.message || "Não foi possível salvar o custo.", "error");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector("#costs-list")?.addEventListener("click", async (event) => {
+  const save = event.target.closest("[data-save-cost]");
+  const remove = event.target.closest("[data-delete-cost]");
+  if (!save && !remove) return;
+  const sku = (save || remove).dataset.saveCost || (save || remove).dataset.deleteCost;
+  const row = (save || remove).closest("[data-cost-row]");
+  const cost = parseLocalizedNumber(row?.querySelector("[data-cost-value]")?.value);
+  if (save && (!Number.isFinite(cost) || cost < 0)) {
+    showToast("Informe um custo válido.", "error");
+    return;
+  }
+  const button = save || remove;
+  button.disabled = true;
+  try {
+    await persistSkuCost(sku, cost, Boolean(remove));
+  } catch (error) {
+    showToast(error.message || "Não foi possível atualizar o custo.", "error");
+  } finally {
+    if (button.isConnected) button.disabled = false;
+  }
+});
+
+document.querySelector("#clear-ads-filters")?.addEventListener("click", () => {
+  Object.assign(state, {
+    adsAccount: "all",
+    adsProduct: "",
+    adsBrand: "",
+    adsSku: "",
+    adsCode: "",
+    adsStatus: "all",
+    adsListingType: "all",
+    adsCatalog: "all",
+    adsFlex: "all",
+    adsProfit: "all",
+    adsPage: 1,
+  });
+  const values = {
+    "#ads-account-filter": "all",
+    "#ads-product-filter": "",
+    "#ads-brand-filter": "",
+    "#ads-sku-filter": "",
+    "#ads-code-filter": "",
+    "#ads-status-filter": "all",
+    "#ads-listing-type-filter": "all",
+    "#ads-catalog-filter": "all",
+    "#ads-flex-filter": "all",
+    "#ads-profit-filter": "all",
+  };
+  Object.entries(values).forEach(([selector, value]) => {
+    const input = document.querySelector(selector);
+    if (input) input.value = value;
+  });
+  renderAds();
 });
 
 document.querySelector("#ads-list")?.addEventListener("click", async (event) => {
@@ -2556,20 +2882,58 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
   }
   button.disabled = true;
   const original = button.textContent;
+  state.bulkPriceProgress = {
+    status: "running",
+    message: "Adicionando alterações à fila prioritária...",
+    completed: 0,
+    total: state.adsSelectedIds.size,
+    percent: 0,
+    results: [],
+  };
+  renderBulkPriceProgress();
   try {
     const queued = await api("/api/meli/items/bulk-price", {
       method: "POST",
       body: JSON.stringify({ item_ids: [...state.adsSelectedIds], mode, value }),
     });
-    const result = await waitForAsyncOperation(queued, (message) => { button.textContent = message || "Atualizando preços..."; });
+    const result = await waitForAsyncOperation(queued, (message, job) => {
+      button.textContent = message || "Atualizando preços...";
+      state.bulkPriceProgress = {
+        ...state.bulkPriceProgress,
+        status: job?.status || "running",
+        message: message || "Atualizando preços...",
+        completed: Number(job?.completed || 0),
+        total: Number(job?.total || state.adsSelectedIds.size),
+        percent: Number(job?.percent || 0),
+      };
+      renderBulkPriceProgress();
+    });
     const updates = new Map((result.results || []).filter((row) => row.status === "updated").map((row) => [row.item_id, row.price]));
     state.data.catalog = state.data.catalog.map((item) => updates.has(item.id)
-      ? { ...item, price: updates.get(item.id), sale_fee_status: "pending", sale_fee_updated_at: "", sale_fee_basis: "" }
+      ? { ...item, price: updates.get(item.id), price_source: "manual_update", sale_price_checked_at: "", sale_fee_status: "pending", sale_fee_updated_at: "", sale_fee_basis: "", item_data_checked_at: new Date().toISOString() }
       : item);
+    updates.forEach((_, itemId) => state.adsSelectedIds.delete(itemId));
+    resetBulkPriceControls(root);
+    state.bulkPriceProgress = {
+      status: "completed",
+      message: result.failed ? "Confira os anúncios que precisam de nova tentativa." : "Todos os preços foram atualizados no Mercado Livre.",
+      completed: Number(result.updated || 0) + Number(result.failed || 0),
+      total: (result.results || []).length,
+      percent: 100,
+      updated: Number(result.updated || 0),
+      failed: Number(result.failed || 0),
+      results: result.results || [],
+    };
     showToast(`${result.updated || 0} preço(s) alterado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`, result.failed ? "error" : "success");
-    if (!result.failed) resetBulkPriceControls(root);
     renderAds();
   } catch (error) {
+    resetBulkPriceControls(root);
+    state.bulkPriceProgress = {
+      ...state.bulkPriceProgress,
+      status: "error",
+      message: error.message || "Não foi possível concluir a alteração.",
+    };
+    renderBulkPriceProgress();
     showToast(error.message || "Não foi possível alterar os preços selecionados.", "error");
   } finally {
     button.disabled = state.adsSelectedIds.size === 0;
@@ -2610,8 +2974,9 @@ document.querySelector("#catalog-list").addEventListener("click", async (event) 
   const id = (win || price).dataset.winCatalog || (win || price).dataset.saveCatalogPrice;
   const item = state.data.catalog.find((row) => row.id === id);
   try {
+    let result;
     if (win) {
-      await runManualItemOperation(
+      result = await runManualItemOperation(
         "/api/meli/item/win_catalog",
         { item_id: id },
         win,
@@ -2625,7 +2990,7 @@ document.querySelector("#catalog-list").addEventListener("click", async (event) 
         alert("Informe um preço válido para atualizar o anúncio.");
         return;
       }
-      await runManualItemOperation(
+      result = await runManualItemOperation(
         "/api/meli/item/update",
         { item_id: id, account_id: item.account_id, price: value },
         price,
@@ -2633,7 +2998,8 @@ document.querySelector("#catalog-list").addEventListener("click", async (event) 
       );
       showToast("Preço do anúncio alterado com sucesso.");
     }
-    await load();
+    mergeCatalogItem(result?.item);
+    renderCatalog();
   } catch (error) {
     showToast(error.message || "Não foi possível atualizar o anúncio.", "error");
     alert(error.message || "Não foi possível atualizar o anúncio.");
@@ -2647,14 +3013,15 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   const item = state.data.catalog.find((row) => row.id === id);
   if (button.dataset.removeFlex) {
     try {
-      await runManualItemOperation(
+      const result = await runManualItemOperation(
         "/api/meli/item/remove_flex",
         { item_id: id, account_id: item.account_id },
         button,
         "Desativando...",
       );
+      mergeCatalogItem(result?.item);
       showToast("Mercado Envios Flex desativado com sucesso.");
-      await load();
+      renderAds();
     } catch (error) {
       showToast(error.message || "Não foi possível remover o anúncio do Mercado Envios Flex.", "error");
       alert(error.message || "Não foi possível remover o anúncio do Mercado Envios Flex.");
@@ -2663,14 +3030,15 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   }
   if (button.dataset.activateFlex) {
     try {
-      await runManualItemOperation(
+      const result = await runManualItemOperation(
         "/api/meli/item/activate_flex",
         { item_id: id, account_id: item.account_id },
         button,
         "Ativando...",
       );
+      mergeCatalogItem(result?.item);
       showToast("Mercado Envios Flex ativado com sucesso.");
-      await load();
+      renderAds();
     } catch (error) {
       showToast(error.message || "Não foi possível ativar o anúncio no Mercado Envios Flex.", "error");
       alert(error.message || "Não foi possível ativar o anúncio no Mercado Envios Flex.");
@@ -2693,16 +3061,17 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   if (button.dataset.pauseAd) payload.status_action = "pause";
   if (button.dataset.activateAd) payload.status_action = "activate";
   try {
-    await runManualItemOperation(
+    const result = await runManualItemOperation(
       "/api/meli/item/update",
       payload,
       button,
       button.dataset.pauseAd ? "Pausando..." : button.dataset.activateAd ? "Ativando..." : "Salvando...",
     );
+    mergeCatalogItem(result?.item);
     if (button.dataset.pauseAd) showToast("Anúncio pausado com sucesso.");
     else if (button.dataset.activateAd) showToast("Anúncio ativado com sucesso.");
     else showToast("Anúncio atualizado com sucesso.");
-    await load();
+    renderAds();
   } catch (error) {
     showToast(error.message || "Não foi possível atualizar o anúncio.", "error");
     alert(error.message || "Não foi possível atualizar o anúncio.");

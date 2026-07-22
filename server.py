@@ -97,6 +97,8 @@ CERTS = DATA / "certs"
 CERTS.mkdir(exist_ok=True)
 APP_DATA_FILE = "app.json"
 CATALOG_DATA_FILE = "catalog.json"
+SKU_COSTS_FILE = "sku_costs.json"
+SKU_LAST_SALES_FILE = "sku_last_sales.json"
 SYNC_PROGRESS_FILE = "sync_progress.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -141,6 +143,7 @@ RESPONSE_CACHE_LOCK = threading.RLock()
 RESPONSE_CACHE = {}
 ASYNC_OPERATION_JOBS_LOCK = threading.RLock()
 ASYNC_OPERATION_JOBS = {}
+SKU_COMMERCIAL_DATA_LOCK = threading.RLock()
 ACTIVE_CLONE_OPERATIONS = set()
 DASHBOARD_THUMBNAIL_REFRESH_LOCK = threading.Lock()
 DASHBOARD_THUMBNAIL_REFRESH_ACTIVE = False
@@ -197,6 +200,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/items/[^/]+(\?|$)"),
     re.compile(r"^/items/[^/]+/description(\?|$)"),
     re.compile(r"^/items/[^/]+/price_to_win(\?|$)"),
+    re.compile(r"^/items/[^/]+/sale_price(\?|$)"),
     re.compile(r"^/categories/[^/]+/attributes(\?|$)"),
     re.compile(r"^/products/[^/]+(\?|$)"),
     re.compile(r"^/products/[^/]+/items(\?|$)"),
@@ -232,11 +236,14 @@ def file_signature(path):
 
 
 def invalidate_response_cache(name=""):
-    if name not in {APP_DATA_FILE, CATALOG_DATA_FILE, ""}:
+    if name not in {APP_DATA_FILE, CATALOG_DATA_FILE, SKU_COSTS_FILE, SKU_LAST_SALES_FILE, ""}:
         return
     with RESPONSE_CACHE_LOCK:
-        if name in {CATALOG_DATA_FILE, ""}:
+        if name in {CATALOG_DATA_FILE, SKU_COSTS_FILE, SKU_LAST_SALES_FILE, ""}:
             RESPONSE_CACHE.pop("catalog-api", None)
+        if name in {APP_DATA_FILE, SKU_COSTS_FILE, SKU_LAST_SALES_FILE, ""}:
+            for key in [key for key in RESPONSE_CACHE if key.startswith("dashboard-api:")]:
+                RESPONSE_CACHE.pop(key, None)
         if not name:
             RESPONSE_CACHE.clear()
 
@@ -368,6 +375,10 @@ def read_payload(include_catalog=True):
             payload["operations_snapshot"] = build_operations(migration_payload)
             write_json(APP_DATA_FILE, payload)
     payload["catalog"] = read_json(CATALOG_DATA_FILE, []) if include_catalog else []
+    costs = read_json(SKU_COSTS_FILE, {})
+    last_sales = read_json(SKU_LAST_SALES_FILE, {})
+    payload["sku_costs"] = costs if isinstance(costs, dict) else {}
+    payload["sku_last_sales"] = last_sales if isinstance(last_sales, dict) else {}
     if include_catalog:
         for item in payload["catalog"]:
             if item.get("winner_source") in {
@@ -513,6 +524,8 @@ def merge_catalog_records(incoming, latest):
 
 def write_payload(payload, replace_collections=None):
     replace_collections = set(replace_collections or [])
+    if getattr(MELI_WORK_CONTEXT, "priority", "interactive") == "background":
+        wait_for_interactive_meli_priority()
     with DATA_LOCK:
         path = DATA / APP_DATA_FILE
         latest = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -546,6 +559,8 @@ def write_payload(payload, replace_collections=None):
             payload["operations_snapshot"] = build_operations(payload)
         metadata = dict(payload)
         metadata.pop("catalog", None)
+        metadata.pop("sku_costs", None)
+        metadata.pop("sku_last_sales", None)
         metadata.pop("_catalog_loaded", None)
         write_json(APP_DATA_FILE, metadata)
 
@@ -1618,6 +1633,9 @@ class MercadoLivreClient:
 
     def price_to_win(self, item_id):
         return self.get(f"/items/{item_id}/price_to_win?version=v2")
+
+    def sale_price(self, item_id):
+        return self.get(f"/items/{item_id}/sale_price?context=channel_marketplace")
 
     def product_winners(self, catalog_product_id):
         return self.get(f"/products/{catalog_product_id}/items?site_id=MLB")
@@ -3254,6 +3272,26 @@ def competition_share(status, visit_share=None):
     return {"maximum": 100, "medium": 50, "minimum": 0}.get(str(visit_share or "").lower(), 0)
 
 
+def sale_price_values(response, fallback=0):
+    data = response if isinstance(response, dict) else {}
+    raw_amount = data.get("amount")
+    raw_regular = data.get("regular_amount")
+    try:
+        amount = round(float(raw_amount), 2) if raw_amount not in (None, "") else round(float(fallback or 0), 2)
+    except (TypeError, ValueError):
+        amount = round(float(fallback or 0), 2)
+    try:
+        regular_amount = round(float(raw_regular), 2) if raw_regular not in (None, "") else None
+    except (TypeError, ValueError):
+        regular_amount = None
+    return {
+        "amount": amount,
+        "regular_amount": regular_amount,
+        "price_id": data.get("price_id") or "",
+        "reference_date": data.get("reference_date") or "",
+    }
+
+
 def synced_catalog_item(account, item, competition=None):
     stock = item_available_quantity(item)
     catalog_product_id = item.get("catalog_product_id") or "-"
@@ -3296,7 +3334,7 @@ def synced_catalog_item(account, item, competition=None):
         **package_values,
         "status": status,
         "share": competition_share(competition.get("competition_status"), competition.get("visit_share")) if is_catalog else 100,
-        "price": item.get("price") or 0,
+        "price": sale_price_values(item.get("sale_price"), item.get("price"))["amount"],
         "stock": stock,
         "competitor": "A sincronizar",
         "action": action,
@@ -3332,9 +3370,20 @@ def shipping_quote_values(response):
     return {"cost": cost, "currency": currency, "billable_weight": billable_weight}
 
 
-def apply_item_net_values(item):
+def normalized_sku_key(value):
+    return clean_attribute_value(value).strip().upper()
+
+
+def apply_item_net_values(item, strict=False):
     price = max(0.0, float(item.get("price") or 0))
-    fee = max(0.0, float(item.get("sale_fee_amount") or 0))
+    raw_fee = item.get("sale_fee_amount")
+    fee_known = raw_fee not in (None, "") and item.get("sale_fee_status") in {None, "", "ok"}
+    if strict and not fee_known:
+        item["net_sale_amount"] = None
+        item["net_stock_value"] = None
+        item["net_stock_excluded"] = "KIT" in normalized_sku_key(item.get("sku"))
+        return item
+    fee = max(0.0, float(raw_fee or 0))
     shipping = max(0.0, float(item.get("shipping_cost") or 0))
     net = round(max(0.0, price - fee - shipping), 2)
     item["net_sale_amount"] = net
@@ -3345,6 +3394,99 @@ def apply_item_net_values(item):
         item["net_stock_value"] = round(net * max(0, int(float(item.get("stock") or 0))), 2)
         item["net_stock_excluded"] = False
     return item
+
+
+def commercial_values_for_item(item, payload, strict=True):
+    row = dict(item or {})
+    apply_item_net_values(row, strict=strict)
+    sku_key = normalized_sku_key(row.get("sku"))
+    cost_record = (payload.get("sku_costs") or {}).get(sku_key) if sku_key else None
+    last_sale = (payload.get("sku_last_sales") or {}).get(sku_key) if sku_key else None
+    cost_amount = None
+    if isinstance(cost_record, dict) and cost_record.get("cost") not in (None, ""):
+        try:
+            cost_amount = round(max(0.0, float(cost_record.get("cost"))), 2)
+        except (TypeError, ValueError):
+            cost_amount = None
+    net_amount = row.get("net_sale_amount")
+    profit_amount = None
+    if cost_amount is not None and net_amount is not None:
+        profit_amount = round(float(net_amount) - cost_amount, 2)
+    row.update(
+        {
+            "cost_amount": cost_amount,
+            "cost_status": "ok" if cost_amount is not None else "missing",
+            "profit_amount": profit_amount,
+            "profit_status": "profit" if profit_amount is not None and profit_amount >= 0 else "loss" if profit_amount is not None else "unknown",
+            "last_sale_at": (last_sale or {}).get("date") if isinstance(last_sale, dict) else "",
+            "last_sale_account": (last_sale or {}).get("account") if isinstance(last_sale, dict) else "",
+        }
+    )
+    return row
+
+
+def save_sku_costs(request, actor=None):
+    entries = request.get("costs") if isinstance(request.get("costs"), list) else [request]
+    saved = []
+    deleted = []
+    with SKU_COMMERCIAL_DATA_LOCK:
+        costs = read_json(SKU_COSTS_FILE, {})
+        costs = costs if isinstance(costs, dict) else {}
+        for entry in entries:
+            sku = normalized_sku_key((entry or {}).get("sku"))
+            if not sku:
+                raise RuntimeError("Informe um SKU válido.")
+            if (entry or {}).get("delete") or (entry or {}).get("cost") in (None, ""):
+                costs.pop(sku, None)
+                deleted.append(sku)
+                continue
+            try:
+                amount = round(float(str(entry.get("cost")).replace(",", ".")), 2)
+            except (TypeError, ValueError):
+                raise RuntimeError(f"Informe um custo válido para o SKU {sku}.")
+            if amount < 0:
+                raise RuntimeError("O custo não pode ser negativo.")
+            record = {
+                "sku": sku,
+                "cost": amount,
+                "updated_at": now_label(),
+                "updated_by": (actor or {}).get("name") or (actor or {}).get("email") or "Usuário",
+            }
+            costs[sku] = record
+            saved.append(record)
+        write_json(SKU_COSTS_FILE, costs)
+    return {"ok": True, "saved": saved, "deleted": deleted, "sku_costs": costs}
+
+
+def update_sku_last_sales(rows):
+    changed = False
+    with SKU_COMMERCIAL_DATA_LOCK:
+        stored = read_json(SKU_LAST_SALES_FILE, {})
+        stored = stored if isinstance(stored, dict) else {}
+        for row in rows or []:
+            sku = normalized_sku_key(row.get("sku"))
+            sold_at = row.get("date") or row.get("last_sale_at") or ""
+            if not sku or sku == "-" or not sold_at:
+                continue
+            previous = stored.get(sku) or {}
+            previous_date = parse_meli_datetime(previous.get("date"))
+            candidate_date = parse_meli_datetime(sold_at)
+            if previous_date and candidate_date and candidate_date <= previous_date:
+                continue
+            if previous.get("date") and not candidate_date and str(sold_at) <= str(previous.get("date")):
+                continue
+            stored[sku] = {
+                "sku": sku,
+                "date": sold_at,
+                "item_id": row.get("item_id") or (row.get("item_ids") or [""])[0],
+                "product": row.get("product") or "",
+                "account": row.get("account") or (row.get("accounts") or [""])[0],
+                "thumbnail": row.get("thumbnail") or "",
+            }
+            changed = True
+        if changed:
+            write_json(SKU_LAST_SALES_FILE, stored)
+    return changed
 
 
 def sale_fee_basis(item, account=None):
@@ -3619,6 +3761,19 @@ def preserve_shipping_cost_snapshot(target, previous):
     return target
 
 
+def preserve_sale_price_snapshot(target, previous):
+    previous = previous or {}
+    if previous.get("price_source") != "sale_price" or previous.get("price") in (None, ""):
+        return target
+    for key in (
+        "price", "regular_price", "price_source", "price_id",
+        "sale_price_reference_date", "sale_price_checked_at",
+    ):
+        if key in previous:
+            target[key] = previous[key]
+    return target
+
+
 def preserve_sale_fee_snapshot(target, previous):
     previous = previous or {}
     legacy_snapshot = (
@@ -3744,6 +3899,110 @@ def refresh_item_metadata_operation(kind, item_ids):
     if results:
         write_payload(payload)
     return {"items": results}
+
+
+def refresh_item_prices_operation(item_ids):
+    maximum = max(1, int(os.getenv("MELI_PRICE_ON_DEMAND_LIMIT", "200")))
+    requested = list(dict.fromkeys(str(item_id or "").strip() for item_id in item_ids or [] if item_id))[:maximum]
+    payload = read_payload(include_catalog=True)
+    catalog_by_id = {
+        str(item.get("id")): item
+        for item in payload.get("catalog") or []
+        if str(item.get("id") or "") in requested
+    }
+    accounts_by_id = {
+        str(account.get("id")): account
+        for account in payload.get("accounts") or []
+        if account.get("official") and account.get("access_token")
+    }
+    grouped = {}
+    for item_id in requested:
+        item = catalog_by_id.get(item_id)
+        if item and item.get("account_id"):
+            grouped.setdefault(str(item.get("account_id")), []).append(item_id)
+
+    results = []
+    total = len(requested)
+    completed = 0
+    update_async_operation_progress("Conferindo preços oficiais.", completed, total)
+    for account_id, account_item_ids in grouped.items():
+        account = accounts_by_id.get(account_id)
+        if not account:
+            continue
+        official_by_id = fetch_official_items_by_id(
+            account_client(account),
+            account_item_ids,
+            workers=min(4, max(1, len(account_item_ids))),
+            priority="interactive",
+        )
+        sale_prices_by_id = fetch_current_sale_prices(
+            account_client(account),
+            account_item_ids,
+            workers=min(6, max(1, len(account_item_ids))),
+            priority="interactive",
+        )
+        for item_id in account_item_ids:
+            current = catalog_by_id.get(item_id)
+            official = official_by_id.get(item_id)
+            completed += 1
+            if not current or not official:
+                detail = {
+                    "item_id": item_id,
+                    "result_status": "error",
+                    "error": "Anúncio não retornado pela API oficial.",
+                }
+                results.append(detail)
+                update_async_operation_progress(
+                    f"Conferido {completed} de {total} anúncios.", completed, total, detail
+                )
+                continue
+            first_seen_at = current.get("first_seen_at")
+            refreshed = synced_catalog_item(account, official, competition_snapshot(current))
+            preserve_shipping_cost_snapshot(refreshed, current)
+            preserve_identifier_snapshot(refreshed, current)
+            sale_price = sale_prices_by_id.get(item_id)
+            if sale_price:
+                values = sale_price_values(sale_price, refreshed.get("price"))
+                refreshed.update(
+                    {
+                        "price": values["amount"],
+                        "regular_price": values["regular_amount"],
+                        "price_source": "sale_price",
+                        "price_id": values["price_id"],
+                        "sale_price_reference_date": values["reference_date"],
+                        "sale_price_checked_at": now_label(),
+                    }
+                )
+            else:
+                refreshed["price_source"] = "items_fallback"
+                refreshed["sale_price_checked_at"] = now_label()
+            preserve_sale_fee_snapshot(refreshed, current)
+            refreshed["first_seen_at"] = first_seen_at or now_label()
+            refreshed["updated_at"] = now_label()
+            current.update(refreshed)
+            apply_item_net_values(current)
+            detail = {
+                key: current.get(key)
+                for key in (
+                    "id", "price", "stock", "meli_status", "thumbnail", "title", "sku",
+                    "item_data_checked_at", "updated_at", "sale_fee_amount", "sale_fee_status",
+                    "sale_fee_basis", "sale_fee_updated_at",
+                    "shipping_cost", "shipping_cost_status", "net_sale_amount", "net_stock_value",
+                    "regular_price", "price_source", "sale_price_checked_at",
+                )
+            }
+            detail["result_status"] = "updated"
+            results.append(detail)
+            update_async_operation_progress(
+                f"Conferido {completed} de {total} anúncios.", completed, total, detail
+            )
+    if results:
+        write_payload(payload)
+    return {
+        "updated": sum(row.get("result_status") == "updated" for row in results),
+        "failed": sum(row.get("result_status") == "error" for row in results),
+        "items": results,
+    }
 
 
 def normalized_account_name(value):
@@ -4178,6 +4437,7 @@ def sync_recent_sales(payload, account, client):
             }
             rows.append(sale)
     hydrate_sale_thumbnails(rows, client)
+    update_sku_last_sales(rows)
     existing = [
         item
         for item in payload.get("recent_sales", [])
@@ -4498,6 +4758,7 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
                     competition = competition_snapshot(existing_by_id.get(item_id, {}))
                 row = synced_catalog_item(account, item, competition)
                 previous = existing_by_id.get(item_id, {})
+                preserve_sale_price_snapshot(row, previous)
                 preserve_shipping_cost_snapshot(row, previous)
                 preserve_sale_fee_snapshot(row, previous)
                 preserve_identifier_snapshot(row, previous)
@@ -4540,7 +4801,7 @@ def rotating_batch(rows, cursor, batch_size):
     return selected, next_cursor
 
 
-def fetch_official_items_by_id(client, item_ids, workers=None):
+def fetch_official_items_by_id(client, item_ids, workers=None, priority="background"):
     """Fetch item batches concurrently while the global API lane remains bounded."""
     item_ids = [str(item_id) for item_id in item_ids or [] if item_id]
     if not item_ids:
@@ -4571,12 +4832,34 @@ def fetch_official_items_by_id(client, item_ids, workers=None):
 
     official_by_id = {}
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="meli-refresh") as executor:
-        futures = [executor.submit(run_meli_work, "background", fetch_batch, batch) for batch in batches]
+        futures = [executor.submit(run_meli_work, priority, fetch_batch, batch) for batch in batches]
         for future in as_completed(futures):
             for official in future.result() or []:
                 if official.get("id"):
                     official_by_id[str(official["id"])] = official
     return official_by_id
+
+
+def fetch_current_sale_prices(client, item_ids, workers=None, priority="interactive"):
+    item_ids = [str(item_id) for item_id in item_ids or [] if item_id]
+    if not item_ids:
+        return {}
+    worker_count = max(1, min(len(item_ids), int(workers or os.getenv("MELI_SALE_PRICE_WORKERS", "6"))))
+
+    def fetch_one(item_id):
+        try:
+            return item_id, client.sale_price(item_id)
+        except Exception:
+            return item_id, None
+
+    values = {}
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="meli-sale-price") as executor:
+        futures = [executor.submit(run_meli_work, priority, fetch_one, item_id) for item_id in item_ids]
+        for future in as_completed(futures):
+            item_id, response = future.result()
+            if isinstance(response, dict) and response.get("amount") not in (None, ""):
+                values[item_id] = response
+    return values
 
 
 def discover_recent_official_items(payload, account, client, per_status=None):
@@ -4656,6 +4939,7 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
                 raise RuntimeError("Anúncio não retornado pelo lote oficial nesta rodada.")
             competition = competition_snapshot(current)
             updated = synced_catalog_item(account, official, competition)
+            preserve_sale_price_snapshot(updated, current)
             preserve_identifier_snapshot(updated, current)
             preserve_shipping_cost_snapshot(updated, current)
             preserve_sale_fee_snapshot(updated, current)
@@ -4988,6 +5272,30 @@ def async_operation_result(job_id):
         return json.loads(json.dumps(job, ensure_ascii=False)) if job else None
 
 
+def update_async_operation_progress(message="", completed=None, total=None, detail=None):
+    job_id = getattr(MELI_WORK_CONTEXT, "job_id", "")
+    if not job_id:
+        return
+    with ASYNC_OPERATION_JOBS_LOCK:
+        job = ASYNC_OPERATION_JOBS.get(job_id)
+        if not job:
+            return
+        updates = {"updated_epoch": time.time()}
+        if message:
+            updates["message"] = message
+        if completed is not None:
+            updates["completed"] = max(0, int(completed))
+        if total is not None:
+            updates["total"] = max(0, int(total))
+        denominator = updates.get("total", job.get("total"))
+        numerator = updates.get("completed", job.get("completed"))
+        if denominator:
+            updates["percent"] = round(min(100, max(0, float(numerator or 0) / float(denominator) * 100)), 1)
+        if detail:
+            updates["detail"] = detail
+        job.update(updates)
+
+
 def start_async_operation(kind, work, message="Processamento adicionado à fila.", heavy=False, priority="interactive"):
     cleanup_async_operation_jobs()
     job_id = f"op-{uuid.uuid4().hex[:12]}"
@@ -5006,6 +5314,8 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
 
     def worker():
         interactive = not heavy and priority in {"interactive", "manual"}
+        previous_job_id = getattr(MELI_WORK_CONTEXT, "job_id", None)
+        MELI_WORK_CONTEXT.job_id = job_id
         if interactive:
             with ASYNC_OPERATION_JOBS_LOCK:
                 ACTIVE_CLONE_OPERATIONS.add(job_id)
@@ -5049,6 +5359,13 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
             if interactive:
                 with ASYNC_OPERATION_JOBS_LOCK:
                     ACTIVE_CLONE_OPERATIONS.discard(job_id)
+            if previous_job_id is None:
+                try:
+                    del MELI_WORK_CONTEXT.job_id
+                except AttributeError:
+                    pass
+            else:
+                MELI_WORK_CONTEXT.job_id = previous_job_id
 
     executor = (
         HEAVY_JOB_EXECUTOR if heavy
@@ -5179,6 +5496,8 @@ def update_item_operation(request, actor=None):
         if "price" in update:
             changes["price"] = {"from": item.get("price"), "to": update["price"]}
             item["price"] = update["price"]
+            item["price_source"] = "manual_update"
+            item["sale_price_checked_at"] = ""
             item["sale_fee_status"] = "pending"
             item["sale_fee_updated_at"] = ""
             item["sale_fee_basis"] = ""
@@ -5245,6 +5564,8 @@ def win_catalog_operation(request, actor=None):
     )
     old_price = item.get("price")
     item["price"] = item["price_to_win"]
+    item["price_source"] = "manual_update"
+    item["sale_price_checked_at"] = ""
     item["sale_fee_status"] = "pending"
     item["sale_fee_updated_at"] = ""
     item["sale_fee_basis"] = ""
@@ -5307,11 +5628,14 @@ def bulk_price_operation(request, actor=None):
     catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
     accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
     results = []
-    for item_id in item_ids:
+    total = len(item_ids)
+    update_async_operation_progress("Preparando alterações de preço.", 0, total)
+    for index, item_id in enumerate(item_ids, 1):
         item = catalog.get(item_id)
         account = accounts.get(str((item or {}).get("account_id") or ""))
         if not item or not account:
             results.append({"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."})
+            update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, results[-1])
             continue
         current = max(0.0, float(item.get("price") or 0))
         target = {
@@ -5323,23 +5647,37 @@ def bulk_price_operation(request, actor=None):
         }.get(mode)
         if not target:
             results.append({"item_id": item_id, "status": "error", "error": "Modo de alteração inválido."})
+            update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, results[-1])
             continue
         target_price = round(target(), 2)
         if target_price <= 0:
             results.append({"item_id": item_id, "status": "error", "error": "O preço calculado precisa ser maior que zero."})
+            update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, results[-1])
             continue
         try:
             account_client(account).update_item(item_id, {"price": target_price})
+            checked_at = now_label()
             item["price"] = target_price
+            item["price_source"] = "manual_update"
+            item["sale_price_checked_at"] = ""
             item["sale_fee_status"] = "pending"
             item["sale_fee_updated_at"] = ""
             item["sale_fee_basis"] = ""
-            item["updated_at"] = now_label()
+            item["item_data_checked_at"] = checked_at
+            item["updated_at"] = checked_at
             apply_item_net_values(item)
             append_item_log(payload, item, actor or {}, "Alteração de preço em massa", {"price": {"from": current, "to": target_price}})
-            results.append({"item_id": item_id, "status": "updated", "price": target_price})
+            results.append({
+                "item_id": item_id,
+                "status": "updated",
+                "price": target_price,
+                "checked_at": checked_at,
+                "sale_fee_status": "pending",
+                "net_sale_amount": item.get("net_sale_amount"),
+            })
         except Exception as exc:
             results.append({"item_id": item_id, "status": "error", "error": str(exc)})
+        update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, results[-1])
     write_payload(payload)
     return {
         "updated": sum(row.get("status") == "updated" for row in results),
@@ -5902,6 +6240,7 @@ def hydrate_required_clone_attributes(create_payload, source_item, category_attr
             not attr_id
             or not clone_attribute_is_required(definition)
             or not clone_attribute_user_editable(definition, attr_id)
+            or not clone_attribute_applies_to_source(source_item, attr_id, definition.get("name") or "")
             or clone_required_attribute_satisfied(create_payload, attr_id)
         ):
             continue
@@ -6740,7 +7079,42 @@ def sanitize_clone_answers(answers, category_attributes):
     return clean
 
 
-def sanitize_clone_payload_attributes(create_payload, category_attributes):
+def clone_attribute_describes_refurbished_status(attr_id, label=""):
+    normalized = normalized_attribute_label(f"{attr_id or ''} {label or ''}")
+    return any(token in normalized for token in ("refurb", "recondicion", "recondition"))
+
+
+def clone_source_condition(source_item):
+    condition = str((source_item or {}).get("condition") or "").strip().lower()
+    if condition:
+        return condition
+    for attribute in (source_item or {}).get("attributes") or []:
+        attr_id = str(attribute.get("id") or "").upper()
+        if attr_id not in {"CONDITION", "ITEM_CONDITION"}:
+            continue
+        value = normalized_attribute_label(
+            attribute.get("value_name")
+            or first_present(attribute, ["values.0.name"], "")
+        )
+        if value in {"novo", "new"}:
+            return "new"
+        if "recondicion" in value or "refurb" in value:
+            return "refurbished"
+        if value:
+            return value
+    # A criação já usa `new` quando a API antiga omite condition; a validação
+    # precisa seguir a mesma regra para não exigir atributos de recondicionado.
+    return "new"
+
+
+def clone_attribute_applies_to_source(source_item, attr_id, label=""):
+    return not (
+        clone_source_condition(source_item) == "new"
+        and clone_attribute_describes_refurbished_status(attr_id, label)
+    )
+
+
+def sanitize_clone_payload_attributes(create_payload, category_attributes, source_item=None):
     if not category_attributes:
         return []
     allowed = category_attribute_ids(category_attributes)
@@ -6753,6 +7127,11 @@ def sanitize_clone_payload_attributes(create_payload, category_attributes):
             original_id = str(attribute.get("id") or "").upper()
             attr_id = canonical_clone_attribute_id(original_id)
             clean = attribute
+            definition = category_attribute_definition(category_attributes, attr_id)
+            attribute_label = attribute.get("name") or definition.get("name") or ""
+            if not clone_attribute_applies_to_source(source_item or {}, attr_id, attribute_label):
+                removed.append(original_id or attr_id)
+                continue
             if original_id in GTIN_IDENTIFIER_ATTRS and original_id != "GTIN" and "GTIN" in allowed and original_id not in allowed:
                 attr_id = "GTIN"
                 clean = {**attribute, "id": "GTIN"}
@@ -6792,6 +7171,8 @@ def pending_clone_attribute(attr_id, source_item, category_attributes, item_id="
         return {}
     source_label = source_attribute_label(source_item, resolved_id)
     label = clone_attribute_label(resolved_id, source_label or definition.get("name") or fallback_label)
+    if not clone_attribute_applies_to_source(source_item, resolved_id, label):
+        return {}
     options = []
     for value in definition.get("values") or []:
         name = clean_attribute_value(value.get("name"))
@@ -7166,7 +7547,7 @@ def friendly_clone_error(exc):
 
 def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id="", category_attributes=None, cross_account=False, destination_store_id=None, destination_stores=None):
     payload = json.loads(json.dumps(create_payload, ensure_ascii=False))
-    sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [])
+    sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [], source_item)
     payload = clone_payload_from_answers(payload, sanitize_clone_answers(answers or {}, category_attributes or []))
     adjustments = []
     if sanitized_attributes:
@@ -7379,7 +7760,12 @@ def clone_preflight_pending_fields(payload, source_name, item_ids, edits):
             item_fields = []
             for attribute in category_cache.get(category_id) or []:
                 attr_id = attribute.get("id")
-                if not clone_attribute_is_required(attribute) or not attr_id or not clone_attribute_user_editable(attribute, attr_id):
+                if (
+                    not clone_attribute_is_required(attribute)
+                    or not attr_id
+                    or not clone_attribute_user_editable(attribute, attr_id)
+                    or not clone_attribute_applies_to_source(source_item, attr_id, attribute.get("name") or "")
+                ):
                     continue
                 if clone_required_attribute_satisfied(create_payload, attr_id):
                     continue
@@ -7616,6 +8002,7 @@ def aggregate_sku_statistics(account_orders, catalog, maximum_shipment_lookups=N
             if str(order.get("status") or "").lower() in ignored_statuses:
                 continue
             order_id = str(order.get("id") or "-")
+            order_date = order.get("date_created") or order.get("last_updated") or ""
             flex = order_is_flex(client, order, catalog_by_id, shipment_cache, lookup_state)
             for order_item in order.get("order_items") or []:
                 item = order_item.get("item") or {}
@@ -7649,6 +8036,8 @@ def aggregate_sku_statistics(account_orders, catalog, maximum_shipment_lookups=N
                         "flex_order_ids": set(),
                         "non_flex_order_ids": set(),
                         "unknown_order_ids": set(),
+                        "last_sale_at": "",
+                        "last_sale_account": "",
                     },
                 )
                 unit_price = order_item.get("unit_price") or order_item.get("full_unit_price") or 0
@@ -7662,6 +8051,9 @@ def aggregate_sku_statistics(account_orders, catalog, maximum_shipment_lookups=N
                 if item_id:
                     row["item_ids"].add(item_id)
                 row["order_ids"].add(order_id)
+                if order_date and str(order_date) > str(row.get("last_sale_at") or ""):
+                    row["last_sale_at"] = order_date
+                    row["last_sale_account"] = account.get("nickname") or str(account.get("seller_id") or "Conta")
                 if flex is True:
                     row["flex_units"] += quantity
                     row["flex_revenue"] += line_total
@@ -7746,6 +8138,7 @@ def query_sku_statistics(payload, request):
         if not account_orders and warnings:
             raise RuntimeError(" ".join(warnings))
         base = aggregate_sku_statistics(account_orders, payload.get("catalog") or [], maximum_lookups)
+        update_sku_last_sales(base.get("rows") or [])
         unknown_units = sum(row.get("unknown_units") or 0 for row in base.get("rows") or [])
         if unknown_units:
             base.setdefault("warnings", []).append(
@@ -8037,6 +8430,7 @@ def report_filtered_catalog(payload, report_type, filters):
     stock_filter = str(filters.get("stock") or "all")
     catalog_filter = str(filters.get("catalog") or "all")
     flex_filter = str(filters.get("flex") or "all")
+    profit_filter = str(filters.get("profit") or "all")
     rows = []
     for item in payload.get("catalog") or []:
         if report_type == "catalog" and not is_catalog_listing(item):
@@ -8073,10 +8467,16 @@ def report_filtered_catalog(payload, report_type, filters):
             continue
         if brand_search and brand_search not in normalized_attribute_label(f"{item.get('brand', '')} {item.get('title', '')}"):
             continue
-        if sku_search and sku_search not in normalized_attribute_label(item.get("sku") or ""):
+        if sku_search and sku_search != normalized_attribute_label(item.get("sku") or ""):
             continue
         if code_search and code_search not in normalized_attribute_label(item.get("id") or ""):
             continue
+        if profit_filter != "all":
+            profit_status = commercial_values_for_item(item, payload, strict=True).get("profit_status")
+            if profit_filter == "missing" and profit_status != "unknown":
+                continue
+            if profit_filter in {"profit", "loss"} and profit_status != profit_filter:
+                continue
         rows.append(item)
     return rows
 
@@ -8191,6 +8591,11 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
         ("sale_fee_amount", "Tarifa de venda", "currency"),
         ("net_sale_amount", "Valor líquido por venda", "currency"),
         ("net_stock_value", "Estoque a valor líquido", "currency"),
+        ("cost_amount", "Custo do SKU", "currency"),
+        ("profit_amount", "Lucro ou prejuízo por venda", "currency"),
+        ("profit_status_label", "Situação do resultado", "text"),
+        ("last_sale_at", "Última venda do SKU", "text"),
+        ("last_sale_account", "Conta da última venda", "text"),
         ("shipping_cost_status_label", "Situação do frete", "text"),
         ("shipping_cost_updated_at", "Frete consultado em", "text"),
     ]
@@ -8219,9 +8624,10 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
         title = "Anúncios Mercado Livre"
     normalized_rows = []
     for item in rows:
+        commercial = commercial_values_for_item(item, payload, strict=True)
         normalized_rows.append(
             {
-                **item,
+                **commercial,
                 "listing_type_label": "Premium" if item.get("listing_type_id") == "gold_pro" else "Clássico" if item.get("listing_type_id") == "gold_special" else item.get("listing_type_id") or "-",
                 "catalog_mode": "Catálogo" if is_catalog_listing(item) else "Tradicional",
                 "meli_status_label": {"active": "Ativo", "paused": "Pausado", "under_review": "Aguardando revisão"}.get(item.get("meli_status"), item.get("meli_status") or "-"),
@@ -8233,6 +8639,11 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
                     "not_available": "Não informado pela API",
                     "error": "Erro na consulta",
                 }.get(item.get("shipping_cost_status"), "Aguardando cotação"),
+                "profit_status_label": {
+                    "profit": "Lucro",
+                    "loss": "Prejuízo",
+                    "unknown": "Sem custo cadastrado",
+                }.get(commercial.get("profit_status"), "Sem custo cadastrado"),
             }
         )
     metadata = {
@@ -8999,7 +9410,11 @@ def execute_clone_batch_request(request):
 
 
 def catalog_api_response(payload=None):
-    signatures = (file_signature(DATA / CATALOG_DATA_FILE),)
+    signatures = (
+        file_signature(DATA / CATALOG_DATA_FILE),
+        file_signature(DATA / SKU_COSTS_FILE),
+        file_signature(DATA / SKU_LAST_SALES_FILE),
+    )
     with RESPONSE_CACHE_LOCK:
         cached = RESPONSE_CACHE.get("catalog-api")
         if cached and cached.get("signatures") == signatures:
@@ -9012,6 +9427,8 @@ def catalog_api_response(payload=None):
         "catalog": catalog,
         "catalog_counts": catalog_counts(catalog),
         "sale_fee_progress": sale_fee_progress(catalog),
+        "sku_costs": payload.get("sku_costs") or {},
+        "sku_last_sales": payload.get("sku_last_sales") or {},
     }
     body = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     signature_text = repr(signatures).encode("utf-8")
@@ -9029,6 +9446,8 @@ def dashboard_api_response(payload, actor):
     signatures = (
         file_signature(DATA / APP_DATA_FILE),
         file_signature(DATA / SYNC_PROGRESS_FILE),
+        file_signature(DATA / SKU_COSTS_FILE),
+        file_signature(DATA / SKU_LAST_SALES_FILE),
     )
     actor_key = str((actor or {}).get("id") or "anonymous")
     cache_key = f"dashboard-api:{actor_key}"
@@ -9060,26 +9479,26 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         request.settimeout(max(5, int(os.getenv("COMPETIDOR_HTTP_KEEPALIVE_TIMEOUT_SECONDS", "30"))))
         return request, client_address
 
-    def process_request(self, request, client_address):
-        HTTP_REQUEST_SEMAPHORE.acquire()
-        try:
-            super().process_request(request, client_address)
-        except Exception:
-            HTTP_REQUEST_SEMAPHORE.release()
-            raise
-
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            HTTP_REQUEST_SEMAPHORE.release()
-
 
 class App(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
         return
+
+    def run_with_request_slot(self, handler):
+        timeout = max(1, int(os.getenv("COMPETIDOR_HTTP_QUEUE_TIMEOUT_SECONDS", "10")))
+        if not HTTP_REQUEST_SEMAPHORE.acquire(timeout=timeout):
+            self.send_json(
+                {"error": "O servidor está processando muitas solicitações. Tente novamente em alguns segundos."},
+                status=503,
+                headers={"Retry-After": "2"},
+            )
+            return
+        try:
+            handler()
+        finally:
+            HTTP_REQUEST_SEMAPHORE.release()
 
     def write_response_body(self, body):
         try:
@@ -9302,6 +9721,9 @@ class App(BaseHTTPRequestHandler):
         self.write_response_body(body)
 
     def do_GET(self):
+        self.run_with_request_slot(self._do_GET)
+
+    def _do_GET(self):
         parsed = urlparse(self.path)
         if not parsed.path.startswith("/api/"):
             self.serve_file(parsed.path if "." in Path(parsed.path).name else "/")
@@ -9589,6 +10011,9 @@ class App(BaseHTTPRequestHandler):
         self.send_json({"error": "Endpoint não encontrado"}, status=404)
 
     def do_POST(self):
+        self.run_with_request_slot(self._do_POST)
+
+    def _do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/notifications/meli":
             try:
@@ -9635,9 +10060,11 @@ class App(BaseHTTPRequestHandler):
             "/api/clone/execute",
             "/api/clone/execute-batch",
             "/api/meli/items/bulk-price",
+            "/api/meli/prices/refresh",
             "/api/meli/shipping-costs/refresh",
             "/api/meli/sale-fees/refresh",
             "/api/meli/identifiers/refresh",
+            "/api/costs/save",
             "/api/spreadsheet/template",
             "/api/spreadsheet/import",
             "/api/spreadsheet/apply",
@@ -10073,6 +10500,31 @@ class App(BaseHTTPRequestHandler):
                 item_ids = list(request.get("item_ids") or [])
                 operation = start_async_operation("identifiers", lambda: refresh_item_metadata_operation("identifiers", item_ids), "Atualizando códigos universais em segundo plano.", priority="background")
                 self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/prices/refresh":
+            try:
+                item_ids = list(request.get("item_ids") or [])
+                operation = start_async_operation(
+                    "prices_refresh",
+                    lambda: refresh_item_prices_operation(item_ids),
+                    "Conferência de preços oficiais adicionada à fila prioritária.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/costs/save":
+            try:
+                actor = self.current_user(payload)
+                if (actor or {}).get("role") == "viewer":
+                    self.send_json({"error": "Seu usuário possui acesso somente para leitura."}, status=403)
+                    return
+                self.send_json(save_sku_costs(request, actor))
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return

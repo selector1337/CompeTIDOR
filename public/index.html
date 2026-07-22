@@ -35,6 +35,7 @@
       <nav aria-label="Menu principal">
         <a class="active" href="#/dashboard" data-route="dashboard" aria-label="Dashboard" title="Dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/></svg></span><strong>Dashboard</strong></a>
         <a href="#/estatisticas" data-route="estatisticas" aria-label="Estatísticas" title="Estatísticas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19h16v2H2V3h2v16Zm3-2H5v-6h2v6Zm4 0H9V7h2v10Zm4 0h-2V4h2v13Zm4 0h-2V9h2v8Z"/></svg></span><strong>Estatísticas</strong></a>
+        <a href="#/custos" data-route="custos" aria-label="Custos" title="Custos"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2v2.1c-3.4.4-5 2.3-5 4.7 0 2.9 2.5 4 5 4.7 2.2.6 3 1.1 3 2.2 0 1.2-1.1 2.1-3 2.1-2.2 0-3.8-.8-5.2-1.8l-1.5 2.3c1.6 1.2 3.8 2 6.7 2.2V22h2v-1.7c3.5-.5 5.2-2.5 5.2-5 0-3-2.4-4.1-5.2-4.9-2.1-.6-3-1.1-3-2.1 0-1 .9-1.8 2.8-1.8 1.8 0 3.2.6 4.4 1.4l1.4-2.3A10.7 10.7 0 0 0 14 4.1V2h-2Z"/></svg></span><strong>Custos</strong></a>
         <a href="#/relatorios" data-route="relatorios" aria-label="Relatórios" title="Relatórios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 3h10l4 4v14H5V3Zm9 1.8V8h3.2L14 4.8ZM8 12h8v-2H8v2Zm0 4h8v-2H8v2Zm0 3h6v-2H8v2Z"/></svg></span><strong>Relatórios</strong></a>
         <a href="#/contas" data-route="contas" aria-label="Contas" title="Contas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8-6h5v2h-5V5Zm0 4h5v2h-5V9ZM3 21v-2a5 5 0 0 1 10 0v2H3Zm12-6h6v2h-6v-2Zm0 4h6v2h-6v-2Z"/></svg></span><strong>Contas</strong></a>
         <a href="#/catalogo" data-route="catalogo" aria-label="Catálogo" title="Catálogo"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8ZM7.5 8.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/></svg></span><strong>Catálogo</strong></a>
@@ -336,6 +337,30 @@
         </div>
       </section>
 
+      <section class="page" id="page-custos">
+        <div class="panel costs-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Rentabilidade</p>
+              <h2>Custos por SKU</h2>
+            </div>
+          </div>
+          <form id="cost-quick-form" class="cost-quick-form">
+            <label>SKU <input name="sku" type="search" placeholder="Digite o SKU exato" required /></label>
+            <label>Custo unitário <span class="money-field"><input name="cost" type="text" inputmode="decimal" placeholder="0,00" required /></span></label>
+            <button class="primary" type="submit">Salvar custo</button>
+          </form>
+          <div class="costs-toolbar">
+            <label>Pesquisar <input id="costs-search" type="search" placeholder="SKU ou produto" /></label>
+            <label>Por página
+              <select id="costs-page-size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select>
+            </label>
+          </div>
+          <div id="costs-summary" class="inventory-summary"></div>
+          <div id="costs-list" class="costs-list"></div>
+        </div>
+      </section>
+
       <section class="page" id="page-relatorios">
         <div class="panel catalog-panel">
           <div class="panel-heading">
@@ -390,10 +415,10 @@
           </div>
           <div class="filter-bar">
             <label>Conta <select id="ads-account-filter"></select></label>
-            <label>Produto <input id="ads-product-filter" placeholder="Nome do produto" /></label>
-            <label>Marca <input id="ads-brand-filter" placeholder="Marca" /></label>
-            <label>SKU <input id="ads-sku-filter" placeholder="SKU" /></label>
-            <label>Código ML <input id="ads-code-filter" placeholder="MLB..." /></label>
+            <label>Produto <input id="ads-product-filter" type="search" placeholder="Nome do produto" /></label>
+            <label>Marca <input id="ads-brand-filter" type="search" placeholder="Marca" /></label>
+            <label>SKU <input id="ads-sku-filter" type="search" placeholder="SKU exato" /></label>
+            <label>Código ML <input id="ads-code-filter" type="search" placeholder="MLB..." /></label>
             <label>Status <select id="ads-status-filter"></select></label>
             <label>Tipo de anúncio
               <select id="ads-listing-type-filter">
@@ -416,6 +441,15 @@
                 <option value="inactive">Flex inativo</option>
               </select>
             </label>
+            <label>Resultado
+              <select id="ads-profit-filter">
+                <option value="all">Todos</option>
+                <option value="profit">Com lucro</option>
+                <option value="loss">Com prejuízo</option>
+                <option value="missing">Sem custo cadastrado</option>
+              </select>
+            </label>
+            <button class="mini-button clear-filters-button" id="clear-ads-filters" type="button">Limpar filtros</button>
           </div>
           <div id="ads-bulk-price" class="bulk-price-bar" aria-live="polite">
             <div class="bulk-price-heading">
@@ -438,6 +472,12 @@
               </label>
               <label>Valor <input data-bulk-price-value type="number" min="0.01" step="0.01" placeholder="0,00" /></label>
               <button class="mini-button success-button bulk-price-apply" type="button" data-apply-bulk-price disabled>Aplicar preços</button>
+            </div>
+            <div class="bulk-price-progress" data-bulk-price-progress hidden>
+              <div><strong data-bulk-progress-title>Processando alterações</strong><span data-bulk-progress-count></span></div>
+              <div class="job-progress-track"><span data-bulk-progress-bar style="width:0%"></span></div>
+              <small data-bulk-progress-message></small>
+              <div class="bulk-result-list" data-bulk-result-list></div>
             </div>
           </div>
           <div id="ads-inventory-summary" class="inventory-summary" aria-live="polite"></div>
