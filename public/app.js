@@ -64,6 +64,7 @@
   pricesLoading: false,
   bulkPriceProgress: null,
   costsSearch: "",
+  costsStatus: "all",
   costsPage: 1,
   costsPageSize: 50,
   equalizationType: "listing_type_gap",
@@ -81,6 +82,8 @@
 
 const PAGE_SIZE = 100;
 const renderTimers = {};
+const manualActions = new Map();
+let manualActionSequence = 0;
 
 document.addEventListener("error", (event) => {
   const image = event.target;
@@ -140,26 +143,114 @@ function sunIcon() {
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10ZM11 1h2v4h-2V1Zm0 18h2v4h-2v-4ZM1 11h4v2H1v-2Zm18 0h4v2h-4v-2ZM4.2 2.8 7 5.6 5.6 7 2.8 4.2l1.4-1.4Zm14.2 14.2 2.8 2.8-1.4 1.4-2.8-2.8 1.4-1.4Zm2.8-12.8L18.4 7 17 5.6l2.8-2.8 1.4 1.4ZM7 18.4l-2.8 2.8-1.4-1.4L5.6 17 7 18.4Z"/></svg>`;
 }
 
-async function api(path, options) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    credentials: "same-origin",
-    ...options,
+function manualActionLabel(path) {
+  const labelsByPath = {
+    "/api/statistics/query": "Gerando estatísticas",
+    "/api/reports/export": "Gerando relatório",
+    "/api/clone/preview": "Preparando cópia do anúncio",
+    "/api/clone/execute": "Copiando anúncio",
+    "/api/clone/execute-batch": "Copiando anúncios",
+    "/api/meli/items/bulk-price": "Atualizando preços em lote",
+    "/api/meli/item/update": "Atualizando anúncio",
+    "/api/spreadsheet/template": "Gerando planilha",
+    "/api/spreadsheet/import": "Validando planilha",
+    "/api/spreadsheet/apply": "Aplicando planilha",
+    "/api/costs/save": "Salvando custo",
+  };
+  return labelsByPath[path] || "Processando ação";
+}
+
+function shouldTrackManualRequest(path, options = {}) {
+  if (options.manualProgress === false) return false;
+  if (options.manualProgress === true) return true;
+  if (String(options.method || "GET").toUpperCase() !== "POST") return false;
+  return ![
+    "/api/auth/login", "/api/auth/logout", "/api/auth/setup-master",
+    "/api/notifications/meli", "/api/meli/prices/refresh",
+    "/api/meli/shipping-costs/refresh", "/api/meli/sale-fees/refresh",
+    "/api/meli/identifiers/refresh",
+  ].includes(path);
+}
+
+function renderManualActions() {
+  const root = document.querySelector("#manual-action-center");
+  if (!root) return;
+  root.innerHTML = [...manualActions.values()].slice(-4).reverse().map((action) => {
+    const progress = Number.isFinite(action.progress) ? Math.max(0, Math.min(100, action.progress)) : null;
+    const tone = action.status === "success" ? "success" : action.status === "error" ? "error" : "running";
+    const status = action.status === "success" ? "Concluído"
+      : action.status === "error" ? "Falhou" : progress === null ? "Em andamento" : `${Math.round(progress)}%`;
+    return `<article class="manual-action ${tone}">
+      <div class="manual-action-head"><strong>${escapeText(action.label)}</strong><span>${status}</span></div>
+      <div class="manual-action-track ${progress === null ? "indeterminate" : ""}"><span style="width:${progress === null ? 35 : progress}%"></span></div>
+      <small>${escapeText(action.message || "Processando no servidor...")}</small>
+    </article>`;
+  }).join("");
+}
+
+function beginManualAction(label, message = "Enviando solicitação ao servidor...") {
+  const id = `manual-${Date.now()}-${++manualActionSequence}`;
+  manualActions.set(id, { id, label, message, progress: null, status: "running" });
+  renderManualActions();
+  return id;
+}
+
+function updateManualAction(id, values = {}) {
+  if (!id || !manualActions.has(id)) return;
+  manualActions.set(id, { ...manualActions.get(id), ...values });
+  renderManualActions();
+}
+
+function finishManualAction(id, status, message) {
+  if (!id || !manualActions.has(id)) return;
+  updateManualAction(id, {
+    status,
+    message,
+    progress: status === "success" ? 100 : manualActions.get(id).progress,
   });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    if (response.status === 401 && !["/api/auth/me", "/api/auth/login", "/api/auth/setup-master"].includes(path)) {
-      showLogin();
+  window.setTimeout(() => {
+    manualActions.delete(id);
+    renderManualActions();
+  }, status === "success" ? 5000 : 9000);
+}
+
+async function api(path, options = {}) {
+  const actionId = shouldTrackManualRequest(path, options)
+    ? beginManualAction(options.progressLabel || manualActionLabel(path)) : "";
+  const fetchOptions = { ...options };
+  delete fetchOptions.manualProgress;
+  delete fetchOptions.progressLabel;
+  try {
+    const response = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      ...fetchOptions,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      if (response.status === 401 && !["/api/auth/me", "/api/auth/login", "/api/auth/setup-master"].includes(path)) {
+        showLogin();
+      }
+      const error = new Error(payload.error || payload.message || `Erro ${response.status}`);
+      Object.assign(error, payload);
+      throw error;
     }
-    const error = new Error(payload.error || payload.message || `Erro ${response.status}`);
-    Object.assign(error, payload);
+    if (actionId && payload?.job_id) {
+      payload._manualActionId = actionId;
+      updateManualAction(actionId, { message: payload.message || "Ação adicionada à fila do servidor." });
+    } else if (actionId) {
+      finishManualAction(actionId, "success", payload.message || "Ação concluída com sucesso.");
+    }
+    return payload;
+  } catch (error) {
+    if (actionId) finishManualAction(actionId, "error", error.message || "Não foi possível concluir a ação.");
     throw error;
   }
-  return payload;
 }
 
 async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 1000) {
   if (!initial?.job_id) return initial;
+  const actionId = initial._manualActionId || "";
   const startedAt = Date.now();
   const pollUrl = initial.poll_url || `/api/async/jobs/${initial.job_id}`;
   while (Date.now() - startedAt < timeoutMs) {
@@ -167,9 +258,22 @@ async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 
     await new Promise((resolve) => window.setTimeout(resolve, 900));
     const job = await api(pollUrl);
     if (typeof onProgress === "function") onProgress(job.message || "Processando no servidor...", job);
-    if (job.status === "completed") return job.result || {};
-    if (job.status === "error") throw new Error(job.message || "O processamento em segundo plano não foi concluído.");
+    const progress = Number(job.progress ?? job.percent);
+    updateManualAction(actionId, {
+      message: job.message || "Processando no servidor...",
+      progress: Number.isFinite(progress) ? progress : null,
+    });
+    if (job.status === "completed") {
+      finishManualAction(actionId, "success", job.message || "Ação concluída com sucesso.");
+      return job.result || {};
+    }
+    if (job.status === "error") {
+      const message = job.message || "O processamento em segundo plano não foi concluído.";
+      finishManualAction(actionId, "error", message);
+      throw new Error(message);
+    }
   }
+  finishManualAction(actionId, "error", "O acompanhamento excedeu o tempo desta tela.");
   throw new Error("O processamento continua no servidor, mas excedeu o tempo de acompanhamento desta tela. Atualize a página para consultar o resultado.");
 }
 
@@ -704,6 +808,7 @@ function renderCosts() {
         thumbnail: item.thumbnail || "",
         accounts: new Set(),
         listings: 0,
+        activeListings: 0,
         stock: 0,
       });
     }
@@ -711,11 +816,14 @@ function renderCosts() {
     if (!row.thumbnail && item.thumbnail) row.thumbnail = item.thumbnail;
     if (item.account) row.accounts.add(item.account);
     row.listings += 1;
+    if (String(item.meli_status || item.status || "").toLowerCase() === "active") row.activeListings += 1;
     row.stock += Math.max(0, Number(item.stock) || 0);
   }
   const term = state.costsSearch.trim().toLowerCase();
   const rows = [...grouped.values()]
     .filter((row) => !term || `${row.sku} ${row.title}`.toLowerCase().includes(term))
+    .filter((row) => state.costsStatus === "all"
+      || (state.costsStatus === "active" ? row.activeListings > 0 : row.activeListings === 0))
     .sort((a, b) => a.sku.localeCompare(b.sku, "pt-BR"));
   const costs = state.data.sku_costs || {};
   const configured = rows.filter((row) => costs[row.sku]?.cost !== undefined).length;
@@ -733,7 +841,7 @@ function renderCosts() {
       return `
         <article class="cost-item" data-cost-row="${escapeAttr(row.sku)}">
           ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="${escapeAttr(row.title || row.sku)}" loading="lazy" />` : `<span class="cost-thumb-empty">${escapeText(row.sku.slice(0, 2))}</span>`}
-          <div class="cost-product"><strong>${escapeText(row.sku)}</strong><span>${escapeText(row.title || "Produto sem título")}</span><small>${row.accounts.size} conta(s) · ${row.listings} anúncio(s) · estoque ${row.stock}</small></div>
+          <div class="cost-product"><strong>${escapeText(row.sku)}</strong><span>${escapeText(row.title || "Produto sem título")}</span><small>${row.accounts.size} conta(s) · ${row.activeListings} ativo(s) de ${row.listings} anúncio(s) · estoque ${row.stock}</small></div>
           <label>Custo unitário <span class="money-field"><input type="text" inputmode="decimal" data-cost-value="${escapeAttr(row.sku)}" value="${record.cost ?? ""}" placeholder="0,00" /></span></label>
           <div class="cost-actions">
             <button class="mini-button success-button" type="button" data-save-cost="${escapeAttr(row.sku)}">Salvar</button>
@@ -1167,7 +1275,14 @@ async function queueOfficialPriceRefresh(items) {
 
 function saleFeeNeedsRefresh(item) {
   if (!item.official_source || !item.listing_type_id) return false;
-  if (item.sale_fee_basis && item.sale_fee_status === "ok") return false;
+  const expectedBasis = [
+    item.site_id || "MLB",
+    Math.max(0, Number(item.price) || 0).toFixed(2),
+    item.listing_type_id || "",
+    item.category_id || "",
+  ].join("|");
+  if (item.sale_fee_basis === expectedBasis && item.sale_fee_status === "ok") return false;
+  if (item.sale_fee_basis && item.sale_fee_basis !== expectedBasis) return true;
   if (!item.sale_fee_basis) return true;
   const raw = String(item.sale_fee_updated_at || "").replace(" ", "T");
   const updated = new Date(raw);
@@ -1805,12 +1920,14 @@ async function loadStatistics() {
   state.statisticsLoading = true;
   state.statisticsAttempted = true;
   state.statisticsProgress = "Preparando a consulta no servidor...";
+  const actionId = beginManualAction("Gerando estatísticas", state.statisticsProgress);
   const requestToken = ++state.statisticsRequestToken;
   renderStatistics();
   try {
     const range = statisticsDateRange(form);
     let job = await api("/api/statistics/query", {
       method: "POST",
+      manualProgress: false,
       body: JSON.stringify({
         account: form.elements.account.value,
         sku: form.elements.sku.value,
@@ -1822,6 +1939,10 @@ async function loadStatistics() {
     while (["queued", "processing"].includes(job.status)) {
       if (requestToken !== state.statisticsRequestToken) return;
       state.statisticsProgress = job.message || "Consulta em andamento no servidor...";
+      updateManualAction(actionId, {
+        message: state.statisticsProgress,
+        progress: Number.isFinite(Number(job.progress)) ? Number(job.progress) : null,
+      });
       renderStatistics();
       await new Promise((resolve) => window.setTimeout(resolve, 1800));
       job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
@@ -1831,9 +1952,11 @@ async function loadStatistics() {
     }
     if (requestToken !== state.statisticsRequestToken) return;
     state.statistics = job.result;
+    finishManualAction(actionId, "success", "Estatísticas concluídas.");
     state.statisticsError = "";
     state.statisticsPage = 1;
   } catch (error) {
+    finishManualAction(actionId, "error", error.message || "Não foi possível consultar as estatísticas.");
     state.statistics = null;
     state.statisticsError = error.message || "Não foi possível consultar as estatísticas.";
     showToast(error.message || "Não foi possível consultar as estatísticas.", "error");
@@ -1893,6 +2016,7 @@ async function downloadReport(button) {
   const original = button.textContent;
   button.disabled = true;
   button.textContent = "Gerando...";
+  const actionId = beginManualAction("Gerando relatório", "Preparando os dados do relatório...");
   try {
     const response = await fetch("/api/reports/export", {
       method: "POST",
@@ -1922,6 +2046,10 @@ async function downloadReport(button) {
       const progress = await progressResponse.json().catch(() => ({}));
       if (!progressResponse.ok) throw new Error(progress.error || "Não foi possível acompanhar a geração do relatório.");
       reportJob = progress;
+      updateManualAction(actionId, {
+        message: reportJob.message || "Gerando relatório...",
+        progress: Number.isFinite(Number(reportJob.progress)) ? Number(reportJob.progress) : null,
+      });
     }
     if (reportJob.status !== "completed") {
       throw new Error(reportJob.message || "Não foi possível gerar o relatório.");
@@ -1945,8 +2073,10 @@ async function downloadReport(button) {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
+    finishManualAction(actionId, "success", "Relatório pronto e baixado.");
     showToast(`Relatório ${format === "pdf" ? "PDF" : "Excel"} gerado com os filtros atuais.`);
   } catch (error) {
+    finishManualAction(actionId, "error", error.message || "Não foi possível gerar o relatório.");
     showToast(error.message || "Não foi possível gerar o relatório.", "error");
   } finally {
     button.disabled = false;
@@ -1959,6 +2089,7 @@ async function downloadBulkSpreadsheet() {
   const original = button.textContent;
   button.disabled = true;
   button.textContent = "Gerando...";
+  const actionId = beginManualAction("Gerando planilha", "Organizando anúncios filtrados...");
   try {
     const response = await fetch("/api/spreadsheet/template", {
       method: "POST",
@@ -1975,6 +2106,7 @@ async function downloadBulkSpreadsheet() {
     let job = initial;
     while (!["completed", "error"].includes(job.status)) {
       state.spreadsheetProgress = { progress: Number(job.progress || 0), message: job.message || "Gerando planilha..." };
+      updateManualAction(actionId, { progress: Number(job.progress || 0), message: job.message || "Gerando planilha..." });
       renderSpreadsheetPreview();
       await new Promise((resolve) => setTimeout(resolve, 900));
       const poll = await fetch(`/api/spreadsheet/jobs/${encodeURIComponent(job.id)}`, { credentials: "same-origin" });
@@ -1997,8 +2129,10 @@ async function downloadBulkSpreadsheet() {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
+    finishManualAction(actionId, "success", "Planilha pronta e baixada.");
     showToast("Planilha de edição gerada com os filtros atuais.");
   } catch (error) {
+    finishManualAction(actionId, "error", error.message || "Não foi possível gerar a planilha.");
     showToast(error.message || "Não foi possível gerar a planilha.", "error");
   } finally {
     state.spreadsheetProgress = null;
@@ -2662,6 +2796,7 @@ document.addEventListener("click", (event) => {
   ["#ads-flex-filter", "adsFlex"],
   ["#ads-profit-filter", "adsProfit"],
   ["#costs-search", "costsSearch"],
+  ["#costs-status-filter", "costsStatus"],
   ["#costs-page-size", "costsPageSize"],
   ["#copy-product-filter", "copySearch"],
   ["#copy-sku-filter", "copySku"],

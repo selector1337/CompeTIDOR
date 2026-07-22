@@ -84,6 +84,16 @@ HTTP_MAX_CONCURRENT_REQUESTS = configured_int(
 )
 HTTP_REQUEST_QUEUE = configured_int("COMPETIDOR_HTTP_REQUEST_QUEUE", "http_request_queue", maximum=256)
 HTTP_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_MAX_CONCURRENT_REQUESTS)
+HTTP_FAST_MAX_CONCURRENT_REQUESTS = max(
+    8, min(32, int(os.getenv("COMPETIDOR_HTTP_FAST_MAX_CONCURRENT_REQUESTS", "16")))
+)
+HTTP_MANUAL_MAX_CONCURRENT_REQUESTS = max(
+    4, min(32, int(os.getenv("COMPETIDOR_HTTP_MANUAL_MAX_CONCURRENT_REQUESTS", "16")))
+)
+HTTP_FAST_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_FAST_MAX_CONCURRENT_REQUESTS)
+HTTP_MANUAL_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_MANUAL_MAX_CONCURRENT_REQUESTS)
+HTTP_POOL_ACTIVITY_LOCK = threading.Lock()
+HTTP_POOL_ACTIVITY = {"default": 0, "fast": 0, "manual": 0}
 RUNTIME_STARTED_AT = time.time()
 
 
@@ -292,21 +302,27 @@ def write_json(name, payload):
         path = DATA / name
         temporary = DATA / f".{name}.{uuid.uuid4().hex}.tmp"
         compact = name == CATALOG_DATA_FILE
-        serialized = json.dumps(
-            payload,
-            indent=None if compact else 2,
-            separators=(",", ":") if compact else None,
-            ensure_ascii=False,
-        )
-        temporary.write_text(serialized, encoding="utf-8")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(
+                payload,
+                stream,
+                indent=None if compact else 2,
+                separators=(",", ":") if compact else None,
+                ensure_ascii=False,
+            )
         os.replace(temporary, path)
-        cached_value = copy.deepcopy(payload)
         with JSON_CACHE_LOCK:
-            JSON_CACHE[str(path.resolve())] = {
-                "signature": file_signature(path),
-                "value": cached_value,
-                "loaded_at": time.monotonic(),
-            }
+            cache_key = str(path.resolve())
+            if compact:
+                # O catálogo é grande. Manter o payload do escritor e uma cópia
+                # integral no cache dobra o pico de RAM durante sincronizações.
+                JSON_CACHE.pop(cache_key, None)
+            else:
+                JSON_CACHE[cache_key] = {
+                    "signature": file_signature(path),
+                    "value": copy.deepcopy(payload),
+                    "loaded_at": time.monotonic(),
+                }
         invalidate_response_cache(name)
 
 
@@ -8249,6 +8265,7 @@ def start_statistics_job(request):
             "id": job_id,
             "signature": signature,
             "status": "queued",
+            "progress": 5,
             "message": "Consulta adicionada à fila.",
             "created_at": now_label(),
             "created_epoch": time.time(),
@@ -8259,7 +8276,7 @@ def start_statistics_job(request):
         with STATISTICS_JOBS_LOCK:
             current = STATISTICS_JOBS.get(job_id)
             if current:
-                current.update({"status": "processing", "message": "Consultando vendas oficiais no Mercado Livre."})
+                current.update({"status": "processing", "progress": 20, "message": "Consultando vendas oficiais no Mercado Livre."})
         try:
             result = query_sku_statistics(read_payload(), safe_request)
             with STATISTICS_JOBS_LOCK:
@@ -8268,6 +8285,7 @@ def start_statistics_job(request):
                     current.update(
                         {
                             "status": "completed",
+                            "progress": 100,
                             "message": "Consulta concluída.",
                             "result": result,
                             "finished_at": now_label(),
@@ -8351,6 +8369,7 @@ def start_report_job(request):
     job = {
         "id": job_id,
         "status": "queued",
+        "progress": 5,
         "message": "Relatório adicionado à fila.",
         "report_type": report_type,
         "format": output_format,
@@ -8365,7 +8384,7 @@ def start_report_job(request):
     def worker():
         try:
             with REPORT_JOBS_LOCK:
-                REPORT_JOBS[job_id].update({"status": "processing", "message": "Preparando os dados do relatório."})
+                REPORT_JOBS[job_id].update({"status": "processing", "progress": 20, "message": "Preparando os dados do relatório."})
             statistics_result = None
             if report_type == "statistics" and statistics_job_id:
                 statistics_result = statistics_job_result(statistics_job_id).get("result")
@@ -8382,7 +8401,7 @@ def start_report_job(request):
                 )
             with REPORT_JOBS_LOCK:
                 REPORT_JOBS[job_id].update(
-                    {"message": f"Gerando {output_format.upper()} com {len(rows)} linha(s).", "row_count": len(rows)}
+                    {"progress": 60, "message": f"Gerando {output_format.upper()} com {len(rows)} linha(s).", "row_count": len(rows)}
                 )
             stamp = datetime.now(APP_TZ).strftime("%Y%m%d-%H%M")
             if output_format == "xlsx":
@@ -8400,6 +8419,7 @@ def start_report_job(request):
                 REPORT_JOBS[job_id].update(
                     {
                         "status": "completed",
+                        "progress": 100,
                         "message": "Relatório concluído e pronto para baixar.",
                         "path": str(target),
                         "content_type": content_type,
@@ -9486,19 +9506,29 @@ class App(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
-    def run_with_request_slot(self, handler):
+    def run_with_request_slot(self, handler, semaphore=None):
         timeout = max(1, int(os.getenv("COMPETIDOR_HTTP_QUEUE_TIMEOUT_SECONDS", "10")))
-        if not HTTP_REQUEST_SEMAPHORE.acquire(timeout=timeout):
+        semaphore = semaphore or HTTP_REQUEST_SEMAPHORE
+        pool_name = (
+            "fast" if semaphore is HTTP_FAST_REQUEST_SEMAPHORE
+            else "manual" if semaphore is HTTP_MANUAL_REQUEST_SEMAPHORE
+            else "default"
+        )
+        if not semaphore.acquire(timeout=timeout):
             self.send_json(
                 {"error": "O servidor está processando muitas solicitações. Tente novamente em alguns segundos."},
                 status=503,
                 headers={"Retry-After": "2"},
             )
             return
+        with HTTP_POOL_ACTIVITY_LOCK:
+            HTTP_POOL_ACTIVITY[pool_name] += 1
         try:
             handler()
         finally:
-            HTTP_REQUEST_SEMAPHORE.release()
+            with HTTP_POOL_ACTIVITY_LOCK:
+                HTTP_POOL_ACTIVITY[pool_name] = max(0, HTTP_POOL_ACTIVITY[pool_name] - 1)
+            semaphore.release()
 
     def write_response_body(self, body):
         try:
@@ -9517,26 +9547,59 @@ class App(BaseHTTPRequestHandler):
 
     def send_json_body(self, body, status=200, headers=None):
         body, encoding = self.response_body(body, "application/json")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        if encoding:
-            self.send_header("Content-Encoding", encoding)
-            self.send_header("Vary", "Accept-Encoding")
-        self.send_security_headers()
-        response_headers = headers or {}
-        if "Set-Cookie" not in response_headers:
-            session_token = self.cookie_value("competidor_session")
-            if session_token:
-                secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
-                self.send_header(
-                    "Set-Cookie",
-                    f"competidor_session={session_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_SECONDS}{secure}",
-                )
-        for key, value in response_headers.items():
-            self.send_header(key, value)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.write_response_body(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
+                self.send_header("Vary", "Accept-Encoding")
+            self.send_security_headers()
+            response_headers = headers or {}
+            if "Set-Cookie" not in response_headers:
+                session_token = self.cookie_value("competidor_session")
+                if session_token:
+                    secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+                    self.send_header(
+                        "Set-Cookie",
+                        f"competidor_session={session_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_SECONDS}{secure}",
+                    )
+            for key, value in response_headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return self.write_response_body(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return False
+
+    def read_json_request(self, maximum_body=None):
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            self.send_json({"error": "Content-Length inválido."}, status=400)
+            return None
+        if length < 0:
+            self.send_json({"error": "Content-Length inválido."}, status=400)
+            return None
+        limit = maximum_body or max(
+            1024 * 1024,
+            int(os.getenv("MAX_REQUEST_BODY_BYTES", str(30 * 1024 * 1024))),
+        )
+        if length > limit:
+            self.send_json({"error": "O arquivo ou a requisição excede o limite permitido pelo servidor."}, status=413)
+            return None
+        try:
+            raw = self.rfile.read(length) if length else b"{}"
+            request = json.loads(raw.decode("utf-8") or "{}")
+        except UnicodeDecodeError:
+            self.send_json({"error": "A requisição precisa estar codificada em UTF-8."}, status=400)
+            return None
+        except json.JSONDecodeError:
+            self.send_json({"error": "O corpo da requisição contém JSON inválido."}, status=400)
+            return None
+        if not isinstance(request, dict):
+            self.send_json({"error": "O corpo da requisição precisa ser um objeto JSON."}, status=400)
+            return None
+        return request
 
     def send_json(self, payload, status=200, headers=None):
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -9675,6 +9738,8 @@ class App(BaseHTTPRequestHandler):
     def serve_file(self, path):
         if path == "/":
             path = "/index.html"
+        elif path == "/favicon.ico":
+            path = "/competidor-menu.png"
         target = (PUBLIC / path.lstrip("/")).resolve()
         if not str(target).startswith(str(PUBLIC.resolve())) or not target.exists():
             if not path.startswith("/api/"):
@@ -9721,7 +9786,21 @@ class App(BaseHTTPRequestHandler):
         self.write_response_body(body)
 
     def do_GET(self):
-        self.run_with_request_slot(self._do_GET)
+        parsed_path = urlparse(self.path).path
+        if not parsed_path.startswith("/api/"):
+            self._do_GET()
+            return
+        fast_prefixes = (
+            "/api/async/jobs/",
+            "/api/statistics/jobs/",
+            "/api/reports/jobs/",
+            "/api/spreadsheet/jobs/",
+        )
+        fast_paths = {"/api/health", "/api/meta", "/api/dashboard", "/api/auth/me"}
+        semaphore = HTTP_FAST_REQUEST_SEMAPHORE if (
+            parsed_path in fast_paths or parsed_path.startswith(fast_prefixes)
+        ) else HTTP_REQUEST_SEMAPHORE
+        self.run_with_request_slot(self._do_GET, semaphore)
 
     def _do_GET(self):
         parsed = urlparse(self.path)
@@ -9737,9 +9816,16 @@ class App(BaseHTTPRequestHandler):
                 for job in ASYNC_OPERATION_JOBS.values():
                     key = f"{job.get('priority') or 'interactive'}_{job.get('status') or 'unknown'}"
                     job_counts[key] = job_counts.get(key, 0) + 1
+            with HTTP_POOL_ACTIVITY_LOCK:
+                pool_activity = dict(HTTP_POOL_ACTIVITY)
+            saturated_pools = []
+            if pool_activity["default"] >= HTTP_MAX_CONCURRENT_REQUESTS:
+                saturated_pools.append("default")
+            if pool_activity["manual"] >= HTTP_MANUAL_MAX_CONCURRENT_REQUESTS:
+                saturated_pools.append("manual")
             self.send_json(
                 {
-                    "ok": True,
+                    "ok": not saturated_pools,
                     "service": "CompeTIDOR",
                     "profile": PERFORMANCE_PROFILE,
                     "uptime_seconds": int(time.time() - RUNTIME_STARTED_AT),
@@ -9748,6 +9834,10 @@ class App(BaseHTTPRequestHandler):
                     "operation_jobs": job_counts,
                     "notification_queue": MELI_NOTIFICATION_QUEUE.qsize(),
                     "http_max_concurrent_requests": HTTP_MAX_CONCURRENT_REQUESTS,
+                    "http_fast_max_concurrent_requests": HTTP_FAST_MAX_CONCURRENT_REQUESTS,
+                    "http_manual_max_concurrent_requests": HTTP_MANUAL_MAX_CONCURRENT_REQUESTS,
+                    "http_pool_activity": pool_activity,
+                    "saturated_pools": saturated_pools,
                     "http_pool_idle_per_host": HTTP_TRANSPORT.max_idle_per_host,
                     "manual_concurrent_jobs": MANUAL_CONCURRENT_JOBS,
                     "clone_concurrent_jobs": CLONE_CONCURRENT_JOBS,
@@ -10011,15 +10101,24 @@ class App(BaseHTTPRequestHandler):
         self.send_json({"error": "Endpoint não encontrado"}, status=404)
 
     def do_POST(self):
-        self.run_with_request_slot(self._do_POST)
+        parsed_path = urlparse(self.path).path
+        automatic_paths = {
+            "/api/notifications/meli",
+            "/api/meli/prices/refresh",
+            "/api/meli/shipping-costs/refresh",
+            "/api/meli/sale-fees/refresh",
+            "/api/meli/identifiers/refresh",
+        }
+        semaphore = HTTP_REQUEST_SEMAPHORE if parsed_path in automatic_paths else HTTP_MANUAL_REQUEST_SEMAPHORE
+        self.run_with_request_slot(self._do_POST, semaphore)
 
     def _do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/notifications/meli":
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length).decode("utf-8") if length else "{}"
-                event = json.loads(body or "{}")
+                event = self.read_json_request(maximum_body=1024 * 1024)
+                if event is None:
+                    return
                 configured_app_id = str(meli_config().get("client_id") or "")
                 event_app_id = str(event.get("application_id") or "")
                 if configured_app_id and event_app_id and configured_app_id != event_app_id:
@@ -10029,18 +10128,14 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"ok": True}, status=200)
             except queue.Full:
                 self.send_json({"ok": False, "error": "Fila temporariamente cheia."}, status=503)
-            except Exception:
-                self.send_json({"ok": True}, status=200)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
         if not self.validate_same_origin():
             return
-        length = int(self.headers.get("Content-Length", 0))
-        maximum_body = max(1024 * 1024, int(os.getenv("MAX_REQUEST_BODY_BYTES", str(30 * 1024 * 1024))))
-        if length > maximum_body:
-            self.send_json({"error": "O arquivo ou a requisição excede o limite permitido pelo servidor."}, status=413)
+        request = self.read_json_request()
+        if request is None:
             return
-        body = self.rfile.read(length).decode("utf-8") if length else "{}"
-        request = json.loads(body or "{}")
         lightweight_paths = {
             "/api/auth/setup-master",
             "/api/auth/login",
@@ -10860,6 +10955,70 @@ class App(BaseHTTPRequestHandler):
         self.send_json({"error": "Endpoint não encontrado"}, status=404)
 
 
+def current_process_rss_bytes():
+    """Return current RSS on Linux without adding a runtime dependency."""
+    try:
+        pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[1])
+        return pages * int(os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, ValueError, IndexError, AttributeError):
+        return 0
+
+
+def trim_runtime_cache(cache, lock, maximum):
+    with lock:
+        overflow = len(cache) - maximum
+        if overflow <= 0:
+            return 0
+        for key in list(cache)[:overflow]:
+            cache.pop(key, None)
+        return overflow
+
+
+def release_unused_process_memory():
+    gc.collect()
+    if os.name != "posix":
+        return
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        return
+
+
+def memory_maintenance_loop():
+    interval = max(60, int(os.getenv("COMPETIDOR_MEMORY_MAINTENANCE_SECONDS", "300")))
+    trim_threshold = max(512, int(os.getenv("COMPETIDOR_MEMORY_TRIM_RSS_MB", "3072"))) * 1024 * 1024
+    cache_limits = (
+        (CATEGORY_ATTRIBUTES_CACHE, CATEGORY_ATTRIBUTES_LOCK, 5000),
+        (SELLER_PROFILE_CACHE, SELLER_PROFILE_LOCK, 2000),
+        (OFFICIAL_STORE_CACHE, OFFICIAL_STORE_CACHE_LOCK, 1000),
+        (PUBLIC_BUYBOX_CACHE, PUBLIC_BUYBOX_CACHE_LOCK, 5000),
+        (CATALOG_OFFERS_CACHE, CATALOG_OFFERS_CACHE_LOCK, 5000),
+        (STATISTICS_CACHE, STATISTICS_CACHE_LOCK, 256),
+        (SHIPMENT_MODE_CACHE, SHIPMENT_MODE_CACHE_LOCK, 20000),
+        (SALE_FEE_CACHE, SALE_FEE_CACHE_LOCK, 100000),
+        (CLONE_SOURCE_CACHE, CLONE_SOURCE_CACHE_LOCK, 512),
+        (STATIC_FILE_CACHE, STATIC_FILE_CACHE_LOCK, 128),
+        (RESPONSE_CACHE, RESPONSE_CACHE_LOCK, 64),
+    )
+    time.sleep(min(60, interval))
+    while True:
+        try:
+            cleanup_async_operation_jobs()
+            cleanup_statistics_jobs()
+            cleanup_report_jobs()
+            cleanup_spreadsheet_jobs()
+            for cache, lock, maximum in cache_limits:
+                trim_runtime_cache(cache, lock, maximum)
+            rss = current_process_rss_bytes()
+            if rss and rss >= trim_threshold:
+                release_unused_process_memory()
+        except Exception as exc:
+            print(f"Manutenção de memória ignorou uma falha: {exc}")
+        time.sleep(interval)
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8765"))
     http_server = BoundedThreadingHTTPServer(("127.0.0.1", port), App)
@@ -10879,6 +11038,7 @@ if __name__ == "__main__":
     threading.Thread(target=auto_official_sync_loop, daemon=True).start()
     threading.Thread(target=auto_sale_fee_loop, daemon=True).start()
     threading.Thread(target=auto_catalog_competition_loop, daemon=True).start()
+    threading.Thread(target=memory_maintenance_loop, name="memory-maintenance", daemon=True).start()
     print(
         f"CompeTIDOR rodando em http://127.0.0.1:{port} "
         f"[perfil={PERFORMANCE_PROFILE}, http={HTTP_MAX_CONCURRENT_REQUESTS}, "

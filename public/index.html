@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260722" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -352,6 +352,13 @@
           </form>
           <div class="costs-toolbar">
             <label>Pesquisar <input id="costs-search" type="search" placeholder="SKU ou produto" /></label>
+            <label>Status do anúncio
+              <select id="costs-status-filter">
+                <option value="all">Todos os SKUs</option>
+                <option value="active">Com anúncio ativo</option>
+                <option value="inactive">Sem anúncio ativo</option>
+              </select>
+            </label>
             <label>Por página
               <select id="costs-page-size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select>
             </label>
@@ -730,7 +737,8 @@
       </section>
     </main>
 
+    <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-    <script src="/app.js"></script>
+    <script src="/app.js?v=20260722"></script>
   </body>
 </html>
