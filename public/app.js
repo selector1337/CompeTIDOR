@@ -56,6 +56,13 @@
   statisticsRequestToken: 0,
   statisticsPage: 1,
   statisticsPageSize: 50,
+  salesReport: null,
+  salesReportLoading: false,
+  salesReportError: "",
+  salesReportProgress: "",
+  salesReportJobId: "",
+  salesReportPage: 1,
+  salesReportPageSize: 50,
   spreadsheetPreview: null,
   spreadsheetProgress: null,
   shippingCostsLoading: false,
@@ -84,6 +91,7 @@ const PAGE_SIZE = 100;
 const renderTimers = {};
 const manualActions = new Map();
 let manualActionSequence = 0;
+window.setInterval(updateScheduleCountdowns, 1000);
 
 document.addEventListener("error", (event) => {
   const image = event.target;
@@ -98,7 +106,7 @@ const pageTitles = {
   dashboard: ["Painel unificado", "Dashboard"],
   estatisticas: ["Vendas oficiais", "Estatísticas por SKU"],
   custos: ["Rentabilidade", "Custos por SKU"],
-  relatorios: ["Equalização de contas", "Relatórios por SKU"],
+  relatorios: ["Vendas e equalização", "Relatórios"],
   contas: ["OAuth oficial", "Contas Mercado Livre"],
   catalogo: ["Catálogo Mercado Livre", "Disputa de catálogo"],
   anuncios: ["Gestão operacional", "Anúncios"],
@@ -520,7 +528,10 @@ function renderRoute() {
     dashboard: renderDashboard,
     estatisticas: renderStatistics,
     custos: renderCosts,
-    relatorios: renderEqualizationReports,
+    relatorios: () => {
+      renderSalesReport();
+      renderEqualizationReports();
+    },
     contas: () => {
       renderAccounts();
       renderMeliConfig();
@@ -757,6 +768,7 @@ function itemCommercialValues(item) {
   const fee = feeKnown ? Math.max(0, Number(item?.sale_fee_amount) || 0) : null;
   const net = feeKnown ? Math.max(0, price - fee - shipping) : null;
   const profit = cost !== null && net !== null ? net - cost : null;
+  const profitPercentage = profit !== null && net > 0 ? (profit / net) * 100 : null;
   const lastSale = state.data?.sku_last_sales?.[sku] || {};
   return {
     sku,
@@ -765,6 +777,7 @@ function itemCommercialValues(item) {
     shipping,
     net,
     profit,
+    profitPercentage,
     profitStatus: profit === null ? "missing" : profit >= 0 ? "profit" : "loss",
     lastSale,
   };
@@ -786,7 +799,52 @@ function profitFact(item) {
   const commercial = itemCommercialValues(item);
   const tone = commercial.profitStatus === "profit" ? "profit-positive"
     : commercial.profitStatus === "loss" ? "profit-negative" : "profit-missing";
-  return `<div class="fact ${tone}"><small>Lucro / prejuízo</small><strong>${profitLabel(item)}</strong></div>`;
+  const margin = commercial.profitPercentage === null
+    ? ""
+    : `<em>${commercial.profitPercentage >= 0 ? "+" : ""}${commercial.profitPercentage.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%</em>`;
+  return `<div class="fact ${tone}"><small>Lucro / prejuízo</small><strong>${profitLabel(item)}</strong>${margin}</div>`;
+}
+
+function scheduleForItem(item) {
+  return (state.data?.price_schedules || []).find(
+    (row) => !row.deleted && row.item_id === item.id && row.account_id === item.account_id
+  ) || null;
+}
+
+function priceScheduleHtml(item) {
+  const schedule = scheduleForItem(item);
+  if (!schedule) return "";
+  const weekdayLabels = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"];
+  const recurrence = schedule.mode === "weekly"
+    ? (schedule.weekdays || []).map((day) => weekdayLabels[Number(day)]).filter(Boolean).join(", ")
+    : formatDateBR(schedule.start_date);
+  const tone = schedule.active ? "active" : schedule.status === "retry" ? "error" : "scheduled";
+  return `<div class="price-schedule-status ${tone}">
+    <div><small>${schedule.active ? "Preço agendado ativo" : "Agendamento de preço"}</small>
+      <strong>${money.format(schedule.scheduled_price || 0)}</strong>
+      <span>${escapeText(recurrence)} · ${escapeText(schedule.start_time)} até ${escapeText(schedule.end_time)} · padrão ${money.format(schedule.base_price || 0)}</span>
+      ${schedule.active_until ? `<em data-schedule-countdown="${escapeAttr(schedule.active_until)}"></em>` : ""}
+      ${schedule.last_error ? `<em class="schedule-error">${escapeText(schedule.last_error)}</em>` : ""}
+    </div>
+    <div>
+      <button class="mini-button" type="button" data-schedule-price="${item.id}">Editar</button>
+      <button class="mini-button" type="button" data-schedule-state="${schedule.id}">${schedule.enabled ? "Desativar" : "Ativar"}</button>
+      <button class="icon-button danger-button" type="button" data-delete-schedule="${schedule.id}" title="Excluir agendamento">×</button>
+    </div>
+  </div>`;
+}
+
+function updateScheduleCountdowns() {
+  document.querySelectorAll("[data-schedule-countdown]").forEach((node) => {
+    const remaining = Math.max(0, new Date(node.dataset.scheduleCountdown).getTime() - Date.now());
+    const seconds = Math.floor(remaining / 1000);
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const rest = seconds % 60;
+    node.textContent = remaining > 0
+      ? `Preço padrão volta em ${hours}h ${String(minutes).padStart(2, "0")}min ${String(rest).padStart(2, "0")}s`
+      : "Aguardando restauração pelo servidor";
+  });
 }
 
 function renderCosts() {
@@ -1100,8 +1158,10 @@ function renderAds() {
               : item.official_source
                 ? `<button class="mini-button success-button" data-activate-flex="${item.id}">Ativar Flex</button>`
                 : ""}
+            <button class="mini-button schedule-price-button" type="button" data-schedule-price="${item.id}">Agendar preço</button>
           </div>
         </div>
+        ${priceScheduleHtml(item)}
         ${renderAdDescriptionEditor(item)}
         ${renderItemLog(item)}
       </div>
@@ -1969,7 +2029,107 @@ async function loadStatistics() {
   }
 }
 
+function updateSalesReportPeriodFields() {
+  const form = document.querySelector("#sales-report-form");
+  if (!form) return;
+  const period = form.elements.period.value;
+  form.querySelectorAll("[data-sales-date]").forEach((node) => { node.hidden = period !== "specific_date"; });
+  form.querySelectorAll("[data-sales-custom]").forEach((node) => { node.hidden = period !== "custom"; });
+}
+
+function renderSalesReport() {
+  const form = document.querySelector("#sales-report-form");
+  const feedback = document.querySelector("#sales-report-feedback");
+  const summary = document.querySelector("#sales-report-summary");
+  const results = document.querySelector("#sales-report-results");
+  if (!form || !feedback || !summary || !results) return;
+  const selected = form.elements.account.value || "all";
+  form.elements.account.innerHTML = `<option value="all">Todas as contas</option>${connectedAccounts()
+    .map((account) => `<option value="${escapeAttr(account.id || account.seller_id)}">${escapeText(account.nickname)}</option>`)
+    .join("")}`;
+  if ([...form.elements.account.options].some((option) => option.value === selected)) form.elements.account.value = selected;
+  const today = new Date();
+  if (!form.elements.specific_date.value) form.elements.specific_date.value = localDateValue(today);
+  if (!form.elements.date_from.value) form.elements.date_from.value = localDateValue(new Date(today.getFullYear(), today.getMonth(), 1));
+  if (!form.elements.date_to.value) form.elements.date_to.value = localDateValue(today);
+  updateSalesReportPeriodFields();
+  feedback.innerHTML = state.salesReportLoading
+    ? `<div class="statistics-loading"><span></span><strong>${escapeText(state.salesReportProgress || "Consultando vendas oficiais...")}</strong></div>`
+    : state.salesReportError ? `<div class="notice danger-notice">${escapeText(state.salesReportError)}</div>` : "";
+  if (!state.salesReport) {
+    summary.innerHTML = "";
+    results.innerHTML = `<div class="notice">Use os filtros e clique em “Consultar vendas”. A consulta só é executada quando solicitada.</div>`;
+    return;
+  }
+  const totals = state.salesReport.summary || {};
+  summary.innerHTML = `
+    <div><span>Itens vendidos</span><strong>${Number(totals.sales || 0).toLocaleString("pt-BR")}</strong></div>
+    <div><span>Unidades</span><strong>${Number(totals.units || 0).toLocaleString("pt-BR")}</strong></div>
+    <div><span>Valor vendido</span><strong>${money.format(totals.gross_amount || 0)}</strong></div>
+    <div><span>Valor líquido</span><strong>${money.format(totals.net_amount || 0)}</strong></div>
+    <div class="${Number(totals.profit_amount || 0) >= 0 ? "profit-positive" : "profit-negative"}"><span>Lucro / prejuízo</span><strong>${money.format(totals.profit_amount || 0)}</strong></div>`;
+  const pageInfo = paginate(state.salesReport.rows || [], state.salesReportPage, state.salesReportPageSize);
+  state.salesReportPage = pageInfo.current;
+  results.innerHTML = `${paginationHtml("salesReportPage", pageInfo)}
+    <div class="sales-report-table">
+      ${pageInfo.items.map((row) => `
+        <article class="sales-report-row">
+          ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
+          <div class="sales-report-product"><strong>${escapeText(row.product)}</strong><small>${escapeText(row.account)} · SKU ${escapeText(row.sku)} · Pedido ${escapeText(row.order_id)}</small><small>${formatDateBR(row.date)}</small></div>
+          <span><small>Qtd.</small><strong>${Number(row.quantity || 0)}</strong></span>
+          <span><small>Venda</small><strong>${money.format(row.gross_amount || 0)}</strong></span>
+          <span><small>Tarifa</small><strong>${row.sale_fee_amount == null ? "Não disponível" : money.format(row.sale_fee_amount)}</strong></span>
+          <span><small>Frete</small><strong>${money.format(row.shipping_amount || 0)}</strong></span>
+          <span><small>Líquido</small><strong>${row.net_amount == null ? "Calculando" : money.format(row.net_amount)}</strong></span>
+          <span><small>Custo</small><strong>${row.cost_amount == null ? "Sem custo" : money.format(row.cost_amount)}</strong></span>
+          <span class="${row.profit_status === "profit" ? "profit-positive" : row.profit_status === "loss" ? "profit-negative" : ""}"><small>Resultado</small><strong>${row.profit_amount == null ? "Sem custo" : money.format(row.profit_amount)}</strong><em>${row.profit_percentage == null ? "" : `${row.profit_percentage >= 0 ? "+" : ""}${Number(row.profit_percentage).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</em></span>
+        </article>`).join("") || `<div class="notice">Nenhuma venda encontrada no período.</div>`}
+    </div>${paginationHtml("salesReportPage", pageInfo)}`;
+}
+
+async function loadSalesReport() {
+  const form = document.querySelector("#sales-report-form");
+  if (!form || state.salesReportLoading) return;
+  state.salesReportLoading = true;
+  state.salesReportError = "";
+  state.salesReportProgress = "Preparando a consulta no servidor...";
+  renderSalesReport();
+  const actionId = beginManualAction("Relatório de vendas", state.salesReportProgress);
+  try {
+    const range = statisticsDateRange(form);
+    let job = await api("/api/sales-report/query", {
+      method: "POST",
+      manualProgress: false,
+      body: JSON.stringify({ account: form.elements.account.value, ...range }),
+    });
+    state.salesReportJobId = job.id || "";
+    while (["queued", "processing"].includes(job.status)) {
+      state.salesReportProgress = job.message || "Consultando vendas oficiais...";
+      updateManualAction(actionId, { message: state.salesReportProgress, progress: Number(job.progress || 0) });
+      renderSalesReport();
+      await new Promise((resolve) => setTimeout(resolve, 1600));
+      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+    }
+    if (job.status !== "completed" || !job.result) throw new Error(job.message || "O relatório não foi concluído.");
+    state.salesReport = job.result;
+    state.salesReportPage = 1;
+    finishManualAction(actionId, "success", "Relatório de vendas concluído.");
+  } catch (error) {
+    state.salesReport = null;
+    state.salesReportError = error.message || "Não foi possível consultar as vendas.";
+    finishManualAction(actionId, "error", state.salesReportError);
+  } finally {
+    state.salesReportLoading = false;
+    state.salesReportProgress = "";
+    renderSalesReport();
+  }
+}
+
 function currentReportFilters(reportType) {
+  if (reportType === "sales") {
+    const form = document.querySelector("#sales-report-form");
+    return { account: form.elements.account.value, ...statisticsDateRange(form) };
+  }
   if (reportType === "statistics") {
     const form = document.querySelector("#statistics-form");
     return {
@@ -2026,7 +2186,7 @@ async function downloadReport(button) {
         report_type: reportType,
         format,
         filters: currentReportFilters(reportType),
-        statistics_job_id: reportType === "statistics" ? state.statisticsJobId : "",
+        statistics_job_id: reportType === "statistics" ? state.statisticsJobId : reportType === "sales" ? state.salesReportJobId : "",
       }),
     });
     if (!response.ok) {
@@ -2723,6 +2883,7 @@ document.addEventListener("click", (event) => {
   if (key === "scanPage") renderScan();
   if (key === "competitorsPage") renderCompetitors();
   if (key === "statisticsPage") renderStatistics();
+  if (key === "salesReportPage") renderSalesReport();
   if (key === "equalizationPage") renderEqualizationReports();
   if (key === "costsPage") renderCosts();
   if (["dashboardStockPage", "dashboardCatalogPage", "dashboardShipmentPage", "dashboardSalesPage", "dashboardTopSkuPage"].includes(key)) renderDashboard();
@@ -2768,6 +2929,20 @@ document.querySelector("#statistics-form")?.addEventListener("submit", async (ev
   event.preventDefault();
   state.statisticsPage = 1;
   await loadStatistics();
+});
+
+document.querySelector("#sales-report-form")?.addEventListener("change", (event) => {
+  if (event.target.name === "period") updateSalesReportPeriodFields();
+  if (event.target.name === "page_size") {
+    state.salesReportPageSize = Number(event.target.value || 50);
+    state.salesReportPage = 1;
+    renderSalesReport();
+  }
+});
+
+document.querySelector("#sales-report-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadSalesReport();
 });
 
 document.addEventListener("click", (event) => {
@@ -3210,6 +3385,112 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   } catch (error) {
     showToast(error.message || "Não foi possível atualizar o anúncio.", "error");
     alert(error.message || "Não foi possível atualizar o anúncio.");
+  }
+});
+
+function openPriceScheduleDialog(item) {
+  const existing = scheduleForItem(item);
+  document.querySelector("#price-schedule-dialog")?.remove();
+  const today = localDateValue(new Date());
+  const dialog = document.createElement("dialog");
+  dialog.id = "price-schedule-dialog";
+  dialog.className = "price-schedule-dialog";
+  dialog.innerHTML = `
+    <form method="dialog" class="price-schedule-card">
+      <div class="stock-calculator-heading">
+        <div><small>Preço temporário automático</small><h3>Agendar preço</h3><p>${escapeText(item.title)}</p></div>
+        <button class="icon-button" type="button" data-close-price-schedule aria-label="Fechar">×</button>
+      </div>
+      <div class="schedule-price-baseline">
+        <span><small>Preço padrão preservado</small><strong>${money.format(existing?.base_price ?? item.price ?? 0)}</strong></span>
+        <span><small>Conta</small><strong>${escapeText(item.account)}</strong></span>
+        <span><small>SKU</small><strong>${escapeText(item.sku || "-")}</strong></span>
+      </div>
+      <div class="price-schedule-fields">
+        <label>Preço agendado <span class="money-field"><input name="scheduled_price" type="number" min="0.01" step="0.01" required value="${escapeAttr(existing?.scheduled_price ?? item.price ?? "")}" /></span></label>
+        <label>Recorrência
+          <select name="mode"><option value="once">Data específica</option><option value="weekly">Dias da semana</option></select>
+        </label>
+        <label data-schedule-date>Data de início <input name="start_date" type="date" value="${escapeAttr(existing?.start_date || today)}" /></label>
+        <label data-schedule-date>Data final <input name="end_date" type="date" value="${escapeAttr(existing?.end_date || "")}" /></label>
+        <label>Ativar às <input name="start_time" type="time" required value="${escapeAttr(existing?.start_time || "19:00")}" /></label>
+        <label>Restaurar às <input name="end_time" type="time" required value="${escapeAttr(existing?.end_time || "05:00")}" /></label>
+      </div>
+      <fieldset class="schedule-weekdays" data-schedule-weekdays hidden>
+        <legend>Dias em que o preço temporário começa</legend>
+        ${["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"].map((label, index) => `<label><input type="checkbox" name="weekday" value="${index}" ${(existing?.weekdays || []).includes(index) ? "checked" : ""} /><span>${label}</span></label>`).join("")}
+      </fieldset>
+      <div class="notice">Se o horário final for menor que o inicial, a restauração ocorre no dia seguinte. O servidor mantém o agendamento e tenta novamente caso a API esteja temporariamente indisponível.</div>
+      <button class="primary" type="submit" value="save">Salvar agendamento</button>
+    </form>`;
+  document.body.appendChild(dialog);
+  const form = dialog.querySelector("form");
+  form.elements.mode.value = existing?.mode || "once";
+  const toggleFields = () => {
+    const weekly = form.elements.mode.value === "weekly";
+    form.querySelectorAll("[data-schedule-date]").forEach((node) => { node.hidden = weekly; });
+    form.querySelector("[data-schedule-weekdays]").hidden = !weekly;
+  };
+  form.elements.mode.addEventListener("change", toggleFields);
+  toggleFields();
+  dialog.querySelector("[data-close-price-schedule]").addEventListener("click", () => dialog.close());
+  form.addEventListener("submit", async (event) => {
+    if (event.submitter?.value !== "save") return;
+    event.preventDefault();
+    const button = event.submitter;
+    button.disabled = true;
+    button.textContent = "Salvando...";
+    try {
+      const result = await api("/api/price-schedules/save", {
+        method: "POST",
+        body: JSON.stringify({
+          item_id: item.id,
+          account_id: item.account_id,
+          scheduled_price: form.elements.scheduled_price.value,
+          mode: form.elements.mode.value,
+          start_date: form.elements.start_date.value,
+          end_date: form.elements.end_date.value,
+          start_time: form.elements.start_time.value,
+          end_time: form.elements.end_time.value,
+          weekdays: [...form.querySelectorAll('[name="weekday"]:checked')].map((input) => Number(input.value)),
+        }),
+      });
+      state.data.price_schedules = result.price_schedules || [];
+      showToast("Agendamento salvo com sucesso.", "success");
+      dialog.close();
+      renderAds();
+    } catch (error) {
+      showToast(error.message || "Não foi possível salvar o agendamento.", "error");
+      button.disabled = false;
+      button.textContent = "Salvar agendamento";
+    }
+  });
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.showModal();
+}
+
+document.querySelector("#ads-list")?.addEventListener("click", async (event) => {
+  const scheduleButton = event.target.closest("[data-schedule-price]");
+  if (scheduleButton) {
+    const item = state.data.catalog.find((row) => row.id === scheduleButton.dataset.schedulePrice);
+    if (item) openPriceScheduleDialog(item);
+    return;
+  }
+  const stateButton = event.target.closest("[data-schedule-state], [data-delete-schedule]");
+  if (!stateButton) return;
+  const id = stateButton.dataset.scheduleState || stateButton.dataset.deleteSchedule;
+  stateButton.disabled = true;
+  try {
+    const result = await api("/api/price-schedules/state", {
+      method: "POST",
+      body: JSON.stringify({ id, action: stateButton.dataset.deleteSchedule ? "delete" : "toggle" }),
+    });
+    state.data.price_schedules = result.price_schedules || [];
+    showToast(stateButton.dataset.deleteSchedule ? "Agendamento excluído." : "Agendamento atualizado.", "success");
+    renderAds();
+  } catch (error) {
+    showToast(error.message || "Não foi possível atualizar o agendamento.", "error");
+    stateButton.disabled = false;
   }
 });
 

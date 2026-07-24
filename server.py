@@ -471,6 +471,22 @@ def merge_critical_records(collection, incoming, latest):
     return merged
 
 
+def merge_price_schedules(incoming, latest):
+    incoming_by_id = {str(row.get("id")): row for row in incoming or [] if row.get("id")}
+    latest_by_id = {str(row.get("id")): row for row in latest or [] if row.get("id")}
+    merged = []
+    for schedule_id in [*latest_by_id, *[key for key in incoming_by_id if key not in latest_by_id]]:
+        current = incoming_by_id.get(schedule_id)
+        saved = latest_by_id.get(schedule_id)
+        if current is None or saved is None:
+            merged.append(current or saved)
+            continue
+        current_changed = str(current.get("updated_at") or current.get("created_at") or "")
+        saved_changed = str(saved.get("updated_at") or saved.get("created_at") or "")
+        merged.append(current if current_changed >= saved_changed else saved)
+    return merged
+
+
 CATALOG_COMPETITION_FIELDS = {
     "competition_status", "competition_consistent", "competition_checked_at", "competition_reason",
     "winner_item_id", "winner_seller_id", "winner_name", "winner_price", "winner_confirmed", "winner_source",
@@ -561,6 +577,10 @@ def write_payload(payload, replace_collections=None):
             payload["clone_jobs"] = merge_clone_jobs(
                 payload.get("clone_jobs", []),
                 latest.get("clone_jobs", []),
+            )
+            payload["price_schedules"] = merge_price_schedules(
+                payload.get("price_schedules", []),
+                latest.get("price_schedules", []),
             )
             if payload.get("_catalog_loaded", True):
                 payload["catalog"] = merge_catalog_records(
@@ -1202,8 +1222,13 @@ def build_operations(payload):
         for account in accounts
         if account.get("official")
     ]
+    today_key = datetime.now(APP_TZ).date().isoformat()
     top_skus_today = sorted(
-        payload.get("daily_sku_sales", []),
+        [
+            row
+            for row in payload.get("daily_sku_sales", [])
+            if str(row.get("date") or "")[:10] == today_key
+        ],
         key=lambda item: (int(item.get("units") or 0), float(item.get("revenue") or 0)),
         reverse=True,
     )[:20]
@@ -1429,6 +1454,7 @@ def empty_payload():
         "recent_sales": [],
         "claim_details": [],
         "pending_shipments": [],
+        "price_schedules": [],
         "monthly_revenue": {"period": current_month_period(), "accounts": {}},
         "user_notifications": {},
         "notifications_migrated_to_users": True,
@@ -3426,13 +3452,17 @@ def commercial_values_for_item(item, payload, strict=True):
             cost_amount = None
     net_amount = row.get("net_sale_amount")
     profit_amount = None
+    profit_percentage = None
     if cost_amount is not None and net_amount is not None:
         profit_amount = round(float(net_amount) - cost_amount, 2)
+        if float(net_amount) > 0:
+            profit_percentage = round((profit_amount / float(net_amount)) * 100, 2)
     row.update(
         {
             "cost_amount": cost_amount,
             "cost_status": "ok" if cost_amount is not None else "missing",
             "profit_amount": profit_amount,
+            "profit_percentage": profit_percentage,
             "profit_status": "profit" if profit_amount is not None and profit_amount >= 0 else "loss" if profit_amount is not None else "unknown",
             "last_sale_at": (last_sale or {}).get("date") if isinstance(last_sale, dict) else "",
             "last_sale_account": (last_sale or {}).get("account") if isinstance(last_sale, dict) else "",
@@ -5562,6 +5592,265 @@ def update_item_operation(request, actor=None):
         notify_alert(payload, alert)
     write_payload(payload)
     return {"ok": True, "official": official, "item": updated_item}
+
+
+PRICE_SCHEDULE_LOCK = threading.RLock()
+
+
+def schedule_time(value):
+    try:
+        return datetime_time.fromisoformat(str(value or "")[:5])
+    except ValueError as exc:
+        raise RuntimeError("Informe horários válidos para o agendamento.") from exc
+
+
+def price_schedule_window(schedule, reference=None):
+    current = reference or datetime.now(APP_TZ)
+    start_clock = schedule_time(schedule.get("start_time"))
+    end_clock = schedule_time(schedule.get("end_time"))
+    candidates = []
+    if schedule.get("mode") == "once":
+        try:
+            start_date = date.fromisoformat(str(schedule.get("start_date") or "")[:10])
+        except ValueError as exc:
+            raise RuntimeError("Informe a data do agendamento.") from exc
+        start_at = datetime.combine(start_date, start_clock).replace(tzinfo=APP_TZ)
+        end_date_text = str(schedule.get("end_date") or "")[:10]
+        end_date = date.fromisoformat(end_date_text) if end_date_text else start_date
+        end_at = datetime.combine(end_date, end_clock).replace(tzinfo=APP_TZ)
+        if end_at <= start_at:
+            end_at += timedelta(days=1)
+        candidates.append((start_at, end_at))
+    else:
+        weekdays = {int(value) for value in schedule.get("weekdays") or []}
+        for delta in range(-1, 9):
+            candidate_date = current.date() + timedelta(days=delta)
+            if candidate_date.weekday() not in weekdays:
+                continue
+            start_at = datetime.combine(candidate_date, start_clock).replace(tzinfo=APP_TZ)
+            end_at = datetime.combine(candidate_date, end_clock).replace(tzinfo=APP_TZ)
+            if end_at <= start_at:
+                end_at += timedelta(days=1)
+            candidates.append((start_at, end_at))
+    active = next(((start, end) for start, end in candidates if start <= current < end), None)
+    future = next(((start, end) for start, end in sorted(candidates) if start > current), None)
+    return active, future
+
+
+def apply_price_schedule(schedule_id, activate):
+    with PRICE_SCHEDULE_LOCK:
+        payload = read_payload()
+        schedule = next((row for row in payload.get("price_schedules", []) if row.get("id") == schedule_id), None)
+        if not schedule:
+            return
+        item = next(
+            (
+                row for row in payload.get("catalog", [])
+                if row.get("id") == schedule.get("item_id")
+                and row.get("account_id") == schedule.get("account_id")
+            ),
+            None,
+        )
+        account = next((row for row in payload.get("accounts", []) if row.get("id") == schedule.get("account_id")), None)
+        if not item or not account or not account.get("official"):
+            raise RuntimeError("Conta ou anúncio do agendamento não está mais disponível.")
+        target = float(schedule.get("scheduled_price") if activate else schedule.get("base_price"))
+        client = account_client(account)
+        run_meli_work("background", client.update_item, item.get("id"), {"price": target})
+        previous = item.get("price")
+        item["price"] = target
+        item["price_source"] = "scheduled" if activate else "schedule_restored"
+        item["sale_fee_status"] = "pending"
+        item["sale_fee_updated_at"] = ""
+        item["sale_fee_basis"] = ""
+        item["item_data_checked_at"] = now_label()
+        item["updated_at"] = now_label()
+        apply_item_net_values(item)
+        schedule["status"] = "active" if activate else ("completed" if schedule.get("mode") == "once" else "scheduled")
+        schedule["active"] = bool(activate)
+        schedule["last_error"] = ""
+        schedule["last_action_at"] = now_label()
+        schedule["updated_at"] = datetime.now(APP_TZ).isoformat()
+        append_item_log(
+            payload,
+            item,
+            {"name": "Agendamento automático"},
+            "Preço agendado ativado" if activate else "Preço original restaurado",
+            {"price": {"from": previous, "to": target}},
+        )
+        write_payload(payload)
+
+
+def save_price_schedule(request, actor=None):
+    with PRICE_SCHEDULE_LOCK:
+        payload = read_payload()
+        item_id = str(request.get("item_id") or "")
+        account_id = str(request.get("account_id") or "")
+        item = next(
+            (row for row in payload.get("catalog", []) if row.get("id") == item_id and row.get("account_id") == account_id),
+            None,
+        )
+        if not item:
+            raise RuntimeError("Anúncio não encontrado para criar o agendamento.")
+        try:
+            scheduled_price = round(float(request.get("scheduled_price") or 0), 2)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Informe um preço agendado válido.") from exc
+        if scheduled_price <= 0:
+            raise RuntimeError("O preço agendado precisa ser maior que zero.")
+        mode = str(request.get("mode") or "once")
+        if mode not in {"once", "weekly"}:
+            raise RuntimeError("Selecione agendamento por data ou por dias da semana.")
+        schedule_time(request.get("start_time"))
+        schedule_time(request.get("end_time"))
+        weekdays = sorted({int(value) for value in request.get("weekdays") or [] if str(value).isdigit()})
+        if mode == "weekly" and not weekdays:
+            raise RuntimeError("Selecione pelo menos um dia da semana.")
+        schedules = payload.setdefault("price_schedules", [])
+        schedule = next(
+            (
+                row for row in schedules
+                if not row.get("deleted")
+                and row.get("item_id") == item_id
+                and row.get("account_id") == account_id
+            ),
+            None,
+        )
+        if schedule and schedule.get("active"):
+            raise RuntimeError("Desative o preço agendado atual antes de alterar este agendamento.")
+        now_iso = datetime.now(APP_TZ).isoformat()
+        values = {
+            "id": (schedule or {}).get("id") or f"price-{uuid.uuid4().hex[:12]}",
+            "item_id": item_id,
+            "account_id": account_id,
+            "account": item.get("account"),
+            "sku": item.get("sku") or "-",
+            "title": item.get("title") or item_id,
+            "base_price": float(item.get("price") or 0),
+            "scheduled_price": scheduled_price,
+            "mode": mode,
+            "start_date": str(request.get("start_date") or "")[:10],
+            "end_date": str(request.get("end_date") or "")[:10],
+            "start_time": str(request.get("start_time") or "")[:5],
+            "end_time": str(request.get("end_time") or "")[:5],
+            "weekdays": weekdays,
+            "enabled": True,
+            "active": False,
+            "status": "scheduled",
+            "created_at": (schedule or {}).get("created_at") or now_iso,
+            "created_by": (actor or {}).get("name") or (actor or {}).get("email") or "Usuário",
+            "updated_at": now_iso,
+            "last_error": "",
+        }
+        price_schedule_window(values)
+        if schedule:
+            schedule.update(values)
+        else:
+            schedules.append(values)
+            schedule = values
+        write_payload(payload)
+        return {"ok": True, "schedule": schedule, "price_schedules": schedules}
+
+
+def set_price_schedule_state(request):
+    schedule_id = str(request.get("id") or "")
+    action = str(request.get("action") or "toggle")
+    with PRICE_SCHEDULE_LOCK:
+        payload = read_payload()
+        schedule = next(
+            (
+                row for row in payload.get("price_schedules", [])
+                if row.get("id") == schedule_id and not row.get("deleted")
+            ),
+            None,
+        )
+        if not schedule:
+            raise RuntimeError("Agendamento não encontrado.")
+        was_active = bool(schedule.get("active"))
+    if was_active:
+        apply_price_schedule(schedule_id, False)
+    with PRICE_SCHEDULE_LOCK:
+        payload = read_payload()
+        schedule = next(
+            (
+                row for row in payload.get("price_schedules", [])
+                if row.get("id") == schedule_id and not row.get("deleted")
+            ),
+            None,
+        )
+        if not schedule:
+            raise RuntimeError("Agendamento não encontrado.")
+        if action == "delete":
+            schedule.update(
+                {
+                    "deleted": True,
+                    "enabled": False,
+                    "active": False,
+                    "status": "deleted",
+                    "updated_at": datetime.now(APP_TZ).isoformat(),
+                }
+            )
+        else:
+            schedule["enabled"] = not bool(schedule.get("enabled"))
+            schedule["status"] = "scheduled" if schedule["enabled"] else "disabled"
+            schedule["updated_at"] = datetime.now(APP_TZ).isoformat()
+        write_payload(payload)
+        return {
+            "ok": True,
+            "price_schedules": [
+                row for row in payload.get("price_schedules", []) if not row.get("deleted")
+            ],
+        }
+
+
+def price_schedule_loop():
+    MELI_WORK_CONTEXT.priority = "background"
+    while True:
+        time.sleep(10)
+        try:
+            payload = read_payload(include_catalog=False)
+            schedules = list(payload.get("price_schedules", []))
+            now = datetime.now(APP_TZ)
+            for schedule in schedules:
+                schedule_id = schedule.get("id")
+                if not schedule_id or schedule.get("deleted"):
+                    continue
+                try:
+                    active_window, future_window = price_schedule_window(schedule, now)
+                    if schedule.get("active"):
+                        active_until = parse_meli_datetime(schedule.get("active_until"))
+                        if not active_window or (active_until and now >= active_until):
+                            apply_price_schedule(schedule_id, False)
+                    elif schedule.get("enabled") and active_window:
+                        with PRICE_SCHEDULE_LOCK:
+                            latest = read_payload()
+                            current = next((row for row in latest.get("price_schedules", []) if row.get("id") == schedule_id), None)
+                            if current:
+                                current["active_from"] = active_window[0].isoformat()
+                                current["active_until"] = active_window[1].isoformat()
+                                current["updated_at"] = datetime.now(APP_TZ).isoformat()
+                                write_payload(latest)
+                        apply_price_schedule(schedule_id, True)
+                    elif schedule.get("enabled") and schedule.get("mode") == "once" and not future_window:
+                        with PRICE_SCHEDULE_LOCK:
+                            latest = read_payload(include_catalog=False)
+                            current = next((row for row in latest.get("price_schedules", []) if row.get("id") == schedule_id), None)
+                            if current and current.get("status") != "completed":
+                                current["status"] = "completed"
+                                current["enabled"] = False
+                                current["updated_at"] = datetime.now(APP_TZ).isoformat()
+                                write_payload(latest)
+                except Exception as exc:
+                    with PRICE_SCHEDULE_LOCK:
+                        latest = read_payload(include_catalog=False)
+                        current = next((row for row in latest.get("price_schedules", []) if row.get("id") == schedule_id), None)
+                        if current:
+                            current["status"] = "retry"
+                            current["last_error"] = str(exc)
+                            current["updated_at"] = datetime.now(APP_TZ).isoformat()
+                            write_payload(latest)
+        except Exception:
+            pass
 
 
 def win_catalog_operation(request, actor=None):
@@ -8223,8 +8512,137 @@ def query_sku_statistics(payload, request):
     }
 
 
+def order_item_fee_amount(order_item, catalog_item, line_total):
+    candidates = (
+        order_item.get("sale_fee"),
+        order_item.get("sale_fee_amount"),
+        first_present(order_item, ["sale_fee_details.total", "fees.sale_fee"], None),
+    )
+    for candidate in candidates:
+        try:
+            if candidate not in (None, ""):
+                return round(max(0.0, float(candidate)), 2)
+        except (TypeError, ValueError):
+            continue
+    listing_price = float(catalog_item.get("price") or 0)
+    listing_fee = catalog_item.get("sale_fee_amount")
+    if listing_price > 0 and listing_fee not in (None, ""):
+        return round(max(0.0, float(listing_fee)) * max(0.0, line_total) / listing_price, 2)
+    return None
+
+
+def query_sales_report(payload, request):
+    start, end, _, _ = statistics_date_window(request.get("date_from"), request.get("date_to"))
+    account_filter = str(request.get("account") or "all")
+    accounts = [
+        account for account in payload.get("accounts") or []
+        if account.get("official") and account.get("access_token") and account.get("status") == "connected"
+    ]
+    if account_filter != "all":
+        accounts = [
+            account for account in accounts
+            if account.get("id") == account_filter
+            or str(account.get("seller_id")) == account_filter
+            or account.get("nickname") == account_filter
+        ]
+    if not accounts:
+        raise RuntimeError("Nenhuma conta oficial conectada corresponde ao filtro selecionado.")
+
+    catalog = payload.get("catalog") or []
+    catalog_by_account_item = {
+        (str(item.get("account_id") or ""), str(item.get("id") or "")): item
+        for item in catalog if item.get("id")
+    }
+    catalog_by_name_item = {
+        (str(item.get("account") or ""), str(item.get("id") or "")): item
+        for item in catalog if item.get("id")
+    }
+    rows = []
+    warnings = []
+    truncated = False
+    ignored_statuses = {"cancelled", "canceled", "invalid"}
+    for account in accounts:
+        try:
+            orders, account_truncated = fetch_statistics_orders(
+                account_client(account), account.get("seller_id"), start, end
+            )
+            truncated = truncated or account_truncated
+        except Exception as exc:
+            warnings.append(f"{account.get('nickname')}: {policy_error_message(exc, 'a leitura das vendas do período')}")
+            continue
+        for order in orders:
+            if str(order.get("status") or "").lower() in ignored_statuses:
+                continue
+            order_id = str(order.get("id") or "")
+            sold_at = parse_meli_datetime(order.get("date_created") or order.get("last_updated"))
+            for order_item in order.get("order_items") or []:
+                source = order_item.get("item") or {}
+                item_id = str(source.get("id") or "")
+                catalog_item = (
+                    catalog_by_account_item.get((str(account.get("id") or ""), item_id))
+                    or catalog_by_name_item.get((str(account.get("nickname") or ""), item_id))
+                    or {}
+                )
+                quantity = max(1, int(order_item.get("quantity") or 1))
+                unit_price = float(order_item.get("unit_price") or order_item.get("full_unit_price") or 0)
+                line_total = round(unit_price * quantity, 2)
+                fee = order_item_fee_amount(order_item, catalog_item, line_total)
+                shipping = round(max(0.0, float(catalog_item.get("shipping_cost") or 0)), 2)
+                sku = order_item_sku(order_item, catalog_item) or "-"
+                cost_record = (payload.get("sku_costs") or {}).get(normalized_sku_key(sku))
+                unit_cost = None
+                if isinstance(cost_record, dict) and cost_record.get("cost") not in (None, ""):
+                    unit_cost = round(max(0.0, float(cost_record.get("cost"))), 2)
+                cost_total = round(unit_cost * quantity, 2) if unit_cost is not None else None
+                net = round(line_total - fee - shipping, 2) if fee is not None else None
+                profit = round(net - cost_total, 2) if net is not None and cost_total is not None else None
+                margin = round((profit / net) * 100, 2) if profit is not None and net and net > 0 else None
+                rows.append(
+                    {
+                        "date": sold_at.isoformat() if sold_at else str(order.get("date_created") or ""),
+                        "account": account.get("nickname") or str(account.get("seller_id") or ""),
+                        "order_id": order_id,
+                        "item_id": item_id,
+                        "sku": sku,
+                        "product": source.get("title") or catalog_item.get("title") or "Produto vendido",
+                        "thumbnail": source.get("thumbnail") or catalog_item.get("thumbnail") or "",
+                        "quantity": quantity,
+                        "unit_price": round(unit_price, 2),
+                        "gross_amount": line_total,
+                        "sale_fee_amount": fee,
+                        "shipping_amount": shipping,
+                        "net_amount": net,
+                        "unit_cost": unit_cost,
+                        "cost_amount": cost_total,
+                        "profit_amount": profit,
+                        "profit_percentage": margin,
+                        "profit_status": "profit" if profit is not None and profit >= 0 else "loss" if profit is not None else "unknown",
+                    }
+                )
+    if not rows and warnings:
+        raise RuntimeError(" ".join(warnings))
+    rows.sort(key=lambda row: str(row.get("date") or ""), reverse=True)
+    return {
+        "ok": True,
+        "date_from": start.isoformat(),
+        "date_to": end.isoformat(),
+        "account": account_filter,
+        "rows": rows,
+        "summary": {
+            "sales": len(rows),
+            "units": sum(int(row.get("quantity") or 0) for row in rows),
+            "gross_amount": round(sum(float(row.get("gross_amount") or 0) for row in rows), 2),
+            "net_amount": round(sum(float(row.get("net_amount") or 0) for row in rows if row.get("net_amount") is not None), 2),
+            "profit_amount": round(sum(float(row.get("profit_amount") or 0) for row in rows if row.get("profit_amount") is not None), 2),
+        },
+        "warnings": warnings,
+        "truncated": truncated,
+        "generated_at": now_label(),
+    }
+
+
 def statistics_job_signature(request):
-    keys = ("account", "sku", "flex", "date_from", "date_to")
+    keys = ("kind", "account", "sku", "flex", "date_from", "date_to")
     normalized = {key: str((request or {}).get(key) or "") for key in keys}
     return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
 
@@ -8246,7 +8664,7 @@ def start_statistics_job(request):
     cleanup_statistics_jobs()
     safe_request = {
         key: str((request or {}).get(key) or "")
-        for key in ("account", "sku", "flex", "date_from", "date_to")
+        for key in ("kind", "account", "sku", "flex", "date_from", "date_to")
     }
     signature = statistics_job_signature(safe_request)
     with STATISTICS_JOBS_LOCK:
@@ -8278,7 +8696,12 @@ def start_statistics_job(request):
             if current:
                 current.update({"status": "processing", "progress": 20, "message": "Consultando vendas oficiais no Mercado Livre."})
         try:
-            result = query_sku_statistics(read_payload(), safe_request)
+            source_payload = read_payload()
+            result = (
+                query_sales_report(source_payload, safe_request)
+                if safe_request.get("kind") == "sales"
+                else query_sku_statistics(source_payload, safe_request)
+            )
             with STATISTICS_JOBS_LOCK:
                 current = STATISTICS_JOBS.get(job_id)
                 if current:
@@ -8354,12 +8777,12 @@ def report_job_result(job_id, include_body=False):
 def start_report_job(request):
     report_type = str((request or {}).get("report_type") or "").lower()
     output_format = str((request or {}).get("format") or "xlsx").lower()
-    if report_type not in {"statistics", "catalog", "ads", "equalization"}:
-        raise RuntimeError("Selecione Estatísticas, Catálogo, Anúncios ou Equalização para exportar.")
+    if report_type not in {"statistics", "sales", "catalog", "ads", "equalization"}:
+        raise RuntimeError("Selecione Vendas, Estatísticas, Catálogo, Anúncios ou Equalização para exportar.")
     if output_format not in {"xlsx", "pdf"}:
         raise RuntimeError("Formato de relatório inválido.")
     statistics_job_id = str((request or {}).get("statistics_job_id") or "")
-    if report_type == "statistics" and statistics_job_id:
+    if report_type in {"statistics", "sales"} and statistics_job_id:
         statistics_job = statistics_job_result(statistics_job_id)
         if not statistics_job or statistics_job.get("status") != "completed" or not statistics_job.get("result"):
             raise RuntimeError("A consulta de estatísticas ainda não foi concluída. Aguarde e tente exportar novamente.")
@@ -8386,10 +8809,10 @@ def start_report_job(request):
             with REPORT_JOBS_LOCK:
                 REPORT_JOBS[job_id].update({"status": "processing", "progress": 20, "message": "Preparando os dados do relatório."})
             statistics_result = None
-            if report_type == "statistics" and statistics_job_id:
+            if report_type in {"statistics", "sales"} and statistics_job_id:
                 statistics_result = statistics_job_result(statistics_job_id).get("result")
             title, columns, rows, metadata = report_dataset(
-                read_payload(include_catalog=report_type in {"catalog", "ads", "equalization"}),
+                read_payload(include_catalog=report_type in {"sales", "catalog", "ads", "equalization"}),
                 report_type,
                 filters,
                 statistics_result,
@@ -8502,6 +8925,35 @@ def report_filtered_catalog(payload, report_type, filters):
 
 
 def report_dataset(payload, report_type, filters, statistics_result=None):
+    if report_type == "sales":
+        result = statistics_result or query_sales_report(payload, filters)
+        columns = [
+            ("date", "Data e hora", "datetime"),
+            ("account", "Conta", "text"),
+            ("order_id", "Pedido", "text"),
+            ("item_id", "Anúncio", "text"),
+            ("sku", "SKU", "text"),
+            ("product", "Produto", "text"),
+            ("quantity", "Quantidade", "integer"),
+            ("unit_price", "Preço unitário", "currency"),
+            ("gross_amount", "Valor vendido", "currency"),
+            ("sale_fee_amount", "Tarifa de venda", "currency"),
+            ("shipping_amount", "Frete estimado ML", "currency"),
+            ("net_amount", "Valor líquido", "currency"),
+            ("cost_amount", "Custo total", "currency"),
+            ("profit_amount", "Lucro / prejuízo", "currency"),
+            ("profit_percentage", "Margem líquida (%)", "percent"),
+        ]
+        return (
+            "Vendas das contas conectadas",
+            columns,
+            result.get("rows") or [],
+            {
+                "Período": f"{result.get('date_from')} a {result.get('date_to')}",
+                "Conta": filters.get("account") or "Todas",
+                "Gerado em": now_label(),
+            },
+        )
     if report_type == "statistics":
         result = statistics_result or query_sku_statistics(payload, filters)
         columns = [
@@ -8613,6 +9065,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
         ("net_stock_value", "Estoque a valor líquido", "currency"),
         ("cost_amount", "Custo do SKU", "currency"),
         ("profit_amount", "Lucro ou prejuízo por venda", "currency"),
+        ("profit_percentage", "Margem líquida (%)", "percent"),
         ("profit_status_label", "Situação do resultado", "text"),
         ("last_sale_at", "Última venda do SKU", "text"),
         ("last_sale_account", "Conta da última venda", "text"),
@@ -8702,6 +9155,9 @@ def build_report_xlsx(title, columns, rows, metadata):
             cell = WriteOnlyCell(sheet, value=value)
             if kind == "currency" and cell.value not in (None, ""):
                 cell.number_format = 'R$ #,##0.00'
+            elif kind == "percent" and cell.value not in (None, ""):
+                cell.value = float(cell.value) / 100
+                cell.number_format = '0.00%'
             elif kind == "integer" and cell.value not in (None, ""):
                 cell.number_format = '#,##0'
             widths[column_index] = max(widths[column_index], len(str(value or "")))
@@ -8777,6 +9233,8 @@ def build_report_pdf(title, columns, rows, metadata):
                 value = row.get(key, "")
                 if kind == "currency" and value not in (None, ""):
                     value = brl(value)
+                elif kind == "percent" and value not in (None, ""):
+                    value = f"{float(value):.2f}%"
                 values.append(Paragraph(html.escape(str(value if value not in (None, "") else "-")), cell_style))
             table_rows.append(values)
         table = LongTable(table_rows, colWidths=widths, repeatRows=1, hAlign="LEFT")
@@ -10495,6 +10953,14 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=400)
             return
 
+        if parsed.path == "/api/sales-report/query":
+            try:
+                job = start_statistics_job({**request, "kind": "sales"})
+                self.send_json({"ok": True, **job}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
         if parsed.path == "/api/reports/export":
             try:
                 job = start_report_job(request)
@@ -10620,6 +11086,20 @@ class App(BaseHTTPRequestHandler):
                     self.send_json({"error": "Seu usuário possui acesso somente para leitura."}, status=403)
                     return
                 self.send_json(save_sku_costs(request, actor))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/price-schedules/save":
+            try:
+                self.send_json(save_price_schedule(request, self.current_user(payload)))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/price-schedules/state":
+            try:
+                self.send_json(set_price_schedule_state(request))
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
@@ -11038,6 +11518,7 @@ if __name__ == "__main__":
     threading.Thread(target=auto_official_sync_loop, daemon=True).start()
     threading.Thread(target=auto_sale_fee_loop, daemon=True).start()
     threading.Thread(target=auto_catalog_competition_loop, daemon=True).start()
+    threading.Thread(target=price_schedule_loop, name="price-schedules", daemon=True).start()
     threading.Thread(target=memory_maintenance_loop, name="memory-maintenance", daemon=True).start()
     print(
         f"CompeTIDOR rodando em http://127.0.0.1:{port} "

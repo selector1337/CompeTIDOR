@@ -369,6 +369,43 @@
       </section>
 
       <section class="page" id="page-relatorios">
+        <div class="panel catalog-panel sales-report-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Vendas oficiais Mercado Livre</p>
+              <h2>Relatório de vendas por período</h2>
+            </div>
+            <div class="report-actions" aria-label="Exportar relatório de vendas">
+              <button class="mini-button" type="button" data-export-report="sales" data-export-format="pdf">PDF</button>
+              <button class="mini-button" type="button" data-export-report="sales" data-export-format="xlsx">Excel</button>
+            </div>
+          </div>
+          <form id="sales-report-form" class="filter-bar report-filter-bar">
+            <label>Conta <select name="account"></select></label>
+            <label>Período
+              <select name="period">
+                <option value="today">Hoje</option>
+                <option value="yesterday">Ontem</option>
+                <option value="week">Últimos 7 dias</option>
+                <option value="fortnight">Últimos 15 dias</option>
+                <option value="month">Mês atual</option>
+                <option value="year">Ano atual</option>
+                <option value="specific_date">Dia específico</option>
+                <option value="custom">Período personalizado</option>
+              </select>
+            </label>
+            <label data-sales-date hidden>Data <input name="specific_date" type="date" /></label>
+            <label data-sales-custom hidden>Início <input name="date_from" type="date" /></label>
+            <label data-sales-custom hidden>Fim <input name="date_to" type="date" /></label>
+            <label>Por página
+              <select name="page_size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select>
+            </label>
+            <button class="primary" type="submit">Consultar vendas</button>
+          </form>
+          <div id="sales-report-feedback"></div>
+          <div id="sales-report-summary" class="inventory-summary"></div>
+          <div id="sales-report-results"></div>
+        </div>
         <div class="panel catalog-panel">
           <div class="panel-heading">
             <div>

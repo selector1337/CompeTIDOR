@@ -1654,7 +1654,8 @@ h2 {
 }
 
 .fact.profit-positive strong,
-.profit-positive strong {
+.profit-positive strong,
+.fact.profit-positive em {
   color: var(--green);
 }
 
@@ -1665,13 +1666,197 @@ h2 {
 }
 
 .fact.profit-negative strong,
-.profit-negative strong {
+.profit-negative strong,
+.fact.profit-negative em {
   color: var(--red);
+}
+
+.fact[class*="profit-"] em {
+  display: block;
+  margin-top: 3px;
+  font-size: .76rem;
+  font-style: normal;
+  font-weight: 800;
 }
 
 .fact.profit-missing strong {
   color: var(--muted);
   font-size: .78rem;
+}
+
+.sales-report-panel {
+  margin-bottom: 16px;
+}
+
+.sales-report-table {
+  display: grid;
+  gap: 8px;
+}
+
+.sales-report-row {
+  display: grid;
+  grid-template-columns: 56px minmax(260px, 2fr) repeat(7, minmax(92px, 1fr));
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+.sales-report-row > img,
+.sales-report-row > .statistics-thumb-empty {
+  width: 52px;
+  height: 52px;
+  object-fit: contain;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.sales-report-row small,
+.sales-report-product small {
+  display: block;
+  color: var(--muted);
+}
+
+.sales-report-row em {
+  display: block;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.price-schedule-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 10px 0;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--brand) 58%, var(--line));
+  background: color-mix(in srgb, var(--brand) 5%, var(--panel-2));
+}
+
+.price-schedule-status.active {
+  border-color: var(--green);
+  box-shadow: inset 0 0 22px color-mix(in srgb, var(--green) 9%, transparent);
+}
+
+.price-schedule-status.error {
+  border-color: var(--red);
+}
+
+.price-schedule-status > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.price-schedule-status small {
+  color: var(--brand);
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.price-schedule-status span,
+.price-schedule-status em {
+  color: var(--muted);
+  font-size: .78rem;
+  font-style: normal;
+}
+
+.price-schedule-status em:not(.schedule-error) {
+  color: var(--green);
+  font-weight: 800;
+}
+
+.price-schedule-status .schedule-error {
+  color: var(--red);
+}
+
+.price-schedule-status > div:last-child {
+  display: flex;
+  gap: 8px;
+}
+
+.price-schedule-dialog {
+  width: min(760px, calc(100vw - 28px));
+  padding: 0;
+  border: 1px solid var(--brand);
+  background: var(--panel);
+  color: var(--text);
+}
+
+.price-schedule-dialog::backdrop {
+  background: rgba(0, 0, 0, .76);
+  backdrop-filter: blur(5px);
+}
+
+.price-schedule-card {
+  display: grid;
+  gap: 16px;
+  padding: 22px;
+}
+
+.schedule-price-baseline,
+.price-schedule-fields {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.schedule-price-baseline span {
+  padding: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+.schedule-price-baseline small,
+.schedule-price-baseline strong {
+  display: block;
+}
+
+.schedule-weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 8px;
+  border: 0;
+  padding: 0;
+}
+
+.schedule-weekdays legend {
+  grid-column: 1 / -1;
+  margin-bottom: 8px;
+  color: var(--muted);
+}
+
+.schedule-weekdays label {
+  display: grid;
+  place-items: center;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+@media (max-width: 1050px) {
+  .sales-report-row {
+    grid-template-columns: 52px minmax(180px, 1fr) repeat(3, minmax(90px, 1fr));
+  }
+  .sales-report-row > span:nth-of-type(n+4) {
+    display: none;
+  }
+}
+
+@media (max-width: 700px) {
+  .schedule-price-baseline,
+  .price-schedule-fields {
+    grid-template-columns: 1fr;
+  }
+  .schedule-weekdays {
+    grid-template-columns: repeat(4, 1fr);
+  }
+  .price-schedule-status {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 
 .clear-filters-button {
