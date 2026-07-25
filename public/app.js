@@ -7,6 +7,8 @@
   catalogSearch: "",
   catalogMlStatus: "all",
   catalogStock: "all",
+  catalogSales: "all",
+  catalogNoSaleDays: 30,
   adsAccount: "all",
   adsProduct: "",
   adsBrand: "",
@@ -865,11 +867,16 @@ function priceScheduleHtml(item) {
     ? (schedule.weekdays || []).map((day) => weekdayLabels[Number(day)]).filter(Boolean).join(", ")
     : formatDateBR(schedule.start_date);
   const tone = schedule.active ? "active" : schedule.status === "retry" ? "error" : "scheduled";
+  const restoredConfirmation = !schedule.active && schedule.restoration_confirmed_at
+    ? `<em>Preço padrão restaurado e confirmado em ${formatDateBR(schedule.restoration_confirmed_at)}</em>`
+    : !schedule.active && schedule.status === "completed"
+      ? `<em>Preço padrão restaurado</em>`
+    : "";
   return `<div class="price-schedule-status ${tone}">
     <div><small>${schedule.active ? "Preço agendado ativo" : "Agendamento de preço"}</small>
       <strong>${money.format(schedule.scheduled_price || 0)}</strong>
       <span>${escapeText(recurrence)} · ${escapeText(schedule.start_time)} até ${escapeText(schedule.end_time)} · padrão ${money.format(schedule.base_price || 0)}</span>
-      ${schedule.active_until ? `<em data-schedule-countdown="${escapeAttr(schedule.active_until)}"></em>` : ""}
+      ${schedule.active && schedule.active_until ? `<em data-schedule-countdown="${escapeAttr(schedule.active_until)}"></em>` : restoredConfirmation}
       ${schedule.last_error ? `<em class="schedule-error">${escapeText(schedule.last_error)}</em>` : ""}
     </div>
     <div>
@@ -878,6 +885,36 @@ function priceScheduleHtml(item) {
       <button class="icon-button danger-button" type="button" data-delete-schedule="${schedule.id}" title="Excluir agendamento">×</button>
     </div>
   </div>`;
+}
+
+let priceScheduleRefreshPromise = null;
+let lastPriceScheduleRefreshAt = 0;
+
+async function refreshExpiredPriceSchedules() {
+  const now = Date.now();
+  if (priceScheduleRefreshPromise || now - lastPriceScheduleRefreshAt < 3000) return;
+  lastPriceScheduleRefreshAt = now;
+  priceScheduleRefreshPromise = (async () => {
+    try {
+      const dashboard = await api("/api/dashboard");
+      if (!state.data) return;
+      state.data.price_schedules = dashboard.price_schedules || state.data.price_schedules || [];
+      for (const schedule of state.data.price_schedules) {
+        if (!schedule.active && schedule.restored_price !== null && schedule.restored_price !== undefined) {
+          const item = (state.data.catalog || []).find(
+            (row) => row.id === schedule.item_id && row.account_id === schedule.account_id
+          );
+          if (item) item.price = Number(schedule.restored_price);
+        }
+      }
+      if (state.route === "anuncios") renderAds();
+      if (state.route === "catalogo") renderCatalog();
+    } catch (_) {
+      // A próxima rodada confirma o estado sem interromper o uso da aplicação.
+    } finally {
+      priceScheduleRefreshPromise = null;
+    }
+  })();
 }
 
 function updateScheduleCountdowns() {
@@ -889,8 +926,36 @@ function updateScheduleCountdowns() {
     const rest = seconds % 60;
     node.textContent = remaining > 0
       ? `Preço padrão volta em ${hours}h ${String(minutes).padStart(2, "0")}min ${String(rest).padStart(2, "0")}s`
-      : "Aguardando restauração pelo servidor";
+      : "Confirmando restauração no Mercado Livre...";
+    if (remaining <= 0) refreshExpiredPriceSchedules();
   });
+}
+
+function catalogLastSaleDate(item) {
+  const value = itemCommercialValues(item).lastSale?.date;
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function catalogMatchesSalesFilter(item) {
+  if (state.catalogSales === "all") return true;
+  const lastSale = catalogLastSaleDate(item);
+  if (state.catalogSales === "never") return !lastSale;
+  if (state.catalogSales === "inactive") {
+    if (!lastSale) return true;
+    const days = Math.max(1, Number(state.catalogNoSaleDays) || 30);
+    const threshold = new Date();
+    threshold.setHours(0, 0, 0, 0);
+    threshold.setDate(threshold.getDate() - days);
+    return lastSale < threshold;
+  }
+  return true;
+}
+
+function updateCatalogSalesFilterFields() {
+  const field = document.querySelector("#catalog-no-sale-days-field");
+  if (field) field.hidden = state.catalogSales !== "inactive";
 }
 
 function renderCosts() {
@@ -964,6 +1029,7 @@ function renderCatalog() {
     return;
   }
   renderFilterOptions();
+  updateCatalogSalesFilterFields();
   const term = state.catalogSearch.toLowerCase();
   const filtered = state.data.catalog.filter((item) => {
     const text = `${item.title} ${item.sku} ${item.id}`.toLowerCase();
@@ -972,6 +1038,7 @@ function renderCatalog() {
       && (state.catalogAccount === "all" || item.account === state.catalogAccount)
       && (state.catalogMlStatus === "all" || item.meli_status === state.catalogMlStatus)
       && (state.catalogStock === "all" || (state.catalogStock === "zero" ? Number(item.stock) === 0 : Number(item.stock) > 0))
+      && catalogMatchesSalesFilter(item)
       && (!term || text.includes(term));
   });
   const pageInfo = paginate(filtered, state.catalogPage);
@@ -1123,7 +1190,10 @@ function renderAds() {
       && (state.adsListingType === "all" || item.listing_type_id === state.adsListingType)
       && (state.adsCatalog === "all" || (state.adsCatalog === "catalog" ? isCatalogItem(item) : !isCatalogItem(item)))
       && (state.adsFlex === "all" || (state.adsFlex === "active" ? item.shipping_logistic_type === "self_service" : item.shipping_logistic_type !== "self_service"))
-      && (state.adsProfit === "all" || itemCommercialValues(item).profitStatus === state.adsProfit)
+      && (state.adsProfit === "all"
+        || (state.adsProfit === "cost"
+          ? itemCommercialValues(item).cost !== null
+          : itemCommercialValues(item).profitStatus === state.adsProfit))
       && (!productTerm || title.includes(productTerm))
       && (!brandTerm || brand.includes(brandTerm) || title.includes(brandTerm))
       && (!skuTerm || sku === skuTerm)
@@ -1136,6 +1206,8 @@ function renderAds() {
     if (!String(item.sku || "").toUpperCase().includes("KIT")) {
       summary.value += stock * price;
       const commercial = itemCommercialValues(item);
+      if (commercial.cost !== null) summary.costValue += commercial.cost * stock;
+      else summary.missingCosts += 1;
       if (commercial.net !== null) summary.netValue += commercial.net * stock;
       else summary.pendingFees += 1;
       if (commercial.profit !== null) summary.profitValue += commercial.profit * stock;
@@ -1144,7 +1216,7 @@ function renderAds() {
       summary.excludedKitSkus += 1;
     }
     return summary;
-  }, { units: 0, value: 0, netValue: 0, profitValue: 0, pendingFees: 0, pendingCosts: 0, excludedKitSkus: 0 });
+  }, { units: 0, value: 0, costValue: 0, netValue: 0, profitValue: 0, missingCosts: 0, pendingFees: 0, pendingCosts: 0, excludedKitSkus: 0 });
   const inventorySummary = document.querySelector("#ads-inventory-summary");
   const feeCompleted = filtered.filter((item) => item.sale_fee_status === "ok").length;
   const feePending = Math.max(0, filtered.length - feeCompleted);
@@ -1154,6 +1226,7 @@ function renderAds() {
     <div><span>Anúncios filtrados</span><strong>${filtered.length.toLocaleString("pt-BR")}</strong></div>
     <div><span>Unidades em estoque</span><strong>${inventory.units.toLocaleString("pt-BR")}</strong></div>
     <div class="inventory-value"><span>Estoque a preço de venda <small>SKUs com KIT não entram no valor</small></span><strong>${money.format(inventory.value)}</strong></div>
+    <div class="inventory-value cost"><span>Estoque a preço de custo <small>Custo unitário x estoque; sem SKUs com KIT${inventory.missingCosts ? ` · ${inventory.missingCosts} item(ns) sem custo` : ""}</small></span><strong>${money.format(inventory.costValue)}</strong></div>
     <div class="inventory-value net"><span>Estoque a valor líquido <small>Venda - tarifa - frete; sem SKUs com KIT${inventory.pendingFees ? ` · ${inventory.pendingFees} tarifa(s) calculando` : ""}</small></span><strong>${money.format(inventory.netValue)}</strong></div>
     <div class="${inventory.profitValue >= 0 ? "inventory-value profit-positive" : "profit-negative"}"><span>Resultado potencial do estoque <small>Valor líquido - custo; sem SKUs com KIT${inventory.pendingCosts ? ` · ${inventory.pendingCosts} item(ns) sem cálculo completo` : ""}</small></span><strong>${money.format(inventory.profitValue)}</strong></div>
     <div class="fee-progress-card"><span>Tarifas dos anúncios filtrados <small>${feeCompleted.toLocaleString("pt-BR")} concluídas · ${feePending.toLocaleString("pt-BR")} pendentes${globalFeeProgress.estimated_label ? ` · previsão geral: ${escapeText(globalFeeProgress.estimated_label)}` : ""}</small></span><strong>${feePercent.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</strong><i><b style="width:${Math.max(0, Math.min(100, feePercent))}%"></b></i></div>
@@ -2321,6 +2394,8 @@ function currentReportFilters(reportType) {
       status: state.filter,
       ml_status: state.catalogMlStatus,
       stock: state.catalogStock,
+      sales: state.catalogSales,
+      no_sale_days: state.catalogNoSaleDays,
     };
   }
   if (reportType === "equalization") {
@@ -3135,6 +3210,8 @@ document.addEventListener("click", (event) => {
   ["#catalog-search", "catalogSearch"],
   ["#catalog-ml-status-filter", "catalogMlStatus"],
   ["#catalog-stock-filter", "catalogStock"],
+  ["#catalog-sales-filter", "catalogSales"],
+  ["#catalog-no-sale-days", "catalogNoSaleDays"],
   ["#ads-account-filter", "adsAccount"],
   ["#ads-product-filter", "adsProduct"],
   ["#ads-brand-filter", "adsBrand"],
@@ -3160,7 +3237,11 @@ document.addEventListener("click", (event) => {
 ].forEach(([selector, key]) => {
   document.addEventListener("input", (event) => {
     if (!event.target.matches(selector)) return;
-    state[key] = ["copyPageSize", "equalizationPageSize", "costsPageSize"].includes(key) ? Number(event.target.value || 20) : event.target.value;
+    state[key] = key === "catalogNoSaleDays"
+      ? Math.max(1, Number(event.target.value) || 30)
+      : ["copyPageSize", "equalizationPageSize", "costsPageSize"].includes(key)
+        ? Number(event.target.value || 20)
+        : event.target.value;
     if (key === "copyPageSize") localStorage.setItem("competidor-copy-page-size", String(state.copyPageSize));
     if (key.startsWith("catalog")) {
       state.catalogPage = 1;

@@ -3375,6 +3375,8 @@ body {
 }
 
 .inventory-summary .inventory-value strong { color: var(--green); }
+.inventory-summary .inventory-value.cost { border-color: color-mix(in srgb, var(--brand) 62%, var(--line)); }
+.inventory-summary .inventory-value.cost strong { color: var(--brand); }
 .inventory-summary .inventory-value.net { border-color: color-mix(in srgb, #38bdf8 60%, var(--line)); }
 .inventory-summary .inventory-value.net strong { color: #38bdf8; }
 .inventory-summary .fee-progress-card { border-color: color-mix(in srgb, var(--brand) 58%, var(--line)); }

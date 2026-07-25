@@ -3471,6 +3471,27 @@ def commercial_values_for_item(item, payload, strict=True):
     return row
 
 
+def catalog_item_matches_sales_filter(item, payload, sales_filter="all", no_sale_days=30, reference=None):
+    if sales_filter == "all":
+        return True
+    sku_key = normalized_sku_key((item or {}).get("sku"))
+    record = (payload.get("sku_last_sales") or {}).get(sku_key) if sku_key else None
+    last_sale = parse_meli_datetime((record or {}).get("date")) if isinstance(record, dict) else None
+    if sales_filter == "never":
+        return last_sale is None
+    if sales_filter == "inactive":
+        if last_sale is None:
+            return True
+        try:
+            days = max(1, min(3650, int(no_sale_days or 30)))
+        except (TypeError, ValueError):
+            days = 30
+        current = reference or datetime.now(APP_TZ)
+        threshold = datetime.combine(current.date() - timedelta(days=days), datetime_time.min).replace(tzinfo=APP_TZ)
+        return last_sale < threshold
+    return True
+
+
 def save_sku_costs(request, actor=None):
     entries = request.get("costs") if isinstance(request.get("costs"), list) else [request]
     saved = []
@@ -5637,6 +5658,31 @@ def price_schedule_window(schedule, reference=None):
     return active, future
 
 
+def response_item_price(response):
+    if not isinstance(response, dict):
+        return None
+    value = response.get("price")
+    if value in (None, "") and isinstance(response.get("sale_price"), dict):
+        value = response["sale_price"].get("amount")
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def confirm_scheduled_item_price(client, item_id, target, update_response=None):
+    expected = round(float(target), 2)
+    confirmed = response_item_price(update_response)
+    if confirmed is None or abs(confirmed - expected) > 0.009:
+        confirmed = response_item_price(run_meli_work("background", client.item, item_id))
+    if confirmed is None or abs(confirmed - expected) > 0.009:
+        raise RuntimeError(
+            f"O Mercado Livre ainda não confirmou o preço de R$ {expected:,.2f}. "
+            "A aplicação tentará novamente automaticamente."
+        )
+    return confirmed
+
+
 def apply_price_schedule(schedule_id, activate):
     with PRICE_SCHEDULE_LOCK:
         payload = read_payload()
@@ -5656,9 +5702,15 @@ def apply_price_schedule(schedule_id, activate):
             raise RuntimeError("Conta ou anúncio do agendamento não está mais disponível.")
         target = float(schedule.get("scheduled_price") if activate else schedule.get("base_price"))
         client = account_client(account)
-        run_meli_work("background", client.update_item, item.get("id"), {"price": target})
+        update_response = run_meli_work("background", client.update_item, item.get("id"), {"price": target})
+        confirmed_price = confirm_scheduled_item_price(
+            client,
+            item.get("id"),
+            target,
+            update_response=update_response,
+        )
         previous = item.get("price")
-        item["price"] = target
+        item["price"] = confirmed_price
         item["price_source"] = "scheduled" if activate else "schedule_restored"
         item["sale_fee_status"] = "pending"
         item["sale_fee_updated_at"] = ""
@@ -5666,17 +5718,27 @@ def apply_price_schedule(schedule_id, activate):
         item["item_data_checked_at"] = now_label()
         item["updated_at"] = now_label()
         apply_item_net_values(item)
+        now_iso = datetime.now(APP_TZ).isoformat()
         schedule["status"] = "active" if activate else ("completed" if schedule.get("mode") == "once" else "scheduled")
         schedule["active"] = bool(activate)
         schedule["last_error"] = ""
         schedule["last_action_at"] = now_label()
-        schedule["updated_at"] = datetime.now(APP_TZ).isoformat()
+        schedule["updated_at"] = now_iso
+        if activate:
+            schedule["activation_confirmed_at"] = now_iso
+        else:
+            schedule["restoration_confirmed_at"] = now_iso
+            schedule["restored_price"] = confirmed_price
+            schedule.pop("active_from", None)
+            schedule.pop("active_until", None)
+            if schedule.get("mode") == "once":
+                schedule["enabled"] = False
         append_item_log(
             payload,
             item,
             {"name": "Agendamento automático"},
             "Preço agendado ativado" if activate else "Preço original restaurado",
-            {"price": {"from": previous, "to": target}},
+            {"price": {"from": previous, "to": confirmed_price}},
         )
         write_payload(payload)
 
@@ -8874,6 +8936,8 @@ def report_filtered_catalog(payload, report_type, filters):
     catalog_filter = str(filters.get("catalog") or "all")
     flex_filter = str(filters.get("flex") or "all")
     profit_filter = str(filters.get("profit") or "all")
+    sales_filter = str(filters.get("sales") or "all")
+    no_sale_days = filters.get("no_sale_days") or 30
     rows = []
     for item in payload.get("catalog") or []:
         if report_type == "catalog" and not is_catalog_listing(item):
@@ -8905,6 +8969,13 @@ def report_filtered_catalog(payload, report_type, filters):
             continue
         if flex_filter == "inactive" and is_flex:
             continue
+        if report_type == "catalog" and not catalog_item_matches_sales_filter(
+            item,
+            payload,
+            sales_filter=sales_filter,
+            no_sale_days=no_sale_days,
+        ):
+            continue
         haystack = normalized_attribute_label(f"{item.get('title', '')} {item.get('sku', '')} {item.get('id', '')}")
         if search and search not in haystack:
             continue
@@ -8915,7 +8986,10 @@ def report_filtered_catalog(payload, report_type, filters):
         if code_search and code_search not in normalized_attribute_label(item.get("id") or ""):
             continue
         if profit_filter != "all":
-            profit_status = commercial_values_for_item(item, payload, strict=True).get("profit_status")
+            commercial = commercial_values_for_item(item, payload, strict=True)
+            profit_status = commercial.get("profit_status")
+            if profit_filter == "cost" and commercial.get("cost_status") != "ok":
+                continue
             if profit_filter == "missing" and profit_status != "unknown":
                 continue
             if profit_filter in {"profit", "loss"} and profit_status != profit_filter:
