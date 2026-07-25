@@ -151,6 +151,14 @@ function sunIcon() {
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10ZM11 1h2v4h-2V1Zm0 18h2v4h-2v-4ZM1 11h4v2H1v-2Zm18 0h4v2h-4v-2ZM4.2 2.8 7 5.6 5.6 7 2.8 4.2l1.4-1.4Zm14.2 14.2 2.8 2.8-1.4 1.4-2.8-2.8 1.4-1.4Zm2.8-12.8L18.4 7 17 5.6l2.8-2.8 1.4 1.4ZM7 18.4l-2.8 2.8-1.4-1.4L5.6 17 7 18.4Z"/></svg>`;
 }
 
+function calculatorIcon() {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="4" y="2.5" width="16" height="19" rx="2"></rect>
+    <rect x="7" y="5.5" width="10" height="3.5" rx="0.5"></rect>
+    <path d="M8 13h.01M12 13h.01M16 13h.01M8 17h.01M12 17h.01M16 17h.01"></path>
+  </svg>`;
+}
+
 function manualActionLabel(path) {
   const labelsByPath = {
     "/api/statistics/query": "Gerando estatísticas",
@@ -783,6 +791,44 @@ function itemCommercialValues(item) {
   };
 }
 
+function profitSimulationValues(item, candidatePrice) {
+  const current = itemCommercialValues(item);
+  const currentPrice = Math.max(0, Number(item?.price) || 0);
+  const price = Math.max(0, Number(candidatePrice) || 0);
+  const feeRate = current.fee !== null && currentPrice > 0
+    ? current.fee / currentPrice
+    : null;
+  const fee = feeRate === null ? null : Math.round(price * feeRate * 100) / 100;
+  const net = fee === null ? null : Math.max(0, Math.round((price - fee - current.shipping) * 100) / 100);
+  const profit = net !== null && current.cost !== null
+    ? Math.round((net - current.cost) * 100) / 100
+    : null;
+  const profitPercentage = profit !== null && net > 0
+    ? (profit / net) * 100
+    : null;
+  return {
+    ...current,
+    currentPrice,
+    price,
+    feeRate,
+    fee,
+    net,
+    profit,
+    profitPercentage,
+    profitStatus: profit === null ? "missing" : profit >= 0 ? "profit" : "loss",
+  };
+}
+
+function priceForDesiredProfitMargin(item, desiredPercentage) {
+  const current = profitSimulationValues(item, item?.price);
+  const margin = Number(desiredPercentage) / 100;
+  if (current.cost === null || current.feeRate === null || margin < 0 || margin >= 1 || current.feeRate >= 1) {
+    return null;
+  }
+  const requiredNet = current.cost / (1 - margin);
+  return Math.ceil(((requiredNet + current.shipping) / (1 - current.feeRate)) * 100) / 100;
+}
+
 function costLabel(item) {
   const value = itemCommercialValues(item).cost;
   return value === null ? "Sem custo cadastrado" : money.format(value);
@@ -1123,7 +1169,10 @@ function renderAds() {
       <div class="ad-main">
         <div class="ad-title-row">
           <strong>${item.title}</strong>
-          <span class="badge ${item.meli_status === "paused" ? "paused" : "winning"}">${statusLabel(item.meli_status || item.status)}</span>
+          <div class="ad-title-actions">
+            <button class="icon-button ad-profit-calculator-button" type="button" data-profit-calculator="${item.id}" title="Calcular lucro, prejuízo e margem" aria-label="Abrir calculadora de rentabilidade de ${escapeAttr(item.title || item.id)}">${calculatorIcon()}</button>
+            <span class="badge ${item.meli_status === "paused" ? "paused" : "winning"}">${statusLabel(item.meli_status || item.status)}</span>
+          </div>
         </div>
         <div class="ad-facts">
           ${fact("Conta", item.account)}
@@ -1969,6 +2018,132 @@ function openStockCalculator(row) {
   dialog.addEventListener("close", () => dialog.remove());
   dialog.showModal();
   calculate();
+}
+
+function openProfitCalculator(item) {
+  if (!item) return;
+  document.querySelector("#profit-calculator-dialog")?.remove();
+  const current = profitSimulationValues(item, item.price);
+  const feeReady = current.feeRate !== null && current.feeRate < 1;
+  const costReady = current.cost !== null;
+  const dialog = document.createElement("dialog");
+  dialog.id = "profit-calculator-dialog";
+  dialog.className = "stock-calculator-dialog profit-calculator-dialog";
+  dialog.innerHTML = `
+    <form method="dialog" class="stock-calculator-card profit-calculator-card">
+      <div class="stock-calculator-heading">
+        <div>
+          <small>Simulação sem alterar o anúncio</small>
+          <h3>Calculadora de rentabilidade</h3>
+          <p>${escapeText(item.title || item.id)}</p>
+        </div>
+        <button class="icon-button" type="button" data-close-profit-calculator aria-label="Fechar">×</button>
+      </div>
+      <div class="profit-calculator-identity">
+        <span><small>Conta</small><strong>${escapeText(item.account || "-")}</strong></span>
+        <span><small>SKU</small><strong>${escapeText(item.sku || "-")}</strong></span>
+        <span><small>Anúncio ML</small><strong>${escapeText(item.id || "-")}</strong></span>
+      </div>
+      <div class="stock-calculator-baseline profit-calculator-baseline">
+        <span><small>Preço atual</small><strong>${money.format(current.currentPrice)}</strong></span>
+        <span><small>Tarifa atual</small><strong>${current.fee === null ? "Aguardando ML" : money.format(current.fee)}</strong></span>
+        <span><small>Taxa efetiva</small><strong>${current.feeRate === null ? "-" : `${(current.feeRate * 100).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</strong></span>
+        <span><small>Frete estimado</small><strong>${money.format(current.shipping)}</strong></span>
+        <span><small>Custo do SKU</small><strong>${current.cost === null ? "Não cadastrado" : money.format(current.cost)}</strong></span>
+      </div>
+      ${!feeReady ? `<div class="notice warning-notice">A tarifa oficial deste anúncio ainda não está disponível. A calculadora será liberada assim que a sincronização da tarifa terminar.</div>` : ""}
+      ${!costReady ? `<div class="notice">Cadastre o custo deste SKU no menu Custos para calcular lucro, prejuízo e preço por margem. A simulação de valor líquido continua disponível.</div>` : ""}
+      <div class="profit-calculator-fields">
+        <label>
+          Preço de venda simulado
+          <span class="money-field"><input name="sale_price" type="text" inputmode="decimal" value="${current.currentPrice.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}" ${feeReady ? "" : "disabled"} /></span>
+          <small>Digite qualquer preço para atualizar a simulação imediatamente.</small>
+        </label>
+        <label>
+          Margem líquida desejada
+          <span class="percent-field"><input name="desired_margin" type="text" inputmode="decimal" placeholder="Ex.: 20" ${feeReady && costReady ? "" : "disabled"} /><span>%</span></span>
+          <small>Preenche automaticamente o preço necessário. Aceita valores entre 0% e 99,99%.</small>
+        </label>
+      </div>
+      <div class="profit-calculator-result" aria-live="polite"></div>
+      <div class="profit-calculator-note">
+        <strong>Como calculamos</strong>
+        <span>A tarifa usa a taxa efetiva oficial já sincronizada para este anúncio. O frete permanece fixo porque peso e medidas não mudam nesta simulação.</span>
+      </div>
+      <div class="profit-calculator-actions">
+        <button class="ghost" type="button" data-close-profit-calculator>Fechar</button>
+        <button class="primary" type="button" data-use-simulated-price ${feeReady ? "" : "disabled"}>Levar preço para o anúncio</button>
+      </div>
+    </form>`;
+  document.body.appendChild(dialog);
+  const form = dialog.querySelector("form");
+  const priceInput = form.elements.sale_price;
+  const marginInput = form.elements.desired_margin;
+  const resultNode = dialog.querySelector(".profit-calculator-result");
+  const useButton = dialog.querySelector("[data-use-simulated-price]");
+  let simulatedPrice = current.currentPrice;
+
+  const renderSimulation = (source = "price") => {
+    let message = "";
+    if (source === "margin") {
+      const desired = parseLocalizedNumber(marginInput.value);
+      if (!Number.isFinite(desired) || desired < 0 || desired >= 100) {
+        message = "Informe uma margem entre 0% e 99,99%.";
+      } else {
+        const target = priceForDesiredProfitMargin(item, desired);
+        if (target === null) {
+          message = "Não foi possível calcular o preço: confira a tarifa oficial e o custo do SKU.";
+        } else {
+          simulatedPrice = target;
+          priceInput.value = target.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+      }
+    } else {
+      const parsed = parseLocalizedNumber(priceInput.value);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        message = "Informe um preço de venda maior que zero.";
+      } else {
+        simulatedPrice = parsed;
+      }
+    }
+    const values = profitSimulationValues(item, simulatedPrice);
+    const tone = values.profitStatus === "profit" ? "profit-positive"
+      : values.profitStatus === "loss" ? "profit-negative" : "profit-missing";
+    useButton.disabled = !feeReady || Boolean(message);
+    resultNode.innerHTML = `
+      ${message ? `<p class="profit-calculator-validation">${escapeText(message)}</p>` : ""}
+      <div class="profit-calculator-result-grid">
+        <span><small>Preço simulado</small><strong>${money.format(values.price)}</strong></span>
+        <span><small>Tarifa de venda</small><strong>${values.fee === null ? "-" : money.format(values.fee)}</strong><em>${values.feeRate === null ? "" : `${(values.feeRate * 100).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</em></span>
+        <span><small>Frete estimado ML</small><strong>${money.format(values.shipping)}</strong><em>valor fixo</em></span>
+        <span><small>Valor líquido</small><strong>${values.net === null ? "-" : money.format(values.net)}</strong></span>
+        <span><small>Custo do SKU</small><strong>${values.cost === null ? "Sem custo" : money.format(values.cost)}</strong></span>
+        <span class="${tone}"><small>Lucro / prejuízo</small><strong>${values.profit === null ? "Sem custo cadastrado" : money.format(values.profit)}</strong><em>${values.profitPercentage === null ? "" : `${values.profitPercentage >= 0 ? "+" : ""}${values.profitPercentage.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</em></span>
+      </div>`;
+  };
+
+  priceInput?.addEventListener("input", () => renderSimulation("price"));
+  marginInput?.addEventListener("input", () => {
+    if (!marginInput.value.trim()) {
+      renderSimulation("price");
+      return;
+    }
+    renderSimulation("margin");
+  });
+  dialog.querySelectorAll("[data-close-profit-calculator]").forEach((button) => {
+    button.addEventListener("click", () => dialog.close());
+  });
+  useButton.addEventListener("click", () => {
+    const adPriceInput = document.querySelector(`[data-price-input="${item.id}"]`);
+    if (!adPriceInput) return;
+    adPriceInput.value = simulatedPrice.toFixed(2);
+    adPriceInput.focus();
+    showToast("Preço simulado preenchido no anúncio. Clique em Salvar para enviá-lo ao Mercado Livre.", "success");
+    dialog.close();
+  });
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.showModal();
+  renderSimulation("price");
 }
 
 async function loadStatistics() {
@@ -3470,6 +3645,12 @@ function openPriceScheduleDialog(item) {
 }
 
 document.querySelector("#ads-list")?.addEventListener("click", async (event) => {
+  const calculatorButton = event.target.closest("[data-profit-calculator]");
+  if (calculatorButton) {
+    const item = state.data.catalog.find((row) => row.id === calculatorButton.dataset.profitCalculator);
+    if (item) openProfitCalculator(item);
+    return;
+  }
   const scheduleButton = event.target.closest("[data-schedule-price]");
   if (scheduleButton) {
     const item = state.data.catalog.find((row) => row.id === scheduleButton.dataset.schedulePrice);

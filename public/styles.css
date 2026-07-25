@@ -3805,6 +3805,208 @@ body {
   background: var(--panel-2);
 }
 
+.ad-title-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.ad-profit-calculator-button {
+  width: 36px;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0;
+  color: var(--brand);
+  border-color: color-mix(in srgb, var(--brand) 48%, var(--line));
+}
+
+.ad-profit-calculator-button:hover {
+  color: var(--brand-ink);
+  border-color: var(--brand);
+  background: var(--brand);
+  box-shadow: var(--neon);
+}
+
+.ad-profit-calculator-button svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.profit-calculator-dialog {
+  width: min(860px, calc(100vw - 28px));
+}
+
+.profit-calculator-card {
+  gap: 14px;
+}
+
+.profit-calculator-identity,
+.profit-calculator-baseline {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(125px, 1fr));
+  gap: 8px;
+}
+
+.profit-calculator-identity span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--brand);
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel-2) 84%, transparent);
+}
+
+.profit-calculator-identity small,
+.profit-calculator-result-grid small {
+  color: var(--muted);
+  font-size: 0.67rem;
+  text-transform: uppercase;
+}
+
+.profit-calculator-identity strong {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.profit-calculator-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.profit-calculator-fields label {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  color: var(--ink);
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.profit-calculator-fields label > small {
+  min-height: 2.4em;
+  color: var(--muted);
+  font-size: 0.67rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.profit-calculator-fields input {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.percent-field {
+  position: relative;
+  display: block;
+}
+
+.percent-field input {
+  padding: 0 42px 0 11px;
+}
+
+.percent-field > span {
+  position: absolute;
+  top: 50%;
+  right: 13px;
+  transform: translateY(-50%);
+  color: var(--brand);
+  font-weight: 900;
+  pointer-events: none;
+}
+
+.profit-calculator-result {
+  min-height: 98px;
+}
+
+.profit-calculator-validation {
+  margin: 0 0 8px;
+  padding: 9px 11px;
+  border-left: 3px solid var(--red);
+  color: var(--red);
+  background: var(--red-soft);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.profit-calculator-result-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.profit-calculator-result-grid > span {
+  display: grid;
+  align-content: center;
+  gap: 3px;
+  min-height: 76px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+}
+
+.profit-calculator-result-grid strong {
+  font-size: 1.08rem;
+}
+
+.profit-calculator-result-grid em {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.profit-calculator-result-grid .profit-positive {
+  border-color: color-mix(in srgb, var(--green) 58%, var(--line));
+  background: color-mix(in srgb, var(--green) 8%, var(--panel-2));
+}
+
+.profit-calculator-result-grid .profit-negative {
+  border-color: color-mix(in srgb, var(--red) 62%, var(--line));
+  background: color-mix(in srgb, var(--red) 9%, var(--panel-2));
+}
+
+.profit-calculator-note {
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  border-left: 2px solid var(--brand);
+  color: var(--muted);
+  background: color-mix(in srgb, var(--brand) 5%, var(--panel-2));
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.profit-calculator-note strong {
+  color: var(--ink);
+}
+
+.profit-calculator-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.profit-calculator-actions button {
+  min-width: 180px;
+}
+
 .statistics-loading {
   min-height: 54px;
   display: flex;
@@ -5136,12 +5338,23 @@ textarea:focus {
 @media (max-width: 760px) {
   .stock-calculator-fields,
   .stock-calculator-baseline,
-  .stock-calculator-result {
+  .stock-calculator-result,
+  .profit-calculator-fields,
+  .profit-calculator-result-grid {
     grid-template-columns: 1fr;
   }
 
   .stock-calculator-result p {
     grid-column: auto;
+  }
+
+  .profit-calculator-actions {
+    display: grid;
+  }
+
+  .profit-calculator-actions button {
+    width: 100%;
+    min-width: 0;
   }
 
   .clone-edit-heading {
