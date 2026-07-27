@@ -6398,6 +6398,9 @@ def merge_clone_source_local_snapshot(source_item, payload, account, item_id):
     )
     if not local_item:
         return source_item
+    local_sku = clean_attribute_value(local_item.get("sku"))
+    if local_sku and local_sku != "-" and item_sku(source_item) == "-":
+        source_item["seller_custom_field"] = local_sku
     package_map = {
         "package_height": "SELLER_PACKAGE_HEIGHT",
         "package_width": "SELLER_PACKAGE_WIDTH",
@@ -6405,17 +6408,26 @@ def merge_clone_source_local_snapshot(source_item, payload, account, item_id):
         "package_weight": "SELLER_PACKAGE_WEIGHT",
     }
     attributes = source_item.setdefault("attributes", [])
-    existing_ids = {canonical_clone_attribute_id(row.get("id")) for row in attributes if row.get("id")}
     for field, attr_id in package_map.items():
         value = clean_attribute_value(local_item.get(field))
-        if not value or attr_id in existing_ids:
+        if not value:
             continue
         try:
             value = seller_package_api_value(field, value)
         except Exception:
             continue
-        attributes.append({"id": attr_id, "value_name": value})
-        existing_ids.add(attr_id)
+        existing = next(
+            (
+                row for row in attributes
+                if canonical_clone_attribute_id(row.get("id")) == attr_id
+            ),
+            None,
+        )
+        if existing is not None:
+            existing.clear()
+            existing.update({"id": attr_id, "value_name": value})
+        else:
+            attributes.append({"id": attr_id, "value_name": value})
     local_gtin = clean_attribute_value(local_item.get("gtin"))
     if local_gtin and not source_clone_identifiers(source_item):
         attributes.append({"id": "GTIN", "value_name": local_gtin})
@@ -10119,6 +10131,24 @@ def generated_kit_sku(components):
     return f"{''.join(row['sku'] for row in components)}KIT"
 
 
+def detach_kit_from_source_product(create_payload, title, stock):
+    """Turn a clone payload into an independent kit publication."""
+    create_payload = json.loads(json.dumps(create_payload or {}, ensure_ascii=False))
+    for field in ("catalog_product_id", "catalog_listing", "user_product_id"):
+        create_payload.pop(field, None)
+    create_payload["title"] = str(title or "").strip()[:60]
+    create_payload["family_name"] = normalize_family_name(create_payload["title"])
+    create_payload["condition"] = "new"
+    create_payload.pop("variations", None)
+    create_payload["available_quantity"] = max(0, int(float(stock or 0)))
+    blocked_attributes = {"CATALOG_PRODUCT_ID", "USER_PRODUCT_ID"}
+    create_payload["attributes"] = [
+        row for row in create_payload.get("attributes") or []
+        if str(row.get("id") or "").upper() not in blocked_attributes
+    ]
+    return create_payload
+
+
 def prepare_kit_preview(request):
     payload = read_payload(include_catalog=False)
     source_account, components = kit_components_from_request(payload, request)
@@ -10230,9 +10260,11 @@ def create_kit_listing(request, actor=None):
         "listing_type_id": fields.get("listing_type_id"),
     }
     create_payload = build_clone_item_payload(first, edits)
-    create_payload.pop("catalog_product_id", None)
-    create_payload.pop("catalog_listing", None)
-    create_payload["condition"] = "new"
+    create_payload = detach_kit_from_source_product(
+        create_payload,
+        edits["title"],
+        edits["stock"],
+    )
     pictures = request.get("pictures") or []
     if not pictures:
         raise RuntimeError("O kit precisa ter ao menos uma imagem.")

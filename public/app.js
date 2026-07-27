@@ -2940,7 +2940,11 @@ function renderKits() {
   document.querySelector("#kit-products").innerHTML = products.length ? products.map((item) => `
     <article class="kit-product ${selectedIds.has(item.id) ? "selected" : ""}">
       ${item.thumbnail ? `<img src="${escapeAttr(item.thumbnail)}" alt="" loading="lazy" />` : `<span class="copy-thumb copy-thumb-empty"></span>`}
-      <div><strong>${escapeText(item.title)}</strong><small>SKU ${escapeText(item.sku || "-")} · ${money.format(item.price || 0)} · estoque ${Number(item.stock || 0)}</small></div>
+      <div>
+        <strong>${escapeText(item.title)}</strong>
+        <small>SKU ${escapeText(item.sku || "-")} · ${money.format(item.price || 0)} · estoque ${Number(item.stock || 0)}</small>
+        <span class="kit-mode-badge ${isCatalogListing(item) ? "catalog" : "traditional"}">${isCatalogListing(item) ? "Catálogo" : "Tradicional"}</span>
+      </div>
       <button class="icon-button" type="button" data-kit-add="${escapeAttr(item.id)}" title="${selectedIds.has(item.id) ? "Já selecionado" : "Adicionar ao kit"}" ${selectedIds.has(item.id) ? "disabled" : ""}>+</button>
     </article>
   `).join("") : `<div class="notice">Nenhum anúncio encontrado nessa conta.</div>`;
@@ -4709,6 +4713,14 @@ document.querySelector("#kit-form")?.addEventListener("submit", async (event) =>
     });
     setKitProgress(100, `Anúncio ${result.item?.id || ""} criado com sucesso.`, "Kit publicado");
     if (result.item) state.data.catalog.push(result.item);
+    const resultLink = document.querySelector("#kit-result-link");
+    if (resultLink) {
+      resultLink.hidden = !result.item?.permalink;
+      resultLink.href = result.item?.permalink || "#";
+      resultLink.textContent = result.item?.id
+        ? `Abrir anúncio ${result.item.id} no Mercado Livre`
+        : "Abrir anúncio no Mercado Livre";
+    }
     showToast(`Kit publicado com sucesso${result.item?.id ? `: ${result.item.id}` : ""}.`);
   } catch (error) {
     setKitProgress(100, error.message || "Não foi possível publicar.", "Falha na publicação");

@@ -5759,6 +5759,11 @@ textarea:focus {
 .kit-product img, .kit-component img { width:52px; height:52px; object-fit:contain; border-radius:5px; background:#fff; }
 .kit-product strong, .kit-component strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .kit-product small, .kit-component small { display:block; margin-top:4px; color:var(--muted); }
+.kit-mode-badge { display:inline-flex; margin-top:6px; padding:3px 7px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:11px; font-weight:800; }
+.kit-mode-badge.catalog { border-color:rgba(255,214,0,.55); color:var(--yellow); }
+.kit-mode-badge.traditional { border-color:rgba(74,222,128,.4); color:var(--green); }
+.kit-result-link { display:flex; justify-content:center; align-items:center; min-height:42px; border:1px solid var(--green); border-radius:7px; color:var(--green); font-weight:800; text-decoration:none; }
+.kit-result-link:hover { background:rgba(16,185,129,.1); box-shadow:0 0 18px rgba(16,185,129,.14); }
 .kit-component { grid-template-columns:28px 52px minmax(0,1fr) 86px 36px; }
 .kit-component label { display:grid; gap:3px; font-size:10px; color:var(--muted); }
 .kit-component input { min-width:0; }
