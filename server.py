@@ -10145,6 +10145,23 @@ def generated_kit_sku(components):
     return f"{''.join(row['sku'] for row in components)}KIT"
 
 
+def generated_kit_weight(components):
+    total_kg = 0.0
+    for component in components:
+        source_weight = package_values_from_item(component.get("source_item") or {}).get("package_weight")
+        normalized = normalize_package_value(source_weight, ["SELLER_PACKAGE_WEIGHT"])
+        if not clean_attribute_value(normalized):
+            return ""
+        try:
+            weight_kg = parse_decimal_number(normalized)
+        except (TypeError, ValueError):
+            return ""
+        if weight_kg <= 0:
+            return ""
+        total_kg += weight_kg * max(1, int(component.get("quantity") or 1))
+    return f"{total_kg:g} kg" if total_kg > 0 else ""
+
+
 def detach_kit_from_source_product(create_payload, title, stock):
     """Turn a clone payload into an independent kit publication."""
     create_payload = json.loads(json.dumps(create_payload or {}, ensure_ascii=False))
@@ -10189,6 +10206,7 @@ def prepare_kit_preview(request):
         else "Kit " + " + ".join(row["title"] for row in components)
     )[:60]
     package = package_values_from_item(first)
+    package["package_weight"] = generated_kit_weight(components)
     catalog = payload["catalog"]
     target_stores = target_official_stores(
         account_client(target_account),
@@ -10297,6 +10315,7 @@ def create_kit_listing(request, actor=None):
         "package_length": "SELLER_PACKAGE_LENGTH",
     }
     source_package = package_values_from_item(first)
+    source_package["package_weight"] = generated_kit_weight(components)
     expected_package = {}
     for field, attr_id in package_map.items():
         raw_value = fields.get(field) or source_package.get(field)
