@@ -2006,23 +2006,26 @@ def package_value_number(field, value):
     return parse_decimal_number(match.group(0)) if match else None
 
 
+def package_value_mismatches(item, expected):
+    actual = package_values_from_item(item)
+    mismatches = []
+    for field, value in expected.items():
+        if not clean_attribute_value(value):
+            continue
+        expected_number = package_value_number(field, value)
+        actual_number = package_value_number(field, actual.get(field))
+        tolerance = 0.005 if field == "package_weight" else 0.05
+        if actual_number is None or expected_number is None or abs(actual_number - expected_number) > tolerance:
+            mismatches.append(field)
+    return mismatches
+
+
 def verify_package_update(client, item_id, expected):
-    expected_numbers = {
-        field: package_value_number(field, value)
-        for field, value in expected.items()
-        if clean_attribute_value(value)
-    }
     latest = {}
     mismatches = []
     for attempt in range(4):
         latest = client.item(item_id)
-        actual = package_values_from_item(latest)
-        mismatches = []
-        for field, expected_number in expected_numbers.items():
-            actual_number = package_value_number(field, actual.get(field))
-            tolerance = 0.005 if field == "package_weight" else 0.05
-            if actual_number is None or expected_number is None or abs(actual_number - expected_number) > tolerance:
-                mismatches.append(field)
+        mismatches = package_value_mismatches(latest, expected)
         if not mismatches:
             return latest
         if attempt < 3:
@@ -6399,7 +6402,13 @@ def merge_clone_source_local_snapshot(source_item, payload, account, item_id):
     if not local_item:
         return source_item
     local_sku = clean_attribute_value(local_item.get("sku"))
-    if local_sku and local_sku != "-" and item_sku(source_item) == "-":
+    source_sku = clean_attribute_value(item_sku(source_item))
+    if (
+        local_sku
+        and local_sku != "-"
+        and local_sku.upper() != str(item_id or "").upper()
+        and (not source_sku or source_sku == "-" or source_sku.upper() == str(item_id or "").upper())
+    ):
         source_item["seller_custom_field"] = local_sku
     package_map = {
         "package_height": "SELLER_PACKAGE_HEIGHT",
@@ -10104,13 +10113,18 @@ def kit_components_from_request(payload, request, include_description=True):
             include_description=include_description,
         )
         source_item = bundle.get("source_item") or {}
-        sku = item_sku(source_item)
+        sku = clean_attribute_value(item_sku(source_item))
+        if not sku or sku == "-" or sku.upper() == item_id.upper():
+            raise RuntimeError(
+                f"O anúncio {item_id} não possui um SKU de vendedor confirmado. "
+                "Sincronize a conta ou informe o SKU no Mercado Livre antes de criar o kit."
+            )
         components.append(
             {
                 "position": index,
                 "item_id": item_id,
                 "quantity": quantity,
-                "sku": sku if sku and sku != "-" else item_id,
+                "sku": sku,
                 "title": source_item.get("title") or item_id,
                 "price": float(source_item.get("price") or 0),
                 "stock": int(item_available_quantity(source_item) or 0),
@@ -10151,6 +10165,7 @@ def detach_kit_from_source_product(create_payload, title, stock):
 
 def prepare_kit_preview(request):
     payload = read_payload(include_catalog=False)
+    payload["catalog"] = read_json(CATALOG_DATA_FILE, [])
     source_account, components = kit_components_from_request(payload, request)
     target_account = official_account_by_name(payload, request.get("target"))
     if not target_account or not target_account.get("official"):
@@ -10174,7 +10189,7 @@ def prepare_kit_preview(request):
         else "Kit " + " + ".join(row["title"] for row in components)
     )[:60]
     package = package_values_from_item(first)
-    catalog = read_json(CATALOG_DATA_FILE, [])
+    catalog = payload["catalog"]
     target_stores = target_official_stores(
         account_client(target_account),
         target_account,
@@ -10281,13 +10296,15 @@ def create_kit_listing(request, actor=None):
         "package_width": "SELLER_PACKAGE_WIDTH",
         "package_length": "SELLER_PACKAGE_LENGTH",
     }
+    source_package = package_values_from_item(first)
+    expected_package = {}
     for field, attr_id in package_map.items():
-        if clean_attribute_value(fields.get(field)):
-            add_or_update_clone_attribute(
-                create_payload,
-                attr_id,
-                seller_package_api_value(field, fields.get(field)),
-            )
+        raw_value = fields.get(field) or source_package.get(field)
+        if not clean_attribute_value(raw_value):
+            continue
+        api_value = seller_package_api_value(field, raw_value)
+        expected_package[field] = api_value
+        add_or_update_clone_attribute(create_payload, attr_id, api_value)
     source_client = account_client(source_account)
     category_attributes = cached_category_attributes(source_client, first.get("category_id"))
     hydrate_required_clone_attributes(create_payload, first, category_attributes, {})
@@ -10320,8 +10337,9 @@ def create_kit_listing(request, actor=None):
         first,
         destination_stores,
     )
+    target_client = account_client(target_account)
     created = create_item_with_clone_retries(
-        account_client(target_account),
+        target_client,
         create_payload,
         first,
         {},
@@ -10333,8 +10351,15 @@ def create_kit_listing(request, actor=None):
     )
     description = str(fields.get("description") or "").strip()
     if description and created.get("id"):
-        account_client(target_account).create_item_description(created["id"], description)
-    official = account_client(target_account).item(created["id"]) if created.get("id") else created
+        target_client.create_item_description(created["id"], description)
+    official = target_client.item(created["id"]) if created.get("id") else created
+    if created.get("id") and expected_package and package_value_mismatches(official, expected_package):
+        dimension_attributes = [
+            {"id": package_map[field], "value_name": value}
+            for field, value in expected_package.items()
+        ]
+        target_client.update_item(created["id"], {"attributes": dimension_attributes})
+        official = verify_package_update(target_client, created["id"], expected_package)
     new_item = synced_catalog_item(target_account, {**create_payload, **created, **official})
     new_item.update(
         {
