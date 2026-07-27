@@ -87,6 +87,14 @@
   cloneSourceCache: {},
   cloneSourceRequestToken: 0,
   cloneSourceLoading: false,
+  kitSource: "",
+  kitTarget: "",
+  kitSearch: "",
+  kitComponents: [],
+  kitPreview: null,
+  kitPictures: [],
+  kitDragIndex: null,
+  kitLoading: false,
 };
 
 const PAGE_SIZE = 100;
@@ -113,6 +121,7 @@ const pageTitles = {
   catalogo: ["Catálogo Mercado Livre", "Disputa de catálogo"],
   anuncios: ["Gestão operacional", "Anúncios"],
   copiar: ["Multiplicar anúncios", "Copiar anúncios específicos"],
+  kits: ["Composição de produtos", "Anunciar Kits"],
   concorrentes: ["Monitoramento", "Concorrentes"],
   scan: ["Scan", "Acompanhar preços"],
   alertas: ["Alertas oficiais", "Canais e prioridades"],
@@ -531,7 +540,7 @@ function render() {
 
 function renderRoute() {
   if (!state.data) return;
-  if (["catalogo", "anuncios", "copiar", "relatorios", "custos"].includes(state.route) && !state.catalogLoaded) {
+  if (["catalogo", "anuncios", "copiar", "kits", "relatorios", "custos"].includes(state.route) && !state.catalogLoaded) {
     loadCatalogInBackground();
   }
   const routeRenderers = {
@@ -549,6 +558,7 @@ function renderRoute() {
     catalogo: renderCatalog,
     anuncios: renderAds,
     copiar: renderClone,
+    kits: renderKits,
     concorrentes: renderCompetitors,
     scan: renderScan,
     alertas: () => {
@@ -671,7 +681,7 @@ function renderDashboard() {
       ${item.thumbnail ? `<img class="sale-thumb" src="${item.thumbnail}" alt="${escapeAttr(item.product || item.sku)}" loading="lazy" />` : `<span class="sale-thumb sale-thumb-empty"></span>`}
       <div>
         <strong>${escapeText(item.product || item.sku || "SKU vendido")}</strong>
-        <div class="chip-row">${copyChip("Conta", item.account || "-")}${copyChip("SKU", item.sku || "-")}${copyChip("MLB", item.item_id || "-")}</div>
+        <div class="chip-row">${copyChip((item.accounts || []).length > 1 ? "Contas" : "Conta", (item.accounts || []).join(", ") || item.account || "-")}${copyChip("SKU", item.sku || "-")}${copyChip((item.item_ids || []).length > 1 ? "Anúncios" : "MLB", (item.item_ids || []).join(", ") || item.item_id || "-")}</div>
       </div>
       <div class="sale-total"><span>Unidades vendidas</span><strong>${Number(item.units || 0)}</strong><small>${money.format(item.revenue || 0)}</small></div>
     </article>
@@ -915,6 +925,13 @@ function renderListingRouteStable() {
   });
 }
 
+function refreshListingOnlyWhenAtTop() {
+  if (window.scrollY > 120) return;
+  const active = document.activeElement;
+  if (active && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return;
+  renderListingRouteStable();
+}
+
 async function refreshExpiredPriceSchedules() {
   const now = Date.now();
   if (priceScheduleRefreshPromise || now - lastPriceScheduleRefreshAt < 3000) return;
@@ -932,7 +949,7 @@ async function refreshExpiredPriceSchedules() {
           if (item) item.price = Number(schedule.restored_price);
         }
       }
-      renderListingRouteStable();
+      refreshListingOnlyWhenAtTop();
     } catch (_) {
       // A próxima rodada confirma o estado sem interromper o uso da aplicação.
     } finally {
@@ -1476,7 +1493,7 @@ async function queueOfficialPriceRefresh(items) {
     // A varredura automática fará uma nova tentativa sem interromper a operação manual.
   } finally {
     state.pricesLoading = false;
-    if (changed) renderListingRouteStable();
+    if (changed) refreshListingOnlyWhenAtTop();
   }
 }
 
@@ -1488,7 +1505,9 @@ function saleFeeNeedsRefresh(item) {
     item.listing_type_id || "",
     item.category_id || "",
   ].join("|");
-  if (item.sale_fee_basis === expectedBasis && item.sale_fee_status === "ok") return false;
+  if (item.sale_fee_status === "ok" && item.sale_fee_amount !== null && item.sale_fee_amount !== undefined) {
+    return Boolean(item.sale_fee_basis && item.sale_fee_basis !== expectedBasis);
+  }
   if (item.sale_fee_basis && item.sale_fee_basis !== expectedBasis) return true;
   if (!item.sale_fee_basis) return true;
   const raw = String(item.sale_fee_updated_at || "").replace(" ", "T");
@@ -1519,7 +1538,7 @@ async function queueSaleFeeRefresh(items) {
     showToast(error.message || "Não foi possível consultar as tarifas de venda.", "error");
   } finally {
     state.saleFeesLoading = false;
-    if (changed) renderListingRouteStable();
+    if (changed) refreshListingOnlyWhenAtTop();
   }
 }
 
@@ -1602,7 +1621,7 @@ async function queueShippingCostRefresh(items) {
     showToast(error.message || "Não foi possível consultar o frete dos anúncios.", "error");
   } finally {
     state.shippingCostsLoading = false;
-    if (changed) renderListingRouteStable();
+    if (changed) refreshListingOnlyWhenAtTop();
   }
 }
 
@@ -1634,7 +1653,7 @@ async function queueIdentifierRefresh(items) {
     // A consulta volta a ser tentada após o intervalo de erro sem interromper a gestão dos anúncios.
   } finally {
     state.identifiersLoading = false;
-    if (changed) renderListingRouteStable();
+    if (changed) refreshListingOnlyWhenAtTop();
   }
 }
 
@@ -2759,7 +2778,6 @@ function renderClone() {
   if ([...source.options].some((option) => option.value === currentSource)) source.value = currentSource;
   const validTargetIds = new Set(accounts.map((account) => String(account.id || account.seller_id)));
   state.cloneTargetIds = new Set([...state.cloneTargetIds].filter((id) => validTargetIds.has(String(id))));
-  if (!state.cloneTargetIds.size && accounts.length) state.cloneTargetIds.add(String(accounts[0].id || accounts[0].seller_id));
   const targets = document.querySelector("#clone-targets");
   if (targets) {
     targets.innerHTML = accounts.map((account) => {
@@ -2895,6 +2913,108 @@ function cloneErrorsHtml(errors, validationVersion = 0) {
       `).join("")}
     </div>
   `;
+}
+
+function renderKits() {
+  const accounts = connectedAccounts();
+  const source = document.querySelector("#kit-source-account");
+  const target = document.querySelector("#kit-target-account");
+  if (!source || !target) return;
+  const options = accounts.map((account) => {
+    const id = String(account.id || account.seller_id);
+    return `<option value="${escapeAttr(id)}">${escapeText(account.nickname)} · Seller ${escapeText(account.seller_id || "-")}</option>`;
+  }).join("");
+  source.innerHTML = options;
+  target.innerHTML = `<option value="">Selecione a conta de publicação</option>${options}`;
+  if (!state.kitSource && accounts[0]) state.kitSource = String(accounts[0].id || accounts[0].seller_id);
+  source.value = state.kitSource;
+  target.value = state.kitTarget;
+  const sourceAccount = accounts.find((account) => String(account.id || account.seller_id) === state.kitSource);
+  const term = state.kitSearch.trim().toLowerCase();
+  const selectedIds = new Set(state.kitComponents.map((row) => row.item_id));
+  const products = (state.data.catalog || []).filter((item) => {
+    const accountMatches = item.account_id === state.kitSource || item.account === sourceAccount?.nickname;
+    const haystack = `${item.title || ""} ${item.sku || ""} ${item.id || ""}`.toLowerCase();
+    return accountMatches && (!term || haystack.includes(term));
+  }).slice(0, 100);
+  document.querySelector("#kit-products").innerHTML = products.length ? products.map((item) => `
+    <article class="kit-product ${selectedIds.has(item.id) ? "selected" : ""}">
+      ${item.thumbnail ? `<img src="${escapeAttr(item.thumbnail)}" alt="" loading="lazy" />` : `<span class="copy-thumb copy-thumb-empty"></span>`}
+      <div><strong>${escapeText(item.title)}</strong><small>SKU ${escapeText(item.sku || "-")} · ${money.format(item.price || 0)} · estoque ${Number(item.stock || 0)}</small></div>
+      <button class="icon-button" type="button" data-kit-add="${escapeAttr(item.id)}" title="${selectedIds.has(item.id) ? "Já selecionado" : "Adicionar ao kit"}" ${selectedIds.has(item.id) ? "disabled" : ""}>+</button>
+    </article>
+  `).join("") : `<div class="notice">Nenhum anúncio encontrado nessa conta.</div>`;
+  document.querySelector("#kit-components").innerHTML = state.kitComponents.length ? state.kitComponents.map((row, index) => {
+    const item = state.data.catalog.find((candidate) => candidate.id === row.item_id) || {};
+    return `<article class="kit-component">
+      <span class="kit-order">${index + 1}</span>
+      ${item.thumbnail ? `<img src="${escapeAttr(item.thumbnail)}" alt="" />` : `<span class="copy-thumb copy-thumb-empty"></span>`}
+      <div><strong>${escapeText(item.title || row.item_id)}</strong><small>SKU ${escapeText(item.sku || "-")}</small></div>
+      <label>Qtd. <input type="number" min="1" max="999" value="${row.quantity}" data-kit-quantity="${escapeAttr(row.item_id)}" /></label>
+      <button class="icon-button danger-button" type="button" data-kit-remove="${escapeAttr(row.item_id)}" title="Remover">×</button>
+    </article>`;
+  }).join("") : `<div class="notice">Adicione um ou mais produtos. A ordem escolhida define a composição do SKU.</div>`;
+  renderKitPictures();
+}
+
+function renderKitPictures() {
+  const list = document.querySelector("#kit-pictures");
+  const status = document.querySelector("#kit-picture-status");
+  if (!list || !status) return;
+  const excess = Math.max(0, state.kitPictures.length - 12);
+  status.textContent = excess
+    ? `${state.kitPictures.length} fotos · exclua ${excess} para respeitar o máximo de 12`
+    : `${state.kitPictures.length} de 12 fotos`;
+  status.classList.toggle("error-text", excess > 0);
+  list.innerHTML = state.kitPictures.map((picture, index) => `
+    <article class="kit-picture" draggable="true" data-kit-picture-index="${index}">
+      <span>${index + 1}</span>
+      <img src="${escapeAttr(picture.source || picture.preview || "")}" alt="Foto ${index + 1}" />
+      <div>
+        <button class="icon-button" type="button" data-kit-picture-left="${index}" title="Mover para a esquerda" ${index === 0 ? "disabled" : ""}>←</button>
+        <button class="icon-button" type="button" data-kit-picture-right="${index}" title="Mover para a direita" ${index === state.kitPictures.length - 1 ? "disabled" : ""}>→</button>
+        <button class="icon-button danger-button" type="button" data-kit-picture-remove="${index}" title="Excluir">×</button>
+      </div>
+    </article>
+  `).join("");
+}
+
+function setKitProgress(percent, message, title = "Preparando kit") {
+  const root = document.querySelector("#kit-progress");
+  if (!root) return;
+  root.hidden = percent === null;
+  if (percent === null) return;
+  root.querySelector("strong").textContent = title;
+  root.querySelector("span").style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  root.querySelector("small").textContent = message || "";
+}
+
+function applyKitPreview(preview) {
+  state.kitPreview = preview;
+  state.kitPictures = (preview.pictures || []).map((picture) => ({ ...picture, preview: picture.source }));
+  const form = document.querySelector("#kit-form");
+  form.hidden = false;
+  for (const name of ["title", "sku", "gtin", "price", "stock", "listing_type_id"]) {
+    if (form.elements[name]) form.elements[name].value = preview[name] ?? "";
+  }
+  for (const name of ["package_weight", "package_height", "package_width", "package_length"]) {
+    form.elements[name].value = measureInputValue(preview[name]);
+  }
+  form.elements.description.value = preview.description || "";
+  const officialStoreField = document.querySelector("#kit-official-store-field");
+  const officialStoreSelect = form.elements.official_store_id;
+  const stores = preview.official_store_options || [];
+  if (officialStoreField && officialStoreSelect) {
+    officialStoreField.hidden = stores.length <= 1;
+    officialStoreSelect.required = stores.length > 1;
+    officialStoreSelect.innerHTML = stores.length > 1
+      ? `<option value="">Selecione a Loja Oficial</option>${stores.map((store) => `<option value="${escapeAttr(store.value)}">${escapeText(store.label)}</option>`).join("")}`
+      : stores.map((store) => `<option value="${escapeAttr(store.value)}">${escapeText(store.label)}</option>`).join("");
+    officialStoreSelect.value = String(preview.official_store_id || "");
+  }
+  document.querySelector("[data-kit-title-counter]").textContent = `${form.elements.title.value.length}/60`;
+  renderKitPictures();
+  form.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function renderUsers() {
@@ -3752,7 +3872,17 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
     mergeCatalogItem(result?.item);
     if (button.dataset.pauseAd) showToast("Anúncio pausado com sucesso.");
     else if (button.dataset.activateAd) showToast("Anúncio ativado com sucesso.");
-    else showToast("Anúncio atualizado com sucesso.");
+    else {
+      const propagated = result?.propagated_dimensions || [];
+      const updated = propagated.filter((row) => row.status === "updated").length;
+      const failed = propagated.filter((row) => row.status === "error").length;
+      showToast(
+        updated || failed
+          ? `Anúncio atualizado. Medidas aplicadas em mais ${updated} anúncio(s) do mesmo SKU${failed ? `; ${failed} não aceitaram a alteração` : ""}.`
+          : "Anúncio atualizado com sucesso.",
+        failed ? "error" : "success",
+      );
+    }
     renderAds();
   } catch (error) {
     showToast(error.message || "Não foi possível atualizar o anúncio.", "error");
@@ -4390,6 +4520,201 @@ document.querySelector("#test-notifications").addEventListener("click", async ()
     showToast(result.results.telegram.error || result.results.telegram.status || "Teste do Telegram falhou.", "error");
   } else {
     showToast("Teste do Telegram enviado.");
+  }
+});
+
+document.querySelector("#kit-source-account")?.addEventListener("change", (event) => {
+  state.kitSource = event.target.value;
+  state.kitComponents = [];
+  state.kitPreview = null;
+  state.kitPictures = [];
+  document.querySelector("#kit-form").hidden = true;
+  renderKits();
+});
+
+document.querySelector("#kit-target-account")?.addEventListener("change", (event) => {
+  state.kitTarget = event.target.value;
+});
+
+document.querySelector("#kit-search")?.addEventListener("input", (event) => {
+  state.kitSearch = event.target.value;
+  scheduleRender("kit-search", renderKits, 180);
+});
+
+document.querySelector("#kit-products")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-kit-add]");
+  if (!button) return;
+  state.kitComponents.push({ item_id: button.dataset.kitAdd, quantity: 1 });
+  state.kitPreview = null;
+  document.querySelector("#kit-form").hidden = true;
+  renderKits();
+});
+
+document.querySelector("#kit-components")?.addEventListener("input", (event) => {
+  const input = event.target.closest("[data-kit-quantity]");
+  if (!input) return;
+  const component = state.kitComponents.find((row) => row.item_id === input.dataset.kitQuantity);
+  if (component) component.quantity = Math.max(1, Number(input.value) || 1);
+});
+
+document.querySelector("#kit-components")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-kit-remove]");
+  if (!button) return;
+  state.kitComponents = state.kitComponents.filter((row) => row.item_id !== button.dataset.kitRemove);
+  state.kitPreview = null;
+  document.querySelector("#kit-form").hidden = true;
+  renderKits();
+});
+
+document.querySelector("#kit-prepare")?.addEventListener("click", async (event) => {
+  if (!state.kitComponents.length) {
+    showToast("Selecione ao menos um produto para o kit.", "error");
+    return;
+  }
+  if (!state.kitTarget) {
+    showToast("Selecione a conta destino do kit.", "error");
+    return;
+  }
+  const button = event.currentTarget;
+  button.disabled = true;
+  button.textContent = "Carregando dados oficiais...";
+  try {
+    const queued = await api("/api/kits/preview", {
+      method: "POST",
+      body: JSON.stringify({ source: state.kitSource, target: state.kitTarget, components: state.kitComponents }),
+    });
+    const preview = await waitForAsyncOperation(queued, (message) => {
+      button.textContent = message.includes("fila") ? "Aguardando..." : "Montando o kit...";
+    });
+    applyKitPreview(preview);
+    showToast("Kit preparado com dados oficiais dos produtos.");
+  } catch (error) {
+    showToast(error.message || "Não foi possível preparar o kit.", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Preparar kit";
+  }
+});
+
+document.querySelector('#kit-form input[name="title"]')?.addEventListener("input", (event) => {
+  document.querySelector("[data-kit-title-counter]").textContent = `${event.target.value.length}/60`;
+});
+
+document.querySelector("#kit-pictures")?.addEventListener("click", (event) => {
+  const remove = event.target.closest("[data-kit-picture-remove]");
+  const left = event.target.closest("[data-kit-picture-left]");
+  const right = event.target.closest("[data-kit-picture-right]");
+  if (!remove && !left && !right) return;
+  const index = Number((remove || left || right).dataset.kitPictureRemove
+    ?? (left || right)?.dataset.kitPictureLeft
+    ?? right?.dataset.kitPictureRight);
+  if (remove) state.kitPictures.splice(index, 1);
+  else {
+    const target = left ? index - 1 : index + 1;
+    [state.kitPictures[index], state.kitPictures[target]] = [state.kitPictures[target], state.kitPictures[index]];
+  }
+  renderKitPictures();
+});
+
+document.querySelector("#kit-pictures")?.addEventListener("dragstart", (event) => {
+  const card = event.target.closest("[data-kit-picture-index]");
+  if (!card) return;
+  state.kitDragIndex = Number(card.dataset.kitPictureIndex);
+  event.dataTransfer.effectAllowed = "move";
+});
+
+document.querySelector("#kit-pictures")?.addEventListener("dragover", (event) => {
+  if (event.target.closest("[data-kit-picture-index]")) event.preventDefault();
+});
+
+document.querySelector("#kit-pictures")?.addEventListener("drop", (event) => {
+  const card = event.target.closest("[data-kit-picture-index]");
+  if (!card || state.kitDragIndex === null) return;
+  event.preventDefault();
+  const targetIndex = Number(card.dataset.kitPictureIndex);
+  const [picture] = state.kitPictures.splice(state.kitDragIndex, 1);
+  state.kitPictures.splice(targetIndex, 0, picture);
+  state.kitDragIndex = null;
+  renderKitPictures();
+});
+
+document.querySelector("#kit-picture-upload")?.addEventListener("change", async (event) => {
+  if (!state.kitTarget) {
+    showToast("Selecione primeiro a conta destino do kit.", "error");
+    event.target.value = "";
+    return;
+  }
+  const files = [...event.target.files];
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    try {
+      setKitProgress(Math.round((index / Math.max(1, files.length)) * 100), `Enviando ${file.name}`, "Enviando fotos");
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      const queued = await api("/api/kits/picture", {
+        method: "POST",
+        body: JSON.stringify({
+          account_id: state.kitTarget,
+          filename: file.name,
+          data_url: dataUrl,
+        }),
+      });
+      const uploaded = await waitForAsyncOperation(queued);
+      state.kitPictures.push({ id: uploaded.id, preview: dataUrl });
+      renderKitPictures();
+    } catch (error) {
+      showToast(`${file.name}: ${error.message || "falha no upload"}`, "error");
+    }
+  }
+  setKitProgress(null);
+  event.target.value = "";
+});
+
+document.querySelector("#kit-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!state.kitTarget) {
+    showToast("Selecione a conta destino.", "error");
+    return;
+  }
+  if (state.kitPictures.length > 12) {
+    showToast(`Exclua ${state.kitPictures.length - 12} foto(s) antes de publicar.`, "error");
+    return;
+  }
+  const form = new FormData(event.currentTarget);
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  button.disabled = true;
+  setKitProgress(10, "Validando atributos e imagens.", "Publicando kit");
+  try {
+    const fields = Object.fromEntries(form.entries());
+    for (const name of ["package_weight", "package_height", "package_width", "package_length"]) {
+      const unit = name === "package_weight" ? "kg" : "cm";
+      fields[name] = withUnit(fields[name], unit);
+    }
+    const queued = await api("/api/kits/create", {
+      method: "POST",
+      body: JSON.stringify({
+        source: state.kitSource,
+        target: state.kitTarget,
+        components: state.kitComponents,
+        pictures: state.kitPictures.map(({ id, source }) => ({ id, source })),
+        fields,
+      }),
+    });
+    const result = await waitForAsyncOperation(queued, (message) => {
+      setKitProgress(55, message || "Criando anúncio oficial.", "Publicando kit");
+    });
+    setKitProgress(100, `Anúncio ${result.item?.id || ""} criado com sucesso.`, "Kit publicado");
+    if (result.item) state.data.catalog.push(result.item);
+    showToast(`Kit publicado com sucesso${result.item?.id ? `: ${result.item.id}` : ""}.`);
+  } catch (error) {
+    setKitProgress(100, error.message || "Não foi possível publicar.", "Falha na publicação");
+    showToast(error.message || "Não foi possível publicar o kit.", "error");
+  } finally {
+    button.disabled = false;
   }
 });
 

@@ -223,6 +223,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/post-purchase/v1/claims/search(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/[^/]+/detail(\?|$)"),
     re.compile(r"^/sites/[^/]+/listing_prices(\?|$)"),
+    re.compile(r"^/pictures/items/upload$"),
 )
 
 
@@ -1223,12 +1224,37 @@ def build_operations(payload):
         if account.get("official")
     ]
     today_key = datetime.now(APP_TZ).date().isoformat()
+    top_skus_by_key = {}
+    for row in payload.get("daily_sku_sales", []):
+        if str(row.get("date") or "")[:10] != today_key:
+            continue
+        sku = str(row.get("sku") or "").strip()
+        key = sku.upper() if sku and sku != "-" else str(row.get("item_id") or row.get("id") or "").upper()
+        if not key:
+            continue
+        current = top_skus_by_key.setdefault(
+            key,
+            {
+                **row,
+                "sku": sku or "-",
+                "units": 0,
+                "revenue": 0.0,
+                "accounts": [],
+                "item_ids": [],
+            },
+        )
+        current["units"] += int(row.get("units") or 0)
+        current["revenue"] += float(row.get("revenue") or 0)
+        account_name = row.get("account")
+        if account_name and account_name not in current["accounts"]:
+            current["accounts"].append(account_name)
+        row_item_id = row.get("item_id") or row.get("id")
+        if row_item_id and row_item_id not in current["item_ids"]:
+            current["item_ids"].append(row_item_id)
+        if not current.get("thumbnail") and row.get("thumbnail"):
+            current["thumbnail"] = row.get("thumbnail")
     top_skus_today = sorted(
-        [
-            row
-            for row in payload.get("daily_sku_sales", [])
-            if str(row.get("date") or "")[:10] == today_key
-        ],
+        top_skus_by_key.values(),
         key=lambda item: (int(item.get("units") or 0), float(item.get("revenue") or 0)),
         reverse=True,
     )[:20]
@@ -1688,6 +1714,32 @@ class MercadoLivreClient:
     def create_item(self, payload):
         return self.post("/items", payload)
 
+    def upload_item_picture(self, content, filename="kit.jpg", content_type="image/jpeg"):
+        path = "/pictures/items/upload"
+        validate_meli_path(path)
+        boundary = f"----competidor-{uuid.uuid4().hex}"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8") + content + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        status, response_body, _ = HTTP_TRANSPORT.request(
+            f"{MELI_API_URL}{path}",
+            method="POST",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {self.access_token}",
+                "Accept": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body)),
+            },
+            timeout=max(10.0, float(os.getenv("MELI_INTERACTIVE_TIMEOUT_SECONDS", "20"))),
+        )
+        text = response_body.decode("utf-8", errors="replace")
+        if not 200 <= status < 300:
+            raise RuntimeError(f"HTTP {status}: {text}")
+        return json.loads(text) if text else {}
+
     def create_item_description(self, item_id, plain_text):
         return self.post(f"/items/{item_id}/description", {"plain_text": plain_text})
 
@@ -1900,7 +1952,10 @@ def normalize_package_value(value, attr_ids):
 
 
 def parse_decimal_number(value):
-    text = str(value or "").strip()
+    match = re.search(r"[-+]?\d[\d.,]*", str(value or "").strip())
+    if not match:
+        raise ValueError(f"Valor numérico inválido: {value}")
+    text = match.group(0)
     if "," in text and "." in text:
         if text.rfind(",") > text.rfind("."):
             text = text.replace(".", "").replace(",", ".")
@@ -5611,13 +5666,72 @@ def update_item_operation(request, actor=None):
         break
     if not updated_item:
         raise RuntimeError("Anúncio não encontrado na conta informada.")
+    propagated_dimensions = []
+    if expected_package_values and updated_item.get("sku") not in (None, "", "-"):
+        source_sku = str(updated_item.get("sku")).strip().upper()
+        siblings = [
+            row for row in payload.get("catalog", [])
+            if row.get("id") != item_id
+            and str(row.get("sku") or "").strip().upper() == source_sku
+            and row.get("official_source")
+        ]
+        total_siblings = len(siblings)
+        for index, sibling in enumerate(siblings, 1):
+            sibling_account = next(
+                (
+                    row for row in payload.get("accounts", [])
+                    if row.get("id") == sibling.get("account_id")
+                    or row.get("nickname") == sibling.get("account")
+                ),
+                None,
+            )
+            result = {"item_id": sibling.get("id"), "account": sibling.get("account")}
+            try:
+                if not sibling_account or not sibling_account.get("official"):
+                    raise RuntimeError("Conta oficial não encontrada.")
+                run_interactive_meli_call(
+                    account_client(sibling_account).update_item,
+                    sibling.get("id"),
+                    {"attributes": dimension_attrs},
+                )
+                changes = {}
+                for request_key in dimension_map:
+                    if request_key not in expected_package_values:
+                        continue
+                    normalized_value = verified_package_values.get(request_key) or normalize_package_value(
+                        expected_package_values[request_key],
+                        [dimension_map[request_key]],
+                    )
+                    changes[request_key] = {"from": sibling.get(request_key), "to": normalized_value}
+                    sibling[request_key] = normalized_value
+                sibling["shipping_cost_status"] = "pending"
+                sibling["shipping_cost_updated_at"] = ""
+                sibling["shipping_cost_basis"] = ""
+                sibling["updated_at"] = now_label()
+                apply_item_net_values(sibling)
+                append_item_log(payload, sibling, actor or {}, "Medidas propagadas pelo SKU", changes)
+                result["status"] = "updated"
+            except Exception as exc:
+                result.update({"status": "error", "error": str(exc)})
+            propagated_dimensions.append(result)
+            update_async_operation_progress(
+                f"Aplicando medidas do SKU em {index} de {total_siblings} anúncios.",
+                index,
+                total_siblings,
+                result,
+            )
     if stock_transition and stock_transition[0] > 0 and stock_transition[1] == 0:
         alert_id = f"stock-{account.get('id')}-{item_id}-{uuid.uuid4().hex[:8]}"
         alert = stock_alert(alert_id, account, stock_transition[2])
         payload.setdefault("alerts", []).insert(0, alert)
         notify_alert(payload, alert)
     write_payload(payload)
-    return {"ok": True, "official": official, "item": updated_item}
+    return {
+        "ok": True,
+        "official": official,
+        "item": updated_item,
+        "propagated_dimensions": propagated_dimensions,
+    }
 
 
 PRICE_SCHEDULE_LOCK = threading.RLock()
@@ -9496,11 +9610,8 @@ def spreadsheet_number(value, field_name):
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    text = str(value).strip().replace("R$", "").replace(" ", "")
-    if "," in text:
-        text = text.replace(".", "").replace(",", ".")
     try:
-        return float(text)
+        return parse_decimal_number(str(value).replace("R$", ""))
     except ValueError as exc:
         raise RuntimeError(f"{field_name}: informe um número válido.") from exc
 
@@ -9959,6 +10070,255 @@ def execute_clone_job(payload, job, incoming_answers=None):
     if errors:
         job["note"] += f" {len(errors)} anúncio(s) precisam de atenção; veja os detalhes abaixo."
     return copied
+
+
+def kit_components_from_request(payload, request, include_description=True):
+    source_account = official_account_by_name(payload, request.get("source"))
+    if not source_account or not source_account.get("official"):
+        raise RuntimeError("Selecione uma conta origem oficial.")
+    rows = request.get("components") or []
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("Selecione ao menos um anúncio para montar o kit.")
+    components = []
+    for index, row in enumerate(rows):
+        item_id = str((row or {}).get("item_id") or "").strip()
+        quantity = max(1, int((row or {}).get("quantity") or 1))
+        if not item_id:
+            continue
+        bundle = clone_source_bundle(
+            payload,
+            source_account.get("id"),
+            item_id,
+            include_description=include_description,
+        )
+        source_item = bundle.get("source_item") or {}
+        sku = item_sku(source_item)
+        components.append(
+            {
+                "position": index,
+                "item_id": item_id,
+                "quantity": quantity,
+                "sku": sku if sku and sku != "-" else item_id,
+                "title": source_item.get("title") or item_id,
+                "price": float(source_item.get("price") or 0),
+                "stock": int(item_available_quantity(source_item) or 0),
+                "description": bundle.get("description") or "",
+                "pictures": clone_picture_payload(source_item),
+                "source_item": source_item,
+            }
+        )
+    if not components:
+        raise RuntimeError("Os anúncios selecionados não foram encontrados na conta origem.")
+    return source_account, components
+
+
+def generated_kit_sku(components):
+    if len(components) == 1:
+        row = components[0]
+        return f"{row['sku']}KIT{row['quantity']}"
+    return f"{''.join(row['sku'] for row in components)}KIT"
+
+
+def prepare_kit_preview(request):
+    payload = read_payload(include_catalog=False)
+    source_account, components = kit_components_from_request(payload, request)
+    target_account = official_account_by_name(payload, request.get("target"))
+    if not target_account or not target_account.get("official"):
+        raise RuntimeError("Selecione uma conta destino oficial.")
+    first = components[0]["source_item"]
+    pictures = []
+    for component in components:
+        for picture in component["pictures"]:
+            source = picture.get("source")
+            if source and source not in {row.get("source") for row in pictures}:
+                pictures.append({"source": source, "component": component["item_id"]})
+    descriptions = []
+    for component in components:
+        heading = f"{component['quantity']}x {component['title']}"
+        body = component["description"].strip()
+        descriptions.append(f"{heading}\n{body}".strip())
+    quantity_label = sum(row["quantity"] for row in components)
+    title = (
+        f"Kit {quantity_label} unidades {components[0]['title']}"
+        if len(components) == 1
+        else "Kit " + " + ".join(row["title"] for row in components)
+    )[:60]
+    package = package_values_from_item(first)
+    catalog = read_json(CATALOG_DATA_FILE, [])
+    target_stores = target_official_stores(
+        account_client(target_account),
+        target_account,
+        catalog,
+    )
+    suggested_store_id = target_official_store_id(
+        account_client(target_account),
+        target_account,
+        first,
+        target_stores,
+    )
+    return {
+        "ok": True,
+        "source": source_account.get("id"),
+        "target": target_account.get("id"),
+        "components": [
+            {key: value for key, value in row.items() if key != "source_item"}
+            for row in components
+        ],
+        "title": title,
+        "sku": generated_kit_sku(components),
+        "price": round(sum(row["price"] * row["quantity"] for row in components), 2),
+        "stock": min(
+            max(0, row["stock"] // row["quantity"])
+            for row in components
+        ),
+        "gtin": (source_clone_identifiers(first) or [""])[0],
+        "description": "\n\n".join(descriptions),
+        "pictures": pictures,
+        "picture_limit": 12,
+        "package_weight": package.get("package_weight") or "",
+        "package_height": package.get("package_height") or "",
+        "package_width": package.get("package_width") or "",
+        "package_length": package.get("package_length") or "",
+        "category_id": first.get("category_id") or "",
+        "listing_type_id": first.get("listing_type_id") or "gold_special",
+        "official_store_id": suggested_store_id or "",
+        "official_store_options": [official_store_option(store) for store in target_stores],
+    }
+
+
+def upload_kit_picture(request):
+    payload = read_payload(include_catalog=False)
+    account = official_account_by_name(payload, request.get("account_id") or request.get("account"))
+    if not account or not account.get("official"):
+        raise RuntimeError("Selecione uma conta oficial para enviar a imagem.")
+    raw = str(request.get("data_url") or "")
+    match = re.match(r"^data:(image/(?:jpeg|png));base64,(.+)$", raw, re.I | re.S)
+    if not match:
+        raise RuntimeError("Envie uma imagem JPG ou PNG válida.")
+    content = base64.b64decode(match.group(2), validate=True)
+    if len(content) > 10 * 1024 * 1024:
+        raise RuntimeError("A imagem excede o limite de 10 MB.")
+    result = run_interactive_meli_call(
+        account_client(account).upload_item_picture,
+        content,
+        str(request.get("filename") or "kit.jpg"),
+        match.group(1).lower(),
+    )
+    size = str(result.get("max_size") or "")
+    size_match = re.match(r"(\d+)x(\d+)", size)
+    if size_match and min(int(size_match.group(1)), int(size_match.group(2))) < 500:
+        raise RuntimeError("A imagem precisa ter no mínimo 500 x 500 px.")
+    if not result.get("id"):
+        raise RuntimeError("O Mercado Livre não confirmou o upload da imagem.")
+    return {"ok": True, "id": result["id"], "max_size": size}
+
+
+def create_kit_listing(request, actor=None):
+    payload = read_payload(include_catalog=True)
+    source_account, components = kit_components_from_request(payload, request)
+    target_account = official_account_by_name(payload, request.get("target"))
+    if not target_account or not target_account.get("official"):
+        raise RuntimeError("Selecione uma conta destino oficial.")
+    first = components[0]["source_item"]
+    fields = request.get("fields") or {}
+    edits = {
+        "title": str(fields.get("title") or "")[:60],
+        "sku": fields.get("sku") or generated_kit_sku(components),
+        "price": fields.get("price"),
+        "stock": fields.get("stock"),
+        "gtin": fields.get("gtin"),
+        "listing_type_id": fields.get("listing_type_id"),
+    }
+    create_payload = build_clone_item_payload(first, edits)
+    create_payload.pop("catalog_product_id", None)
+    create_payload.pop("catalog_listing", None)
+    create_payload["condition"] = "new"
+    pictures = request.get("pictures") or []
+    if not pictures:
+        raise RuntimeError("O kit precisa ter ao menos uma imagem.")
+    if len(pictures) > 12:
+        raise RuntimeError(f"Remova {len(pictures) - 12} imagem(ns). O Mercado Livre aceita no máximo 12.")
+    create_payload["pictures"] = [
+        {"id": row.get("id")} if row.get("id") else {"source": row.get("source")}
+        for row in pictures
+        if row.get("id") or row.get("source")
+    ]
+    package_map = {
+        "package_weight": "SELLER_PACKAGE_WEIGHT",
+        "package_height": "SELLER_PACKAGE_HEIGHT",
+        "package_width": "SELLER_PACKAGE_WIDTH",
+        "package_length": "SELLER_PACKAGE_LENGTH",
+    }
+    for field, attr_id in package_map.items():
+        if clean_attribute_value(fields.get(field)):
+            add_or_update_clone_attribute(
+                create_payload,
+                attr_id,
+                seller_package_api_value(field, fields.get(field)),
+            )
+    source_client = account_client(source_account)
+    category_attributes = cached_category_attributes(source_client, first.get("category_id"))
+    hydrate_required_clone_attributes(create_payload, first, category_attributes, {})
+    hydrate_clone_package_attributes(create_payload, first)
+    create_payload = apply_target_account_clone_rules(
+        create_payload,
+        first,
+        source_account,
+        target_account,
+    )
+    cross_account = str(source_account.get("id")) != str(target_account.get("id"))
+    destination_stores = target_official_stores(
+        account_client(target_account),
+        target_account,
+        payload.get("catalog") or [],
+    ) if cross_account else []
+    requested_store_id = clean_attribute_value(fields.get("official_store_id"))
+    allowed_store_ids = {
+        str(store.get("official_store_id") or "")
+        for store in destination_stores
+        if store.get("official_store_id") not in (None, "")
+    }
+    if requested_store_id and allowed_store_ids and requested_store_id not in allowed_store_ids:
+        raise RuntimeError("A Loja Oficial selecionada não pertence à conta destino.")
+    if cross_account and len(destination_stores) > 1 and not requested_store_id:
+        raise RuntimeError("Selecione a Loja Oficial da conta destino para publicar o kit.")
+    destination_store_id = requested_store_id or target_official_store_id(
+        account_client(target_account),
+        target_account,
+        first,
+        destination_stores,
+    )
+    created = create_item_with_clone_retries(
+        account_client(target_account),
+        create_payload,
+        first,
+        {},
+        components[0]["item_id"],
+        category_attributes,
+        cross_account,
+        destination_store_id,
+        destination_stores,
+    )
+    description = str(fields.get("description") or "").strip()
+    if description and created.get("id"):
+        account_client(target_account).create_item_description(created["id"], description)
+    official = account_client(target_account).item(created["id"]) if created.get("id") else created
+    new_item = synced_catalog_item(target_account, {**create_payload, **created, **official})
+    new_item.update(
+        {
+            "sku": edits["sku"],
+            "clone_source_item_id": components[0]["item_id"],
+            "kit_components": [
+                {"item_id": row["item_id"], "sku": row["sku"], "quantity": row["quantity"]}
+                for row in components
+            ],
+            "updated_at": now_label(),
+        }
+    )
+    payload.setdefault("catalog", []).append(new_item)
+    append_item_log(payload, new_item, actor or {}, "Kit anunciado", {"components": {"to": new_item["kit_components"]}})
+    write_payload(payload)
+    return {"ok": True, "item": new_item, "created": created}
 
 
 def prepare_clone_preview(request):
@@ -10839,6 +11199,9 @@ class App(BaseHTTPRequestHandler):
             "/api/clone/preview",
             "/api/clone/execute",
             "/api/clone/execute-batch",
+            "/api/kits/preview",
+            "/api/kits/picture",
+            "/api/kits/create",
             "/api/meli/items/bulk-price",
             "/api/meli/prices/refresh",
             "/api/meli/shipping-costs/refresh",
@@ -11657,6 +12020,49 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": f"Não foi possível copiar o anúncio: {exc}"}, status=400)
+            return
+
+        if parsed.path == "/api/kits/preview":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "kit_preview",
+                    lambda: prepare_kit_preview(request_copy),
+                    "Carregando produtos, descrições e fotos oficiais do kit.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/kits/picture":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "kit_picture",
+                    lambda: upload_kit_picture(request_copy),
+                    "Validando e enviando a imagem ao Mercado Livre.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/kits/create":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                operation = start_async_operation(
+                    "kit_create",
+                    lambda: create_kit_listing(request_copy, actor),
+                    "Criando o kit oficialmente no Mercado Livre.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
             return
 
         self.send_json({"error": "Endpoint não encontrado"}, status=404)

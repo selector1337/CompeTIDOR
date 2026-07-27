@@ -41,6 +41,7 @@
         <a href="#/catalogo" data-route="catalogo" aria-label="Catálogo" title="Catálogo"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8ZM7.5 8.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/></svg></span><strong>Catálogo</strong></a>
         <a href="#/anuncios" data-route="anuncios" aria-label="Anúncios" title="Anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16v4H4V5Zm0 6h16v8H4v-8Zm3 2v2h7v-2H7Zm0 3v1h10v-1H7Z"/></svg></span><strong>Anúncios</strong></a>
         <a href="#/copiar" data-route="copiar" aria-label="Copiar anúncios" title="Copiar anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 8h11v13H8V8Zm-3 8H3V3h13v2H5v11Z"/></svg></span><strong>Copiar anúncios</strong></a>
+        <a href="#/kits" data-route="kits" aria-label="Anunciar Kits" title="Anunciar Kits"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Zm-7 9 7 4 7-4v6l-7 4-7-4v-6Zm7-1.3L16.9 7 12 4.3 7.1 7 12 9.7Z"/></svg></span><strong>Anunciar Kits</strong></a>
         <a href="#/concorrentes" data-route="concorrentes" aria-label="Concorrentes" title="Concorrentes"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 5c5.5 0 9 5.2 9 7s-3.5 7-9 7-9-5.2-9-7 3.5-7 9-7Zm0 10.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/></svg></span><strong>Concorrentes</strong></a>
         <a href="#/scan" data-route="scan" aria-label="Scan" title="Scan"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2Zm1 1v10l7.1 7.1 1.4-1.4-6.5-6.5V3h-2Zm-1 5a4 4 0 1 0 4 4h-2a2 2 0 1 1-2-2V8Z"/></svg></span><strong>Scan</strong></a>
         <a href="#/alertas" data-route="alertas" aria-label="Alertas" title="Alertas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22a2.5 2.5 0 0 0 2.4-2h-4.8A2.5 2.5 0 0 0 12 22Zm7-5-2-2V9a5 5 0 0 0-4-4.9V2h-2v2.1A5 5 0 0 0 7 9v6l-2 2v1h14v-1Z"/></svg></span><strong>Alertas</strong></a>
@@ -644,6 +645,63 @@
             <button class="primary" type="submit">Preparar cópia</button>
           </form>
           <div id="clone-jobs" class="clone-jobs"></div>
+        </div>
+      </section>
+
+      <section class="page" id="page-kits">
+        <div class="panel kit-builder">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Composição de produtos</p>
+              <h2>Anunciar Kits</h2>
+            </div>
+            <div class="kit-step-indicator"><span class="active">1 Produtos</span><span>2 Composição</span><span>3 Publicação</span></div>
+          </div>
+          <div class="kit-account-grid">
+            <label>Conta origem <select id="kit-source-account"></select></label>
+            <label>Conta destino <select id="kit-target-account"></select></label>
+            <label>Buscar produto ou SKU <input id="kit-search" type="search" placeholder="Nome, SKU ou MLB" /></label>
+          </div>
+          <div class="kit-workspace">
+            <section>
+              <div class="item-picker-head"><strong>Produtos disponíveis</strong><small>Selecione na ordem desejada para o SKU</small></div>
+              <div id="kit-products" class="kit-products"></div>
+            </section>
+            <section>
+              <div class="item-picker-head"><strong>Composição do kit</strong><small>Defina a quantidade de cada item</small></div>
+              <div id="kit-components" class="kit-components"></div>
+              <button id="kit-prepare" class="primary" type="button">Preparar kit</button>
+            </section>
+          </div>
+          <form id="kit-form" class="kit-form" hidden>
+            <div class="clone-edit-heading"><span>Dados do novo anúncio</span><small>Categoria e especificações vêm do primeiro produto selecionado.</small></div>
+            <label class="span-2">Título <input name="title" maxlength="60" required /><small data-kit-title-counter>0/60</small></label>
+            <label>SKU <input name="sku" required /></label>
+            <label>EAN / UPC / GTIN <input name="gtin" /></label>
+            <label>Preço <span class="money-field"><input name="price" type="number" min="0.01" step="0.01" required /></span></label>
+            <label>Estoque disponível <input name="stock" type="number" min="0" step="1" required /></label>
+            <label>Tipo de anúncio
+              <select name="listing_type_id"><option value="gold_special">Clássico</option><option value="gold_pro">Premium</option></select>
+            </label>
+            <label id="kit-official-store-field" hidden>Loja Oficial
+              <select name="official_store_id"></select>
+            </label>
+            <label>Peso <span class="unit-field"><input name="package_weight" inputmode="decimal" /><span>kg</span></span></label>
+            <label>Altura <span class="unit-field"><input name="package_height" inputmode="decimal" /><span>cm</span></span></label>
+            <label>Largura <span class="unit-field"><input name="package_width" inputmode="decimal" /><span>cm</span></span></label>
+            <label>Comprimento <span class="unit-field"><input name="package_length" inputmode="decimal" /><span>cm</span></span></label>
+            <div class="notice warning span-2">Peso e medidas são uma referência do primeiro anúncio. Confira a embalagem completa do kit antes de publicar.</div>
+            <label class="span-2">Descrição combinada <textarea name="description" rows="10"></textarea></label>
+            <section class="kit-picture-editor span-2">
+              <div class="item-picker-head"><strong>Fotos do kit</strong><small id="kit-picture-status">Máximo permitido: 12</small></div>
+              <div id="kit-pictures" class="kit-pictures"></div>
+              <label class="kit-upload-button">Adicionar fotos
+                <input id="kit-picture-upload" type="file" accept="image/png,image/jpeg" multiple />
+              </label>
+            </section>
+            <div id="kit-progress" class="manual-progress span-2" hidden><strong>Preparando</strong><div><span></span></div><small></small></div>
+            <button class="primary span-2" type="submit">Publicar kit no Mercado Livre</button>
+          </form>
         </div>
       </section>
 
