@@ -3505,7 +3505,7 @@ body {
 
 .statistics-filters {
   display: grid;
-  grid-template-columns: minmax(170px, 0.9fr) minmax(180px, 1fr) minmax(170px, 0.9fr) minmax(170px, 0.9fr) minmax(132px, 0.6fr) auto;
+  grid-template-columns: repeat(6, minmax(150px, 1fr)) auto;
   align-items: end;
   gap: 10px;
   padding: 12px;
@@ -3622,6 +3622,26 @@ body {
 
 .statistics-row:hover {
   background: color-mix(in srgb, var(--brand) 3%, var(--panel));
+}
+
+.no-sales-statistics-table .statistics-table-head,
+.no-sales-statistics-table .statistics-row {
+  grid-template-columns: 68px minmax(260px, 1.7fr) minmax(120px, 0.8fr) 108px 82px 104px minmax(150px, 0.9fr) minmax(130px, 0.8fr);
+}
+
+.statistics-item-ids {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.statistics-item-ids em {
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-style: normal;
 }
 
 .statistics-rank {

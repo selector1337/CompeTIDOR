@@ -184,7 +184,7 @@
           <div class="panel-heading">
             <div>
               <p class="eyebrow">Vendas oficiais Mercado Livre</p>
-              <h2>Desempenho por SKU</h2>
+              <h2 id="statistics-title">Desempenho por SKU</h2>
             </div>
             <div class="heading-actions">
               <span id="statistics-updated" class="statistics-updated"></span>
@@ -195,6 +195,12 @@
             </div>
           </div>
           <form id="statistics-form" class="statistics-filters">
+            <label>Relatório
+              <select name="report_type">
+                <option value="sku_sales">Vendas por SKU</option>
+                <option value="no_sales">SKUs ativos sem venda</option>
+              </select>
+            </label>
             <label>Conta
               <select name="account"></select>
             </label>
@@ -214,7 +220,7 @@
                 <option value="custom">Período personalizado</option>
               </select>
             </label>
-            <label>Mercado Envios
+            <label data-statistics-flex>Mercado Envios
               <select name="flex">
                 <option value="all">Todas as modalidades</option>
                 <option value="flex">Somente Flex</option>

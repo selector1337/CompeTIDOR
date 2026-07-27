@@ -3416,6 +3416,11 @@ def normalized_sku_key(value):
     return clean_attribute_value(value).strip().upper()
 
 
+def normalized_meli_status(value):
+    status = str(value or "").lower()
+    return "paused" if status == "inactive" else status
+
+
 def apply_item_net_values(item, strict=False):
     price = max(0.0, float(item.get("price") or 0))
     raw_fee = item.get("sale_fee_amount")
@@ -8574,6 +8579,118 @@ def query_sku_statistics(payload, request):
     }
 
 
+def active_skus_without_sales_rows(payload, request, sold_rows):
+    account_filter = str((request or {}).get("account") or "all")
+    sku_filter = normalized_attribute_label((request or {}).get("sku") or "")
+    accounts = [
+        account
+        for account in payload.get("accounts") or []
+        if account.get("official") and account.get("status") == "connected"
+    ]
+    if account_filter != "all":
+        accounts = [
+            account
+            for account in accounts
+            if account.get("id") == account_filter
+            or str(account.get("seller_id") or "") == account_filter
+            or account.get("nickname") == account_filter
+        ]
+    allowed_ids = {
+        str(value)
+        for account in accounts
+        for value in (account.get("id"), account.get("seller_id"))
+        if value not in (None, "")
+    }
+    allowed_names = {str(account.get("nickname") or "") for account in accounts}
+    sold_skus = {
+        normalized_sku_key(row.get("sku"))
+        for row in sold_rows or []
+        if normalized_sku_key(row.get("sku")) not in {"", "-"}
+    }
+    grouped = {}
+    for item in payload.get("catalog") or []:
+        if str(item.get("meli_status") or "").lower() != "active":
+            continue
+        item_account_id = str(item.get("account_id") or "")
+        item_account_name = str(item.get("account") or "")
+        if item_account_id not in allowed_ids and item_account_name not in allowed_names:
+            continue
+        sku = normalized_sku_key(item.get("sku"))
+        if not sku or sku == "-" or sku in sold_skus:
+            continue
+        if sku_filter and sku_filter not in normalized_attribute_label(sku):
+            continue
+        row = grouped.setdefault(
+            sku,
+            {
+                "sku": sku,
+                "product": item.get("title") or "",
+                "thumbnail": item.get("thumbnail") or "",
+                "accounts": set(),
+                "item_ids": [],
+                "listing_types": set(),
+                "active_listings": 0,
+                "current_stock": 0,
+            },
+        )
+        if not row["thumbnail"] and item.get("thumbnail"):
+            row["thumbnail"] = item.get("thumbnail")
+        if item_account_name:
+            row["accounts"].add(item_account_name)
+        if item.get("id") and item.get("id") not in row["item_ids"]:
+            row["item_ids"].append(item.get("id"))
+        listing_type = str(item.get("listing_type_id") or "")
+        row["listing_types"].add(
+            "Premium" if listing_type == "gold_pro"
+            else "Clássico" if listing_type == "gold_special"
+            else listing_type or "Não informado"
+        )
+        row["active_listings"] += 1
+        try:
+            row["current_stock"] += max(0, int(float(item.get("stock") or 0)))
+        except (TypeError, ValueError):
+            pass
+    last_sales = payload.get("sku_last_sales") or {}
+    rows = []
+    for sku, row in grouped.items():
+        last_sale = last_sales.get(sku) if isinstance(last_sales, dict) else None
+        rows.append(
+            {
+                **row,
+                "accounts": sorted(row["accounts"]),
+                "item_ids": sorted(row["item_ids"]),
+                "listing_types": sorted(row["listing_types"]),
+                "last_sale_at": (last_sale or {}).get("date") if isinstance(last_sale, dict) else "",
+            }
+        )
+    rows.sort(key=lambda row: (str(row.get("last_sale_at") or ""), row["sku"]))
+    return rows
+
+
+def query_active_skus_without_sales(payload, request):
+    sales_request = {**(request or {}), "flex": "all"}
+    sales = query_sku_statistics(payload, sales_request)
+    rows = active_skus_without_sales_rows(payload, request, sales.get("rows") or [])
+    return {
+        "ok": True,
+        "kind": "no_sales",
+        "date_from": sales.get("date_from"),
+        "date_to": sales.get("date_to"),
+        "account": str((request or {}).get("account") or "all"),
+        "rows": rows,
+        "summary": {
+            "skus": len(rows),
+            "active_listings": sum(int(row.get("active_listings") or 0) for row in rows),
+            "accounts": len({account for row in rows for account in row.get("accounts") or []}),
+            "stock_units": sum(int(row.get("current_stock") or 0) for row in rows),
+        },
+        "warnings": sales.get("warnings") or [],
+        "truncated": bool(sales.get("truncated")),
+        "cached": bool(sales.get("cached")),
+        "generated_at": now_label(),
+    }
+
+
 def order_item_fee_amount(order_item, catalog_item, line_total):
     candidates = (
         order_item.get("sale_fee"),
@@ -8759,11 +8876,12 @@ def start_statistics_job(request):
                 current.update({"status": "processing", "progress": 20, "message": "Consultando vendas oficiais no Mercado Livre."})
         try:
             source_payload = read_payload()
-            result = (
-                query_sales_report(source_payload, safe_request)
-                if safe_request.get("kind") == "sales"
-                else query_sku_statistics(source_payload, safe_request)
-            )
+            if safe_request.get("kind") == "sales":
+                result = query_sales_report(source_payload, safe_request)
+            elif safe_request.get("kind") == "no_sales":
+                result = query_active_skus_without_sales(source_payload, safe_request)
+            else:
+                result = query_sku_statistics(source_payload, safe_request)
             with STATISTICS_JOBS_LOCK:
                 current = STATISTICS_JOBS.get(job_id)
                 if current:
@@ -8874,7 +8992,7 @@ def start_report_job(request):
             if report_type in {"statistics", "sales"} and statistics_job_id:
                 statistics_result = statistics_job_result(statistics_job_id).get("result")
             title, columns, rows, metadata = report_dataset(
-                read_payload(include_catalog=report_type in {"sales", "catalog", "ads", "equalization"}),
+                read_payload(include_catalog=report_type in {"statistics", "sales", "catalog", "ads", "equalization"}),
                 report_type,
                 filters,
                 statistics_result,
@@ -8952,7 +9070,7 @@ def report_filtered_catalog(payload, report_type, filters):
                 continue
             if status_filter != "internal" and item.get("status") != status_filter:
                 continue
-        if ml_status_filter != "all" and item.get("meli_status") != ml_status_filter:
+        if ml_status_filter != "all" and normalized_meli_status(item.get("meli_status")) != ml_status_filter:
             continue
         if listing_type_filter != "all" and item.get("listing_type_id") != listing_type_filter:
             continue
@@ -9029,7 +9147,42 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             },
         )
     if report_type == "statistics":
-        result = statistics_result or query_sku_statistics(payload, filters)
+        result = statistics_result or (
+            query_active_skus_without_sales(payload, filters)
+            if str(filters.get("kind") or "") == "no_sales"
+            else query_sku_statistics(payload, filters)
+        )
+        if result.get("kind") == "no_sales":
+            columns = [
+                ("sku", "SKU", "text"),
+                ("product", "Produto", "text"),
+                ("accounts_label", "Contas", "text"),
+                ("active_listings", "Anúncios ativos", "integer"),
+                ("current_stock", "Estoque somado", "integer"),
+                ("listing_types_label", "Tipos", "text"),
+                ("item_ids_label", "Anúncios ML", "text"),
+                ("last_sale_at", "Última venda sincronizada", "text"),
+            ]
+            rows = [
+                {
+                    **row,
+                    "accounts_label": ", ".join(row.get("accounts") or []),
+                    "listing_types_label": ", ".join(row.get("listing_types") or []),
+                    "item_ids_label": ", ".join(row.get("item_ids") or []),
+                }
+                for row in result.get("rows") or []
+            ]
+            return (
+                "SKUs ativos sem venda no período",
+                columns,
+                rows,
+                {
+                    "Período": f"{result.get('date_from')} a {result.get('date_to')}",
+                    "Conta": filters.get("account") or "Todas",
+                    "SKU": filters.get("sku") or "Todos",
+                    "Somente anúncios": "Ativos",
+                },
+            )
         columns = [
             ("rank", "Posição", "integer"),
             ("sku", "SKU", "text"),
@@ -9058,7 +9211,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
         ml_status_filter = str(filters.get("ml_status") or "all").lower()
         matrix = {}
         for item in payload.get("catalog") or []:
-            if ml_status_filter != "all" and str(item.get("meli_status") or "").lower() != ml_status_filter:
+            if ml_status_filter != "all" and normalized_meli_status(item.get("meli_status")) != ml_status_filter:
                 continue
             sku = str(item.get("sku") or "").strip().upper()
             account_name = str(item.get("account") or "")
@@ -9177,7 +9330,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
                 **commercial,
                 "listing_type_label": "Premium" if item.get("listing_type_id") == "gold_pro" else "Clássico" if item.get("listing_type_id") == "gold_special" else item.get("listing_type_id") or "-",
                 "catalog_mode": "Catálogo" if is_catalog_listing(item) else "Tradicional",
-                "meli_status_label": {"active": "Ativo", "paused": "Pausado", "under_review": "Aguardando revisão"}.get(item.get("meli_status"), item.get("meli_status") or "-"),
+                "meli_status_label": {"active": "Ativo", "paused": "Pausado", "under_review": "Aguardando revisão"}.get(normalized_meli_status(item.get("meli_status")), normalized_meli_status(item.get("meli_status")) or "-"),
                 "status_label": "Entre suas contas" if item.get("internal_competition") else {"winning": "Ganhando", "losing": "Perdendo", "sharing": "Compartilhando", "paused": "Pausado"}.get(item.get("status"), item.get("status") or "-"),
                 "internal_label": "Sim" if item.get("internal_competition") else "Não",
                 "flex_label": "Ativo" if item.get("shipping_logistic_type") == "self_service" else "Inativo",

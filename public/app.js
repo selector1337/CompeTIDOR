@@ -890,6 +890,31 @@ function priceScheduleHtml(item) {
 let priceScheduleRefreshPromise = null;
 let lastPriceScheduleRefreshAt = 0;
 
+function renderListingRouteStable() {
+  const route = state.route;
+  if (!["anuncios", "catalogo"].includes(route)) return;
+  const list = document.querySelector(route === "anuncios" ? "#ads-list" : "#catalog-list");
+  const fallbackY = window.scrollY;
+  const anchor = [...(list?.querySelectorAll("[data-listing-id]") || [])]
+    .find((node) => node.getBoundingClientRect().bottom > 80);
+  const anchorId = anchor?.dataset.listingId || "";
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  if (route === "anuncios") renderAds();
+  else renderCatalog();
+  window.requestAnimationFrame(() => {
+    if (state.route !== route) return;
+    const currentList = document.querySelector(route === "anuncios" ? "#ads-list" : "#catalog-list");
+    const replacement = anchorId
+      ? [...(currentList?.querySelectorAll("[data-listing-id]") || [])].find((node) => node.dataset.listingId === anchorId)
+      : null;
+    if (replacement && Number.isFinite(anchorTop)) {
+      window.scrollBy({ top: replacement.getBoundingClientRect().top - anchorTop, behavior: "auto" });
+    } else {
+      window.scrollTo({ top: fallbackY, behavior: "auto" });
+    }
+  });
+}
+
 async function refreshExpiredPriceSchedules() {
   const now = Date.now();
   if (priceScheduleRefreshPromise || now - lastPriceScheduleRefreshAt < 3000) return;
@@ -907,8 +932,7 @@ async function refreshExpiredPriceSchedules() {
           if (item) item.price = Number(schedule.restored_price);
         }
       }
-      if (state.route === "anuncios") renderAds();
-      if (state.route === "catalogo") renderCatalog();
+      renderListingRouteStable();
     } catch (_) {
       // A próxima rodada confirma o estado sem interromper o uso da aplicação.
     } finally {
@@ -1036,7 +1060,7 @@ function renderCatalog() {
     return isCatalogListing(item)
       && (state.filter === "all" || (state.filter === "internal" ? item.internal_competition : item.status === state.filter))
       && (state.catalogAccount === "all" || item.account === state.catalogAccount)
-      && (state.catalogMlStatus === "all" || item.meli_status === state.catalogMlStatus)
+      && (state.catalogMlStatus === "all" || normalizedMlStatus(item.meli_status) === state.catalogMlStatus)
       && (state.catalogStock === "all" || (state.catalogStock === "zero" ? Number(item.stock) === 0 : Number(item.stock) > 0))
       && catalogMatchesSalesFilter(item)
       && (!term || text.includes(term));
@@ -1046,7 +1070,7 @@ function renderCatalog() {
   list.innerHTML = filtered.length ? paginationHtml("catalogPage", pageInfo) + pageInfo.items
     .map(
       (item) => `
-        <article class="catalog-item ${item.status}">
+        <article class="catalog-item ${item.status}" data-listing-id="${escapeAttr(item.id)}">
           <a class="product-media" href="${catalogPublicUrl(item)}" target="_blank" rel="noreferrer" aria-label="Abrir catálogo ${item.catalog_product_id || item.id}">
             ${item.thumbnail ? `<img src="${item.thumbnail}" alt="${item.title}" loading="lazy" />` : `<span>${(item.title || item.id).slice(0, 2).toUpperCase()}</span>`}
           </a>
@@ -1064,7 +1088,7 @@ function renderCatalog() {
               ${fact("Catálogo", item.catalog_product_id)}
               ${fact("Estoque", item.stock)}
               ${fact("Preço", money.format(item.price))}
-              ${item.meli_status ? fact("Status ML", item.meli_status === "paused" ? "Pausado" : item.meli_status) : ""}
+              ${item.meli_status ? fact("Status ML", statusLabel(item.meli_status)) : ""}
               ${fact("Vencedor", catalogWinnerName(item))}
               ${fact("Preço vencedor", catalogWinnerPrice(item))}
               ${item.winner_confirmed && item.winner_item_id ? fact("Anúncio vencedor", item.winner_item_id) : ""}
@@ -1148,7 +1172,7 @@ function catalogWinnerSource(source) {
 
 function renderFilterOptions() {
   const accounts = ["all", ...new Set(state.data.catalog.map((item) => item.account).filter(Boolean))];
-  const mlStatuses = ["all", ...new Set(["active", "paused", "under_review", ...state.data.catalog.map((item) => item.meli_status).filter(Boolean)])];
+  const mlStatuses = ["all", "active", "paused", "under_review"];
   setOptions("#catalog-account-filter", accounts, state.catalogAccount, "Todas");
   setOptions("#catalog-ml-status-filter", mlStatuses, state.catalogMlStatus, "Todos", statusLabel);
   setOptions("#ads-account-filter", accounts, state.adsAccount, "Todas");
@@ -1186,7 +1210,7 @@ function renderAds() {
     const sku = `${item.sku || ""}`.trim().toLowerCase();
     const code = `${item.id || ""}`.toLowerCase();
     return (state.adsAccount === "all" || item.account === state.adsAccount)
-      && (state.adsStatus === "all" || item.meli_status === state.adsStatus)
+      && (state.adsStatus === "all" || normalizedMlStatus(item.meli_status) === state.adsStatus)
       && (state.adsListingType === "all" || item.listing_type_id === state.adsListingType)
       && (state.adsCatalog === "all" || (state.adsCatalog === "catalog" ? isCatalogItem(item) : !isCatalogItem(item)))
       && (state.adsFlex === "all" || (state.adsFlex === "active" ? item.shipping_logistic_type === "self_service" : item.shipping_logistic_type !== "self_service"))
@@ -1234,7 +1258,7 @@ function renderAds() {
   const pageInfo = paginate(filtered, state.adsPage);
   state.adsPage = pageInfo.current;
   list.innerHTML = filtered.length ? paginationHtml("adsPage", pageInfo) + pageInfo.items.map((item) => `
-    <article class="ad-item ${state.adsSelectedIds.has(item.id) ? "selected" : ""}">
+    <article class="ad-item ${state.adsSelectedIds.has(item.id) ? "selected" : ""}" data-listing-id="${escapeAttr(item.id)}">
       <label class="ad-select" title="Selecionar anúncio para alteração em massa"><input type="checkbox" data-select-ad="${item.id}" ${state.adsSelectedIds.has(item.id) ? "checked" : ""} /><span></span></label>
       <a class="product-media" href="${item.permalink || "#"}" target="_blank" rel="noreferrer">
         ${item.thumbnail ? `<img src="${item.thumbnail}" alt="${item.title}" loading="lazy" />` : `<span>${(item.title || item.id).slice(0, 2).toUpperCase()}</span>`}
@@ -1244,7 +1268,7 @@ function renderAds() {
           <strong>${item.title}</strong>
           <div class="ad-title-actions">
             <button class="icon-button ad-profit-calculator-button" type="button" data-profit-calculator="${item.id}" title="Calcular lucro, prejuízo e margem" aria-label="Abrir calculadora de rentabilidade de ${escapeAttr(item.title || item.id)}">${calculatorIcon()}</button>
-            <span class="badge ${item.meli_status === "paused" ? "paused" : "winning"}">${statusLabel(item.meli_status || item.status)}</span>
+            <span class="badge ${normalizedMlStatus(item.meli_status) === "paused" ? "paused" : "winning"}">${statusLabel(item.meli_status || item.status)}</span>
           </div>
         </div>
         <div class="ad-facts">
@@ -1272,7 +1296,7 @@ function renderAds() {
           <label>Comprimento <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_length))}" placeholder="13" data-length-input="${item.id}" /><span>cm</span></span></label>
           <div class="ad-actions">
             <button class="mini-button" data-save-ad="${item.id}">Salvar</button>
-            ${item.meli_status === "paused" || item.status === "paused"
+            ${normalizedMlStatus(item.meli_status) === "paused" || item.status === "paused"
               ? `<button class="mini-button success-button" data-activate-ad="${item.id}">Ativar</button>`
               : `<button class="mini-button danger-button" data-pause-ad="${item.id}">Pausar</button>`}
             ${item.official_source && item.shipping_logistic_type === "self_service"
@@ -1434,6 +1458,7 @@ async function queueOfficialPriceRefresh(items) {
   const itemIds = (items || []).filter(officialPriceNeedsRefresh).slice(0, 100).map((item) => item.id);
   if (!itemIds.length) return;
   state.pricesLoading = true;
+  let changed = false;
   try {
     const queued = await api("/api/meli/prices/refresh", {
       method: "POST",
@@ -1443,6 +1468,7 @@ async function queueOfficialPriceRefresh(items) {
     const updates = new Map((result.items || [])
       .filter((item) => item.result_status === "updated" && item.id)
       .map((item) => [item.id, item]));
+    changed = updates.size > 0;
     state.data.catalog = state.data.catalog.map((item) => updates.has(item.id)
       ? { ...item, ...updates.get(item.id) }
       : item);
@@ -1450,8 +1476,7 @@ async function queueOfficialPriceRefresh(items) {
     // A varredura automática fará uma nova tentativa sem interromper a operação manual.
   } finally {
     state.pricesLoading = false;
-    if (state.route === "anuncios") renderAds();
-    if (state.route === "catalogo") renderCatalog();
+    if (changed) renderListingRouteStable();
   }
 }
 
@@ -1480,6 +1505,7 @@ async function queueSaleFeeRefresh(items) {
   const itemIds = (items || []).filter(saleFeeNeedsRefresh).slice(0, 15).map((item) => item.id);
   if (!itemIds.length) return;
   state.saleFeesLoading = true;
+  let changed = false;
   try {
     const queued = await api("/api/meli/sale-fees/refresh", {
       method: "POST",
@@ -1487,13 +1513,13 @@ async function queueSaleFeeRefresh(items) {
     });
     const result = await waitForAsyncOperation(queued);
     const updates = new Map((result.items || []).map((item) => [item.id, item]));
+    changed = updates.size > 0;
     state.data.catalog = state.data.catalog.map((item) => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
   } catch (error) {
     showToast(error.message || "Não foi possível consultar as tarifas de venda.", "error");
   } finally {
     state.saleFeesLoading = false;
-    if (state.route === "anuncios") renderAds();
-    if (state.route === "catalogo") renderCatalog();
+    if (changed) renderListingRouteStable();
   }
 }
 
@@ -1562,6 +1588,7 @@ async function queueShippingCostRefresh(items) {
   const itemIds = (items || []).filter(shippingCostNeedsRefresh).slice(0, 25).map((item) => item.id);
   if (!itemIds.length) return;
   state.shippingCostsLoading = true;
+  let changed = false;
   try {
     const queued = await api("/api/meli/shipping-costs/refresh", {
       method: "POST",
@@ -1569,13 +1596,13 @@ async function queueShippingCostRefresh(items) {
     });
     const result = await waitForAsyncOperation(queued);
     const updates = new Map((result.items || []).map((item) => [item.id, item]));
+    changed = updates.size > 0;
     state.data.catalog = state.data.catalog.map((item) => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
   } catch (error) {
     showToast(error.message || "Não foi possível consultar o frete dos anúncios.", "error");
   } finally {
     state.shippingCostsLoading = false;
-    if (state.route === "anuncios") renderAds();
-    if (state.route === "catalogo") renderCatalog();
+    if (changed) renderListingRouteStable();
   }
 }
 
@@ -1593,6 +1620,7 @@ async function queueIdentifierRefresh(items) {
   const itemIds = (items || []).filter(identifierNeedsRefresh).slice(0, 15).map((item) => item.id);
   if (!itemIds.length) return;
   state.identifiersLoading = true;
+  let changed = false;
   try {
     const queued = await api("/api/meli/identifiers/refresh", {
       method: "POST",
@@ -1600,12 +1628,13 @@ async function queueIdentifierRefresh(items) {
     });
     const result = await waitForAsyncOperation(queued);
     const updates = new Map((result.items || []).map((item) => [item.id, item]));
+    changed = updates.size > 0;
     state.data.catalog = state.data.catalog.map((item) => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
   } catch (_) {
     // A consulta volta a ser tentada após o intervalo de erro sem interromper a gestão dos anúncios.
   } finally {
     state.identifiersLoading = false;
-    if (state.route === "anuncios") renderAds();
+    if (changed) renderListingRouteStable();
   }
 }
 
@@ -1953,6 +1982,22 @@ function updateStatisticsPeriodFields() {
   form.querySelectorAll("[data-statistics-custom]").forEach((node) => { node.hidden = period !== "custom"; });
 }
 
+function updateStatisticsReportFields() {
+  const form = document.querySelector("#statistics-form");
+  if (!form) return;
+  const noSales = form.elements.report_type?.value === "no_sales";
+  const title = document.querySelector("#statistics-title");
+  if (title) title.textContent = noSales ? "SKUs ativos sem venda" : "Desempenho por SKU";
+  const flexField = form.querySelector("[data-statistics-flex]");
+  if (flexField) flexField.hidden = noSales;
+  if (form.elements.flex) {
+    form.elements.flex.disabled = noSales;
+    if (noSales) form.elements.flex.value = "all";
+  }
+  const submit = form.querySelector(".statistics-submit");
+  if (submit) submit.textContent = noSales ? "Consultar SKUs" : "Consultar vendas";
+}
+
 function renderStatistics() {
   const form = document.querySelector("#statistics-form");
   const feedback = document.querySelector("#statistics-feedback");
@@ -1973,6 +2018,7 @@ function renderStatistics() {
   if (!form.elements.date_from.value) form.elements.date_from.value = localDateValue(new Date(today.getFullYear(), today.getMonth(), 1));
   if (!form.elements.date_to.value) form.elements.date_to.value = localDateValue(today);
   updateStatisticsPeriodFields();
+  updateStatisticsReportFields();
 
   if (!accounts.length) {
     feedback.innerHTML = `<div class="notice">Conecte uma conta oficial do Mercado Livre para consultar as vendas.</div>`;
@@ -1992,12 +2038,54 @@ function renderStatistics() {
     window.setTimeout(loadStatistics, 0);
     return;
   }
-  if (!state.statistics) return;
+  if (!state.statistics) {
+    summary.innerHTML = "";
+    results.innerHTML = "";
+    return;
+  }
 
   const data = state.statistics;
+  const isNoSales = data.kind === "no_sales";
   const updated = document.querySelector("#statistics-updated");
   if (updated) updated.textContent = `${formatDateBR(data.date_from)} a ${formatDateBR(data.date_to)}`;
   const summaryData = data.summary || {};
+  if (isNoSales) {
+    summary.innerHTML = `
+      <article><small>SKUs ativos sem venda</small><strong>${Number(summaryData.skus || 0).toLocaleString("pt-BR")}</strong></article>
+      <article><small>Anúncios ativos</small><strong>${Number(summaryData.active_listings || 0).toLocaleString("pt-BR")}</strong></article>
+      <article><small>Contas analisadas</small><strong>${Number(summaryData.accounts || 0).toLocaleString("pt-BR")}</strong></article>
+      <article><small>Unidades em estoque</small><strong>${Number(summaryData.stock_units || 0).toLocaleString("pt-BR")}</strong></article>
+    `;
+    const pageInfo = paginate(data.rows || [], state.statisticsPage, state.statisticsPageSize);
+    state.statisticsPage = pageInfo.current;
+    const warning = data.truncated
+      ? `<div class="notice danger-notice">A consulta atingiu o limite configurado de pedidos. Reduza o período para garantir a conferência completa.</div>`
+      : "";
+    const messages = (data.warnings || []).map((message) => `<div class="notice warning-notice">${escapeText(message)}</div>`).join("");
+    results.innerHTML = `${warning}${messages}${paginationHtml("statisticsPage", pageInfo)}${pageInfo.items.length ? `
+      <div class="statistics-table no-sales-statistics-table" role="table" aria-label="SKUs ativos sem venda">
+        <div class="statistics-table-head" role="row">
+          <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Anúncios ativos</span><span>Estoque</span><span>Tipos</span><span>Anúncios ML</span><span>Última venda</span>
+        </div>
+        ${pageInfo.items.map((row, index) => `
+          <article class="statistics-row" role="row">
+            <strong class="statistics-rank">${pageInfo.start + index + 1}</strong>
+            <div class="statistics-product">
+              ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="${escapeAttr(row.product)}" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
+              <span><strong>${escapeText(row.product || "Produto sem título")}</strong><small>SKU ${escapeText(row.sku)}</small></span>
+            </div>
+            <span class="statistics-accounts">${(row.accounts || []).map((account) => `<em>${escapeText(account)}</em>`).join("")}</span>
+            <strong>${Number(row.active_listings || 0).toLocaleString("pt-BR")}</strong>
+            <strong>${Number(row.current_stock || 0).toLocaleString("pt-BR")}</strong>
+            <span>${escapeText((row.listing_types || []).join(" e ") || "-")}</span>
+            <span class="statistics-item-ids">${(row.item_ids || []).map((id) => `<em>${escapeText(id)}</em>`).join("")}</span>
+            <span>${row.last_sale_at ? formatDateBR(row.last_sale_at) : "Sem venda sincronizada"}</span>
+          </article>
+        `).join("")}
+      </div>
+    ` : `<div class="notice">Todos os SKUs ativos correspondentes aos filtros tiveram venda no período.</div>`}${paginationHtml("statisticsPage", pageInfo)}`;
+    return;
+  }
   summary.innerHTML = `
     <article><small>Unidades vendidas</small><strong>${Number(summaryData.units || 0).toLocaleString("pt-BR")}</strong></article>
     <article><small>SKUs vendidos</small><strong>${Number(summaryData.skus || 0).toLocaleString("pt-BR")}</strong></article>
@@ -2145,7 +2233,7 @@ function openProfitCalculator(item) {
       </div>
       <div class="profit-calculator-actions">
         <button class="ghost" type="button" data-close-profit-calculator>Fechar</button>
-        <button class="primary" type="button" data-use-simulated-price ${feeReady ? "" : "disabled"}>Levar preço para o anúncio</button>
+        <button class="primary" type="button" data-use-simulated-price ${feeReady ? "" : "disabled"}>Levar para o ajuste em lote</button>
       </div>
     </form>`;
   document.body.appendChild(dialog);
@@ -2207,11 +2295,22 @@ function openProfitCalculator(item) {
     button.addEventListener("click", () => dialog.close());
   });
   useButton.addEventListener("click", () => {
-    const adPriceInput = document.querySelector(`[data-price-input="${item.id}"]`);
-    if (!adPriceInput) return;
-    adPriceInput.value = simulatedPrice.toFixed(2);
-    adPriceInput.focus();
-    showToast("Preço simulado preenchido no anúncio. Clique em Salvar para enviá-lo ao Mercado Livre.", "success");
+    const bulkRoot = document.querySelector("#ads-bulk-price");
+    const mode = bulkRoot?.querySelector("[data-bulk-price-mode]");
+    const value = bulkRoot?.querySelector("[data-bulk-price-value]");
+    if (!bulkRoot || !mode || !value) return;
+    state.adsSelectedIds.clear();
+    state.adsSelectedIds.add(item.id);
+    document.querySelectorAll("[data-select-ad]").forEach((checkbox) => {
+      checkbox.checked = checkbox.dataset.selectAd === item.id;
+      checkbox.closest(".ad-item")?.classList.toggle("selected", checkbox.checked);
+    });
+    mode.value = "fixed";
+    value.value = simulatedPrice.toFixed(2);
+    updateBulkPriceBar();
+    bulkRoot.scrollIntoView({ block: "center", behavior: "auto" });
+    value.focus();
+    showToast("Preço preenchido em Definir valor. Revise a seleção e clique em Aplicar preços.", "success");
     dialog.close();
   });
   dialog.addEventListener("close", () => dialog.remove());
@@ -2237,6 +2336,7 @@ async function loadStatistics() {
       method: "POST",
       manualProgress: false,
       body: JSON.stringify({
+        kind: form.elements.report_type?.value || "sku_sales",
         account: form.elements.account.value,
         sku: form.elements.sku.value,
         flex: form.elements.flex.value,
@@ -2382,6 +2482,7 @@ function currentReportFilters(reportType) {
     const form = document.querySelector("#statistics-form");
     return {
       account: form.elements.account.value,
+      kind: form.elements.report_type?.value || "sku_sales",
       sku: form.elements.sku.value,
       flex: form.elements.flex.value,
       ...statisticsDateRange(form),
@@ -2952,7 +3053,13 @@ function escapeText(value) {
   return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function normalizedMlStatus(status) {
+  const value = String(status || "").toLowerCase();
+  return value === "inactive" ? "paused" : value;
+}
+
 function statusLabel(status) {
+  const normalized = normalizedMlStatus(status);
   const map = {
     active: "Ativo",
     paused: "Pausado",
@@ -2962,7 +3069,7 @@ function statusLabel(status) {
     losing: "Perdendo",
     sharing: "Compartilhando",
   };
-  return map[status] || status || "-";
+  return map[normalized] || normalized || "-";
 }
 
 function shippingLabel(value) {
@@ -3168,6 +3275,15 @@ document.querySelector("#spreadsheet-preview")?.addEventListener("click", (event
 
 document.querySelector("#statistics-form")?.addEventListener("change", (event) => {
   if (event.target.name === "period") updateStatisticsPeriodFields();
+  if (event.target.name === "report_type") {
+    updateStatisticsReportFields();
+    state.statistics = null;
+    state.statisticsJobId = "";
+    state.statisticsAttempted = true;
+    state.statisticsError = "";
+    state.statisticsPage = 1;
+    renderStatistics();
+  }
   if (event.target.name === "page_size") {
     state.statisticsPageSize = Number(event.target.value || 50);
     state.statisticsPage = 1;
@@ -3381,7 +3497,7 @@ document.querySelector("#clear-ads-filters")?.addEventListener("click", () => {
     const input = document.querySelector(selector);
     if (input) input.value = value;
   });
-  renderAds();
+  renderListingRouteStable();
 });
 
 document.querySelector("#ads-list")?.addEventListener("click", async (event) => {
@@ -3402,7 +3518,7 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
     return;
   }
   state.itemDescriptions[itemId] = { loading: true, loaded: false, value: "" };
-  renderAds();
+  renderListingRouteStable();
   try {
     const queued = await api("/api/meli/item/description", {
       method: "POST",
@@ -3414,7 +3530,7 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
     state.itemDescriptions[itemId] = { loading: false, loaded: false, value: "" };
     showToast(error.message || "Não foi possível carregar a descrição.", "error");
   }
-  renderAds();
+  renderListingRouteStable();
 });
 
 document.querySelector("#ads-list")?.addEventListener("change", (event) => {
