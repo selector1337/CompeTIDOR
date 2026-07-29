@@ -8671,7 +8671,8 @@ def aggregate_sku_statistics(account_orders, catalog, maximum_shipment_lookups=N
         if not sku_key or sku_key == "-":
             continue
         try:
-            current_stock_by_sku[sku_key] = current_stock_by_sku.get(sku_key, 0) + max(0, int(catalog_item.get("stock") or 0))
+            stock = max(0, int(catalog_item.get("stock") or 0))
+            current_stock_by_sku[sku_key] = max(current_stock_by_sku.get(sku_key, 0), stock)
         except (TypeError, ValueError):
             continue
     aggregates = {}
@@ -9205,7 +9206,7 @@ def query_brand_sales_report(payload, request):
     ]
 
     grouped = {}
-    stock_by_account_sku = {}
+    stock_by_sku = {}
     for item in matching_items:
         sku = normalized_sku_key(item.get("sku"))
         row = grouped.setdefault(
@@ -9256,12 +9257,11 @@ def query_brand_sales_report(payload, request):
             stock = max(0, int(float(item.get("stock") or 0)))
         except (TypeError, ValueError):
             stock = 0
-        stock_key = (account_name or str(item.get("account_id") or ""), sku)
-        stock_by_account_sku[stock_key] = max(stock_by_account_sku.get(stock_key, 0), stock)
+        stock_by_sku[sku] = max(stock_by_sku.get(sku, 0), stock)
 
-    for (_account_name, sku), stock in stock_by_account_sku.items():
+    for sku, stock in stock_by_sku.items():
         if sku in grouped:
-            grouped[sku]["current_stock"] += stock
+            grouped[sku]["current_stock"] = stock
 
     for sale in sales_rows:
         sku = normalized_sku_key(sale.get("sku"))
