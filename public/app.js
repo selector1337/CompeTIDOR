@@ -72,6 +72,7 @@
   identifiersLoading: false,
   pricesLoading: false,
   bulkPriceProgress: null,
+  kitInventoryOpen: false,
   costsSearch: "",
   costsStatus: "all",
   costsPage: 1,
@@ -925,6 +926,31 @@ function renderListingRouteStable() {
   });
 }
 
+function captureListingAnchor(list) {
+  if (!list) return null;
+  const focused = document.activeElement?.closest?.("[data-listing-id]");
+  const anchor = focused && list.contains(focused)
+    ? focused
+    : [...list.querySelectorAll("[data-listing-id]")].find((node) => node.getBoundingClientRect().bottom > 80);
+  return anchor
+    ? { id: anchor.dataset.listingId || "", top: anchor.getBoundingClientRect().top }
+    : { id: "", scrollY: window.scrollY };
+}
+
+function restoreListingAnchor(list, anchor) {
+  if (!list || !anchor) return;
+  window.requestAnimationFrame(() => {
+    const replacement = anchor.id
+      ? [...list.querySelectorAll("[data-listing-id]")].find((node) => node.dataset.listingId === anchor.id)
+      : null;
+    if (replacement && Number.isFinite(anchor.top)) {
+      window.scrollBy({ top: replacement.getBoundingClientRect().top - anchor.top, behavior: "auto" });
+    } else if (Number.isFinite(anchor.scrollY)) {
+      window.scrollTo({ top: anchor.scrollY, behavior: "auto" });
+    }
+  });
+}
+
 function refreshListingOnlyWhenAtTop() {
   if (window.scrollY > 120) return;
   const active = document.activeElement;
@@ -1064,6 +1090,7 @@ function renderCosts() {
 
 function renderCatalog() {
   const list = document.querySelector("#catalog-list");
+  const renderAnchor = captureListingAnchor(list);
   if (!state.catalogLoaded) {
     list.innerHTML = `<div class="notice">Carregando anúncios e disputa de catálogo em segundo plano...</div>`;
     loadCatalogInBackground();
@@ -1150,6 +1177,7 @@ function renderCatalog() {
   queueOfficialPriceRefresh(pageInfo.items);
   queueShippingCostRefresh(pageInfo.items);
   queueSaleFeeRefresh(pageInfo.items);
+  restoreListingAnchor(list, renderAnchor);
 }
 
 function catalogWinnerName(item) {
@@ -1210,6 +1238,7 @@ function setOptions(selector, values, current, allLabel, formatter = (value) => 
 
 function renderAds() {
   const list = document.querySelector("#ads-list");
+  const renderAnchor = captureListingAnchor(list);
   if (!state.catalogLoaded) {
     list.innerHTML = `<div class="notice">Carregando anúncios em segundo plano...</div>`;
     loadCatalogInBackground();
@@ -1255,9 +1284,29 @@ function renderAds() {
       else summary.pendingCosts += 1;
     } else {
       summary.excludedKitSkus += 1;
+      summary.kit.units += stock;
+      summary.kit.value += stock * price;
+      const commercial = itemCommercialValues(item);
+      if (commercial.cost !== null) summary.kit.costValue += commercial.cost * stock;
+      else summary.kit.missingCosts += 1;
+      if (commercial.net !== null) summary.kit.netValue += commercial.net * stock;
+      else summary.kit.pendingFees += 1;
+      if (commercial.profit !== null) summary.kit.profitValue += commercial.profit * stock;
+      else summary.kit.pendingCosts += 1;
     }
     return summary;
-  }, { units: 0, value: 0, costValue: 0, netValue: 0, profitValue: 0, missingCosts: 0, pendingFees: 0, pendingCosts: 0, excludedKitSkus: 0 });
+  }, {
+    units: 0,
+    value: 0,
+    costValue: 0,
+    netValue: 0,
+    profitValue: 0,
+    missingCosts: 0,
+    pendingFees: 0,
+    pendingCosts: 0,
+    excludedKitSkus: 0,
+    kit: { units: 0, value: 0, costValue: 0, netValue: 0, profitValue: 0, missingCosts: 0, pendingFees: 0, pendingCosts: 0 },
+  });
   const inventorySummary = document.querySelector("#ads-inventory-summary");
   const feeCompleted = filtered.filter((item) => item.sale_fee_status === "ok").length;
   const feePending = Math.max(0, filtered.length - feeCompleted);
@@ -1271,6 +1320,16 @@ function renderAds() {
     <div class="inventory-value net"><span>Estoque a valor líquido <small>Venda - tarifa - frete; sem SKUs com KIT${inventory.pendingFees ? ` · ${inventory.pendingFees} tarifa(s) calculando` : ""}</small></span><strong>${money.format(inventory.netValue)}</strong></div>
     <div class="${inventory.profitValue >= 0 ? "inventory-value profit-positive" : "profit-negative"}"><span>Resultado potencial do estoque <small>Valor líquido - custo; sem SKUs com KIT${inventory.pendingCosts ? ` · ${inventory.pendingCosts} item(ns) sem cálculo completo` : ""}</small></span><strong>${money.format(inventory.profitValue)}</strong></div>
     <div class="fee-progress-card"><span>Tarifas dos anúncios filtrados <small>${feeCompleted.toLocaleString("pt-BR")} concluídas · ${feePending.toLocaleString("pt-BR")} pendentes${globalFeeProgress.estimated_label ? ` · previsão geral: ${escapeText(globalFeeProgress.estimated_label)}` : ""}</small></span><strong>${feePercent.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</strong><i><b style="width:${Math.max(0, Math.min(100, feePercent))}%"></b></i></div>
+    <details class="kit-inventory-summary" ${state.kitInventoryOpen ? "open" : ""}>
+      <summary>Resumo financeiro dos SKUs KIT <small>${inventory.excludedKitSkus.toLocaleString("pt-BR")} anúncio(s)</small></summary>
+      <div>
+        <article><span>Unidades KIT</span><strong>${inventory.kit.units.toLocaleString("pt-BR")}</strong></article>
+        <article><span>Estoque a preço de venda</span><strong>${money.format(inventory.kit.value)}</strong></article>
+        <article><span>Estoque a preço de custo</span><strong>${money.format(inventory.kit.costValue)}</strong><small>${inventory.kit.missingCosts ? `${inventory.kit.missingCosts} sem custo cadastrado` : "Custos completos"}</small></article>
+        <article><span>Estoque a valor líquido</span><strong>${money.format(inventory.kit.netValue)}</strong><small>${inventory.kit.pendingFees ? `${inventory.kit.pendingFees} tarifa(s) pendentes` : "Tarifas completas"}</small></article>
+        <article class="${inventory.kit.profitValue >= 0 ? "profit-positive" : "profit-negative"}"><span>Resultado potencial</span><strong>${money.format(inventory.kit.profitValue)}</strong><small>${inventory.kit.pendingCosts ? `${inventory.kit.pendingCosts} sem cálculo completo` : "Resultado completo"}</small></article>
+      </div>
+    </details>
   `;
   const pageInfo = paginate(filtered, state.adsPage);
   state.adsPage = pageInfo.current;
@@ -1335,6 +1394,7 @@ function renderAds() {
   queueSaleFeeRefresh(pageInfo.items);
   queueIdentifierRefresh(pageInfo.items);
   updateBulkPriceBar();
+  restoreListingAnchor(list, renderAnchor);
 }
 
 function renderAdDescriptionEditor(item) {
@@ -1548,8 +1608,10 @@ function updateBulkPriceBar() {
   const count = state.adsSelectedIds.size;
   const label = root.querySelector("[data-bulk-selected-count]");
   const button = root.querySelector("[data-apply-bulk-price]");
+  const flexButton = root.querySelector("[data-bulk-remove-flex]");
   if (label) label.textContent = count;
   if (button) button.disabled = count === 0;
+  if (flexButton) flexButton.disabled = count === 0;
   renderBulkPriceProgress();
 }
 
@@ -1577,7 +1639,8 @@ function renderBulkPriceProgress() {
   root.dataset.status = progress.status || "running";
   if (title) title.textContent = progress.status === "completed"
     ? progress.failed ? "Alteração concluída com pendências" : "Alteração concluída com sucesso"
-    : progress.status === "error" ? "Alteração interrompida" : "Atualizando preços";
+    : progress.status === "error" ? "Alteração interrompida"
+      : progress.operation === "flex" ? "Removendo Mercado Envios Flex" : "Atualizando preços";
   if (count) count.textContent = total ? `${completed} de ${total} · ${percent.toLocaleString("pt-BR")}%` : "";
   if (bar) bar.style.width = `${percent}%`;
   if (message) message.textContent = progress.message || "";
@@ -1585,7 +1648,9 @@ function renderBulkPriceProgress() {
     results.innerHTML = (progress.results || []).slice(0, 30).map((item) => `
       <span class="${item.status === "updated" ? "bulk-result-ok" : "bulk-result-error"}">
         <b>${item.status === "updated" ? "✓" : "!"}</b>
-        ${escapeText(item.item_id || "Anúncio")}${item.status === "updated" ? ` · ${money.format(item.price)}` : ` · ${escapeText(item.error || "Falhou")}`}
+        ${escapeText(item.item_id || "Anúncio")}${item.status === "updated"
+          ? progress.operation === "flex" ? " · Flex removido" : ` · ${money.format(item.price)}`
+          : item.status === "ignored" ? ` · ${escapeText(item.message || "Sem alteração")}` : ` · ${escapeText(item.error || "Falhou")}`}
       </span>`).join("");
   }
 }
@@ -2005,8 +2070,9 @@ function updateStatisticsReportFields() {
   const form = document.querySelector("#statistics-form");
   if (!form) return;
   const noSales = form.elements.report_type?.value === "no_sales";
+  const skuHistory = form.elements.report_type?.value === "sku_history";
   const title = document.querySelector("#statistics-title");
-  if (title) title.textContent = noSales ? "SKUs ativos sem venda" : "Desempenho por SKU";
+  if (title) title.textContent = noSales ? "SKUs ativos sem venda" : skuHistory ? "Histórico detalhado do SKU" : "Desempenho por SKU";
   const flexField = form.querySelector("[data-statistics-flex]");
   if (flexField) flexField.hidden = noSales;
   if (form.elements.flex) {
@@ -2014,7 +2080,11 @@ function updateStatisticsReportFields() {
     if (noSales) form.elements.flex.value = "all";
   }
   const submit = form.querySelector(".statistics-submit");
-  if (submit) submit.textContent = noSales ? "Consultar SKUs" : "Consultar vendas";
+  if (submit) submit.textContent = noSales ? "Consultar SKUs" : skuHistory ? "Consultar histórico" : "Consultar vendas";
+  if (form.elements.sku) {
+    form.elements.sku.placeholder = skuHistory ? "Digite um SKU específico" : "Todos os SKUs";
+    form.elements.sku.required = skuHistory;
+  }
 }
 
 function renderStatistics() {
@@ -2065,9 +2135,52 @@ function renderStatistics() {
 
   const data = state.statistics;
   const isNoSales = data.kind === "no_sales";
+  const isSkuHistory = data.kind === "sku_history";
   const updated = document.querySelector("#statistics-updated");
   if (updated) updated.textContent = `${formatDateBR(data.date_from)} a ${formatDateBR(data.date_to)}`;
   const summaryData = data.summary || {};
+  if (isSkuHistory) {
+    summary.innerHTML = `
+      <article><small>SKU consultado</small><strong>${escapeText(data.sku || "-")}</strong></article>
+      <article><small>Unidades vendidas</small><strong>${Number(summaryData.units || 0).toLocaleString("pt-BR")}</strong></article>
+      <article><small>Vendas</small><strong>${Number(summaryData.sales || 0).toLocaleString("pt-BR")}</strong></article>
+      <article class="flex-stat"><small>Unidades Flex</small><strong>${Number(summaryData.flex_units || 0).toLocaleString("pt-BR")}</strong></article>
+      <article><small>Faturamento</small><strong>${money.format(summaryData.revenue || 0)}</strong></article>
+      <article><small>Preço médio</small><strong>${money.format(summaryData.average_unit_price || 0)}</strong></article>
+      <article><small>Menor preço</small><strong>${money.format(summaryData.minimum_unit_price || 0)}</strong></article>
+      <article><small>Maior preço</small><strong>${money.format(summaryData.maximum_unit_price || 0)}</strong></article>
+    `;
+    const messages = (data.warnings || []).map((message) => `<div class="notice warning-notice">${escapeText(message)}</div>`).join("");
+    const pageInfo = paginate(data.rows || [], state.statisticsPage, state.statisticsPageSize);
+    state.statisticsPage = pageInfo.current;
+    results.innerHTML = `${messages}
+      <section class="sku-history-block">
+        <h3>Vendas por dia</h3>
+        ${(data.daily || []).length ? `<div class="sku-history-grid">
+          ${(data.daily || []).map((row) => `<article>
+            <strong>${formatDateBR(row.date)}</strong>
+            <span>${Number(row.units || 0).toLocaleString("pt-BR")} unidade(s)</span>
+            <span>${Number(row.sales || 0).toLocaleString("pt-BR")} venda(s)</span>
+            <span>${Number(row.flex_units || 0).toLocaleString("pt-BR")} via Flex</span>
+            <b>${money.format(row.revenue || 0)}</b>
+          </article>`).join("")}
+        </div>` : `<div class="notice">Nenhuma venda deste SKU foi encontrada no período.</div>`}
+      </section>
+      ${paginationHtml("statisticsPage", pageInfo)}
+      ${pageInfo.items.length ? `<div class="sku-history-sales">
+        ${pageInfo.items.map((row) => `<article>
+          ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="${escapeAttr(row.product || row.sku)}" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
+          <div><strong>${escapeText(row.product || "Produto vendido")}</strong><small>${formatDateBR(row.date)} · Pedido ${escapeText(row.order_id || "-")}</small></div>
+          <span><small>Conta</small><strong>${escapeText(row.account || "-")}</strong></span>
+          <span><small>Quantidade</small><strong>${Number(row.quantity || 0).toLocaleString("pt-BR")}</strong></span>
+          <span><small>Valor unitário</small><strong>${money.format(row.unit_price || 0)}</strong></span>
+          <span><small>Total</small><strong>${money.format(row.gross_amount || 0)}</strong></span>
+          <span class="${row.flex ? "profit-positive" : ""}"><small>Envio</small><strong>${row.flex ? "Flex" : "Outra modalidade"}</strong></span>
+        </article>`).join("")}
+      </div>` : ""}
+      ${paginationHtml("statisticsPage", pageInfo)}`;
+    return;
+  }
   if (isNoSales) {
     summary.innerHTML = `
       <article><small>SKUs ativos sem venda</small><strong>${Number(summaryData.skus || 0).toLocaleString("pt-BR")}</strong></article>
@@ -2351,6 +2464,9 @@ async function loadStatistics() {
   renderStatistics();
   try {
     const range = statisticsDateRange(form);
+    if (form.elements.report_type?.value === "sku_history" && !form.elements.sku.value.trim()) {
+      throw new Error("Informe um SKU específico para consultar o histórico.");
+    }
     let job = await api("/api/statistics/query", {
       method: "POST",
       manualProgress: false,
@@ -3642,7 +3758,13 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
     return;
   }
   state.itemDescriptions[itemId] = { loading: true, loaded: false, value: "" };
-  renderListingRouteStable();
+  details.open = true;
+  const textarea = details.querySelector("[data-description-text]");
+  const status = details.querySelector(".ad-description-actions small");
+  const saveButton = details.querySelector('.ad-description-actions button[type="submit"]');
+  if (textarea) textarea.disabled = true;
+  if (status) status.textContent = "Carregando descrição oficial...";
+  if (saveButton) saveButton.disabled = true;
   try {
     const queued = await api("/api/meli/item/description", {
       method: "POST",
@@ -3650,12 +3772,24 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
     });
     const result = await waitForAsyncOperation(queued);
     state.itemDescriptions[itemId] = { loading: false, loaded: true, value: result.description || "" };
+    if (textarea) {
+      textarea.value = result.description || "";
+      textarea.disabled = false;
+    }
+    if (status) status.textContent = "Descrição oficial carregada";
+    if (saveButton) saveButton.disabled = false;
   } catch (error) {
     state.itemDescriptions[itemId] = { loading: false, loaded: false, value: "" };
+    if (textarea) textarea.disabled = false;
+    if (status) status.textContent = "Não foi possível carregar a descrição oficial";
     showToast(error.message || "Não foi possível carregar a descrição.", "error");
   }
-  renderListingRouteStable();
 });
+
+document.querySelector("#ads-inventory-summary")?.addEventListener("toggle", (event) => {
+  if (!event.target.matches(".kit-inventory-summary")) return;
+  state.kitInventoryOpen = event.target.open;
+}, true);
 
 document.querySelector("#ads-list")?.addEventListener("change", (event) => {
   const checkbox = event.target.closest("[data-select-ad]");
@@ -3675,6 +3809,60 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
   if (event.target.closest("[data-select-visible-ads]")) {
     document.querySelectorAll("#ads-list [data-select-ad]").forEach((input) => state.adsSelectedIds.add(input.dataset.selectAd));
     renderAds();
+    return;
+  }
+  const flexButton = event.target.closest("[data-bulk-remove-flex]");
+  if (flexButton) {
+    flexButton.disabled = true;
+    state.bulkPriceProgress = {
+      status: "running",
+      message: "Adicionando remoções do Flex à fila prioritária...",
+      completed: 0,
+      total: state.adsSelectedIds.size,
+      percent: 0,
+      results: [],
+      operation: "flex",
+    };
+    renderBulkPriceProgress();
+    try {
+      const queued = await api("/api/meli/items/bulk-remove-flex", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: [...state.adsSelectedIds] }),
+      });
+      const result = await waitForAsyncOperation(queued, (message, job) => {
+        state.bulkPriceProgress = {
+          ...state.bulkPriceProgress,
+          status: job?.status || "running",
+          message: message || "Removendo Mercado Envios Flex...",
+          completed: Number(job?.completed || 0),
+          total: Number(job?.total || state.adsSelectedIds.size),
+          percent: Number(job?.percent || 0),
+        };
+        renderBulkPriceProgress();
+      });
+      const updatedIds = new Set((result.results || []).filter((row) => row.status === "updated").map((row) => row.item_id));
+      state.data.catalog = state.data.catalog.map((item) => updatedIds.has(item.id)
+        ? { ...item, shipping_logistic_type: "drop_off", updated_at: new Date().toISOString() }
+        : item);
+      state.bulkPriceProgress = {
+        status: "completed",
+        operation: "flex",
+        message: result.failed ? "Alguns anúncios precisam de nova tentativa." : "Mercado Envios Flex removido dos anúncios válidos.",
+        completed: (result.results || []).length,
+        total: (result.results || []).length,
+        percent: 100,
+        failed: Number(result.failed || 0),
+        results: result.results || [],
+      };
+      showToast(`${result.updated || 0} anúncio(s) tiveram o Flex removido.`, result.failed ? "error" : "success");
+      renderAds();
+    } catch (error) {
+      state.bulkPriceProgress = { ...state.bulkPriceProgress, status: "error", message: error.message || "Falha ao remover o Flex." };
+      renderBulkPriceProgress();
+      showToast(error.message || "Não foi possível remover o Flex em massa.", "error");
+    } finally {
+      flexButton.disabled = state.adsSelectedIds.size === 0;
+    }
     return;
   }
   const button = event.target.closest("[data-apply-bulk-price]");

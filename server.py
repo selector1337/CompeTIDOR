@@ -565,6 +565,10 @@ def write_payload(payload, replace_collections=None):
         latest.pop("catalog", None)
         incoming_revision = int(payload.get("_revision") or 0)
         latest_revision = int(latest.get("_revision") or 0)
+        payload["item_logs"] = merge_item_logs(
+            payload.get("item_logs", []),
+            latest.get("item_logs", []),
+        )
         if incoming_revision < latest_revision:
             for collection in ("users", "accounts"):
                 if collection not in replace_collections:
@@ -600,6 +604,27 @@ def write_payload(payload, replace_collections=None):
         metadata.pop("sku_last_sales", None)
         metadata.pop("_catalog_loaded", None)
         write_json(APP_DATA_FILE, metadata)
+
+
+def merge_item_logs(incoming, saved):
+    maximum = max(1000, int(os.getenv("COMPETIDOR_ITEM_LOG_LIMIT", "20000")))
+    merged = []
+    seen = set()
+    for row in [*(incoming or []), *(saved or [])]:
+        if not isinstance(row, dict):
+            continue
+        identity = str(row.get("id") or "")
+        if not identity:
+            identity = "|".join(
+                str(row.get(key) or "")
+                for key in ("item_id", "created_at", "action", "user", "sale_id")
+            )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(row)
+    merged.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    return merged[:maximum]
 
 
 def catalog_counts(catalog):
@@ -4251,7 +4276,7 @@ def append_item_log(payload, item, user, action, changes=None, sale_id=None):
             "created_at": now_label(),
         },
     )
-    payload["item_logs"] = logs[:1000]
+    payload["item_logs"] = logs[:max(1000, int(os.getenv("COMPETIDOR_ITEM_LOG_LIMIT", "20000")))]
 
 
 def upsert_metric(payload, account, user_profile):
@@ -6170,6 +6195,60 @@ def bulk_price_operation(request, actor=None):
     write_payload(payload)
     return {
         "updated": sum(row.get("status") == "updated" for row in results),
+        "failed": sum(row.get("status") == "error" for row in results),
+        "results": results,
+    }
+
+
+def bulk_remove_flex_operation(request, actor=None):
+    item_ids = list(dict.fromkeys(str(value or "").strip() for value in request.get("item_ids") or [] if value))
+    maximum = max(1, int(os.getenv("MELI_BULK_FLEX_MAX_ITEMS", "500")))
+    if not item_ids:
+        raise RuntimeError("Selecione ao menos um anúncio.")
+    if len(item_ids) > maximum:
+        raise RuntimeError(f"Remova o Flex de no máximo {maximum} anúncios por operação.")
+    payload = read_payload(include_catalog=True)
+    catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
+    accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
+    results = []
+    total = len(item_ids)
+    update_async_operation_progress("Preparando remoção do Mercado Envios Flex.", 0, total)
+    for index, item_id in enumerate(item_ids, 1):
+        item = catalog.get(item_id)
+        account = accounts.get(str((item or {}).get("account_id") or ""))
+        if not item or not account:
+            result = {"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."}
+        elif item.get("shipping_logistic_type") != "self_service":
+            result = {"item_id": item_id, "status": "ignored", "message": "ME Flex já estava inativo."}
+        else:
+            try:
+                update = {
+                    "shipping": {
+                        "mode": item.get("shipping_mode") or "me2",
+                        "logistic_type": "drop_off",
+                    }
+                }
+                run_interactive_meli_call(account_client(account).update_item, item_id, update)
+                old_logistic_type = item.get("shipping_logistic_type") or ""
+                item["shipping_logistic_type"] = "drop_off"
+                item["item_data_checked_at"] = now_label()
+                item["updated_at"] = now_label()
+                append_item_log(
+                    payload,
+                    item,
+                    actor or {},
+                    "Remoção do Mercado Envios Flex em massa",
+                    {"shipping_logistic_type": {"from": old_logistic_type, "to": "drop_off"}},
+                )
+                result = {"item_id": item_id, "status": "updated", "shipping_logistic_type": "drop_off"}
+            except Exception as exc:
+                result = {"item_id": item_id, "status": "error", "error": str(exc)}
+        results.append(result)
+        update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, result)
+    write_payload(payload)
+    return {
+        "updated": sum(row.get("status") == "updated" for row in results),
+        "ignored": sum(row.get("status") == "ignored" for row in results),
         "failed": sum(row.get("status") == "error" for row in results),
         "results": results,
     }
@@ -8931,6 +9010,7 @@ def query_sales_report(payload, request):
                         "profit_amount": profit,
                         "profit_percentage": margin,
                         "profit_status": "profit" if profit is not None and profit >= 0 else "loss" if profit is not None else "unknown",
+                        "flex": catalog_item.get("shipping_logistic_type") == "self_service",
                     }
                 )
     if not rows and warnings:
@@ -8952,6 +9032,65 @@ def query_sales_report(payload, request):
         "warnings": warnings,
         "truncated": truncated,
         "generated_at": now_label(),
+    }
+
+
+def query_sku_history(payload, request):
+    sku = normalized_sku_key((request or {}).get("sku"))
+    if not sku or sku == "-":
+        raise RuntimeError("Informe um SKU específico para consultar o histórico.")
+    report = query_sales_report(payload, request)
+    rows = [
+        row for row in report.get("rows") or []
+        if normalized_sku_key(row.get("sku")) == sku
+    ]
+    daily = {}
+    accounts = set()
+    item_ids = set()
+    flex_units = 0
+    for row in rows:
+        sold_at = parse_meli_datetime(row.get("date"))
+        day = sold_at.astimezone(APP_TZ).date().isoformat() if sold_at else str(row.get("date") or "")[:10]
+        quantity = int(row.get("quantity") or 0)
+        gross = float(row.get("gross_amount") or 0)
+        bucket = daily.setdefault(
+            day,
+            {"date": day, "sales": 0, "units": 0, "flex_units": 0, "revenue": 0.0},
+        )
+        bucket["sales"] += 1
+        bucket["units"] += quantity
+        bucket["revenue"] += gross
+        if row.get("flex"):
+            bucket["flex_units"] += quantity
+            flex_units += quantity
+        if row.get("account"):
+            accounts.add(row["account"])
+        if row.get("item_id"):
+            item_ids.add(row["item_id"])
+    daily_rows = sorted(daily.values(), key=lambda row: row["date"], reverse=True)
+    for row in daily_rows:
+        row["revenue"] = round(row["revenue"], 2)
+        row["average_unit_price"] = round(row["revenue"] / row["units"], 2) if row["units"] else 0
+    units = sum(int(row.get("quantity") or 0) for row in rows)
+    revenue = round(sum(float(row.get("gross_amount") or 0) for row in rows), 2)
+    unit_prices = [float(row.get("unit_price") or 0) for row in rows if row.get("unit_price") not in (None, "")]
+    return {
+        **report,
+        "kind": "sku_history",
+        "sku": sku,
+        "rows": rows,
+        "daily": daily_rows,
+        "summary": {
+            "sales": len(rows),
+            "units": units,
+            "flex_units": flex_units,
+            "revenue": revenue,
+            "average_unit_price": round(revenue / units, 2) if units else 0,
+            "minimum_unit_price": round(min(unit_prices), 2) if unit_prices else 0,
+            "maximum_unit_price": round(max(unit_prices), 2) if unit_prices else 0,
+            "accounts": len(accounts),
+            "listings": len(item_ids),
+        },
     }
 
 
@@ -9013,6 +9152,8 @@ def start_statistics_job(request):
             source_payload = read_payload()
             if safe_request.get("kind") == "sales":
                 result = query_sales_report(source_payload, safe_request)
+            elif safe_request.get("kind") == "sku_history":
+                result = query_sku_history(source_payload, safe_request)
             elif safe_request.get("kind") == "no_sales":
                 result = query_active_skus_without_sales(source_payload, safe_request)
             else:
@@ -9817,6 +9958,7 @@ def parse_bulk_spreadsheet(payload, encoded_file, actor):
     accounts = payload.get("accounts") or []
     changes = []
     errors = []
+    marked_rows = 0
     maximum_rows = max(1, int(os.getenv("MELI_SPREADSHEET_MAX_ROWS", "50000")))
     for row_index, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), 2):
         if row_index > maximum_rows + 1:
@@ -9825,6 +9967,7 @@ def parse_bulk_spreadsheet(payload, encoded_file, actor):
         row = dict(zip(BULK_SHEET_HEADERS, values))
         if normalized_attribute_label(row.get("AÇÃO")) != "atualizar":
             continue
+        marked_rows += 1
         item_id = clean_attribute_value(row.get("ID_ANÚNCIO"))
         item = catalog_by_id.get(item_id)
         if not item:
@@ -9898,7 +10041,59 @@ def parse_bulk_spreadsheet(payload, encoded_file, actor):
             "errors": errors,
         }
     cleanup_spreadsheet_jobs()
-    return {"token": token, "changes": changes, "errors": errors, "ready": len(changes), "invalid": len(errors)}
+    if marked_rows == 0:
+        raise RuntimeError(
+            "Nenhuma linha foi marcada para aplicação. Escreva ATUALIZAR na coluna A de cada anúncio alterado."
+        )
+    if not changes and not errors:
+        raise RuntimeError(
+            "As linhas marcadas não possuem valores diferentes dos anúncios sincronizados."
+        )
+    return {
+        "token": token,
+        "changes": changes,
+        "errors": errors,
+        "ready": len(changes),
+        "invalid": len(errors),
+        "marked": marked_rows,
+    }
+
+
+def spreadsheet_update_mismatches(item, changes):
+    mismatches = []
+    if "price" in changes:
+        actual_price = sale_price_values(item.get("sale_price"), item.get("price")).get("amount")
+        if abs(float(actual_price or 0) - float(changes["price"])) > 0.01:
+            mismatches.append("preço")
+    if "available_quantity" in changes:
+        if int(float(item.get("available_quantity") or 0)) != int(changes["available_quantity"]):
+            mismatches.append("estoque")
+    if "title" in changes and clean_attribute_value(item.get("title")) != clean_attribute_value(changes["title"]):
+        mismatches.append("título")
+    expected_status = {
+        "pause": "paused",
+        "activate": "active",
+    }.get(changes.get("status_action"))
+    if expected_status and str(item.get("status") or "") != expected_status:
+        mismatches.append("status")
+    return mismatches
+
+
+def verify_spreadsheet_item_update(client, item_id, update, changes):
+    latest = {}
+    for attempt in range(3):
+        latest = run_interactive_meli_call(client.item, item_id)
+        mismatches = spreadsheet_update_mismatches(latest, changes)
+        if not mismatches:
+            return latest
+        if attempt == 0:
+            run_interactive_meli_call(client.update_item, item_id, update)
+        time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(
+        "O Mercado Livre recebeu a linha, mas não confirmou: "
+        + ", ".join(mismatches)
+        + ". A alteração não foi contabilizada como concluída."
+    )
 
 
 def apply_spreadsheet_change(payload, row, actor):
@@ -9945,7 +10140,8 @@ def apply_spreadsheet_change(payload, row, actor):
         }
     if not update:
         return {"item_id": item_id, "status": "ignored"}
-    client.update_item(item_id, update)
+    run_interactive_meli_call(client.update_item, item_id, update)
+    verified_item = verify_spreadsheet_item_update(client, item_id, update, changes)
     verified = verify_package_update(client, item_id, expected_package) if expected_package else {}
     if expected_gtin:
         verified = verify_gtin_update(client, item_id, expected_gtin)
@@ -9954,6 +10150,9 @@ def apply_spreadsheet_change(payload, row, actor):
         if key in update:
             local_changes[local_key] = {"from": item.get(local_key), "to": update[key]}
             item[local_key] = update[key]
+    official_price = sale_price_values(verified_item.get("sale_price"), verified_item.get("price")).get("amount")
+    if "price" in update and official_price not in (None, ""):
+        item["price"] = float(official_price)
     package_values = package_values_from_item(verified) if verified else {}
     for request_key in dimension_map:
         if request_key in changes:
@@ -10196,12 +10395,14 @@ def prepare_kit_preview(request):
                 pictures.append({"source": source, "component": component["item_id"]})
     descriptions = []
     for component in components:
-        heading = f"{component['quantity']}x {component['title']}"
+        quantity = max(1, int(component.get("quantity") or 1))
+        unit_label = "Unidade" if quantity == 1 else "Unidades"
+        heading = f"Kit {quantity} {unit_label} {component['title']}"
         body = component["description"].strip()
         descriptions.append(f"{heading}\n{body}".strip())
     quantity_label = sum(row["quantity"] for row in components)
     title = (
-        f"Kit {quantity_label} unidades {components[0]['title']}"
+        f"Kit {quantity_label} {components[0]['title']}"
         if len(components) == 1
         else "Kit " + " + ".join(row["title"] for row in components)
     )[:60]
@@ -10976,7 +11177,11 @@ class App(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/item-logs":
                 self.send_json(
-                    {"item_logs": metadata.get("item_logs", [])[:500]},
+                    {
+                        "item_logs": metadata.get("item_logs", [])[
+                            :max(1000, int(os.getenv("COMPETIDOR_ITEM_LOG_LIMIT", "20000")))
+                        ]
+                    },
                     headers={"Cache-Control": "private, no-cache"},
                 )
                 return
@@ -11279,6 +11484,7 @@ class App(BaseHTTPRequestHandler):
             "/api/kits/picture",
             "/api/kits/create",
             "/api/meli/items/bulk-price",
+            "/api/meli/items/bulk-remove-flex",
             "/api/meli/prices/refresh",
             "/api/meli/shipping-costs/refresh",
             "/api/meli/sale-fees/refresh",
@@ -11778,6 +11984,21 @@ class App(BaseHTTPRequestHandler):
                     "bulk_price",
                     lambda: bulk_price_operation(request_copy, actor),
                     "Alteração de preços adicionada à fila.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/items/bulk-remove-flex":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                operation = start_async_operation(
+                    "bulk_remove_flex",
+                    lambda: bulk_remove_flex_operation(request_copy, actor),
+                    "Remoção do Mercado Envios Flex adicionada à fila.",
                     priority="manual",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
