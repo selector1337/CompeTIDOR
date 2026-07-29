@@ -1906,9 +1906,15 @@ h2 {
 
 .costs-toolbar {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) minmax(190px, 240px) minmax(120px, 150px);
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, 230px) minmax(180px, 230px) minmax(110px, 140px);
   gap: 12px;
   margin-top: 14px;
+}
+
+@media (max-width: 1050px) {
+  .costs-toolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .costs-list {
@@ -5793,16 +5799,11 @@ textarea:focus {
   width: 100px;
   height: 100px;
   min-width: 100px;
-  aspect-ratio: auto;
+  aspect-ratio: 1 / 1;
   padding: 8px;
   box-sizing: border-box;
 }
-.product-media img,
-.sale-thumb,
-.statistics-product img,
-.top-sku-item img,
-.kit-product img,
-.kit-component img {
+.product-media img {
   width: 100%;
   height: 100%;
   max-width: 100%;
@@ -5812,6 +5813,41 @@ textarea:focus {
   object-fit: scale-down;
   object-position: center;
   box-sizing: border-box;
+}
+
+.sale-thumb,
+.top-sku-item .sale-thumb {
+  width: 58px;
+  height: 58px;
+  min-width: 58px;
+  aspect-ratio: 1 / 1;
+  padding: 5px;
+  display: block;
+  object-fit: contain;
+  object-position: center;
+  box-sizing: border-box;
+  background: #fff;
+}
+
+.statistics-product img,
+.sku-history-sales img {
+  width: 54px;
+  height: 54px;
+  min-width: 54px;
+  aspect-ratio: 1 / 1;
+  padding: 5px;
+  object-fit: contain;
+  object-position: center;
+  box-sizing: border-box;
+  background: #fff;
+}
+
+.kit-product img,
+.kit-component img {
+  aspect-ratio: 1 / 1;
+  object-fit: contain;
+  object-position: center;
+  background: #fff;
 }
 
 .kit-inventory-summary {
@@ -5868,7 +5904,7 @@ textarea:focus {
 .sku-history-sales { display: grid; gap: 9px; }
 .sku-history-sales article {
   display: grid;
-  grid-template-columns: 54px minmax(220px, 1.5fr) repeat(5, minmax(110px, .65fr));
+  grid-template-columns: 54px minmax(220px, 1.5fr) repeat(6, minmax(110px, .65fr));
   align-items: center;
   gap: 10px;
   padding: 11px;

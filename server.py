@@ -6200,47 +6200,53 @@ def bulk_price_operation(request, actor=None):
     }
 
 
-def bulk_remove_flex_operation(request, actor=None):
+def bulk_flex_operation(request, actor=None, activate=False):
     item_ids = list(dict.fromkeys(str(value or "").strip() for value in request.get("item_ids") or [] if value))
     maximum = max(1, int(os.getenv("MELI_BULK_FLEX_MAX_ITEMS", "500")))
     if not item_ids:
         raise RuntimeError("Selecione ao menos um anúncio.")
     if len(item_ids) > maximum:
-        raise RuntimeError(f"Remova o Flex de no máximo {maximum} anúncios por operação.")
+        raise RuntimeError(f"{'Ative' if activate else 'Remova'} o Flex de no máximo {maximum} anúncios por operação.")
     payload = read_payload(include_catalog=True)
     catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
     accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
     results = []
     total = len(item_ids)
-    update_async_operation_progress("Preparando remoção do Mercado Envios Flex.", 0, total)
+    action_label = "ativação" if activate else "remoção"
+    target_logistic_type = "self_service" if activate else "drop_off"
+    update_async_operation_progress(f"Preparando {action_label} do Mercado Envios Flex.", 0, total)
     for index, item_id in enumerate(item_ids, 1):
         item = catalog.get(item_id)
         account = accounts.get(str((item or {}).get("account_id") or ""))
         if not item or not account:
             result = {"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."}
-        elif item.get("shipping_logistic_type") != "self_service":
-            result = {"item_id": item_id, "status": "ignored", "message": "ME Flex já estava inativo."}
+        elif (item.get("shipping_logistic_type") == "self_service") == activate:
+            result = {
+                "item_id": item_id,
+                "status": "ignored",
+                "message": f"ME Flex já estava {'ativo' if activate else 'inativo'}.",
+            }
         else:
             try:
                 update = {
                     "shipping": {
                         "mode": item.get("shipping_mode") or "me2",
-                        "logistic_type": "drop_off",
+                        "logistic_type": target_logistic_type,
                     }
                 }
                 run_interactive_meli_call(account_client(account).update_item, item_id, update)
                 old_logistic_type = item.get("shipping_logistic_type") or ""
-                item["shipping_logistic_type"] = "drop_off"
+                item["shipping_logistic_type"] = target_logistic_type
                 item["item_data_checked_at"] = now_label()
                 item["updated_at"] = now_label()
                 append_item_log(
                     payload,
                     item,
                     actor or {},
-                    "Remoção do Mercado Envios Flex em massa",
-                    {"shipping_logistic_type": {"from": old_logistic_type, "to": "drop_off"}},
+                    f"{'Ativação' if activate else 'Remoção'} do Mercado Envios Flex em massa",
+                    {"shipping_logistic_type": {"from": old_logistic_type, "to": target_logistic_type}},
                 )
-                result = {"item_id": item_id, "status": "updated", "shipping_logistic_type": "drop_off"}
+                result = {"item_id": item_id, "status": "updated", "shipping_logistic_type": target_logistic_type}
             except Exception as exc:
                 result = {"item_id": item_id, "status": "error", "error": str(exc)}
         results.append(result)
@@ -6252,6 +6258,14 @@ def bulk_remove_flex_operation(request, actor=None):
         "failed": sum(row.get("status") == "error" for row in results),
         "results": results,
     }
+
+
+def bulk_remove_flex_operation(request, actor=None):
+    return bulk_flex_operation(request, actor, activate=False)
+
+
+def bulk_activate_flex_operation(request, actor=None):
+    return bulk_flex_operation(request, actor, activate=True)
 
 
 def official_account_by_name(payload, name):
@@ -9055,11 +9069,17 @@ def query_sku_history(payload, request):
         gross = float(row.get("gross_amount") or 0)
         bucket = daily.setdefault(
             day,
-            {"date": day, "sales": 0, "units": 0, "flex_units": 0, "revenue": 0.0},
+            {
+                "date": day, "sales": 0, "units": 0, "flex_units": 0,
+                "revenue": 0.0, "costed_sales": 0, "profit_amount": 0.0,
+            },
         )
         bucket["sales"] += 1
         bucket["units"] += quantity
         bucket["revenue"] += gross
+        if row.get("profit_amount") is not None:
+            bucket["costed_sales"] += 1
+            bucket["profit_amount"] += float(row.get("profit_amount") or 0)
         if row.get("flex"):
             bucket["flex_units"] += quantity
             flex_units += quantity
@@ -9071,9 +9091,20 @@ def query_sku_history(payload, request):
     for row in daily_rows:
         row["revenue"] = round(row["revenue"], 2)
         row["average_unit_price"] = round(row["revenue"] / row["units"], 2) if row["units"] else 0
+        row["profit_amount"] = (
+            round(row["profit_amount"], 2)
+            if row["costed_sales"] == row["sales"] and row["sales"]
+            else None
+        )
     units = sum(int(row.get("quantity") or 0) for row in rows)
     revenue = round(sum(float(row.get("gross_amount") or 0) for row in rows), 2)
     unit_prices = [float(row.get("unit_price") or 0) for row in rows if row.get("unit_price") not in (None, "")]
+    costed_rows = [row for row in rows if row.get("profit_amount") is not None]
+    profit_amount = (
+        round(sum(float(row.get("profit_amount") or 0) for row in costed_rows), 2)
+        if costed_rows and len(costed_rows) == len(rows)
+        else None
+    )
     return {
         **report,
         "kind": "sku_history",
@@ -9085,6 +9116,8 @@ def query_sku_history(payload, request):
             "units": units,
             "flex_units": flex_units,
             "revenue": revenue,
+            "profit_amount": profit_amount,
+            "costed_sales": len(costed_rows),
             "average_unit_price": round(revenue / units, 2) if units else 0,
             "minimum_unit_price": round(min(unit_prices), 2) if unit_prices else 0,
             "maximum_unit_price": round(max(unit_prices), 2) if unit_prices else 0,
@@ -11485,6 +11518,7 @@ class App(BaseHTTPRequestHandler):
             "/api/kits/create",
             "/api/meli/items/bulk-price",
             "/api/meli/items/bulk-remove-flex",
+            "/api/meli/items/bulk-activate-flex",
             "/api/meli/prices/refresh",
             "/api/meli/shipping-costs/refresh",
             "/api/meli/sale-fees/refresh",
@@ -11999,6 +12033,21 @@ class App(BaseHTTPRequestHandler):
                     "bulk_remove_flex",
                     lambda: bulk_remove_flex_operation(request_copy, actor),
                     "Remoção do Mercado Envios Flex adicionada à fila.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/items/bulk-activate-flex":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                operation = start_async_operation(
+                    "bulk_activate_flex",
+                    lambda: bulk_activate_flex_operation(request_copy, actor),
+                    "Ativação do Mercado Envios Flex adicionada à fila.",
                     priority="manual",
                 )
                 self.send_json({"ok": True, **operation}, status=202)

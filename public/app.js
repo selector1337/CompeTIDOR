@@ -75,6 +75,7 @@
   kitInventoryOpen: false,
   costsSearch: "",
   costsStatus: "all",
+  costsRegistration: "all",
   costsPage: 1,
   costsPageSize: 50,
   equalizationType: "listing_type_gap",
@@ -1056,12 +1057,16 @@ function renderCosts() {
     row.stock += Math.max(0, Number(item.stock) || 0);
   }
   const term = state.costsSearch.trim().toLowerCase();
+  const costs = state.data.sku_costs || {};
   const rows = [...grouped.values()]
     .filter((row) => !term || `${row.sku} ${row.title}`.toLowerCase().includes(term))
     .filter((row) => state.costsStatus === "all"
       || (state.costsStatus === "active" ? row.activeListings > 0 : row.activeListings === 0))
+    .filter((row) => state.costsRegistration === "all"
+      || (state.costsRegistration === "configured"
+        ? costs[row.sku]?.cost !== undefined
+        : costs[row.sku]?.cost === undefined))
     .sort((a, b) => a.sku.localeCompare(b.sku, "pt-BR"));
-  const costs = state.data.sku_costs || {};
   const configured = rows.filter((row) => costs[row.sku]?.cost !== undefined).length;
   const summary = document.querySelector("#costs-summary");
   if (summary) summary.innerHTML = `
@@ -1609,9 +1614,11 @@ function updateBulkPriceBar() {
   const label = root.querySelector("[data-bulk-selected-count]");
   const button = root.querySelector("[data-apply-bulk-price]");
   const flexButton = root.querySelector("[data-bulk-remove-flex]");
+  const activateFlexButton = root.querySelector("[data-bulk-activate-flex]");
   if (label) label.textContent = count;
   if (button) button.disabled = count === 0;
   if (flexButton) flexButton.disabled = count === 0;
+  if (activateFlexButton) activateFlexButton.disabled = count === 0;
   renderBulkPriceProgress();
 }
 
@@ -1640,7 +1647,9 @@ function renderBulkPriceProgress() {
   if (title) title.textContent = progress.status === "completed"
     ? progress.failed ? "Alteração concluída com pendências" : "Alteração concluída com sucesso"
     : progress.status === "error" ? "Alteração interrompida"
-      : progress.operation === "flex" ? "Removendo Mercado Envios Flex" : "Atualizando preços";
+      : progress.operation === "flex_activate" ? "Ativando Mercado Envios Flex"
+        : ["flex", "flex_remove"].includes(progress.operation) ? "Removendo Mercado Envios Flex"
+          : "Atualizando preços";
   if (count) count.textContent = total ? `${completed} de ${total} · ${percent.toLocaleString("pt-BR")}%` : "";
   if (bar) bar.style.width = `${percent}%`;
   if (message) message.textContent = progress.message || "";
@@ -1649,7 +1658,9 @@ function renderBulkPriceProgress() {
       <span class="${item.status === "updated" ? "bulk-result-ok" : "bulk-result-error"}">
         <b>${item.status === "updated" ? "✓" : "!"}</b>
         ${escapeText(item.item_id || "Anúncio")}${item.status === "updated"
-          ? progress.operation === "flex" ? " · Flex removido" : ` · ${money.format(item.price)}`
+          ? progress.operation === "flex_activate" ? " · Flex ativado"
+            : ["flex", "flex_remove"].includes(progress.operation) ? " · Flex removido"
+              : ` · ${money.format(item.price)}`
           : item.status === "ignored" ? ` · ${escapeText(item.message || "Sem alteração")}` : ` · ${escapeText(item.error || "Falhou")}`}
       </span>`).join("");
   }
@@ -2122,14 +2133,13 @@ function renderStatistics() {
   } else {
     feedback.innerHTML = "";
   }
-  if (!state.statistics && !state.statisticsLoading && !state.statisticsAttempted) {
-    state.statisticsLoading = true;
-    window.setTimeout(loadStatistics, 0);
-    return;
-  }
   if (!state.statistics) {
     summary.innerHTML = "";
-    results.innerHTML = "";
+    results.innerHTML = state.statisticsAttempted
+      ? ""
+      : `<div class="notice">Selecione o relatório e os filtros desejados e clique em <strong>Consultar</strong>.</div>`;
+    const updated = document.querySelector("#statistics-updated");
+    if (updated) updated.textContent = "";
     return;
   }
 
@@ -2146,6 +2156,11 @@ function renderStatistics() {
       <article><small>Vendas</small><strong>${Number(summaryData.sales || 0).toLocaleString("pt-BR")}</strong></article>
       <article class="flex-stat"><small>Unidades Flex</small><strong>${Number(summaryData.flex_units || 0).toLocaleString("pt-BR")}</strong></article>
       <article><small>Faturamento</small><strong>${money.format(summaryData.revenue || 0)}</strong></article>
+      <article class="${summaryData.profit_amount === null || summaryData.profit_amount === undefined ? "" : Number(summaryData.profit_amount) >= 0 ? "profit-positive" : "profit-negative"}">
+        <small>Lucro / prejuízo consolidado</small>
+        <strong>${summaryData.profit_amount === null || summaryData.profit_amount === undefined ? "Sem custo cadastrado" : money.format(summaryData.profit_amount)}</strong>
+      </article>
+      <article><small>Vendas com custo apurado</small><strong>${Number(summaryData.costed_sales || 0).toLocaleString("pt-BR")} de ${Number(summaryData.sales || 0).toLocaleString("pt-BR")}</strong></article>
       <article><small>Preço médio</small><strong>${money.format(summaryData.average_unit_price || 0)}</strong></article>
       <article><small>Menor preço</small><strong>${money.format(summaryData.minimum_unit_price || 0)}</strong></article>
       <article><small>Maior preço</small><strong>${money.format(summaryData.maximum_unit_price || 0)}</strong></article>
@@ -2163,6 +2178,9 @@ function renderStatistics() {
             <span>${Number(row.sales || 0).toLocaleString("pt-BR")} venda(s)</span>
             <span>${Number(row.flex_units || 0).toLocaleString("pt-BR")} via Flex</span>
             <b>${money.format(row.revenue || 0)}</b>
+            <strong class="${row.profit_amount === null || row.profit_amount === undefined ? "" : Number(row.profit_amount) >= 0 ? "profit-positive" : "profit-negative"}">
+              ${row.profit_amount === null || row.profit_amount === undefined ? "Resultado sem custo completo" : `Resultado ${money.format(row.profit_amount)}`}
+            </strong>
           </article>`).join("")}
         </div>` : `<div class="notice">Nenhuma venda deste SKU foi encontrada no período.</div>`}
       </section>
@@ -2176,6 +2194,10 @@ function renderStatistics() {
           <span><small>Valor unitário</small><strong>${money.format(row.unit_price || 0)}</strong></span>
           <span><small>Total</small><strong>${money.format(row.gross_amount || 0)}</strong></span>
           <span class="${row.flex ? "profit-positive" : ""}"><small>Envio</small><strong>${row.flex ? "Flex" : "Outra modalidade"}</strong></span>
+          <span class="${row.profit_amount === null || row.profit_amount === undefined ? "" : Number(row.profit_amount) >= 0 ? "profit-positive" : "profit-negative"}">
+            <small>Lucro / prejuízo</small>
+            <strong>${row.profit_amount === null || row.profit_amount === undefined ? "Sem custo cadastrado" : `${money.format(row.profit_amount)} · ${Number(row.profit_percentage || 0).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%`}</strong>
+          </span>
         </article>`).join("")}
       </div>` : ""}
       ${paginationHtml("statisticsPage", pageInfo)}`;
@@ -3515,11 +3537,19 @@ document.querySelector("#spreadsheet-preview")?.addEventListener("click", (event
 
 document.querySelector("#statistics-form")?.addEventListener("change", (event) => {
   if (event.target.name === "period") updateStatisticsPeriodFields();
+  if (["account", "sku", "period", "flex", "specific_date", "specific_month", "date_from", "date_to"].includes(event.target.name)) {
+    state.statistics = null;
+    state.statisticsJobId = "";
+    state.statisticsAttempted = false;
+    state.statisticsError = "";
+    state.statisticsPage = 1;
+    renderStatistics();
+  }
   if (event.target.name === "report_type") {
     updateStatisticsReportFields();
     state.statistics = null;
     state.statisticsJobId = "";
-    state.statisticsAttempted = true;
+    state.statisticsAttempted = false;
     state.statisticsError = "";
     state.statisticsPage = 1;
     renderStatistics();
@@ -3580,6 +3610,7 @@ document.addEventListener("click", (event) => {
   ["#ads-profit-filter", "adsProfit"],
   ["#costs-search", "costsSearch"],
   ["#costs-status-filter", "costsStatus"],
+  ["#costs-registration-filter", "costsRegistration"],
   ["#costs-page-size", "costsPageSize"],
   ["#copy-product-filter", "copySearch"],
   ["#copy-sku-filter", "copySku"],
@@ -3663,27 +3694,6 @@ async function persistSkuCost(sku, cost, remove = false) {
   if (remove) showToast(`Custo do SKU ${sku} removido.`);
   else showToast(`Custo do SKU ${sku} salvo com sucesso.`);
 }
-
-document.querySelector("#cost-quick-form")?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const sku = normalizedSkuKey(form.elements.sku.value);
-  const cost = parseLocalizedNumber(form.elements.cost.value);
-  if (!sku || !Number.isFinite(cost) || cost < 0) {
-    showToast("Informe um SKU e um custo válido.", "error");
-    return;
-  }
-  const button = form.querySelector('button[type="submit"]');
-  button.disabled = true;
-  try {
-    await persistSkuCost(sku, cost);
-    form.reset();
-  } catch (error) {
-    showToast(error.message || "Não foi possível salvar o custo.", "error");
-  } finally {
-    button.disabled = false;
-  }
-});
 
 document.querySelector("#costs-list")?.addEventListener("click", async (event) => {
   const save = event.target.closest("[data-save-cost]");
@@ -3812,20 +3822,23 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
     return;
   }
   const flexButton = event.target.closest("[data-bulk-remove-flex]");
-  if (flexButton) {
-    flexButton.disabled = true;
+  const activateFlexButton = event.target.closest("[data-bulk-activate-flex]");
+  const flexActionButton = flexButton || activateFlexButton;
+  if (flexActionButton) {
+    const activate = Boolean(activateFlexButton);
+    flexActionButton.disabled = true;
     state.bulkPriceProgress = {
       status: "running",
-      message: "Adicionando remoções do Flex à fila prioritária...",
+      message: `Adicionando ${activate ? "ativações" : "remoções"} do Flex à fila prioritária...`,
       completed: 0,
       total: state.adsSelectedIds.size,
       percent: 0,
       results: [],
-      operation: "flex",
+      operation: activate ? "flex_activate" : "flex_remove",
     };
     renderBulkPriceProgress();
     try {
-      const queued = await api("/api/meli/items/bulk-remove-flex", {
+      const queued = await api(activate ? "/api/meli/items/bulk-activate-flex" : "/api/meli/items/bulk-remove-flex", {
         method: "POST",
         body: JSON.stringify({ item_ids: [...state.adsSelectedIds] }),
       });
@@ -3833,7 +3846,7 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
         state.bulkPriceProgress = {
           ...state.bulkPriceProgress,
           status: job?.status || "running",
-          message: message || "Removendo Mercado Envios Flex...",
+          message: message || `${activate ? "Ativando" : "Removendo"} Mercado Envios Flex...`,
           completed: Number(job?.completed || 0),
           total: Number(job?.total || state.adsSelectedIds.size),
           percent: Number(job?.percent || 0),
@@ -3842,26 +3855,26 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
       });
       const updatedIds = new Set((result.results || []).filter((row) => row.status === "updated").map((row) => row.item_id));
       state.data.catalog = state.data.catalog.map((item) => updatedIds.has(item.id)
-        ? { ...item, shipping_logistic_type: "drop_off", updated_at: new Date().toISOString() }
+        ? { ...item, shipping_logistic_type: activate ? "self_service" : "drop_off", updated_at: new Date().toISOString() }
         : item);
       state.bulkPriceProgress = {
         status: "completed",
-        operation: "flex",
-        message: result.failed ? "Alguns anúncios precisam de nova tentativa." : "Mercado Envios Flex removido dos anúncios válidos.",
+        operation: activate ? "flex_activate" : "flex_remove",
+        message: result.failed ? "Alguns anúncios precisam de nova tentativa." : `Mercado Envios Flex ${activate ? "ativado" : "removido"} nos anúncios válidos.`,
         completed: (result.results || []).length,
         total: (result.results || []).length,
         percent: 100,
         failed: Number(result.failed || 0),
         results: result.results || [],
       };
-      showToast(`${result.updated || 0} anúncio(s) tiveram o Flex removido.`, result.failed ? "error" : "success");
+      showToast(`${result.updated || 0} anúncio(s) tiveram o Flex ${activate ? "ativado" : "removido"}.`, result.failed ? "error" : "success");
       renderAds();
     } catch (error) {
-      state.bulkPriceProgress = { ...state.bulkPriceProgress, status: "error", message: error.message || "Falha ao remover o Flex." };
+      state.bulkPriceProgress = { ...state.bulkPriceProgress, status: "error", message: error.message || `Falha ao ${activate ? "ativar" : "remover"} o Flex.` };
       renderBulkPriceProgress();
-      showToast(error.message || "Não foi possível remover o Flex em massa.", "error");
+      showToast(error.message || `Não foi possível ${activate ? "ativar" : "remover"} o Flex em massa.`, "error");
     } finally {
-      flexButton.disabled = state.adsSelectedIds.size === 0;
+      flexActionButton.disabled = state.adsSelectedIds.size === 0;
     }
     return;
   }

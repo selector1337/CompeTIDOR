@@ -363,11 +363,6 @@
               <h2>Custos por SKU</h2>
             </div>
           </div>
-          <form id="cost-quick-form" class="cost-quick-form">
-            <label>SKU <input name="sku" type="search" placeholder="Digite o SKU exato" required /></label>
-            <label>Custo unitário <span class="money-field"><input name="cost" type="text" inputmode="decimal" placeholder="0,00" required /></span></label>
-            <button class="primary" type="submit">Salvar custo</button>
-          </form>
           <div class="costs-toolbar">
             <label>Pesquisar <input id="costs-search" type="search" placeholder="SKU ou produto" /></label>
             <label>Status do anúncio
@@ -375,6 +370,13 @@
                 <option value="all">Todos os SKUs</option>
                 <option value="active">Com anúncio ativo</option>
                 <option value="inactive">Sem anúncio ativo</option>
+              </select>
+            </label>
+            <label>Cadastro de custo
+              <select id="costs-registration-filter">
+                <option value="all">Todos</option>
+                <option value="configured">Com custo cadastrado</option>
+                <option value="missing">Sem custo cadastrado</option>
               </select>
             </label>
             <label>Por página
@@ -522,6 +524,7 @@
             <div class="bulk-price-selection">
               <button class="mini-button" type="button" data-select-visible-ads>Selecionar página</button>
               <button class="mini-button" type="button" data-clear-selected-ads>Limpar seleção</button>
+              <button class="mini-button success-button" type="button" data-bulk-activate-flex disabled>Ativar Flex nos selecionados</button>
               <button class="mini-button warning-button" type="button" data-bulk-remove-flex disabled>Remover Flex dos selecionados</button>
             </div>
             <div class="bulk-price-fields">
