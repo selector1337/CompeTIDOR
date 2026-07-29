@@ -65,6 +65,13 @@
   salesReportJobId: "",
   salesReportPage: 1,
   salesReportPageSize: 50,
+  brandSalesReport: null,
+  brandSalesReportLoading: false,
+  brandSalesReportError: "",
+  brandSalesReportProgress: "",
+  brandSalesReportJobId: "",
+  brandSalesReportPage: 1,
+  brandSalesReportPageSize: 50,
   spreadsheetPreview: null,
   spreadsheetProgress: null,
   shippingCostsLoading: false,
@@ -551,6 +558,7 @@ function renderRoute() {
     custos: renderCosts,
     relatorios: () => {
       renderSalesReport();
+      renderBrandSalesReport();
       renderEqualizationReports();
     },
     contas: () => {
@@ -2643,6 +2651,163 @@ async function loadSalesReport() {
   }
 }
 
+function updateBrandSalesReportPeriodFields() {
+  const form = document.querySelector("#brand-sales-report-form");
+  if (!form) return;
+  const period = form.elements.period.value;
+  form.querySelectorAll("[data-brand-sales-date]").forEach((node) => { node.hidden = period !== "specific_date"; });
+  form.querySelectorAll("[data-brand-sales-custom]").forEach((node) => { node.hidden = period !== "custom"; });
+}
+
+function brandReportRecommendationClass(value) {
+  if (value === "Repor agora") return "urgent";
+  if (value === "Planejar reposição") return "planning";
+  if (value === "Rever preço ou custo") return "review";
+  if (value === "Estoque suficiente") return "healthy";
+  return "idle";
+}
+
+function renderBrandSalesReport() {
+  const form = document.querySelector("#brand-sales-report-form");
+  const feedback = document.querySelector("#brand-sales-report-feedback");
+  const summary = document.querySelector("#brand-sales-report-summary");
+  const results = document.querySelector("#brand-sales-report-results");
+  if (!form || !feedback || !summary || !results) return;
+
+  const selectedAccount = form.elements.account.value || "all";
+  form.elements.account.innerHTML = `<option value="all">Todas as contas</option>${connectedAccounts()
+    .map((account) => `<option value="${escapeAttr(account.id || account.seller_id)}">${escapeText(account.nickname)}</option>`)
+    .join("")}`;
+  if ([...form.elements.account.options].some((option) => option.value === selectedAccount)) {
+    form.elements.account.value = selectedAccount;
+  }
+  const brands = [...new Set((state.data?.catalog || [])
+    .map((item) => String(item.brand || "").trim())
+    .filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right, "pt-BR", { sensitivity: "base" }));
+  const brandOptions = document.querySelector("#brand-sales-options");
+  if (brandOptions) brandOptions.innerHTML = brands.map((brand) => `<option value="${escapeAttr(brand)}"></option>`).join("");
+
+  const today = new Date();
+  if (!form.elements.specific_date.value) form.elements.specific_date.value = localDateValue(today);
+  if (!form.elements.date_from.value) form.elements.date_from.value = localDateValue(new Date(today.getFullYear(), today.getMonth(), 1));
+  if (!form.elements.date_to.value) form.elements.date_to.value = localDateValue(today);
+  updateBrandSalesReportPeriodFields();
+
+  feedback.innerHTML = state.brandSalesReportLoading
+    ? `<div class="statistics-loading"><span></span><strong>${escapeText(state.brandSalesReportProgress || "Analisando vendas e estoque da marca...")}</strong></div>`
+    : state.brandSalesReportError
+      ? `<div class="notice danger-notice">${escapeText(state.brandSalesReportError)}</div>`
+      : "";
+  if (!state.brandSalesReport) {
+    summary.innerHTML = "";
+    results.innerHTML = `<div class="notice">Selecione uma marca e um período para comparar giro, resultado e necessidade de reposição de todos os SKUs.</div>`;
+    return;
+  }
+
+  const data = state.brandSalesReport;
+  const totals = data.summary || {};
+  const totalProfit = Number(totals.profit_amount || 0);
+  const totalMargin = totals.profit_percentage;
+  summary.innerHTML = `
+    <div><span>SKUs analisados</span><strong>${Number(totals.skus || 0).toLocaleString("pt-BR")}</strong><small>${Number(totals.skus_with_sales || 0).toLocaleString("pt-BR")} com venda</small></div>
+    <div><span>Unidades vendidas</span><strong>${Number(totals.units || 0).toLocaleString("pt-BR")}</strong></div>
+    <div><span>Valor vendido</span><strong>${money.format(totals.gross_amount || 0)}</strong></div>
+    <div><span>Valor líquido</span><strong>${money.format(totals.net_amount || 0)}</strong></div>
+    <div class="${totalProfit >= 0 ? "profit-positive" : "profit-negative"}"><span>Resultado conhecido</span><strong>${money.format(totalProfit)}</strong><small>${totalMargin == null ? "Margem incompleta" : `${totalMargin >= 0 ? "+" : ""}${Number(totalMargin).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</small></div>
+    <div><span>Estoque anunciado</span><strong>${Number(totals.current_stock || 0).toLocaleString("pt-BR")}</strong></div>
+    <div class="replenishment-total"><span>Reposição sugerida</span><strong>${Number(totals.suggested_reorder || 0).toLocaleString("pt-BR")}</strong><small>para ${Number(data.coverage_days || 30)} dias</small></div>
+    <div><span>Custos completos</span><strong>${Number(totals.costed_skus || 0).toLocaleString("pt-BR")} / ${Number(totals.skus || 0).toLocaleString("pt-BR")}</strong></div>`;
+
+  const pageInfo = paginate(data.rows || [], state.brandSalesReportPage, state.brandSalesReportPageSize);
+  state.brandSalesReportPage = pageInfo.current;
+  const warning = data.truncated
+    ? `<div class="notice warning-notice">A API atingiu o limite de pedidos configurado. Reduza o período para uma análise integral.</div>`
+    : "";
+  const messages = (data.warnings || []).map((message) => `<div class="notice">${escapeText(message)}</div>`).join("");
+  results.innerHTML = `${warning}${messages}${paginationHtml("brandSalesReportPage", pageInfo)}
+    <div class="brand-report-table-wrap">
+      <table class="brand-report-table">
+        <thead><tr>
+          <th>SKU / Produto</th><th>Estoque</th><th>Pedidos</th><th>Unidades</th><th>Média/dia</th>
+          <th>Venda</th><th>Tarifas</th><th>Frete</th><th>Líquido</th><th>Custo</th>
+          <th>Resultado</th><th>Margem</th><th>Última venda</th><th>Cobertura</th><th>Reposição</th>
+        </tr></thead>
+        <tbody>${pageInfo.items.map((row) => `
+          <tr>
+            <td class="brand-report-product">
+              ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
+              <span><strong>${escapeText(row.sku)}</strong><small>${escapeText(row.product)}</small><em>${escapeText(row.accounts_label || "")}</em></span>
+            </td>
+            <td><strong>${Number(row.current_stock || 0).toLocaleString("pt-BR")}</strong></td>
+            <td>${Number(row.orders || 0).toLocaleString("pt-BR")}</td>
+            <td><strong>${Number(row.units || 0).toLocaleString("pt-BR")}</strong></td>
+            <td>${Number(row.average_daily_units || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 3 })}</td>
+            <td>${money.format(row.gross_amount || 0)}</td>
+            <td>${row.sale_fee_amount == null ? "Incompleta" : money.format(row.sale_fee_amount)}</td>
+            <td>${money.format(row.shipping_amount || 0)}</td>
+            <td>${row.net_amount == null ? "Incompleto" : money.format(row.net_amount)}</td>
+            <td>${row.cost_amount == null ? `<span class="missing-data">Sem custo</span>` : money.format(row.cost_amount)}</td>
+            <td class="${row.profit_status === "profit" ? "profit-positive" : row.profit_status === "loss" ? "profit-negative" : ""}">${row.profit_amount == null ? "Sem custo" : money.format(row.profit_amount)}</td>
+            <td class="${Number(row.profit_percentage || 0) >= 0 ? "profit-positive" : "profit-negative"}">${row.profit_percentage == null ? "-" : `${row.profit_percentage >= 0 ? "+" : ""}${Number(row.profit_percentage).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</td>
+            <td>${row.last_sale_at ? formatDateBR(row.last_sale_at) : "Sem venda"}${row.days_since_last_sale == null ? "" : `<small>${row.days_since_last_sale} dia(s)</small>`}</td>
+            <td>${row.coverage_days == null ? "Sem giro" : `${Number(row.coverage_days).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} dias`}</td>
+            <td><span class="replenishment-badge ${brandReportRecommendationClass(row.recommendation)}">${escapeText(row.recommendation)}</span><strong>${Number(row.suggested_reorder || 0).toLocaleString("pt-BR")} un.</strong></td>
+          </tr>`).join("")}</tbody>
+      </table>
+    </div>${paginationHtml("brandSalesReportPage", pageInfo)}`;
+}
+
+async function loadBrandSalesReport() {
+  const form = document.querySelector("#brand-sales-report-form");
+  if (!form || state.brandSalesReportLoading) return;
+  const brand = form.elements.brand.value.trim();
+  if (!brand) {
+    state.brandSalesReportError = "Informe uma marca para analisar.";
+    renderBrandSalesReport();
+    return;
+  }
+  state.brandSalesReportLoading = true;
+  state.brandSalesReportError = "";
+  state.brandSalesReportProgress = "Preparando a análise da marca...";
+  renderBrandSalesReport();
+  const actionId = beginManualAction("Relatório por marca", state.brandSalesReportProgress);
+  try {
+    const range = statisticsDateRange(form);
+    let job = await api("/api/brand-sales-report/query", {
+      method: "POST",
+      manualProgress: false,
+      body: JSON.stringify({
+        brand,
+        account: form.elements.account.value,
+        ml_status: form.elements.ml_status.value,
+        coverage_days: form.elements.coverage_days.value,
+        ...range,
+      }),
+    });
+    state.brandSalesReportJobId = job.id || "";
+    while (["queued", "processing"].includes(job.status)) {
+      state.brandSalesReportProgress = job.message || "Analisando vendas e estoque da marca...";
+      updateManualAction(actionId, { message: state.brandSalesReportProgress, progress: Number(job.progress || 0) });
+      renderBrandSalesReport();
+      await new Promise((resolve) => setTimeout(resolve, 1600));
+      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+    }
+    if (job.status !== "completed" || !job.result) throw new Error(job.message || "O relatório não foi concluído.");
+    state.brandSalesReport = job.result;
+    state.brandSalesReportPage = 1;
+    finishManualAction(actionId, "success", `Análise da marca ${brand} concluída.`);
+  } catch (error) {
+    state.brandSalesReport = null;
+    state.brandSalesReportError = error.message || "Não foi possível analisar a marca.";
+    finishManualAction(actionId, "error", state.brandSalesReportError);
+  } finally {
+    state.brandSalesReportLoading = false;
+    state.brandSalesReportProgress = "";
+    renderBrandSalesReport();
+  }
+}
+
 function currentReportFilters(reportType) {
   if (reportType === "sales") {
     const form = document.querySelector("#sales-report-form");
@@ -2655,6 +2820,16 @@ function currentReportFilters(reportType) {
       kind: form.elements.report_type?.value || "sku_sales",
       sku: form.elements.sku.value,
       flex: form.elements.flex.value,
+      ...statisticsDateRange(form),
+    };
+  }
+  if (reportType === "brand_sales") {
+    const form = document.querySelector("#brand-sales-report-form");
+    return {
+      brand: form.elements.brand.value,
+      account: form.elements.account.value,
+      ml_status: form.elements.ml_status.value,
+      coverage_days: form.elements.coverage_days.value,
       ...statisticsDateRange(form),
     };
   }
@@ -2707,7 +2882,13 @@ async function downloadReport(button) {
         report_type: reportType,
         format,
         filters: currentReportFilters(reportType),
-        statistics_job_id: reportType === "statistics" ? state.statisticsJobId : reportType === "sales" ? state.salesReportJobId : "",
+        statistics_job_id: reportType === "statistics"
+          ? state.statisticsJobId
+          : reportType === "sales"
+            ? state.salesReportJobId
+            : reportType === "brand_sales"
+              ? state.brandSalesReportJobId
+              : "",
       }),
     });
     if (!response.ok) {
@@ -3515,6 +3696,7 @@ document.addEventListener("click", (event) => {
   if (key === "scanPage") renderScan();
   if (key === "competitorsPage") renderCompetitors();
   if (key === "statisticsPage") renderStatistics();
+  if (key === "brandSalesReportPage") renderBrandSalesReport();
   if (key === "salesReportPage") renderSalesReport();
   if (key === "equalizationPage") renderEqualizationReports();
   if (key === "costsPage") renderCosts();
@@ -3592,6 +3774,20 @@ document.querySelector("#sales-report-form")?.addEventListener("change", (event)
 document.querySelector("#sales-report-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   await loadSalesReport();
+});
+
+document.querySelector("#brand-sales-report-form")?.addEventListener("change", (event) => {
+  if (event.target.name === "period") updateBrandSalesReportPeriodFields();
+  if (event.target.name === "page_size") {
+    state.brandSalesReportPageSize = Number(event.target.value || 50);
+    state.brandSalesReportPage = 1;
+    renderBrandSalesReport();
+  }
+});
+
+document.querySelector("#brand-sales-report-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadBrandSalesReport();
 });
 
 document.addEventListener("click", (event) => {

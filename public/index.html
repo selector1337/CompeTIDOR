@@ -426,6 +426,55 @@
           <div id="sales-report-summary" class="inventory-summary"></div>
           <div id="sales-report-results"></div>
         </div>
+        <div class="panel catalog-panel brand-sales-report-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Rentabilidade e reposição</p>
+              <h2>Vendas por marca</h2>
+            </div>
+            <div class="report-actions" aria-label="Exportar relatório por marca">
+              <button class="mini-button" type="button" data-export-report="brand_sales" data-export-format="pdf">PDF</button>
+              <button class="mini-button" type="button" data-export-report="brand_sales" data-export-format="xlsx">Excel</button>
+            </div>
+          </div>
+          <form id="brand-sales-report-form" class="filter-bar brand-report-filter-bar">
+            <label>Marca
+              <input name="brand" type="search" list="brand-sales-options" placeholder="Digite ou selecione a marca" required autocomplete="off" />
+              <datalist id="brand-sales-options"></datalist>
+            </label>
+            <label>Conta <select name="account"></select></label>
+            <label>Período
+              <select name="period">
+                <option value="week">Últimos 7 dias</option>
+                <option value="fortnight">Últimos 15 dias</option>
+                <option value="month" selected>Mês atual</option>
+                <option value="year">Ano atual</option>
+                <option value="specific_date">Dia específico</option>
+                <option value="custom">Período personalizado</option>
+              </select>
+            </label>
+            <label data-brand-sales-date hidden>Data <input name="specific_date" type="date" /></label>
+            <label data-brand-sales-custom hidden>Início <input name="date_from" type="date" /></label>
+            <label data-brand-sales-custom hidden>Fim <input name="date_to" type="date" /></label>
+            <label>Status dos anúncios
+              <select name="ml_status">
+                <option value="all">Ativos e pausados</option>
+                <option value="active">Somente ativos</option>
+                <option value="paused">Somente pausados</option>
+              </select>
+            </label>
+            <label>Cobertura desejada
+              <span class="input-with-suffix"><input name="coverage_days" type="number" min="1" max="365" value="30" /><em>dias</em></span>
+            </label>
+            <label>Por página
+              <select name="page_size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select>
+            </label>
+            <button class="primary" type="submit">Analisar marca</button>
+          </form>
+          <div id="brand-sales-report-feedback"></div>
+          <div id="brand-sales-report-summary" class="inventory-summary brand-report-summary"></div>
+          <div id="brand-sales-report-results"></div>
+        </div>
         <div class="panel catalog-panel">
           <div class="panel-heading">
             <div>
