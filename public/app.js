@@ -1924,11 +1924,20 @@ function renderCompetitors() {
     .map(
       (competitor) => `
         <article class="competitor-item">
-          <div>
-            <strong>${competitor.name}</strong>
+          <div class="competitor-main">
+            <div class="competitor-title-row">
+              <div>
+                <strong>${competitor.name}</strong>
+                <small>Seller ${competitor.seller_id || "-"}</small>
+              </div>
+              <div class="competitor-actions">
+                ${competitor.permalink ? `<a class="mini-button button-link" href="${competitor.permalink}" target="_blank" rel="noreferrer">Abrir perfil</a>` : ""}
+                <button class="mini-button" type="button" data-refresh-competitor="${competitor.seller_id}" data-competitor-limit="${competitor.analysis_limit || 100}">Atualizar</button>
+                <button class="mini-button danger-button" type="button" data-delete-competitor="${competitor.seller_id}" data-competitor-name="${escapeAttr(competitor.name)}">Remover</button>
+              </div>
+            </div>
             <div class="meta-row">
               <span>${competitor.items_total ?? competitor.watched_products ?? 0} anúncios</span>
-              <span>${competitor.seller_id ? `Seller ${competitor.seller_id}` : `${competitor.price_moves || 0} mudanças de preço`}</span>
               ${competitor.analysis_limit ? `<span>${competitor.items_loaded || 0}/${competitor.analysis_limit} analisados</span>` : ""}
               ${competitor.source ? `<span>${competitor.source === "sites_search_public" ? "Busca pública" : "OAuth"}</span>` : ""}
               ${competitor.reputation ? `<span>Reputação ${competitor.reputation}</span>` : ""}
@@ -1947,6 +1956,7 @@ function renderCompetitors() {
                 <div class="competitor-product-list">
                   ${competitor.items.slice(0, 12).map((item) => `
                     <a href="${item.permalink || "#"}" target="_blank" rel="noreferrer">
+                      ${item.thumbnail ? `<img src="${item.thumbnail}" alt="${escapeAttr(item.title)}" loading="lazy" />` : `<span class="competitor-thumb-empty"></span>`}
                       <span>${escapeText(item.title)}</span>
                       <strong>${money.format(item.price || 0)}</strong>
                       <small>${item.sold_quantity || 0} vendas públicas · ${listingTypeLabel(item.listing_type_id)}</small>
@@ -1976,12 +1986,12 @@ function renderScan() {
     const belowOffers = scan.below_minimum_offers || [];
     const belowMinimum = belowOffers.length || (minimum && Number(scan.last_price || 0) <= minimum);
     return `
-      <article class="scan-item ${belowMinimum ? "danger" : ""}">
+      <article class="scan-item ${belowMinimum ? "danger" : ""}" data-scan-card="${scan.id}">
         <div class="scan-head">
           <a class="product-media scan-media" href="${scan.last_permalink || scan.url || "#"}" target="_blank" rel="noreferrer">
             ${scan.last_thumbnail ? `<img src="${scan.last_thumbnail}" alt="${escapeAttr(scan.name)}" loading="lazy" />` : `<span>${(scan.name || scan.item_id || "SC").slice(0, 2).toUpperCase()}</span>`}
           </a>
-          <div>
+          <div class="scan-main">
             <strong>${escapeText(scan.name)}</strong>
             <div class="item-facts">
               ${fact("Anúncio ML", scan.item_id || "-")}
@@ -1998,7 +2008,10 @@ function renderScan() {
             </form>
             ${scan.auto_scan_error ? `<p class="catalog-action subtle-action">Último erro automático: ${escapeText(scan.auto_scan_error)}</p>` : ""}
           </div>
-          <button class="mini-button scan-run-button" data-run-scan="${scan.id}">Rodar scan</button>
+          <div class="scan-actions">
+            <button class="mini-button scan-run-button" type="button" data-run-scan="${scan.id}">Rodar scan</button>
+            <button class="mini-button danger-button" type="button" data-delete-scan="${scan.id}" data-scan-name="${escapeAttr(scan.name)}">Excluir</button>
+          </div>
         </div>
         <div class="scan-history">
           ${belowOffers.length ? `
@@ -4544,6 +4557,25 @@ document.querySelector("#scan-form").addEventListener("submit", async (event) =>
 });
 
 document.querySelector("#scan-list").addEventListener("click", async (event) => {
+  const deleteButton = event.target.closest("[data-delete-scan]");
+  if (deleteButton) {
+    const name = deleteButton.dataset.scanName || "este scan";
+    if (!confirm(`Excluir ${name} e todo o histórico deste monitoramento?`)) return;
+    deleteButton.disabled = true;
+    try {
+      const result = await api("/api/scan/delete", {
+        method: "POST",
+        body: JSON.stringify({ id: deleteButton.dataset.deleteScan }),
+      });
+      state.data.scan_items = result.scan_items;
+      showToast("Scan excluído com sucesso.");
+      renderScan();
+    } catch (error) {
+      deleteButton.disabled = false;
+      showToast(error.message || "Não foi possível excluir o scan.", "error");
+    }
+    return;
+  }
   const button = event.target.closest("[data-run-scan]");
   if (!button) return;
   button.disabled = true;
@@ -4593,9 +4625,53 @@ document.querySelector("#competitor-form").addEventListener("submit", async (eve
     });
     state.data.competitors = result.competitors;
     showToast("Concorrente analisado com sucesso.");
+    formEl.reset();
+    formEl.elements.limit.value = "100";
     renderCompetitors();
   } catch (error) {
     showToast(error.message || "Não foi possível analisar o concorrente.", "error");
+  }
+});
+
+document.querySelector("#competitors-list")?.addEventListener("click", async (event) => {
+  const refreshButton = event.target.closest("[data-refresh-competitor]");
+  const deleteButton = event.target.closest("[data-delete-competitor]");
+  if (!refreshButton && !deleteButton) return;
+  if (deleteButton) {
+    const name = deleteButton.dataset.competitorName || "este concorrente";
+    if (!confirm(`Remover ${name} do acompanhamento?`)) return;
+    deleteButton.disabled = true;
+    try {
+      const result = await api("/api/competitors/delete", {
+        method: "POST",
+        body: JSON.stringify({ seller_id: deleteButton.dataset.deleteCompetitor }),
+      });
+      state.data.competitors = result.competitors;
+      showToast("Concorrente removido.");
+      renderCompetitors();
+    } catch (error) {
+      deleteButton.disabled = false;
+      showToast(error.message || "Não foi possível remover o concorrente.", "error");
+    }
+    return;
+  }
+  refreshButton.disabled = true;
+  refreshButton.textContent = "Atualizando...";
+  try {
+    const result = await api("/api/competitors/scan", {
+      method: "POST",
+      body: JSON.stringify({
+        reference: refreshButton.dataset.refreshCompetitor,
+        limit: refreshButton.dataset.competitorLimit || 100,
+      }),
+    });
+    state.data.competitors = result.competitors;
+    showToast("Dados públicos do concorrente atualizados.");
+    renderCompetitors();
+  } catch (error) {
+    refreshButton.disabled = false;
+    refreshButton.textContent = "Atualizar";
+    showToast(error.message || "Não foi possível atualizar o concorrente.", "error");
   }
 });
 

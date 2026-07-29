@@ -720,11 +720,14 @@
             </div>
           </div>
           <form id="competitor-form" class="competitor-form">
-            <label>ID do vendedor <input name="seller_id" placeholder="Ex.: 123456789" required /></label>
+            <label>Concorrente
+              <input name="reference" placeholder="Link do anúncio, perfil, nome da loja ou Seller ID" required />
+              <small>Cole qualquer referência que você já tenha; o Seller ID será identificado automaticamente.</small>
+            </label>
             <label>Anúncios para analisar <input name="limit" type="number" min="1" max="500" value="100" /></label>
-            <button class="primary" type="submit">Analisar concorrente</button>
+            <button class="primary" type="submit">Adicionar e analisar</button>
           </form>
-          <div class="notice">Para descobrir o ID: abra um anúncio do concorrente, copie o link do vendedor ou o nome da loja e use o Scan/catálogo para identificar o vendedor da oferta. Quando o Mercado Livre expõe o seller, o ID aparece como Seller ID. Se a API bloquear a listagem direta de anúncios desse vendedor, acompanhe por produto/catálogo no Scan.</div>
+          <div class="notice">Use preferencialmente o link de um anúncio do concorrente. Também são aceitos link do perfil, nome exato da loja e Seller ID.</div>
           <div class="notice">A API oficial permite consultar dados públicos do vendedor e anúncios públicos. Vendas detalhadas, faturamento real por período e pedidos de concorrentes não são expostos sem autorização OAuth da própria conta.</div>
           <div id="competitors-list" class="competitors-list"></div>
         </div>

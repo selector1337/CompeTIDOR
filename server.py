@@ -2,7 +2,7 @@
 from pathlib import Path
 from datetime import date, datetime, time as datetime_time, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from io import BytesIO
 import base64
 import copy
@@ -2118,6 +2118,67 @@ def extract_meli_item_id(value):
     return text if re.fullmatch(r"ML[A-Z]\d{5,}", text) else ""
 
 
+def resolve_competitor_seller(payload, reference):
+    raw = str(reference or "").strip()
+    if not raw:
+        raise RuntimeError("Informe o link de um anúncio, link do perfil, nome da loja ou Seller ID.")
+
+    if re.fullmatch(r"\d+", raw):
+        return raw
+
+    seller_match = re.search(r"(?:seller_id=|_CustId_)(\d+)", raw, flags=re.IGNORECASE)
+    if seller_match:
+        return seller_match.group(1)
+
+    item_id = extract_meli_item_id(raw)
+    if item_id:
+        try:
+            item = try_meli_sources(payload, [f"/items/{item_id}"])
+        except Exception as exc:
+            raise RuntimeError("Não foi possível consultar o anúncio informado para identificar o vendedor.") from exc
+        seller_id = str(item.get("seller_id") or first_present(item, ["seller.id"], "") or "")
+        if seller_id:
+            return seller_id
+        raise RuntimeError("O anúncio foi encontrado, mas o Mercado Livre não informou o vendedor.")
+
+    parsed = urlparse(raw if "://" in raw else "")
+    nickname = ""
+    if parsed.netloc:
+        path_parts = [unquote(part).strip() for part in parsed.path.split("/") if part.strip()]
+        if path_parts:
+            nickname = path_parts[-1]
+    elif not any(char in raw for char in "/?&="):
+        nickname = raw
+
+    nickname = nickname.strip().strip("@")
+    if not nickname:
+        raise RuntimeError(
+            "Não consegui identificar o concorrente. Use o link de um anúncio específico, "
+            "o link do perfil, o nome exato da loja ou o Seller ID."
+        )
+
+    try:
+        query = urlencode({"nickname": nickname, "limit": 1})
+        result = try_meli_sources(payload, [f"/sites/MLB/search?{query}"])
+    except Exception as exc:
+        raise RuntimeError(
+            "Não foi possível localizar esse nome de loja no Mercado Livre. "
+            "Tente colar o link de um anúncio do concorrente."
+        ) from exc
+
+    seller = result.get("seller") if isinstance(result, dict) else {}
+    if not seller and isinstance(result, dict):
+        rows = result.get("results") or []
+        seller = first_present(rows[0], ["seller"], {}) if rows else {}
+    seller_id = str((seller or {}).get("id") or "")
+    if seller_id:
+        return seller_id
+    raise RuntimeError(
+        "O Mercado Livre não retornou um vendedor para essa referência. "
+        "Cole o link de um anúncio específico do concorrente."
+    )
+
+
 def policy_error_message(exc, action):
     text = str(exc)
     if "PA_UNAUTHORIZED_RESULT_FROM_POLICIES" in text or "PolicyAgent" in text or "HTTP 403" in text:
@@ -2472,34 +2533,66 @@ def scan_competitor_profile(payload, seller_id, limit=50):
             errors.append(str(exc))
             ids = []
             continue
-    items = []
-    for item_id in ids[:requested_limit]:
+    item_rows = []
+    selected_ids = ids[:requested_limit]
+    for start in range(0, len(selected_ids), 20):
+        chunk = selected_ids[start:start + 20]
         try:
-            item = try_meli_sources(payload, [f"/items/{item_id}"])
+            rows = try_meli_sources(payload, [f"/items?{urlencode({'ids': ','.join(chunk)})}"])
+            for row in rows if isinstance(rows, list) else []:
+                body = row.get("body") if isinstance(row, dict) else None
+                if body:
+                    item_rows.append(body)
+        except Exception as exc:
+            errors.append(str(exc))
+
+    loaded_ids = {str(item.get("id") or "") for item in item_rows}
+    missing_ids = [item_id for item_id in selected_ids if str(item_id) not in loaded_ids]
+
+    def load_missing_item(item_id):
+        try:
+            return try_meli_sources(payload, [f"/items/{item_id}"])
+        except Exception:
+            return None
+
+    if missing_ids:
+        with ThreadPoolExecutor(max_workers=min(6, len(missing_ids))) as executor:
+            for item in executor.map(load_missing_item, missing_ids):
+                if item:
+                    item_rows.append(item)
+
+    items = []
+    for item in item_rows:
+        try:
             price = float(item.get("price") or 0)
             sold = int(item.get("sold_quantity") or 0)
-            items.append(
-                {
-                    "id": item.get("id"),
-                    "title": item.get("title") or item.get("id"),
-                    "price": price,
-                    "sold_quantity": sold,
-                    "available_quantity": item_available_quantity(item),
-                    "status": item.get("status") or "-",
-                    "listing_type_id": item.get("listing_type_id") or "",
-                    "thumbnail": item_thumbnail(item),
-                    "permalink": item.get("permalink") or "",
-                    "estimated_revenue": round(price * sold, 2),
-                }
-            )
-        except Exception:
+        except (TypeError, ValueError):
             continue
+        items.append(
+            {
+                "id": item.get("id"),
+                "title": item.get("title") or item.get("id"),
+                "price": price,
+                "sold_quantity": sold,
+                "available_quantity": item_available_quantity(item),
+                "status": item.get("status") or "-",
+                "listing_type_id": item.get("listing_type_id") or "",
+                "thumbnail": item_thumbnail(item),
+                "permalink": item.get("permalink") or "",
+                "estimated_revenue": round(price * sold, 2),
+            }
+        )
     prices = [item["price"] for item in items if item.get("price")]
     competitor = {
         "id": f"competitor-{seller_id}",
         "seller_id": seller_id,
         "name": profile.get("nickname") or f"Seller {seller_id}",
-        "permalink": profile.get("permalink") or "",
+        "permalink": profile.get("permalink")
+        or (
+            f"https://perfil.mercadolivre.com.br/{profile.get('nickname')}"
+            if profile.get("nickname")
+            else ""
+        ),
         "reputation": first_present(profile, ["seller_reputation.level_id"], "Não informado"),
         "transactions_total": first_present(profile, ["seller_reputation.transactions.total"], None),
         "transactions_completed": first_present(profile, ["seller_reputation.transactions.completed"], None),
@@ -11842,13 +11935,41 @@ class App(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "scan": scan, "scan_items": scans})
             return
 
+        if parsed.path == "/api/scan/delete":
+            scan_id = str(request.get("id") or "")
+            scans = payload.setdefault("scan_items", [])
+            removed = next((item for item in scans if str(item.get("id")) == scan_id), None)
+            if not removed:
+                self.send_json({"error": "Produto de scan não encontrado."}, status=404)
+                return
+            payload["scan_items"] = [item for item in scans if str(item.get("id")) != scan_id]
+            write_payload(payload)
+            self.send_json({"ok": True, "removed": removed, "scan_items": payload["scan_items"]})
+            return
+
         if parsed.path == "/api/competitors/scan":
             try:
-                competitor = scan_competitor_profile(payload, request.get("seller_id", ""), request.get("limit", 50))
+                reference = request.get("reference") or request.get("seller_id") or ""
+                seller_id = resolve_competitor_seller(payload, reference)
+                competitor = scan_competitor_profile(payload, seller_id, request.get("limit", 50))
                 write_payload(payload)
                 self.send_json({"ok": True, "competitor": competitor, "competitors": payload.get("competitors", [])})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/competitors/delete":
+            seller_id = str(request.get("seller_id") or "")
+            competitors = payload.setdefault("competitors", [])
+            removed = next((item for item in competitors if str(item.get("seller_id")) == seller_id), None)
+            if not removed:
+                self.send_json({"error": "Concorrente não encontrado."}, status=404)
+                return
+            payload["competitors"] = [
+                item for item in competitors if str(item.get("seller_id")) != seller_id
+            ]
+            write_payload(payload)
+            self.send_json({"ok": True, "removed": removed, "competitors": payload["competitors"]})
             return
 
         if parsed.path == "/api/statistics/query":

@@ -5973,3 +5973,159 @@ textarea:focus {
     min-width: 88px;
   }
 }
+
+/* Scan cards use a dedicated layout instead of the generic three-column list. */
+#scan-list .scan-item {
+  display: block;
+  min-width: 0;
+  padding: 16px;
+  cursor: default;
+  contain-intrinsic-size: auto;
+}
+
+#scan-list .scan-head {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: start;
+  min-width: 0;
+}
+
+#scan-list .scan-media {
+  width: 104px;
+  height: 104px;
+  min-width: 104px;
+  padding: 7px;
+  align-self: start;
+  background: #fff;
+}
+
+#scan-list .scan-media > img {
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  object-fit: contain;
+  object-position: center;
+  background: #fff;
+  filter: none;
+}
+
+#scan-list .scan-main {
+  min-width: 0;
+}
+
+#scan-list .scan-main > strong {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+
+#scan-list .scan-main .item-facts {
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  align-items: stretch;
+}
+
+#scan-list .scan-actions,
+.competitor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+#scan-list .scan-history {
+  width: 100%;
+  min-width: 0;
+  margin-top: 14px;
+}
+
+.competitor-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 8px;
+}
+
+.competitor-title-row > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.competitor-title-row small,
+.competitor-form label small {
+  color: var(--muted);
+}
+
+.competitor-form label small {
+  font-size: .72rem;
+  font-weight: 700;
+}
+
+.competitor-main {
+  min-width: 0;
+}
+
+.competitor-product-list a {
+  grid-template-columns: 48px minmax(0, 1fr) 110px 180px;
+}
+
+.competitor-product-list img,
+.competitor-thumb-empty {
+  width: 48px;
+  height: 48px;
+  display: block;
+  padding: 4px;
+  object-fit: contain;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+
+@media (max-width: 900px) {
+  #scan-list .scan-head {
+    grid-template-columns: 88px minmax(0, 1fr);
+  }
+
+  #scan-list .scan-media {
+    width: 88px;
+    height: 88px;
+    min-width: 88px;
+  }
+
+  #scan-list .scan-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+
+  .competitor-title-row {
+    flex-direction: column;
+  }
+
+  .competitor-actions {
+    justify-content: flex-start;
+  }
+
+  .competitor-product-list a {
+    grid-template-columns: 48px minmax(0, 1fr);
+  }
+
+  .competitor-product-list a > strong,
+  .competitor-product-list a > small {
+    grid-column: 2;
+  }
+}
+
+@media (max-width: 560px) {
+  #scan-list .scan-head {
+    grid-template-columns: 1fr;
+  }
+
+  #scan-list .scan-main .item-facts,
+  #scan-list .scan-min-form {
+    grid-template-columns: 1fr;
+  }
+}
