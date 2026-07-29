@@ -1341,7 +1341,7 @@ function renderAds() {
   list.innerHTML = filtered.length ? paginationHtml("adsPage", pageInfo) + pageInfo.items.map((item) => `
     <article class="ad-item ${state.adsSelectedIds.has(item.id) ? "selected" : ""}" data-listing-id="${escapeAttr(item.id)}">
       <label class="ad-select" title="Selecionar anúncio para alteração em massa"><input type="checkbox" data-select-ad="${item.id}" ${state.adsSelectedIds.has(item.id) ? "checked" : ""} /><span></span></label>
-      <a class="product-media" href="${item.permalink || "#"}" target="_blank" rel="noreferrer">
+      <a class="product-media ad-product-media" href="${item.permalink || "#"}" target="_blank" rel="noreferrer">
         ${item.thumbnail ? `<img src="${item.thumbnail}" alt="${item.title}" loading="lazy" />` : `<span>${(item.title || item.id).slice(0, 2).toUpperCase()}</span>`}
       </a>
       <div class="ad-main">
