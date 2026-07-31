@@ -1836,8 +1836,28 @@ class MercadoLivreClient:
         clean_ids = [str(value) for value in order_ids or [] if str(value).isdigit()][:60]
         if not clean_ids:
             return {"results": []}
+        params = {"order_ids": ",".join(clean_ids)}
         return self.get(
-            f"/billing/integration/group/ML/order/details?order_ids={','.join(clean_ids)}",
+            f"/billing/integration/group/ML/order/details?{urlencode(params)}",
+            retries=2,
+            timeout=20,
+        )
+
+    def ml_billing_shipping_bonuses(self, order_ids):
+        """Read shipping bonuses explicitly instead of relying on the default report."""
+        clean_ids = [str(value) for value in order_ids or [] if str(value).isdigit()][:60]
+        if not clean_ids:
+            return {"results": []}
+        params = {
+            "order_ids": ",".join(clean_ids),
+            "detail_type": "bonus",
+            "marketplace_type": "SHIPPING",
+            "limit": 1000,
+            "sort_by": "ID",
+            "order_by": "ASC",
+        }
+        return self.get(
+            f"/billing/integration/group/ML/order/details?{urlencode(params)}",
             retries=2,
             timeout=20,
         )
@@ -9438,7 +9458,8 @@ def fetch_flex_billing_reimbursements(client, order_ids):
     missing = []
     with BILLING_ML_ORDER_CACHE_LOCK:
         for order_id in unique_ids:
-            cached = BILLING_ML_ORDER_CACHE.get(order_id)
+            cache_key = f"shipping-bonus-v2:{order_id}"
+            cached = BILLING_ML_ORDER_CACHE.get(cache_key)
             ttl = positive_ttl if cached and float(cached.get("amount") or 0) > 0 else pending_ttl
             if cached and now - float(cached.get("time") or 0) < ttl:
                 amounts[order_id] = float(cached.get("amount") or 0)
@@ -9448,15 +9469,23 @@ def fetch_flex_billing_reimbursements(client, order_ids):
     for start in range(0, len(missing), 60):
         batch = missing[start:start + 60]
         try:
-            response = client.ml_billing_order_details(batch)
+            bonus_reader = getattr(client, "ml_billing_shipping_bonuses", None)
+            response = bonus_reader(batch) if callable(bonus_reader) else client.ml_billing_order_details(batch)
             parsed = flex_reimbursements_from_billing(response, batch)
         except Exception as exc:
-            warnings.append(f"Bonificações Flex ainda não conciliadas: {policy_error_message(exc, 'a conciliação do bônus Flex')}" )
-            continue
+            # Some older credentials may reject the optional filters. Keep the
+            # official order report as a compatibility fallback.
+            try:
+                response = client.ml_billing_order_details(batch)
+                parsed = flex_reimbursements_from_billing(response, batch)
+            except Exception:
+                warnings.append(f"Bonificações Flex não retornadas: {policy_error_message(exc, 'a conciliação do bônus Flex')}" )
+                continue
         with BILLING_ML_ORDER_CACHE_LOCK:
             for order_id in batch:
                 amount = float(parsed.get(order_id) or 0)
-                BILLING_ML_ORDER_CACHE[order_id] = {"amount": amount, "time": now}
+                cache_key = f"shipping-bonus-v2:{order_id}"
+                BILLING_ML_ORDER_CACHE[cache_key] = {"amount": amount, "time": now}
                 amounts[order_id] = amount
     return amounts, warnings
 
