@@ -2820,7 +2820,7 @@ function renderSalesReport() {
       ${pageInfo.items.map((row) => `
         <article class="sales-report-row">
           ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
-          <div class="sales-report-product"><strong>${escapeText(row.product)}</strong><small>${escapeText(row.account)} · SKU ${escapeText(row.sku)} · Pedido ${escapeText(row.order_id)}</small><small>${formatDateBR(row.date)}</small></div>
+          <div class="sales-report-product"><div class="sales-report-product-title"><strong>${escapeText(row.product)}</strong>${row.flex ? `<span class="sales-flex-badge">FLEX</span>` : ""}</div><small>${escapeText(row.account)} · SKU ${escapeText(row.sku)} · Pedido ${escapeText(row.order_id)}</small><small>${formatDateBR(row.date)}</small></div>
           <span><small>Qtd.</small><strong>${Number(row.quantity || 0)}</strong></span>
           <span><small>Venda</small><strong>${money.format(row.gross_amount || 0)}</strong></span>
           <span><small>Tarifa de venda</small><strong>${row.percentage_fee_amount == null ? "Não disponível" : money.format(row.percentage_fee_amount)}</strong></span>

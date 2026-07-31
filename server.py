@@ -9117,7 +9117,14 @@ def shipment_seller_costs(cost_payload, seller_id=None):
     signed_cost = optional_money(selected.get("cost"))
     if signed_cost is None:
         return None, 0.0
-    return round(max(0.0, signed_cost), 2), round(max(0.0, -signed_cost), 2)
+    compensation = optional_money(selected.get("compensation"))
+    # In the current shipment-cost contract, Flex bonuses are returned as a
+    # positive sender compensation. A negative cost is kept as a legacy
+    # fallback, but the two representations must never be counted twice.
+    reimbursement = max(0.0, compensation or 0.0)
+    if reimbursement == 0:
+        reimbursement = max(0.0, -signed_cost)
+    return round(max(0.0, signed_cost), 2), round(reimbursement, 2)
 
 
 def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_cache):
@@ -9129,8 +9136,9 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
         return local_cache[key]
     ttl = max(300, int(os.getenv("MELI_STATISTICS_SHIPMENT_CACHE_SECONDS", "86400")))
     now = time.monotonic()
+    global_key = f"seller-compensation-v2:{key}"
     with SHIPMENT_COST_CACHE_LOCK:
-        cached = SHIPMENT_COST_CACHE.get(key)
+        cached = SHIPMENT_COST_CACHE.get(global_key)
     if cached and now - cached.get("time", 0) < ttl:
         result = cached.get("result")
         local_cache[key] = result
@@ -9149,7 +9157,7 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
             result = (round(max(0.0, estimate), 2), 0.0, "Cotação estimada do anúncio") if estimate is not None else (None, 0.0, "Frete não disponível")
     local_cache[key] = result
     with SHIPMENT_COST_CACHE_LOCK:
-        SHIPMENT_COST_CACHE[key] = {"time": now, "result": result}
+        SHIPMENT_COST_CACHE[global_key] = {"time": now, "result": result}
     return result
 
 
@@ -9227,6 +9235,7 @@ def query_sales_report(payload, request):
                 allocation = line_total / order_gross if order_gross > 0 else 1.0 / max(1, len(order_lines))
                 shipping = round(order_shipping * allocation, 2) if order_shipping is not None else None
                 reimbursement = round(order_reimbursement * allocation, 2)
+                sale_is_flex = is_flex is True or order_reimbursement > 0
                 sku = order_item_sku(order_item, catalog_item) or "-"
                 cost_record = (payload.get("sku_costs") or {}).get(normalized_sku_key(sku))
                 unit_cost = None
@@ -9258,13 +9267,14 @@ def query_sales_report(payload, request):
                         "shipping_amount": shipping,
                         "shipping_reimbursement_amount": reimbursement,
                         "shipping_source": shipping_source,
+                        "shipping_method": "Mercado Envios Flex" if sale_is_flex else "Outra modalidade",
                         "net_amount": net,
                         "unit_cost": unit_cost,
                         "cost_amount": cost_total,
                         "profit_amount": profit,
                         "profit_percentage": margin,
                         "profit_status": "profit" if profit is not None and profit >= 0 else "loss" if profit is not None else "unknown",
-                        "flex": is_flex is True,
+                        "flex": sale_is_flex,
                     }
                 )
     if not rows and warnings:
@@ -10464,6 +10474,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             ("quantity", "Quantidade", "integer"),
             ("unit_price", "Preço unitário", "currency"),
             ("gross_amount", "Valor vendido", "currency"),
+            ("shipping_method", "Modalidade de envio", "text"),
             ("percentage_fee_amount", "Tarifa de venda", "currency"),
             ("fixed_fee_amount", "Custo fixo", "currency"),
             ("shipping_amount", "Frete debitado", "currency"),
