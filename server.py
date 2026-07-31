@@ -1819,7 +1819,10 @@ class MercadoLivreClient:
         return self.get(f"/shipments/{shipment_id}", extra_headers={"x-format-new": "true"})
 
     def shipment_costs(self, shipment_id):
-        return self.get(f"/shipments/{shipment_id}/costs")
+        return self.get(
+            f"/shipments/{shipment_id}/costs",
+            extra_headers={"x-format-new": "true"},
+        )
 
     def ml_billing_order_details(self, order_ids):
         clean_ids = [str(value) for value in order_ids or [] if str(value).isdigit()][:60]
@@ -9129,15 +9132,14 @@ def shipment_discount_amount(discount):
         return 0.0
     for key in ("amount", "discount_amount", "compensation"):
         amount = optional_money(discount.get(key))
-        if amount is not None:
+        if amount is not None and amount > 0:
             return round(max(0.0, amount), 2)
     promoted = optional_money(discount.get("promoted_amount"))
-    rate = optional_money(discount.get("rate"))
     if promoted is None:
         return 0.0
-    if rate is None:
-        return round(max(0.0, promoted), 2)
-    return round(max(0.0, promoted * rate), 2)
+    # promoted_amount is already the monetary subsidy. `rate` only describes
+    # the applied proportion and must not scale the amount a second time.
+    return round(max(0.0, promoted), 2)
 
 
 def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False):
@@ -9292,18 +9294,37 @@ def flex_reimbursements_from_billing(payload, requested_order_ids=None):
     results = (payload.get("results") or []) if isinstance(payload, dict) else []
     if isinstance(results, dict):
         results = [results]
-    for result in results:
-        if not isinstance(result, dict):
-            continue
-        outer_order_id = billing_detail_order_id(result)
-        details = result.get("details") or [result]
-        if isinstance(details, dict):
-            details = [details]
-        for detail in details:
-            order_id = billing_detail_order_id(detail, outer_order_id)
-            if not order_id or (requested and order_id not in requested):
-                continue
-            reimbursements[order_id] = reimbursements.get(order_id, 0.0) + flex_billing_detail_amount(detail)
+    seen_details = set()
+
+    def visit(node, inherited_order_id=""):
+        if isinstance(node, list):
+            for child in node:
+                visit(child, inherited_order_id)
+            return
+        if not isinstance(node, dict):
+            return
+        order_id = billing_detail_order_id(node, inherited_order_id)
+        charge = node.get("charge_info")
+        if isinstance(charge, dict):
+            detail_id = first_present(charge, ["detail_id", "movement_id", "charge_bonified_id"], None)
+            fingerprint = (
+                str(order_id),
+                str(detail_id) if detail_id not in (None, "") else str(id(node)),
+            )
+            if fingerprint not in seen_details:
+                seen_details.add(fingerprint)
+                if order_id and (not requested or order_id in requested):
+                    reimbursements[order_id] = (
+                        reimbursements.get(order_id, 0.0)
+                        + flex_billing_detail_amount(node)
+                    )
+        # Billing responses may group charges in more than one `details` level.
+        # Traverse only containers to avoid interpreting charge scalar fields.
+        for key in ("details", "results", "charges", "bonuses"):
+            if key in node:
+                visit(node.get(key), order_id)
+
+    visit(results)
     return {key: round(max(0.0, value), 2) for key, value in reimbursements.items()}
 
 
@@ -9412,7 +9433,9 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
         return local_cache[key]
     ttl = max(300, int(os.getenv("MELI_STATISTICS_SHIPMENT_CACHE_SECONDS", "86400")))
     now = time.monotonic()
-    global_key = f"seller-compensation-v3:{key}"
+    # Versioned because older cache entries used promoted_amount * rate and
+    # could persist a value ten times smaller than the official reimbursement.
+    global_key = f"seller-compensation-v4:{key}"
     with SHIPMENT_COST_CACHE_LOCK:
         cached = SHIPMENT_COST_CACHE.get(global_key)
     if cached and now - cached.get("time", 0) < ttl:
