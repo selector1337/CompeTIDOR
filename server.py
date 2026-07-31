@@ -144,6 +144,8 @@ SHIPMENT_MODE_CACHE_LOCK = threading.RLock()
 SHIPMENT_MODE_CACHE = {}
 SHIPMENT_COST_CACHE_LOCK = threading.RLock()
 SHIPMENT_COST_CACHE = {}
+BILLING_ML_ORDER_CACHE_LOCK = threading.RLock()
+BILLING_ML_ORDER_CACHE = {}
 SALE_FEE_CACHE_LOCK = threading.RLock()
 SALE_FEE_CACHE = {}
 CLONE_SOURCE_CACHE_LOCK = threading.RLock()
@@ -204,6 +206,9 @@ SENSITIVE_MELI_PATH_TERMS = (
     "/mp/",
     "/money",
 )
+SAFE_ML_BILLING_ORDER_DETAILS_PATH = re.compile(
+    r"^/billing/integration/group/ML/order/details\?order_ids=[0-9,%]+(?:&(?:sort_by|order_by)=[A-Za-z]+)*$"
+)
 ALLOWED_MELI_PATHS = (
     re.compile(r"^/users/me$"),
     re.compile(r"^/users/[^/]+$"),
@@ -228,6 +233,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/post-purchase/v1/claims/[^/]+/detail(\?|$)"),
     re.compile(r"^/sites/[^/]+/listing_prices(\?|$)"),
     re.compile(r"^/pictures/items/upload$"),
+    SAFE_ML_BILLING_ORDER_DETAILS_PATH,
 )
 
 
@@ -1476,7 +1482,8 @@ def run_interactive_meli_call(work, *args, **kwargs):
 
 def validate_meli_path(path):
     lowered = (path or "").lower()
-    if any(term in lowered for term in SENSITIVE_MELI_PATH_TERMS):
+    safe_ml_billing = bool(SAFE_ML_BILLING_ORDER_DETAILS_PATH.match(path or ""))
+    if any(term in lowered for term in SENSITIVE_MELI_PATH_TERMS) and not safe_ml_billing:
         raise RuntimeError("Endpoint bloqueado por segurança: Mercado Pago, pagamentos e dados financeiros sensíveis não são permitidos.")
     if not any(pattern.match(path or "") for pattern in ALLOWED_MELI_PATHS):
         raise RuntimeError("Endpoint Mercado Livre não autorizado pela política de segurança do CompeTIDOR.")
@@ -1804,6 +1811,16 @@ class MercadoLivreClient:
 
     def shipment_costs(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}/costs")
+
+    def ml_billing_order_details(self, order_ids):
+        clean_ids = [str(value) for value in order_ids or [] if str(value).isdigit()][:60]
+        if not clean_ids:
+            return {"results": []}
+        return self.get(
+            f"/billing/integration/group/ML/order/details?order_ids={','.join(clean_ids)}",
+            retries=2,
+            timeout=20,
+        )
 
     def shipment_sla(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}/sla")
@@ -9127,6 +9144,150 @@ def shipment_seller_costs(cost_payload, seller_id=None):
     return round(max(0.0, signed_cost), 2), round(reimbursement, 2)
 
 
+def normalized_billing_text(value):
+    return re.sub(
+        r"\s+",
+        " ",
+        unicodedata.normalize("NFKD", str(value or ""))
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower(),
+    ).strip()
+
+
+def billing_detail_order_id(detail, fallback=""):
+    if not isinstance(detail, dict):
+        return str(fallback or "")
+    direct = detail.get("order_id")
+    if direct not in (None, ""):
+        return str(direct)
+    shipping_info = detail.get("shipping_info") or {}
+    shipping_order = shipping_info.get("order") or {}
+    if shipping_order.get("order_id") not in (None, ""):
+        return str(shipping_order.get("order_id"))
+    sales_info = detail.get("sales_info") or []
+    if isinstance(sales_info, dict):
+        sales_info = [sales_info]
+    for sale in sales_info:
+        if isinstance(sale, dict) and sale.get("order_id") not in (None, ""):
+            return str(sale.get("order_id"))
+    items_info = detail.get("items_info") or []
+    if isinstance(items_info, dict):
+        items_info = [items_info]
+    for item in items_info:
+        if isinstance(item, dict) and item.get("order_id") not in (None, ""):
+            return str(item.get("order_id"))
+    return str(fallback or "")
+
+
+def flex_billing_detail_amount(detail):
+    """Return a signed Flex bonus from one Mercado Livre billing detail."""
+    if not isinstance(detail, dict):
+        return 0.0
+    charge = detail.get("charge_info") if isinstance(detail.get("charge_info"), dict) else detail
+    concept = normalized_billing_text(charge.get("concept_type"))
+    subtype = normalized_billing_text(charge.get("detail_sub_type"))
+    detail_type = normalized_billing_text(charge.get("detail_type"))
+    status = normalized_billing_text(charge.get("status"))
+    description = normalized_billing_text(
+        charge.get("transaction_detail") or charge.get("status_description")
+    )
+    marketplace = normalized_billing_text(first_present(detail, ["marketplace_info.marketplace"], ""))
+    shipping_bonus_description = any(
+        term in description
+        for term in (
+            "bonus por envio",
+            "bonificacao por envio",
+            "bonus de envio",
+            "bonificacion por envio",
+            "shipping bonus",
+        )
+    )
+    shipping_bonus_detail = marketplace == "shipping" and (
+        detail_type == "bonus" or status.startswith("bonus")
+    )
+    is_flex = (
+        concept == "flex"
+        or "flex" in subtype
+        or "flex" in description
+        or shipping_bonus_description
+        or shipping_bonus_detail
+    )
+    if not is_flex:
+        return 0.0
+    amount = optional_money(charge.get("detail_amount"))
+    if amount is None:
+        return 0.0
+    amount = abs(amount)
+    cancellation = any(term in description for term in ("anulacao", "anulacion", "cancellation", "cancelamento"))
+    if cancellation or subtype.startswith("cflx"):
+        return -amount
+    is_bonus = (
+        detail_type == "bonus"
+        or status.startswith("bonus")
+        or subtype.startswith("bflx")
+        or "bonifica" in description
+        or "bonus" in description
+    )
+    return amount if is_bonus else 0.0
+
+
+def flex_reimbursements_from_billing(payload, requested_order_ids=None):
+    requested = {str(value) for value in requested_order_ids or []}
+    reimbursements = {order_id: 0.0 for order_id in requested}
+    results = (payload.get("results") or []) if isinstance(payload, dict) else []
+    if isinstance(results, dict):
+        results = [results]
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        outer_order_id = billing_detail_order_id(result)
+        details = result.get("details") or [result]
+        if isinstance(details, dict):
+            details = [details]
+        for detail in details:
+            order_id = billing_detail_order_id(detail, outer_order_id)
+            if not order_id or (requested and order_id not in requested):
+                continue
+            reimbursements[order_id] = reimbursements.get(order_id, 0.0) + flex_billing_detail_amount(detail)
+    return {key: round(max(0.0, value), 2) for key, value in reimbursements.items()}
+
+
+def fetch_flex_billing_reimbursements(client, order_ids):
+    """Fetch only ML billing bonuses and cache the derived amount per order."""
+    unique_ids = list(dict.fromkeys(str(value) for value in order_ids or [] if str(value).isdigit()))
+    if not unique_ids:
+        return {}, []
+    now = time.monotonic()
+    positive_ttl = max(3600, int(os.getenv("MELI_FLEX_BONUS_CACHE_SECONDS", "86400")))
+    pending_ttl = max(60, int(os.getenv("MELI_FLEX_BONUS_PENDING_CACHE_SECONDS", "300")))
+    amounts = {}
+    missing = []
+    with BILLING_ML_ORDER_CACHE_LOCK:
+        for order_id in unique_ids:
+            cached = BILLING_ML_ORDER_CACHE.get(order_id)
+            ttl = positive_ttl if cached and float(cached.get("amount") or 0) > 0 else pending_ttl
+            if cached and now - float(cached.get("time") or 0) < ttl:
+                amounts[order_id] = float(cached.get("amount") or 0)
+            else:
+                missing.append(order_id)
+    warnings = []
+    for start in range(0, len(missing), 60):
+        batch = missing[start:start + 60]
+        try:
+            response = client.ml_billing_order_details(batch)
+            parsed = flex_reimbursements_from_billing(response, batch)
+        except Exception as exc:
+            warnings.append(f"Bonificações Flex ainda não conciliadas: {policy_error_message(exc, 'a conciliação do bônus Flex')}" )
+            continue
+        with BILLING_ML_ORDER_CACHE_LOCK:
+            for order_id in batch:
+                amount = float(parsed.get(order_id) or 0)
+                BILLING_ML_ORDER_CACHE[order_id] = {"amount": amount, "time": now}
+                amounts[order_id] = amount
+    return amounts, warnings
+
+
 def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_cache):
     shipment_id = shipment_id_from_order(order)
     if shipment_id in (None, "", 0, "0"):
@@ -9204,12 +9365,23 @@ def query_sales_report(payload, request):
         except Exception as exc:
             warnings.append(f"{account.get('nickname')}: {policy_error_message(exc, 'a leitura das vendas do período')}")
             continue
+        flex_by_order = {}
+        for order in orders:
+            order_id = str(order.get("id") or "")
+            flex_by_order[order_id] = order_is_flex(
+                client, order, catalog_by_account_item, shipment_mode_cache, shipment_lookup_state
+            )
+        billing_reimbursements, billing_warnings = fetch_flex_billing_reimbursements(
+            client,
+            [order_id for order_id, flex in flex_by_order.items() if flex is True],
+        )
+        warnings.extend(f"{account.get('nickname')}: {warning}" for warning in billing_warnings)
         for order in orders:
             if str(order.get("status") or "").lower() in ignored_statuses:
                 continue
             order_id = str(order.get("id") or "")
             sold_at = parse_meli_datetime(order.get("date_created") or order.get("last_updated"))
-            is_flex = order_is_flex(client, order, catalog_by_account_item, shipment_mode_cache, shipment_lookup_state)
+            is_flex = flex_by_order.get(order_id)
             order_lines = order.get("order_items") or []
             order_gross = sum(
                 float(line.get("unit_price") or line.get("full_unit_price") or 0) * max(1, int(line.get("quantity") or 1))
@@ -9232,6 +9404,10 @@ def query_sales_report(payload, request):
                 order_shipping, order_reimbursement, shipping_source = shipment_financials(
                     client, order, account.get("seller_id"), is_flex, catalog_item, shipment_cost_cache
                 )
+                billing_reimbursement = float(billing_reimbursements.get(order_id) or 0)
+                if billing_reimbursement > order_reimbursement:
+                    order_reimbursement = billing_reimbursement
+                    shipping_source = "Bonificação Flex conciliada pelo faturamento ML"
                 allocation = line_total / order_gross if order_gross > 0 else 1.0 / max(1, len(order_lines))
                 shipping = round(order_shipping * allocation, 2) if order_shipping is not None else None
                 reimbursement = round(order_reimbursement * allocation, 2)
@@ -13550,6 +13726,7 @@ def memory_maintenance_loop():
         (STATISTICS_CACHE, STATISTICS_CACHE_LOCK, 256),
         (SHIPMENT_MODE_CACHE, SHIPMENT_MODE_CACHE_LOCK, 20000),
         (SHIPMENT_COST_CACHE, SHIPMENT_COST_CACHE_LOCK, 50000),
+        (BILLING_ML_ORDER_CACHE, BILLING_ML_ORDER_CACHE_LOCK, 100000),
         (SALE_FEE_CACHE, SALE_FEE_CACHE_LOCK, 100000),
         (CLONE_SOURCE_CACHE, CLONE_SOURCE_CACHE_LOCK, 512),
         (STATIC_FILE_CACHE, STATIC_FILE_CACHE_LOCK, 128),
