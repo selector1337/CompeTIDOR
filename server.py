@@ -1815,6 +1815,23 @@ class MercadoLivreClient:
             raise RuntimeError("Pedido inválido para conciliação.")
         return self.get(f"/orders/{clean_id}", retries=2, timeout=15)
 
+    def seller_order(self, seller_id, order_id):
+        clean_seller_id = str(seller_id or "").strip()
+        clean_order_id = str(order_id or "").strip()
+        if not clean_seller_id.isdigit() or not clean_order_id.isdigit():
+            raise RuntimeError("Pedido ou vendedor inválido para conciliação.")
+        params = {
+            "seller": clean_seller_id,
+            "q": clean_order_id,
+            "display": "complete",
+            "limit": 1,
+        }
+        return self.get(
+            f"/orders/search?{urlencode(params)}",
+            retries=2,
+            timeout=15,
+        )
+
     def shipment(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}", extra_headers={"x-format-new": "true"})
 
@@ -1858,6 +1875,37 @@ class MercadoLivreClient:
         }
         return self.get(
             f"/billing/integration/group/ML/order/details?{urlencode(params)}",
+            retries=2,
+            timeout=20,
+        )
+
+    def ml_billing_period_shipping_bonuses(self, period_key, order_ids, document_type):
+        """Read shipping bonuses from the official monthly billing report."""
+        clean_period = str(period_key or "").strip()
+        try:
+            period_date = date.fromisoformat(clean_period)
+        except (TypeError, ValueError):
+            raise RuntimeError("Período de faturamento inválido para conciliação.")
+        if period_date.day != 1:
+            raise RuntimeError("O período de faturamento precisa começar no primeiro dia do mês.")
+        clean_ids = [str(value) for value in order_ids or [] if str(value).isdigit()][:60]
+        if not clean_ids:
+            return {"results": []}
+        clean_document_type = str(document_type or "").strip().upper()
+        if clean_document_type not in {"BILL", "CREDIT_NOTE"}:
+            raise RuntimeError("Tipo de documento de faturamento inválido.")
+        params = {
+            "document_type": clean_document_type,
+            "order_ids": ",".join(clean_ids),
+            "detail_type": "bonus",
+            "marketplace_type": "SHIPPING",
+            "limit": 1000,
+            "from_id": 0,
+            "sort_by": "ID",
+            "order_by": "ASC",
+        }
+        return self.get(
+            f"/billing/integration/periods/key/{clean_period}/group/ML/details?{urlencode(params)}",
             retries=2,
             timeout=20,
         )
@@ -9293,6 +9341,13 @@ def flex_billing_detail_amount(detail):
         discount.get("discount_reason"),
     )))
     marketplace = normalized_billing_text(first_present(detail, ["marketplace_info.marketplace"], ""))
+    shipping_discount = 0.0
+    if marketplace == "shipping":
+        for key in ("discount_amount", "rebate"):
+            candidate = optional_money(discount.get(key))
+            if candidate not in (None, 0):
+                shipping_discount = abs(candidate)
+                break
     shipping_bonus_description = any(
         term in description
         for term in (
@@ -9308,7 +9363,7 @@ def flex_billing_detail_amount(detail):
         )
     )
     shipping_bonus_detail = marketplace == "shipping" and (
-        detail_type == "bonus" or status.startswith("bonus")
+        detail_type == "bonus" or status.startswith("bonus") or shipping_discount > 0
     )
     is_flex = (
         concept == "flex"
@@ -9319,7 +9374,7 @@ def flex_billing_detail_amount(detail):
     )
     if not is_flex:
         return 0.0
-    amount = optional_money(charge.get("detail_amount"))
+    amount = shipping_discount if detail_type == "charge" and shipping_discount > 0 else optional_money(charge.get("detail_amount"))
     if amount is None or amount == 0:
         for key in ("discount_amount", "rebate"):
             amount = optional_money(discount.get(key))
@@ -9341,6 +9396,7 @@ def flex_billing_detail_amount(detail):
         or "reembolso" in description
         or "refund" in description
         or "credito por envio" in description
+        or shipping_discount > 0
     )
     return amount if is_bonus else 0.0
 
@@ -9387,16 +9443,39 @@ def flex_reimbursements_from_billing(payload, requested_order_ids=None):
 
 def order_net_received_amount(order):
     """Read the seller net amount exposed inside the official order payload."""
-    if not isinstance(order, dict):
+    if not isinstance(order, (dict, list)):
         return None
     total = 0.0
     found = False
-    for payment in order.get("payments") or []:
+    seen_payments = set()
+    payments = []
+
+    def collect(node):
+        if isinstance(node, list):
+            for child in node:
+                collect(child)
+            return
+        if not isinstance(node, dict):
+            return
+        node_payments = node.get("payments")
+        if isinstance(node_payments, list):
+            payments.extend(node_payments)
+        for key in ("results", "orders"):
+            if key in node:
+                collect(node.get(key))
+
+    collect(order)
+    for payment in payments:
         if not isinstance(payment, dict):
             continue
         status = str(payment.get("status") or "").lower()
         if status in {"cancelled", "canceled", "rejected", "refunded"}:
             continue
+        payment_id = first_present(payment, ["id", "payment_id"], None)
+        fingerprint = str(payment_id) if payment_id not in (None, "") else str(id(payment))
+        if fingerprint in seen_payments:
+            continue
+        seen_payments.add(fingerprint)
         details = payment.get("transaction_details") or {}
         amount = optional_money(details.get("net_received_amount")) if isinstance(details, dict) else None
         if amount is None:
@@ -9408,7 +9487,7 @@ def order_net_received_amount(order):
     return round(total, 2) if found else None
 
 
-def fetch_order_net_received(client, order):
+def fetch_order_net_received(client, order, seller_id=None):
     """Hydrate only missing order financials and cache the derived scalar value."""
     direct = order_net_received_amount(order)
     if direct is not None:
@@ -9419,8 +9498,9 @@ def fetch_order_net_received(client, order):
     now = time.monotonic()
     positive_ttl = max(3600, int(os.getenv("MELI_ORDER_NET_CACHE_SECONDS", "86400")))
     pending_ttl = max(60, int(os.getenv("MELI_ORDER_NET_PENDING_CACHE_SECONDS", "300")))
+    cache_key = f"order-net-v2:{seller_id or '-'}:{order_id}"
     with ORDER_NET_RECEIVED_CACHE_LOCK:
-        cached = ORDER_NET_RECEIVED_CACHE.get(order_id)
+        cached = ORDER_NET_RECEIVED_CACHE.get(cache_key)
         ttl = positive_ttl if cached and cached.get("amount") is not None else pending_ttl
         if cached and now - float(cached.get("time") or 0) < ttl:
             return cached.get("amount"), str(cached.get("source") or "order_cache")
@@ -9433,8 +9513,18 @@ def fetch_order_net_received(client, order):
             source = "order_detail"
     except Exception:
         source = "order_detail_unavailable"
+    if amount is None and seller_id not in (None, ""):
+        seller_order_reader = getattr(client, "seller_order", None)
+        if callable(seller_order_reader):
+            try:
+                detail = seller_order_reader(seller_id, order_id)
+                amount = order_net_received_amount(detail)
+                if amount is not None:
+                    source = "seller_order_search"
+            except Exception:
+                pass
     with ORDER_NET_RECEIVED_CACHE_LOCK:
-        ORDER_NET_RECEIVED_CACHE[order_id] = {"amount": amount, "source": source, "time": now}
+        ORDER_NET_RECEIVED_CACHE[cache_key] = {"amount": amount, "source": source, "time": now}
     return amount, source
 
 
@@ -9446,8 +9536,8 @@ def inferred_flex_reimbursement(net_received, gross, fee, shipping):
     return difference if difference > 0.009 else 0.0
 
 
-def fetch_flex_billing_reimbursements(client, order_ids):
-    """Fetch only ML billing bonuses and cache the derived amount per order."""
+def fetch_flex_billing_reimbursements(client, order_ids, order_periods=None):
+    """Fetch shipping bonuses from monthly ML billing and cache them per order."""
     unique_ids = list(dict.fromkeys(str(value) for value in order_ids or [] if str(value).isdigit()))
     if not unique_ids:
         return {}, []
@@ -9458,7 +9548,7 @@ def fetch_flex_billing_reimbursements(client, order_ids):
     missing = []
     with BILLING_ML_ORDER_CACHE_LOCK:
         for order_id in unique_ids:
-            cache_key = f"shipping-bonus-v2:{order_id}"
+            cache_key = f"shipping-bonus-v3:{order_id}"
             cached = BILLING_ML_ORDER_CACHE.get(cache_key)
             ttl = positive_ttl if cached and float(cached.get("amount") or 0) > 0 else pending_ttl
             if cached and now - float(cached.get("time") or 0) < ttl:
@@ -9466,12 +9556,60 @@ def fetch_flex_billing_reimbursements(client, order_ids):
             else:
                 missing.append(order_id)
     warnings = []
-    for start in range(0, len(missing), 60):
-        batch = missing[start:start + 60]
+    period_reader = getattr(client, "ml_billing_period_shipping_bonuses", None)
+    grouped_by_period = {}
+    legacy_ids = []
+    for order_id in missing:
+        period = (order_periods or {}).get(order_id)
+        if isinstance(period, (list, tuple, set)):
+            periods = [str(value or "").strip() for value in period]
+        else:
+            periods = [str(period or "").strip()]
+        periods = [value for value in periods if re.fullmatch(r"\d{4}-\d{2}-01", value)]
+        if callable(period_reader) and periods:
+            for period_key in dict.fromkeys(periods):
+                grouped_by_period.setdefault(period_key, []).append(order_id)
+        else:
+            legacy_ids.append(order_id)
+
+    resolved = {order_id: 0.0 for order_id in missing}
+    period_failures = []
+    for period_key, period_order_ids in grouped_by_period.items():
+        for start in range(0, len(period_order_ids), 60):
+            batch = period_order_ids[start:start + 60]
+            combined_results = []
+            successful_documents = 0
+            for document_type in ("BILL", "CREDIT_NOTE"):
+                try:
+                    response = period_reader(period_key, batch, document_type)
+                    successful_documents += 1
+                    response_results = response.get("results") if isinstance(response, dict) else []
+                    if isinstance(response_results, list):
+                        combined_results.extend(response_results)
+                    elif isinstance(response_results, dict):
+                        combined_results.append(response_results)
+                except Exception as exc:
+                    period_failures.append(exc)
+            if successful_documents:
+                parsed = flex_reimbursements_from_billing({"results": combined_results}, batch)
+                for order_id in batch:
+                    resolved[order_id] = max(resolved.get(order_id, 0.0), float(parsed.get(order_id) or 0))
+            else:
+                legacy_ids.extend(batch)
+
+    # Compatibility fallback for credentials or old API behavior. It is also
+    # useful when a recently created bonus has not entered the monthly report.
+    legacy_ids.extend(order_id for order_id in missing if resolved.get(order_id, 0) <= 0)
+    legacy_ids = list(dict.fromkeys(legacy_ids))
+    for start in range(0, len(legacy_ids), 60):
+        batch = legacy_ids[start:start + 60]
         try:
             bonus_reader = getattr(client, "ml_billing_shipping_bonuses", None)
             response = bonus_reader(batch) if callable(bonus_reader) else client.ml_billing_order_details(batch)
             parsed = flex_reimbursements_from_billing(response, batch)
+            if not any(float(parsed.get(order_id) or 0) > 0 for order_id in batch):
+                response = client.ml_billing_order_details(batch)
+                parsed = flex_reimbursements_from_billing(response, batch)
         except Exception as exc:
             # Some older credentials may reject the optional filters. Keep the
             # official order report as a compatibility fallback.
@@ -9481,12 +9619,15 @@ def fetch_flex_billing_reimbursements(client, order_ids):
             except Exception:
                 warnings.append(f"Bonificações Flex não retornadas: {policy_error_message(exc, 'a conciliação do bônus Flex')}" )
                 continue
-        with BILLING_ML_ORDER_CACHE_LOCK:
-            for order_id in batch:
-                amount = float(parsed.get(order_id) or 0)
-                cache_key = f"shipping-bonus-v2:{order_id}"
-                BILLING_ML_ORDER_CACHE[cache_key] = {"amount": amount, "time": now}
-                amounts[order_id] = amount
+        for order_id in batch:
+            resolved[order_id] = max(resolved.get(order_id, 0.0), float(parsed.get(order_id) or 0))
+
+    with BILLING_ML_ORDER_CACHE_LOCK:
+        for order_id in missing:
+            amount = round(max(0.0, float(resolved.get(order_id) or 0)), 2)
+            cache_key = f"shipping-bonus-v3:{order_id}"
+            BILLING_ML_ORDER_CACHE[cache_key] = {"amount": amount, "time": now}
+            amounts[order_id] = amount
     return amounts, warnings
 
 
@@ -9589,14 +9730,19 @@ def query_sales_report(payload, request):
             warnings.append(f"{account.get('nickname')}: {policy_error_message(exc, 'a leitura das vendas do período')}")
             continue
         flex_by_order = {}
+        billing_period_by_order = {}
         for order in orders:
             order_id = str(order.get("id") or "")
             flex_by_order[order_id] = order_is_flex(
                 client, order, catalog_by_account_item, shipment_mode_cache, shipment_lookup_state
             )
+            sold_at = parse_meli_datetime(order.get("date_created") or order.get("last_updated"))
+            if sold_at and order_id:
+                billing_period_by_order[order_id] = f"{sold_at.year:04d}-{sold_at.month:02d}-01"
         billing_reimbursements, billing_warnings = fetch_flex_billing_reimbursements(
             client,
             [order_id for order_id, flex in flex_by_order.items() if flex is True],
+            billing_period_by_order,
         )
         warnings.extend(f"{account.get('nickname')}: {warning}" for warning in billing_warnings)
         for order in orders:
@@ -9643,7 +9789,9 @@ def query_sales_report(payload, request):
             if is_flex is True:
                 reimbursement_status = "confirmed" if order_reimbursement > 0 else "pending"
                 if order_reimbursement <= 0 and order_fees_complete and order_shipping is not None:
-                    net_received, net_source = fetch_order_net_received(client, order)
+                    net_received, net_source = fetch_order_net_received(
+                        client, order, account.get("seller_id")
+                    )
                     inferred = inferred_flex_reimbursement(
                         net_received, order_gross, round(order_fee_total, 2), order_shipping
                     )
