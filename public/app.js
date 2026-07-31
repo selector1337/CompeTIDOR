@@ -2778,6 +2778,16 @@ function updateSalesReportPeriodFields() {
   form.querySelectorAll("[data-sales-custom]").forEach((node) => { node.hidden = period !== "custom"; });
 }
 
+function salesReimbursementPresentation(row) {
+  const amount = Number(row.shipping_reimbursement_amount || 0);
+  if (amount > 0) return { label: money.format(amount), className: "profit-positive", title: row.shipping_source || "Estorno confirmado" };
+  if (!row.flex) return { label: money.format(0), className: "", title: "Não se aplica a esta modalidade" };
+  if (row.shipping_reimbursement_status === "not_identified") {
+    return { label: "Não identificado", className: "reimbursement-pending", title: row.shipping_source || "Pedido conciliado sem estorno identificado" };
+  }
+  return { label: "Aguardando conciliação", className: "reimbursement-pending", title: row.shipping_source || "O Mercado Livre ainda não disponibilizou o estorno" };
+}
+
 function renderSalesReport() {
   const form = document.querySelector("#sales-report-form");
   const feedback = document.querySelector("#sales-report-feedback");
@@ -2817,7 +2827,9 @@ function renderSalesReport() {
   state.salesReportPage = pageInfo.current;
   results.innerHTML = `${paginationHtml("salesReportPage", pageInfo)}
     <div class="sales-report-table">
-      ${pageInfo.items.map((row) => `
+      ${pageInfo.items.map((row) => {
+        const reimbursement = salesReimbursementPresentation(row);
+        return `
         <article class="sales-report-row">
           ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
           <div class="sales-report-product"><div class="sales-report-product-title"><strong>${escapeText(row.product)}</strong>${row.flex ? `<span class="sales-flex-badge">FLEX</span>` : ""}</div><small>${escapeText(row.account)} · SKU ${escapeText(row.sku)} · Pedido ${escapeText(row.order_id)}</small><small>${formatDateBR(row.date)}</small></div>
@@ -2826,11 +2838,12 @@ function renderSalesReport() {
           <span><small>Tarifa de venda</small><strong>${row.percentage_fee_amount == null ? "Não disponível" : money.format(row.percentage_fee_amount)}</strong></span>
           <span><small>Custo fixo</small><strong>${row.fixed_fee_amount == null ? "Não disponível" : money.format(row.fixed_fee_amount)}</strong></span>
           <span><small>Frete</small><strong>${row.shipping_amount == null ? "Não disponível" : money.format(row.shipping_amount)}</strong></span>
-          <span class="${Number(row.shipping_reimbursement_amount || 0) > 0 ? "profit-positive" : ""}"><small>Estorno</small><strong>${money.format(row.shipping_reimbursement_amount || 0)}</strong></span>
+          <span class="${reimbursement.className}" title="${escapeAttr(reimbursement.title)}"><small>Estorno</small><strong>${escapeText(reimbursement.label)}</strong></span>
           <span><small>Líquido</small><strong>${row.net_amount == null ? "Calculando" : money.format(row.net_amount)}</strong></span>
           <span><small>Custo</small><strong>${row.cost_amount == null ? "Sem custo" : money.format(row.cost_amount)}</strong></span>
           <span class="${row.profit_status === "profit" ? "profit-positive" : row.profit_status === "loss" ? "profit-negative" : ""}"><small>Resultado</small><strong>${row.profit_amount == null ? "Sem custo" : money.format(row.profit_amount)}</strong><em>${row.profit_percentage == null ? "" : `${row.profit_percentage >= 0 ? "+" : ""}${Number(row.profit_percentage).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</em></span>
-        </article>`).join("") || `<div class="notice">Nenhuma venda encontrada no período.</div>`}
+        </article>`;
+      }).join("") || `<div class="notice">Nenhuma venda encontrada no período.</div>`}
     </div>${paginationHtml("salesReportPage", pageInfo)}`;
 }
 

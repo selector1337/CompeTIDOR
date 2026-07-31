@@ -1758,6 +1758,13 @@ h2 {
   box-shadow: 0 0 8px color-mix(in srgb, #dfe3ea 72%, transparent);
 }
 
+.sales-report-row .reimbursement-pending strong {
+  color: var(--warning);
+  font-size: 0.78rem;
+  line-height: 1.15;
+  max-width: 8.75rem;
+}
+
 .price-schedule-status {
   display: flex;
   align-items: center;

@@ -146,6 +146,8 @@ SHIPMENT_COST_CACHE_LOCK = threading.RLock()
 SHIPMENT_COST_CACHE = {}
 BILLING_ML_ORDER_CACHE_LOCK = threading.RLock()
 BILLING_ML_ORDER_CACHE = {}
+ORDER_NET_RECEIVED_CACHE_LOCK = threading.RLock()
+ORDER_NET_RECEIVED_CACHE = {}
 SALE_FEE_CACHE_LOCK = threading.RLock()
 SALE_FEE_CACHE = {}
 CLONE_SOURCE_CACHE_LOCK = threading.RLock()
@@ -224,6 +226,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/products/[^/]+/items(\?|$)"),
     re.compile(r"^/user-products/[^/]+(\?|$)"),
     re.compile(r"^/orders/search(\?|$)"),
+    re.compile(r"^/orders/[0-9]+$"),
     re.compile(r"^/shipments/[^/]+(\?|$)"),
     re.compile(r"^/shipments/[^/]+/costs(\?|$)"),
     re.compile(r"^/shipments/[^/]+/sla(\?|$)"),
@@ -1805,6 +1808,12 @@ class MercadoLivreClient:
         if date_to:
             params["order.date_created.to"] = date_to
         return self.get(f"/orders/search?{urlencode(params)}")
+
+    def order(self, order_id):
+        clean_id = str(order_id or "").strip()
+        if not clean_id.isdigit():
+            raise RuntimeError("Pedido inválido para conciliação.")
+        return self.get(f"/orders/{clean_id}", retries=2, timeout=15)
 
     def shipment(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}", extra_headers={"x-format-new": "true"})
@@ -9253,6 +9262,67 @@ def flex_reimbursements_from_billing(payload, requested_order_ids=None):
     return {key: round(max(0.0, value), 2) for key, value in reimbursements.items()}
 
 
+def order_net_received_amount(order):
+    """Read the seller net amount exposed inside the official order payload."""
+    if not isinstance(order, dict):
+        return None
+    total = 0.0
+    found = False
+    for payment in order.get("payments") or []:
+        if not isinstance(payment, dict):
+            continue
+        status = str(payment.get("status") or "").lower()
+        if status in {"cancelled", "canceled", "rejected", "refunded"}:
+            continue
+        details = payment.get("transaction_details") or {}
+        amount = optional_money(details.get("net_received_amount")) if isinstance(details, dict) else None
+        if amount is None:
+            amount = optional_money(payment.get("net_received_amount"))
+        if amount is None:
+            continue
+        total += amount
+        found = True
+    return round(total, 2) if found else None
+
+
+def fetch_order_net_received(client, order):
+    """Hydrate only missing order financials and cache the derived scalar value."""
+    direct = order_net_received_amount(order)
+    if direct is not None:
+        return direct, "order_search"
+    order_id = str((order or {}).get("id") or "")
+    if not order_id.isdigit():
+        return None, "unavailable"
+    now = time.monotonic()
+    positive_ttl = max(3600, int(os.getenv("MELI_ORDER_NET_CACHE_SECONDS", "86400")))
+    pending_ttl = max(60, int(os.getenv("MELI_ORDER_NET_PENDING_CACHE_SECONDS", "300")))
+    with ORDER_NET_RECEIVED_CACHE_LOCK:
+        cached = ORDER_NET_RECEIVED_CACHE.get(order_id)
+        ttl = positive_ttl if cached and cached.get("amount") is not None else pending_ttl
+        if cached and now - float(cached.get("time") or 0) < ttl:
+            return cached.get("amount"), str(cached.get("source") or "order_cache")
+    amount = None
+    source = "order_detail_pending"
+    try:
+        detail = client.order(order_id)
+        amount = order_net_received_amount(detail)
+        if amount is not None:
+            source = "order_detail"
+    except Exception:
+        source = "order_detail_unavailable"
+    with ORDER_NET_RECEIVED_CACHE_LOCK:
+        ORDER_NET_RECEIVED_CACHE[order_id] = {"amount": amount, "source": source, "time": now}
+    return amount, source
+
+
+def inferred_flex_reimbursement(net_received, gross, fee, shipping):
+    if any(value is None for value in (net_received, gross, fee, shipping)):
+        return None
+    baseline = float(gross) - float(fee) - float(shipping)
+    difference = round(float(net_received) - baseline, 2)
+    return difference if difference > 0.009 else 0.0
+
+
 def fetch_flex_billing_reimbursements(client, order_ids):
     """Fetch only ML billing bonuses and cache the derived amount per order."""
     unique_ids = list(dict.fromkeys(str(value) for value in order_ids or [] if str(value).isdigit()))
@@ -9387,6 +9457,50 @@ def query_sales_report(payload, request):
                 float(line.get("unit_price") or line.get("full_unit_price") or 0) * max(1, int(line.get("quantity") or 1))
                 for line in order_lines
             )
+            order_fee_total = 0.0
+            order_fees_complete = True
+            first_catalog_item = {}
+            for line in order_lines:
+                line_source = line.get("item") or {}
+                line_item_id = str(line_source.get("id") or "")
+                line_catalog_item = (
+                    catalog_by_account_item.get((str(account.get("id") or ""), line_item_id))
+                    or catalog_by_name_item.get((str(account.get("nickname") or ""), line_item_id))
+                    or {}
+                )
+                if not first_catalog_item:
+                    first_catalog_item = line_catalog_item
+                line_quantity = max(1, int(line.get("quantity") or 1))
+                line_unit_price = float(line.get("unit_price") or line.get("full_unit_price") or 0)
+                line_fee = order_item_fee_amount(
+                    line, line_catalog_item, round(line_unit_price * line_quantity, 2), line_quantity
+                )
+                if line_fee is None:
+                    order_fees_complete = False
+                else:
+                    order_fee_total += line_fee
+            order_shipping, order_reimbursement, shipping_source = shipment_financials(
+                client, order, account.get("seller_id"), is_flex, first_catalog_item, shipment_cost_cache
+            )
+            billing_reimbursement = float(billing_reimbursements.get(order_id) or 0)
+            if billing_reimbursement > order_reimbursement:
+                order_reimbursement = billing_reimbursement
+                shipping_source = "Bonificação Flex conciliada pelo faturamento ML"
+            reimbursement_status = "not_applicable"
+            if is_flex is True:
+                reimbursement_status = "confirmed" if order_reimbursement > 0 else "pending"
+                if order_reimbursement <= 0 and order_fees_complete and order_shipping is not None:
+                    net_received, net_source = fetch_order_net_received(client, order)
+                    inferred = inferred_flex_reimbursement(
+                        net_received, order_gross, round(order_fee_total, 2), order_shipping
+                    )
+                    if inferred is not None and inferred > 0:
+                        order_reimbursement = inferred
+                        reimbursement_status = "confirmed"
+                        shipping_source = "Estorno Flex conciliado pelo líquido oficial do pedido"
+                    elif net_received is not None:
+                        reimbursement_status = "not_identified"
+                        shipping_source = f"Pedido conciliado sem estorno Flex ({net_source})"
             for order_item in order.get("order_items") or []:
                 source = order_item.get("item") or {}
                 item_id = str(source.get("id") or "")
@@ -9401,13 +9515,6 @@ def query_sales_report(payload, request):
                 fee = order_item_fee_amount(order_item, catalog_item, line_total, quantity)
                 fixed_fee = sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price, quantity, fee)
                 percentage_fee = round(fee - fixed_fee, 2) if fee is not None and fixed_fee is not None else None
-                order_shipping, order_reimbursement, shipping_source = shipment_financials(
-                    client, order, account.get("seller_id"), is_flex, catalog_item, shipment_cost_cache
-                )
-                billing_reimbursement = float(billing_reimbursements.get(order_id) or 0)
-                if billing_reimbursement > order_reimbursement:
-                    order_reimbursement = billing_reimbursement
-                    shipping_source = "Bonificação Flex conciliada pelo faturamento ML"
                 allocation = line_total / order_gross if order_gross > 0 else 1.0 / max(1, len(order_lines))
                 shipping = round(order_shipping * allocation, 2) if order_shipping is not None else None
                 reimbursement = round(order_reimbursement * allocation, 2)
@@ -9442,6 +9549,7 @@ def query_sales_report(payload, request):
                         "fixed_fee_amount": fixed_fee,
                         "shipping_amount": shipping,
                         "shipping_reimbursement_amount": reimbursement,
+                        "shipping_reimbursement_status": reimbursement_status,
                         "shipping_source": shipping_source,
                         "shipping_method": "Mercado Envios Flex" if sale_is_flex else "Outra modalidade",
                         "net_amount": net,
@@ -10655,6 +10763,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             ("fixed_fee_amount", "Custo fixo", "currency"),
             ("shipping_amount", "Frete debitado", "currency"),
             ("shipping_reimbursement_amount", "Estorno Flex", "currency"),
+            ("shipping_reimbursement_status", "Situação do estorno", "text"),
             ("shipping_source", "Origem do frete", "text"),
             ("net_amount", "Valor líquido", "currency"),
             ("cost_amount", "Custo total", "currency"),
@@ -13727,6 +13836,7 @@ def memory_maintenance_loop():
         (SHIPMENT_MODE_CACHE, SHIPMENT_MODE_CACHE_LOCK, 20000),
         (SHIPMENT_COST_CACHE, SHIPMENT_COST_CACHE_LOCK, 50000),
         (BILLING_ML_ORDER_CACHE, BILLING_ML_ORDER_CACHE_LOCK, 100000),
+        (ORDER_NET_RECEIVED_CACHE, ORDER_NET_RECEIVED_CACHE_LOCK, 100000),
         (SALE_FEE_CACHE, SALE_FEE_CACHE_LOCK, 100000),
         (CLONE_SOURCE_CACHE, CLONE_SOURCE_CACHE_LOCK, 512),
         (STATIC_FILE_CACHE, STATIC_FILE_CACHE_LOCK, 128),
