@@ -1824,6 +1824,14 @@ class MercadoLivreClient:
             extra_headers={"x-format-new": "true"},
         )
 
+    def shipment_payments(self, shipment_id):
+        return self.get(
+            f"/shipments/{shipment_id}/payments",
+            extra_headers={"x-format-new": "true"},
+            retries=2,
+            timeout=15,
+        )
+
     def ml_billing_order_details(self, order_ids):
         clean_ids = [str(value) for value in order_ids or [] if str(value).isdigit()][:60]
         if not clean_ids:
@@ -9185,6 +9193,35 @@ def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False):
     return round(shipping, 2), round(reimbursement, 2)
 
 
+def shipment_payment_reimbursement(payments_payload, seller_id):
+    """Return approved shipping credits paid to the connected seller."""
+    payments = payments_payload or []
+    if isinstance(payments, dict):
+        payments = payments.get("results") or payments.get("payments") or [payments]
+    if not isinstance(payments, list):
+        return 0.0
+    total = 0.0
+    seen = set()
+    for payment in payments:
+        if not isinstance(payment, dict):
+            continue
+        status = str(payment.get("status") or "").strip().lower()
+        if status not in {"approved", "accredited"}:
+            continue
+        recipient_id = first_present(payment, ["user_id", "seller_id", "collector_id"], None)
+        if seller_id in (None, "") or str(recipient_id) != str(seller_id):
+            continue
+        payment_id = first_present(payment, ["payment_id", "id"], None)
+        fingerprint = str(payment_id) if payment_id not in (None, "") else str(id(payment))
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        amount = optional_money(payment.get("amount"))
+        if amount is not None and amount > 0:
+            total += amount
+    return round(total, 2)
+
+
 def normalized_billing_text(value):
     return re.sub(
         r"\s+",
@@ -9435,7 +9472,7 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
     now = time.monotonic()
     # Versioned because older cache entries used promoted_amount * rate and
     # could persist a value ten times smaller than the official reimbursement.
-    global_key = f"seller-compensation-v4:{key}"
+    global_key = f"seller-compensation-v5:{key}"
     with SHIPMENT_COST_CACHE_LOCK:
         cached = SHIPMENT_COST_CACHE.get(global_key)
     if cached and now - cached.get("time", 0) < ttl:
@@ -9447,10 +9484,21 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
         shipping, reimbursement = shipment_seller_costs(payload, seller_id, is_flex=is_flex is True)
         if shipping is None:
             raise RuntimeError("A API não informou o custo do remetente.")
+        reimbursement_source = ""
+        if is_flex is True and reimbursement <= 0:
+            try:
+                payment_payload = client.shipment_payments(shipment_id)
+                payment_reimbursement = shipment_payment_reimbursement(payment_payload, seller_id)
+                if payment_reimbursement > 0:
+                    reimbursement = payment_reimbursement
+                    reimbursement_source = "Pagamento aprovado do envio Flex ao vendedor"
+            except Exception:
+                pass
         result = (
             shipping,
             reimbursement,
-            "Mercado Envios Flex: frete sem débito e bônus oficial do envio"
+            reimbursement_source
+            or "Mercado Envios Flex: frete sem débito e bônus oficial do envio"
             if is_flex is True and reimbursement > 0
             else "Mercado Envios Flex: frete sem débito confirmado pela API"
             if is_flex is True
@@ -9577,6 +9625,9 @@ def query_sales_report(payload, request):
                     elif net_received is not None:
                         reimbursement_status = "not_identified"
                         shipping_source = f"Pedido conciliado sem estorno Flex ({net_source})"
+                    else:
+                        reimbursement_status = "not_identified"
+                        shipping_source = "Estorno não retornado pelas fontes oficiais consultadas"
             for order_item in order.get("order_items") or []:
                 source = order_item.get("item") or {}
                 item_id = str(source.get("id") or "")
