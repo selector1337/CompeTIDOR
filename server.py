@@ -142,6 +142,8 @@ SPREADSHEET_JOBS_LOCK = threading.RLock()
 SPREADSHEET_JOBS = {}
 SHIPMENT_MODE_CACHE_LOCK = threading.RLock()
 SHIPMENT_MODE_CACHE = {}
+SHIPMENT_COST_CACHE_LOCK = threading.RLock()
+SHIPMENT_COST_CACHE = {}
 SALE_FEE_CACHE_LOCK = threading.RLock()
 SALE_FEE_CACHE = {}
 CLONE_SOURCE_CACHE_LOCK = threading.RLock()
@@ -218,6 +220,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/user-products/[^/]+(\?|$)"),
     re.compile(r"^/orders/search(\?|$)"),
     re.compile(r"^/shipments/[^/]+(\?|$)"),
+    re.compile(r"^/shipments/[^/]+/costs(\?|$)"),
     re.compile(r"^/shipments/[^/]+/sla(\?|$)"),
     re.compile(r"^/claims/search(\?|$)"),
     re.compile(r"^/v1/claims/search(\?|$)"),
@@ -1716,13 +1719,20 @@ class MercadoLivreClient:
         params = {"item_id": item_id, "verbose": "true"}
         return self.get(f"/users/{seller_id}/shipping_options/free?{urlencode(params)}")
 
-    def listing_prices(self, site_id, price, listing_type_id, category_id=""):
+    def listing_prices(
+        self, site_id, price, listing_type_id, category_id="",
+        logistic_type="", shipping_mode="",
+    ):
         params = {
             "price": f"{float(price):.2f}",
             "listing_type_id": listing_type_id,
         }
         if category_id:
             params["category_id"] = category_id
+        if logistic_type:
+            params["logistic_type"] = logistic_type
+        if shipping_mode:
+            params["shipping_mode"] = shipping_mode
         return self.get(f"/sites/{site_id or 'MLB'}/listing_prices?{urlencode(params)}")
 
     def price_to_win(self, item_id):
@@ -1791,6 +1801,9 @@ class MercadoLivreClient:
 
     def shipment(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}", extra_headers={"x-format-new": "true"})
+
+    def shipment_costs(self, shipment_id):
+        return self.get(f"/shipments/{shipment_id}/costs")
 
     def shipment_sla(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}/sla")
@@ -9014,23 +9027,130 @@ def query_active_skus_without_sales(payload, request):
     }
 
 
-def order_item_fee_amount(order_item, catalog_item, line_total):
-    candidates = (
-        order_item.get("sale_fee"),
-        order_item.get("sale_fee_amount"),
-        first_present(order_item, ["sale_fee_details.total", "fees.sale_fee"], None),
-    )
-    for candidate in candidates:
-        try:
-            if candidate not in (None, ""):
-                return round(max(0.0, float(candidate)), 2)
-        except (TypeError, ValueError):
-            continue
+def optional_money(value):
+    if isinstance(value, dict):
+        value = first_present(value, ["amount", "value", "cost"], None)
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def order_item_fee_amount(order_item, catalog_item, line_total, quantity=1):
+    # The Orders API exposes sale_fee per sold unit. Keeping the multiplication
+    # here avoids understating fees when one order line contains several units.
+    per_unit_candidates = (order_item.get("sale_fee"), order_item.get("sale_fee_amount"))
+    for candidate in per_unit_candidates:
+        amount = optional_money(candidate)
+        if amount is not None:
+            return round(max(0.0, amount) * max(1, int(quantity or 1)), 2)
+    nested_total = optional_money(first_present(order_item, ["sale_fee_details.total", "fees.sale_fee"], None))
+    if nested_total is not None:
+        return round(max(0.0, nested_total), 2)
     listing_price = float(catalog_item.get("price") or 0)
     listing_fee = catalog_item.get("sale_fee_amount")
     if listing_price > 0 and listing_fee not in (None, ""):
         return round(max(0.0, float(listing_fee)) * max(0.0, line_total) / listing_price, 2)
     return None
+
+
+def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price, quantity, total_fee):
+    if total_fee is None:
+        return None
+    fixed = optional_money(first_present(order_item, ["sale_fee_details.fixed_fee", "fees.fixed_fee"], None))
+    if fixed is not None:
+        return round(min(total_fee, max(0.0, fixed) * max(1, int(quantity or 1))), 2)
+
+    listing_type = catalog_item.get("listing_type_id") or first_present(order_item, ["item.listing_type_id"], "")
+    if not listing_type or unit_price <= 0:
+        return 0.0
+    cache_key = (
+        account.get("site_id") or catalog_item.get("site_id") or "MLB",
+        round(float(unit_price), 2),
+        listing_type,
+        catalog_item.get("category_id") or first_present(order_item, ["item.category_id"], ""),
+        catalog_item.get("shipping_logistic_type") or "",
+        catalog_item.get("shipping_mode") or "",
+    )
+    try:
+        with SALE_FEE_CACHE_LOCK:
+            cached = SALE_FEE_CACHE.get(cache_key)
+        if cached and time.monotonic() - cached.get("created", 0) < 21600:
+            details = cached.get("details") or {}
+        else:
+            response = client.listing_prices(
+                cache_key[0], cache_key[1], cache_key[2], category_id=cache_key[3],
+                logistic_type=cache_key[4], shipping_mode=cache_key[5],
+            )
+            _, details = sale_fee_values(response, listing_type)
+            with SALE_FEE_CACHE_LOCK:
+                SALE_FEE_CACHE[cache_key] = {
+                    "amount": optional_money(details.get("sale_fee_amount")),
+                    "details": details,
+                    "created": time.monotonic(),
+                }
+        fixed = optional_money(first_present(details, ["sale_fee_details.fixed_fee", "fixed_fee"], None))
+    except Exception:
+        fixed = None
+    if fixed is None:
+        return 0.0
+    return round(min(total_fee, max(0.0, fixed) * max(1, int(quantity or 1))), 2)
+
+
+def shipment_seller_costs(cost_payload, seller_id=None):
+    """Return actual seller debit and reimbursement from shipment costs."""
+    if not isinstance(cost_payload, dict):
+        return None, 0.0
+    senders = cost_payload.get("senders") or []
+    if isinstance(senders, dict):
+        senders = [senders]
+    selected = next(
+        (
+            sender for sender in senders if isinstance(sender, dict)
+            and seller_id not in (None, "")
+            and str(first_present(sender, ["user_id", "seller_id", "id"], "")) == str(seller_id)
+        ),
+        next((sender for sender in senders if isinstance(sender, dict)), None),
+    )
+    if not selected:
+        return None, 0.0
+    signed_cost = optional_money(selected.get("cost"))
+    if signed_cost is None:
+        return None, 0.0
+    return round(max(0.0, signed_cost), 2), round(max(0.0, -signed_cost), 2)
+
+
+def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_cache):
+    shipment_id = shipment_id_from_order(order)
+    if shipment_id in (None, "", 0, "0"):
+        return 0.0, 0.0, "Sem cobrança de Mercado Envios"
+    key = str(shipment_id)
+    if key in local_cache:
+        return local_cache[key]
+    ttl = max(300, int(os.getenv("MELI_STATISTICS_SHIPMENT_CACHE_SECONDS", "86400")))
+    now = time.monotonic()
+    with SHIPMENT_COST_CACHE_LOCK:
+        cached = SHIPMENT_COST_CACHE.get(key)
+    if cached and now - cached.get("time", 0) < ttl:
+        result = cached.get("result")
+        local_cache[key] = result
+        return result
+    try:
+        payload = client.shipment_costs(shipment_id)
+        shipping, reimbursement = shipment_seller_costs(payload, seller_id)
+        if shipping is None:
+            raise RuntimeError("A API não informou o custo do remetente.")
+        result = (shipping, reimbursement, "Custo real do envio")
+    except Exception:
+        if is_flex is True:
+            result = (0.0, 0.0, "Flex sem débito de frete; estorno não retornado")
+        else:
+            estimate = optional_money(catalog_item.get("shipping_cost"))
+            result = (round(max(0.0, estimate), 2), 0.0, "Cotação estimada do anúncio") if estimate is not None else (None, 0.0, "Frete não disponível")
+    local_cache[key] = result
+    with SHIPMENT_COST_CACHE_LOCK:
+        SHIPMENT_COST_CACHE[key] = {"time": now, "result": result}
+    return result
 
 
 def query_sales_report(payload, request):
@@ -9064,9 +9184,13 @@ def query_sales_report(payload, request):
     truncated = False
     ignored_statuses = {"cancelled", "canceled", "invalid"}
     for account in accounts:
+        client = account_client(account)
+        shipment_mode_cache = {}
+        shipment_cost_cache = {}
+        shipment_lookup_state = {"count": 0, "maximum": os.getenv("MELI_STATISTICS_SHIPMENT_LOOKUPS", "5000")}
         try:
             orders, account_truncated = fetch_statistics_orders(
-                account_client(account), account.get("seller_id"), start, end
+                client, account.get("seller_id"), start, end
             )
             truncated = truncated or account_truncated
         except Exception as exc:
@@ -9077,6 +9201,12 @@ def query_sales_report(payload, request):
                 continue
             order_id = str(order.get("id") or "")
             sold_at = parse_meli_datetime(order.get("date_created") or order.get("last_updated"))
+            is_flex = order_is_flex(client, order, catalog_by_account_item, shipment_mode_cache, shipment_lookup_state)
+            order_lines = order.get("order_items") or []
+            order_gross = sum(
+                float(line.get("unit_price") or line.get("full_unit_price") or 0) * max(1, int(line.get("quantity") or 1))
+                for line in order_lines
+            )
             for order_item in order.get("order_items") or []:
                 source = order_item.get("item") or {}
                 item_id = str(source.get("id") or "")
@@ -9088,15 +9218,25 @@ def query_sales_report(payload, request):
                 quantity = max(1, int(order_item.get("quantity") or 1))
                 unit_price = float(order_item.get("unit_price") or order_item.get("full_unit_price") or 0)
                 line_total = round(unit_price * quantity, 2)
-                fee = order_item_fee_amount(order_item, catalog_item, line_total)
-                shipping = round(max(0.0, float(catalog_item.get("shipping_cost") or 0)), 2)
+                fee = order_item_fee_amount(order_item, catalog_item, line_total, quantity)
+                fixed_fee = sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price, quantity, fee)
+                percentage_fee = round(fee - fixed_fee, 2) if fee is not None and fixed_fee is not None else None
+                order_shipping, order_reimbursement, shipping_source = shipment_financials(
+                    client, order, account.get("seller_id"), is_flex, catalog_item, shipment_cost_cache
+                )
+                allocation = line_total / order_gross if order_gross > 0 else 1.0 / max(1, len(order_lines))
+                shipping = round(order_shipping * allocation, 2) if order_shipping is not None else None
+                reimbursement = round(order_reimbursement * allocation, 2)
                 sku = order_item_sku(order_item, catalog_item) or "-"
                 cost_record = (payload.get("sku_costs") or {}).get(normalized_sku_key(sku))
                 unit_cost = None
                 if isinstance(cost_record, dict) and cost_record.get("cost") not in (None, ""):
                     unit_cost = round(max(0.0, float(cost_record.get("cost"))), 2)
                 cost_total = round(unit_cost * quantity, 2) if unit_cost is not None else None
-                net = round(line_total - fee - shipping, 2) if fee is not None else None
+                net = (
+                    round(line_total - percentage_fee - fixed_fee - shipping + reimbursement, 2)
+                    if percentage_fee is not None and fixed_fee is not None and shipping is not None else None
+                )
                 profit = round(net - cost_total, 2) if net is not None and cost_total is not None else None
                 margin = round((profit / net) * 100, 2) if profit is not None and net and net > 0 else None
                 rows.append(
@@ -9113,14 +9253,18 @@ def query_sales_report(payload, request):
                         "unit_price": round(unit_price, 2),
                         "gross_amount": line_total,
                         "sale_fee_amount": fee,
+                        "percentage_fee_amount": percentage_fee,
+                        "fixed_fee_amount": fixed_fee,
                         "shipping_amount": shipping,
+                        "shipping_reimbursement_amount": reimbursement,
+                        "shipping_source": shipping_source,
                         "net_amount": net,
                         "unit_cost": unit_cost,
                         "cost_amount": cost_total,
                         "profit_amount": profit,
                         "profit_percentage": margin,
                         "profit_status": "profit" if profit is not None and profit >= 0 else "loss" if profit is not None else "unknown",
-                        "flex": catalog_item.get("shipping_logistic_type") == "self_service",
+                        "flex": is_flex is True,
                     }
                 )
     if not rows and warnings:
@@ -9136,6 +9280,10 @@ def query_sales_report(payload, request):
             "sales": len(rows),
             "units": sum(int(row.get("quantity") or 0) for row in rows),
             "gross_amount": round(sum(float(row.get("gross_amount") or 0) for row in rows), 2),
+            "percentage_fee_amount": round(sum(float(row.get("percentage_fee_amount") or 0) for row in rows), 2),
+            "fixed_fee_amount": round(sum(float(row.get("fixed_fee_amount") or 0) for row in rows), 2),
+            "shipping_amount": round(sum(float(row.get("shipping_amount") or 0) for row in rows if row.get("shipping_amount") is not None), 2),
+            "shipping_reimbursement_amount": round(sum(float(row.get("shipping_reimbursement_amount") or 0) for row in rows), 2),
             "net_amount": round(sum(float(row.get("net_amount") or 0) for row in rows if row.get("net_amount") is not None), 2),
             "profit_amount": round(sum(float(row.get("profit_amount") or 0) for row in rows if row.get("profit_amount") is not None), 2),
         },
@@ -9226,7 +9374,10 @@ def query_brand_sales_report(payload, request):
                 "units": 0,
                 "gross_amount": 0.0,
                 "sale_fee_amount": 0.0,
+                "percentage_fee_amount": 0.0,
+                "fixed_fee_amount": 0.0,
                 "shipping_amount": 0.0,
+                "shipping_reimbursement_amount": 0.0,
                 "net_amount": 0.0,
                 "cost_amount": 0.0,
                 "profit_amount": 0.0,
@@ -9272,11 +9423,14 @@ def query_brand_sales_report(payload, request):
         row["units"] += int(sale.get("quantity") or 0)
         row["gross_amount"] += float(sale.get("gross_amount") or 0)
         row["shipping_amount"] += float(sale.get("shipping_amount") or 0)
+        row["shipping_reimbursement_amount"] += float(sale.get("shipping_reimbursement_amount") or 0)
         if sale.get("order_id"):
             row["orders"].add(str(sale.get("order_id")))
         if sale.get("sale_fee_amount") is not None:
             row["known_fee_sales"] += 1
             row["sale_fee_amount"] += float(sale.get("sale_fee_amount") or 0)
+            row["percentage_fee_amount"] += float(sale.get("percentage_fee_amount") or 0)
+            row["fixed_fee_amount"] += float(sale.get("fixed_fee_amount") or 0)
         if sale.get("net_amount") is not None:
             row["known_net_sales"] += 1
             row["net_amount"] += float(sale.get("net_amount") or 0)
@@ -9345,7 +9499,10 @@ def query_brand_sales_report(payload, request):
                 "orders": len(row["orders"]),
                 "gross_amount": round(row["gross_amount"], 2),
                 "sale_fee_amount": round(row["sale_fee_amount"], 2) if all_fees_known and sales_count else 0.0 if not sales_count else None,
+                "percentage_fee_amount": round(row["percentage_fee_amount"], 2) if all_fees_known and sales_count else 0.0 if not sales_count else None,
+                "fixed_fee_amount": round(row["fixed_fee_amount"], 2) if all_fees_known and sales_count else 0.0 if not sales_count else None,
                 "shipping_amount": round(row["shipping_amount"], 2),
+                "shipping_reimbursement_amount": round(row["shipping_reimbursement_amount"], 2),
                 "net_amount": net_amount,
                 "unit_cost": unit_cost,
                 "cost_amount": round(row["cost_amount"], 2) if all_costs_known and sales_count else 0.0 if not sales_count and unit_cost is not None else None,
@@ -9405,6 +9562,408 @@ def query_brand_sales_report(payload, request):
         },
         "warnings": sales.get("warnings") or [],
         "truncated": bool(sales.get("truncated")),
+        "generated_at": now_label(),
+    }
+
+
+def bounded_score(value, minimum=0.0, maximum=100.0):
+    try:
+        return round(max(minimum, min(maximum, float(value))), 1)
+    except (TypeError, ValueError):
+        return round(minimum, 1)
+
+
+def purchase_price_range(value):
+    price = max(0.0, float(value or 0))
+    if price <= 50:
+        return "Até R$ 50"
+    if price <= 100:
+        return "R$ 50 a R$ 100"
+    if price <= 250:
+        return "R$ 100 a R$ 250"
+    if price <= 500:
+        return "R$ 250 a R$ 500"
+    if price <= 1000:
+        return "R$ 500 a R$ 1.000"
+    return "Acima de R$ 1.000"
+
+
+def query_purchase_intelligence(payload, request):
+    start, end, _, _ = statistics_date_window(request.get("date_from"), request.get("date_to"))
+    period_days = max(1, (end - start).days + 1)
+    account_filter = str((request or {}).get("account") or "all")
+    status_filter = str((request or {}).get("ml_status") or "active").lower()
+    abc_basis = str((request or {}).get("abc_basis") or "profit").lower()
+    if abc_basis not in {"profit", "net", "gross", "units"}:
+        abc_basis = "profit"
+    try:
+        lead_time_days = max(1, min(365, int(float((request or {}).get("lead_time_days") or 15))))
+    except (TypeError, ValueError):
+        lead_time_days = 15
+    try:
+        review_days = max(1, min(365, int(float((request or {}).get("review_days") or 15))))
+    except (TypeError, ValueError):
+        review_days = 15
+    try:
+        service_level = max(80.0, min(99.9, float((request or {}).get("service_level") or 95)))
+    except (TypeError, ValueError):
+        service_level = 95.0
+    try:
+        desired_margin = max(0.0, min(90.0, float((request or {}).get("desired_margin") or 20)))
+    except (TypeError, ValueError):
+        desired_margin = 20.0
+    service_z = 2.33 if service_level >= 99 else 1.88 if service_level >= 97 else 1.65 if service_level >= 95 else 1.28
+
+    accounts = [
+        account for account in payload.get("accounts") or []
+        if account.get("official") and account.get("status") == "connected"
+    ]
+    if account_filter != "all":
+        accounts = [
+            account for account in accounts
+            if account.get("id") == account_filter
+            or str(account.get("seller_id") or "") == account_filter
+            or str(account.get("nickname") or "") == account_filter
+        ]
+    if not accounts:
+        raise RuntimeError("Nenhuma conta oficial conectada corresponde ao filtro selecionado.")
+    allowed_ids = {
+        str(value)
+        for account in accounts
+        for value in (account.get("id"), account.get("seller_id"))
+        if value not in (None, "")
+    }
+    allowed_names = {str(account.get("nickname") or "") for account in accounts}
+
+    grouped = {}
+    stock_by_sku = {}
+    for item in payload.get("catalog") or []:
+        if account_filter != "all" and (
+            str(item.get("account_id") or "") not in allowed_ids
+            and str(item.get("account") or "") not in allowed_names
+        ):
+            continue
+        item_status = normalized_meli_status(item.get("meli_status"))
+        if status_filter != "all" and item_status != status_filter:
+            continue
+        sku = normalized_sku_key(item.get("sku"))
+        if not sku or sku == "-":
+            continue
+        row = grouped.setdefault(
+            sku,
+            {
+                "sku": sku,
+                "product": item.get("title") or "Produto sem título",
+                "brand": item.get("brand") or "Sem marca",
+                "thumbnail": item.get("thumbnail") or "",
+                "accounts": set(),
+                "item_ids": set(),
+                "active_listings": 0,
+                "paused_listings": 0,
+                "catalog_listings": 0,
+                "traditional_listings": 0,
+                "winning_listings": 0,
+                "sharing_listings": 0,
+                "losing_listings": 0,
+                "current_stock": 0,
+                "sales": 0,
+                "orders": set(),
+                "units": 0,
+                "gross_amount": 0.0,
+                "sale_fee_amount": 0.0,
+                "percentage_fee_amount": 0.0,
+                "fixed_fee_amount": 0.0,
+                "shipping_amount": 0.0,
+                "shipping_reimbursement_amount": 0.0,
+                "net_amount": 0.0,
+                "cost_amount": 0.0,
+                "profit_amount": 0.0,
+                "known_fee_sales": 0,
+                "known_net_sales": 0,
+                "known_cost_sales": 0,
+                "known_profit_sales": 0,
+                "daily_units": {},
+                "last_sale_at": "",
+            },
+        )
+        if item.get("account"):
+            row["accounts"].add(str(item.get("account")))
+        if item.get("id"):
+            row["item_ids"].add(str(item.get("id")))
+        if item_status == "active":
+            row["active_listings"] += 1
+        elif item_status == "paused":
+            row["paused_listings"] += 1
+        if is_catalog_listing(item):
+            row["catalog_listings"] += 1
+        else:
+            row["traditional_listings"] += 1
+        competition_status = str(item.get("status") or "").lower()
+        if competition_status == "winning":
+            row["winning_listings"] += 1
+        elif competition_status == "sharing":
+            row["sharing_listings"] += 1
+        elif competition_status == "losing":
+            row["losing_listings"] += 1
+        try:
+            stock = max(0, int(float(item.get("stock") or 0)))
+        except (TypeError, ValueError):
+            stock = 0
+        stock_by_sku[sku] = max(stock_by_sku.get(sku, 0), stock)
+
+    if not grouped:
+        raise RuntimeError("Nenhum SKU corresponde às contas e ao status selecionados.")
+    for sku, stock in stock_by_sku.items():
+        grouped[sku]["current_stock"] = stock
+
+    sales = query_sales_report(payload, request)
+    for sale in sales.get("rows") or []:
+        sku = normalized_sku_key(sale.get("sku"))
+        row = grouped.get(sku)
+        if not row:
+            continue
+        quantity = max(0, int(sale.get("quantity") or 0))
+        row["sales"] += 1
+        row["units"] += quantity
+        row["gross_amount"] += float(sale.get("gross_amount") or 0)
+        row["shipping_amount"] += float(sale.get("shipping_amount") or 0)
+        row["shipping_reimbursement_amount"] += float(sale.get("shipping_reimbursement_amount") or 0)
+        if sale.get("order_id"):
+            row["orders"].add(str(sale.get("order_id")))
+        if sale.get("sale_fee_amount") is not None:
+            row["known_fee_sales"] += 1
+            row["sale_fee_amount"] += float(sale.get("sale_fee_amount") or 0)
+            row["percentage_fee_amount"] += float(sale.get("percentage_fee_amount") or 0)
+            row["fixed_fee_amount"] += float(sale.get("fixed_fee_amount") or 0)
+        if sale.get("net_amount") is not None:
+            row["known_net_sales"] += 1
+            row["net_amount"] += float(sale.get("net_amount") or 0)
+        if sale.get("cost_amount") is not None:
+            row["known_cost_sales"] += 1
+            row["cost_amount"] += float(sale.get("cost_amount") or 0)
+        if sale.get("profit_amount") is not None:
+            row["known_profit_sales"] += 1
+            row["profit_amount"] += float(sale.get("profit_amount") or 0)
+        sold_at = parse_meli_datetime(sale.get("date"))
+        day_key = sold_at.astimezone(APP_TZ).date().isoformat() if sold_at else str(sale.get("date") or "")[:10]
+        if day_key:
+            row["daily_units"][day_key] = row["daily_units"].get(day_key, 0) + quantity
+        sold_label = sold_at.isoformat() if sold_at else str(sale.get("date") or "")
+        if sold_label > str(row.get("last_sale_at") or ""):
+            row["last_sale_at"] = sold_label
+        if not row.get("thumbnail") and sale.get("thumbnail"):
+            row["thumbnail"] = sale.get("thumbnail")
+
+    costs = payload.get("sku_costs") or {}
+    output = []
+    for row in grouped.values():
+        units = int(row.get("units") or 0)
+        sales_count = int(row.get("sales") or 0)
+        stock = int(row.get("current_stock") or 0)
+        daily_average = units / period_days if units else 0.0
+        sum_squares = sum(float(value or 0) ** 2 for value in row["daily_units"].values())
+        variance = max(0.0, (sum_squares / period_days) - (daily_average ** 2))
+        daily_deviation = math.sqrt(variance)
+        variation = daily_deviation / daily_average if daily_average > 0 else None
+        xyz_class = "X" if variation is not None and variation <= 0.5 else "Y" if variation is not None and variation <= 1.0 else "Z"
+        safety_stock = int(math.ceil(service_z * daily_deviation * math.sqrt(lead_time_days))) if units else 0
+        reorder_point = int(math.ceil(daily_average * lead_time_days + safety_stock)) if units else 0
+        target_stock = int(math.ceil(daily_average * (lead_time_days + review_days) + safety_stock)) if units else 0
+        suggested_reorder = max(0, target_stock - stock)
+        coverage_days = stock / daily_average if daily_average > 0 else None
+
+        cost_record = costs.get(normalized_sku_key(row.get("sku")))
+        unit_cost = None
+        if isinstance(cost_record, dict) and cost_record.get("cost") not in (None, ""):
+            try:
+                unit_cost = round(max(0.0, float(cost_record.get("cost"))), 2)
+            except (TypeError, ValueError):
+                unit_cost = None
+        all_fees_known = sales_count == row["known_fee_sales"] if sales_count else True
+        all_net_known = sales_count == row["known_net_sales"] if sales_count else True
+        all_costs_known = sales_count == row["known_cost_sales"] if sales_count else unit_cost is not None
+        all_profit_known = sales_count == row["known_profit_sales"] if sales_count else unit_cost is not None
+        gross_amount = round(row["gross_amount"], 2)
+        fee_amount = round(row["sale_fee_amount"], 2) if all_fees_known and sales_count else 0.0 if not sales_count else None
+        net_amount = round(row["net_amount"], 2) if all_net_known and sales_count else 0.0 if not sales_count else None
+        cost_amount = round(row["cost_amount"], 2) if all_costs_known and sales_count else 0.0 if not sales_count and unit_cost is not None else None
+        profit_amount = round(row["profit_amount"], 2) if all_profit_known and sales_count else 0.0 if not sales_count and unit_cost is not None else None
+        profit_margin = round((profit_amount / net_amount) * 100, 2) if profit_amount is not None and net_amount and net_amount > 0 else None
+        monthly_roi = (
+            round((profit_amount / cost_amount) * (30 / period_days) * 100, 2)
+            if profit_amount is not None and cost_amount and cost_amount > 0 else None
+        )
+        average_price = round(gross_amount / units, 2) if units else 0.0
+        average_net_unit = round(net_amount / units, 2) if net_amount is not None and units else None
+        maximum_purchase_cost = (
+            round(average_net_unit * (1 - desired_margin / 100), 2)
+            if average_net_unit is not None else None
+        )
+        fee_percentage = round((fee_amount / gross_amount) * 100, 2) if fee_amount is not None and gross_amount > 0 else None
+        average_shipping = round(row["shipping_amount"] / sales_count, 2) if sales_count else 0.0
+        parsed_last_sale = parse_meli_datetime(row.get("last_sale_at"))
+        days_since_last_sale = (
+            max(0, (datetime.now(APP_TZ).date() - parsed_last_sale.astimezone(APP_TZ).date()).days)
+            if parsed_last_sale else None
+        )
+        competition_total = row["winning_listings"] + row["sharing_listings"] + row["losing_listings"]
+        competition_score = (
+            (row["winning_listings"] * 100 + row["sharing_listings"] * 60 + row["losing_listings"] * 25) / competition_total
+            if competition_total else 50.0
+        )
+        data_quality = 100.0 if not sales_count else (
+            50 * row["known_fee_sales"] / sales_count + 50 * row["known_profit_sales"] / sales_count
+        )
+        if not units:
+            stock_status = "Sem giro no período"
+        elif stock <= reorder_point:
+            stock_status = "Ruptura iminente"
+        elif coverage_days is not None and coverage_days < lead_time_days + review_days:
+            stock_status = "Repor em breve"
+        elif coverage_days is not None and coverage_days > (lead_time_days + review_days) * 3:
+            stock_status = "Excesso de estoque"
+        else:
+            stock_status = "Cobertura adequada"
+        abc_value = {
+            "profit": profit_amount,
+            "net": net_amount,
+            "gross": gross_amount,
+            "units": units,
+        }.get(abc_basis)
+        output.append(
+            {
+                **{key: value for key, value in row.items() if key not in {"accounts", "item_ids", "orders", "daily_units"}},
+                "accounts": sorted(row["accounts"]),
+                "accounts_label": ", ".join(sorted(row["accounts"])),
+                "item_ids": sorted(row["item_ids"]),
+                "orders": len(row["orders"]),
+                "current_stock": stock,
+                "gross_amount": gross_amount,
+                "sale_fee_amount": fee_amount,
+                "percentage_fee_amount": round(row["percentage_fee_amount"], 2) if all_fees_known and sales_count else 0.0 if not sales_count else None,
+                "fixed_fee_amount": round(row["fixed_fee_amount"], 2) if all_fees_known and sales_count else 0.0 if not sales_count else None,
+                "shipping_amount": round(row["shipping_amount"], 2),
+                "shipping_reimbursement_amount": round(row["shipping_reimbursement_amount"], 2),
+                "net_amount": net_amount,
+                "unit_cost": unit_cost,
+                "cost_amount": cost_amount,
+                "profit_amount": profit_amount,
+                "profit_percentage": profit_margin,
+                "monthly_roi": monthly_roi,
+                "average_unit_price": average_price,
+                "average_net_unit": average_net_unit,
+                "average_fee_percentage": fee_percentage,
+                "average_shipping_per_sale": average_shipping,
+                "average_daily_units": round(daily_average, 3),
+                "daily_deviation": round(daily_deviation, 3),
+                "demand_variation": round(variation, 3) if variation is not None else None,
+                "xyz_class": xyz_class,
+                "safety_stock": safety_stock,
+                "reorder_point": reorder_point,
+                "target_stock": target_stock,
+                "suggested_reorder": suggested_reorder,
+                "coverage_days": round(coverage_days, 1) if coverage_days is not None else None,
+                "stock_status": stock_status,
+                "days_since_last_sale": days_since_last_sale,
+                "maximum_purchase_cost": maximum_purchase_cost,
+                "price_range": purchase_price_range(average_price),
+                "competition_score": round(competition_score, 1),
+                "data_quality": round(data_quality, 1),
+                "abc_value": max(0.0, float(abc_value or 0)),
+            }
+        )
+
+    abc_basis_used = abc_basis
+    abc_total = sum(float(row.get("abc_value") or 0) for row in output)
+    if abc_total <= 0:
+        abc_basis_used = "units"
+        for row in output:
+            row["abc_value"] = float(row.get("units") or 0)
+        abc_total = sum(float(row.get("abc_value") or 0) for row in output)
+    ranked_rows = sorted(output, key=lambda current: (-float(current.get("abc_value") or 0), str(current.get("sku") or "")))
+    if abc_total <= 0:
+        for row in ranked_rows:
+            row["abc_class"] = "C"
+            row["abc_cumulative_percentage"] = 100.0
+    else:
+        abc_running = 0.0
+        for index, row in enumerate(ranked_rows):
+            abc_running += float(row.get("abc_value") or 0)
+            cumulative = abc_running / abc_total * 100
+            row["abc_class"] = "A" if cumulative <= 80 or index == 0 else "B" if cumulative <= 95 else "C"
+            row["abc_cumulative_percentage"] = round(cumulative, 2)
+
+    maximum_demand = max((float(row.get("average_daily_units") or 0) for row in output), default=0.0)
+    for row in output:
+        demand_ratio = float(row.get("average_daily_units") or 0) / maximum_demand if maximum_demand > 0 else 0.0
+        demand_score = 100 * math.sqrt(demand_ratio) if demand_ratio > 0 else 0.0
+        margin_score = 40.0 if row.get("profit_percentage") is None else (float(row["profit_percentage"]) + 10) / 40 * 100
+        capital_score = 40.0 if row.get("monthly_roi") is None else (float(row["monthly_roi"]) + 10) / 50 * 100
+        stability_score = {"X": 100.0, "Y": 65.0, "Z": 30.0}.get(row.get("xyz_class"), 30.0)
+        score = (
+            bounded_score(demand_score) * 0.25
+            + bounded_score(margin_score) * 0.20
+            + bounded_score(capital_score) * 0.20
+            + bounded_score(row.get("competition_score")) * 0.15
+            + stability_score * 0.10
+            + bounded_score(row.get("data_quality")) * 0.10
+        )
+        row["attractiveness_score"] = bounded_score(score)
+        row["decision"] = (
+            "Compra prioritária" if score >= 80
+            else "Comprar" if score >= 65
+            else "Negociar condições" if score >= 50
+            else "Compra cautelosa" if score >= 35
+            else "Não recomendado"
+        )
+        confidence_score = (
+            min(100.0, float(row.get("units") or 0) / 20 * 100) * 0.5
+            + min(100.0, period_days / 90 * 100) * 0.2
+            + bounded_score(row.get("data_quality")) * 0.3
+        )
+        row["confidence_score"] = bounded_score(confidence_score)
+        row["confidence"] = "Alta" if confidence_score >= 75 else "Média" if confidence_score >= 45 else "Baixa"
+
+    output.sort(key=lambda row: (-float(row.get("attractiveness_score") or 0), -int(row.get("units") or 0), str(row.get("sku") or "")))
+    costed = [row for row in output if row.get("profit_amount") is not None]
+    total_net = sum(float(row.get("net_amount") or 0) for row in costed)
+    total_profit = sum(float(row.get("profit_amount") or 0) for row in costed)
+    return {
+        "ok": True,
+        "kind": "purchase_intelligence",
+        "date_from": start.isoformat(),
+        "date_to": end.isoformat(),
+        "period_days": period_days,
+        "account": account_filter,
+        "ml_status": status_filter,
+        "abc_basis": abc_basis_used,
+        "lead_time_days": lead_time_days,
+        "review_days": review_days,
+        "service_level": service_level,
+        "desired_margin": desired_margin,
+        "rows": output,
+        "summary": {
+            "skus": len(output),
+            "units": sum(int(row.get("units") or 0) for row in output),
+            "gross_amount": round(sum(float(row.get("gross_amount") or 0) for row in output), 2),
+            "net_amount": round(sum(float(row.get("net_amount") or 0) for row in output if row.get("net_amount") is not None), 2),
+            "profit_amount": round(total_profit, 2),
+            "profit_percentage": round(total_profit / total_net * 100, 2) if total_net > 0 else None,
+            "suggested_reorder": sum(int(row.get("suggested_reorder") or 0) for row in output),
+            "capital_required": round(sum(float(row.get("suggested_reorder") or 0) * float(row.get("unit_cost") or 0) for row in output), 2),
+            "abc": {letter: sum(1 for row in output if row.get("abc_class") == letter) for letter in ("A", "B", "C")},
+            "xyz": {letter: sum(1 for row in output if row.get("xyz_class") == letter) for letter in ("X", "Y", "Z")},
+            "urgent": sum(1 for row in output if row.get("stock_status") == "Ruptura iminente"),
+            "high_confidence": sum(1 for row in output if row.get("confidence") == "Alta"),
+        },
+        "warnings": sales.get("warnings") or [],
+        "truncated": bool(sales.get("truncated")),
+        "methodology": {
+            "index": "Demanda 25%, margem 20%, retorno do capital 20%, catálogo 15%, estabilidade 10% e qualidade dos dados 10%.",
+            "abc": "A até 80% da contribuição acumulada, B até 95% e C no restante.",
+            "xyz": "X para demanda estável, Y para variação moderada e Z para demanda irregular ou sem venda.",
+            "stock": "O estoque físico usa a maior quantidade válida encontrada entre anúncios espelhados do mesmo SKU.",
+        },
         "generated_at": now_label(),
     }
 
@@ -9488,7 +10047,11 @@ def query_sku_history(payload, request):
 
 
 def statistics_job_signature(request):
-    keys = ("kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days", "date_from", "date_to")
+    keys = (
+        "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
+        "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
+        "date_from", "date_to",
+    )
     normalized = {key: str((request or {}).get(key) or "") for key in keys}
     return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
 
@@ -9510,7 +10073,11 @@ def start_statistics_job(request):
     cleanup_statistics_jobs()
     safe_request = {
         key: str((request or {}).get(key) or "")
-        for key in ("kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days", "date_from", "date_to")
+        for key in (
+            "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
+            "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
+            "date_from", "date_to",
+        )
     }
     signature = statistics_job_signature(safe_request)
     with STATISTICS_JOBS_LOCK:
@@ -9547,6 +10114,8 @@ def start_statistics_job(request):
                 result = query_sales_report(source_payload, safe_request)
             elif safe_request.get("kind") == "brand_sales":
                 result = query_brand_sales_report(source_payload, safe_request)
+            elif safe_request.get("kind") == "purchase_intelligence":
+                result = query_purchase_intelligence(source_payload, safe_request)
             elif safe_request.get("kind") == "sku_history":
                 result = query_sku_history(source_payload, safe_request)
             elif safe_request.get("kind") == "no_sales":
@@ -9628,12 +10197,12 @@ def report_job_result(job_id, include_body=False):
 def start_report_job(request):
     report_type = str((request or {}).get("report_type") or "").lower()
     output_format = str((request or {}).get("format") or "xlsx").lower()
-    if report_type not in {"statistics", "sales", "brand_sales", "catalog", "ads", "equalization"}:
-        raise RuntimeError("Selecione Vendas, Vendas por Marca, Estatísticas, Catálogo, Anúncios ou Equalização para exportar.")
+    if report_type not in {"statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization"}:
+        raise RuntimeError("Selecione Vendas, Compras, Estatísticas, Catálogo, Anúncios ou Equalização para exportar.")
     if output_format not in {"xlsx", "pdf"}:
         raise RuntimeError("Formato de relatório inválido.")
     statistics_job_id = str((request or {}).get("statistics_job_id") or "")
-    if report_type in {"statistics", "sales", "brand_sales"} and statistics_job_id:
+    if report_type in {"statistics", "sales", "brand_sales", "purchases"} and statistics_job_id:
         statistics_job = statistics_job_result(statistics_job_id)
         if not statistics_job or statistics_job.get("status") != "completed" or not statistics_job.get("result"):
             raise RuntimeError("A consulta de estatísticas ainda não foi concluída. Aguarde e tente exportar novamente.")
@@ -9660,10 +10229,10 @@ def start_report_job(request):
             with REPORT_JOBS_LOCK:
                 REPORT_JOBS[job_id].update({"status": "processing", "progress": 20, "message": "Preparando os dados do relatório."})
             statistics_result = None
-            if report_type in {"statistics", "sales", "brand_sales"} and statistics_job_id:
+            if report_type in {"statistics", "sales", "brand_sales", "purchases"} and statistics_job_id:
                 statistics_result = statistics_job_result(statistics_job_id).get("result")
             title, columns, rows, metadata = report_dataset(
-                read_payload(include_catalog=report_type in {"statistics", "sales", "brand_sales", "catalog", "ads", "equalization"}),
+                read_payload(include_catalog=report_type in {"statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization"}),
                 report_type,
                 filters,
                 statistics_result,
@@ -9788,6 +10357,54 @@ def report_filtered_catalog(payload, report_type, filters):
 
 
 def report_dataset(payload, report_type, filters, statistics_result=None):
+    if report_type == "purchases":
+        result = statistics_result or query_purchase_intelligence(payload, filters)
+        columns = [
+            ("attractiveness_score", "Índice de atratividade", "number"),
+            ("decision", "Decisão sugerida", "text"),
+            ("confidence", "Confiança", "text"),
+            ("abc_class", "Curva ABC", "text"),
+            ("xyz_class", "Curva XYZ", "text"),
+            ("sku", "SKU", "text"),
+            ("product", "Produto", "text"),
+            ("brand", "Marca", "text"),
+            ("accounts_label", "Contas", "text"),
+            ("current_stock", "Estoque físico consolidado", "integer"),
+            ("units", "Unidades vendidas", "integer"),
+            ("orders", "Pedidos", "integer"),
+            ("average_daily_units", "Demanda média diária", "number"),
+            ("gross_amount", "Valor vendido", "currency"),
+            ("net_amount", "Valor líquido", "currency"),
+            ("profit_amount", "Lucro / prejuízo", "currency"),
+            ("profit_percentage", "Margem líquida (%)", "percent"),
+            ("monthly_roi", "Retorno mensal do capital (%)", "percent"),
+            ("average_unit_price", "Preço médio de venda", "currency"),
+            ("maximum_purchase_cost", "Custo máximo de compra", "currency"),
+            ("coverage_days", "Cobertura atual (dias)", "number"),
+            ("safety_stock", "Estoque de segurança", "integer"),
+            ("reorder_point", "Ponto de reposição", "integer"),
+            ("target_stock", "Estoque alvo", "integer"),
+            ("suggested_reorder", "Compra sugerida", "integer"),
+            ("stock_status", "Situação do estoque", "text"),
+            ("days_since_last_sale", "Dias sem venda", "integer"),
+            ("data_quality", "Qualidade dos dados (%)", "percent"),
+        ]
+        return (
+            "Inteligência de compras e abastecimento",
+            columns,
+            result.get("rows") or [],
+            {
+                "Período": f"{result.get('date_from')} a {result.get('date_to')}",
+                "Conta": filters.get("account") or "Todas",
+                "Status ML": filters.get("ml_status") or "Ativos",
+                "Base da curva ABC": result.get("abc_basis") or "profit",
+                "Prazo de reposição": f"{result.get('lead_time_days') or 15} dias",
+                "Ciclo de revisão": f"{result.get('review_days') or 15} dias",
+                "Nível de serviço": f"{result.get('service_level') or 95}%",
+                "Margem desejada": f"{result.get('desired_margin') or 20}%",
+                "Gerado em": now_label(),
+            },
+        )
     if report_type == "brand_sales":
         result = statistics_result or query_brand_sales_report(payload, filters)
         columns = [
@@ -9805,8 +10422,10 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             ("average_daily_units", "Média diária", "number"),
             ("gross_amount", "Valor vendido", "currency"),
             ("average_unit_price", "Preço médio", "currency"),
-            ("sale_fee_amount", "Tarifas de venda", "currency"),
-            ("shipping_amount", "Fretes estimados ML", "currency"),
+            ("percentage_fee_amount", "Tarifas de venda", "currency"),
+            ("fixed_fee_amount", "Custos fixos", "currency"),
+            ("shipping_amount", "Fretes debitados", "currency"),
+            ("shipping_reimbursement_amount", "Estornos Flex", "currency"),
             ("net_amount", "Valor líquido", "currency"),
             ("unit_cost", "Custo unitário", "currency"),
             ("cost_amount", "Custo das unidades vendidas", "currency"),
@@ -9845,8 +10464,11 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             ("quantity", "Quantidade", "integer"),
             ("unit_price", "Preço unitário", "currency"),
             ("gross_amount", "Valor vendido", "currency"),
-            ("sale_fee_amount", "Tarifa de venda", "currency"),
-            ("shipping_amount", "Frete estimado ML", "currency"),
+            ("percentage_fee_amount", "Tarifa de venda", "currency"),
+            ("fixed_fee_amount", "Custo fixo", "currency"),
+            ("shipping_amount", "Frete debitado", "currency"),
+            ("shipping_reimbursement_amount", "Estorno Flex", "currency"),
+            ("shipping_source", "Origem do frete", "text"),
             ("net_amount", "Valor líquido", "currency"),
             ("cost_amount", "Custo total", "currency"),
             ("profit_amount", "Lucro / prejuízo", "currency"),
@@ -12288,6 +12910,9 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/statistics/query":
             try:
+                if str(request.get("kind") or "").lower() == "purchase_intelligence" and not is_master(self.current_user(payload)):
+                    self.send_json({"error": "A inteligência de compras está temporariamente disponível apenas para o usuário master."}, status=403)
+                    return
                 job = start_statistics_job(request)
                 self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
@@ -12310,8 +12935,22 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=400)
             return
 
+        if parsed.path == "/api/purchases/query":
+            try:
+                if not is_master(self.current_user(payload)):
+                    self.send_json({"error": "A inteligência de compras está temporariamente disponível apenas para o usuário master."}, status=403)
+                    return
+                job = start_statistics_job({**request, "kind": "purchase_intelligence"})
+                self.send_json({"ok": True, **job}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
         if parsed.path == "/api/reports/export":
             try:
+                if str(request.get("report_type") or "").lower() == "purchases" and not is_master(self.current_user(payload)):
+                    self.send_json({"error": "A exportação de Compras está temporariamente disponível apenas para o usuário master."}, status=403)
+                    return
                 job = start_report_job(request)
                 self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
@@ -12899,6 +13538,7 @@ def memory_maintenance_loop():
         (CATALOG_OFFERS_CACHE, CATALOG_OFFERS_CACHE_LOCK, 5000),
         (STATISTICS_CACHE, STATISTICS_CACHE_LOCK, 256),
         (SHIPMENT_MODE_CACHE, SHIPMENT_MODE_CACHE_LOCK, 20000),
+        (SHIPMENT_COST_CACHE, SHIPMENT_COST_CACHE_LOCK, 50000),
         (SALE_FEE_CACHE, SALE_FEE_CACHE_LOCK, 100000),
         (CLONE_SOURCE_CACHE, CLONE_SOURCE_CACHE_LOCK, 512),
         (STATIC_FILE_CACHE, STATIC_FILE_CACHE_LOCK, 128),

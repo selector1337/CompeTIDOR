@@ -1695,7 +1695,7 @@ h2 {
 
 .sales-report-row {
   display: grid;
-  grid-template-columns: 56px minmax(260px, 2fr) repeat(7, minmax(92px, 1fr));
+  grid-template-columns: 56px minmax(260px, 2fr) repeat(9, minmax(92px, 1fr));
   gap: 10px;
   align-items: center;
   padding: 12px;
@@ -3493,6 +3493,248 @@ body {
   .ad-item > .ad-main { grid-column: 1 / -1; }
 }
 
+/* Compras e abastecimento */
+.purchase-analysis-form,
+.purchase-calculator-panel {
+  border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  padding-top: 18px;
+}
+
+.purchase-filter-grid,
+.purchase-result-toolbar,
+.purchase-calculator-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.purchase-filter-grid label,
+.purchase-result-toolbar label,
+.purchase-calculator-grid label {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: .76rem;
+  font-weight: 800;
+}
+
+.purchase-run-button {
+  width: 100%;
+  margin-top: 14px;
+}
+
+.purchase-summary {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(130px, 1fr));
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.purchase-summary > div,
+.purchase-calculator-results > div {
+  display: grid;
+  gap: 5px;
+  min-height: 76px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--line) 45%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel-2) 74%, transparent);
+}
+
+.purchase-summary span,
+.purchase-calculator-results span {
+  color: var(--muted);
+  font-size: .7rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.purchase-summary strong,
+.purchase-calculator-results strong {
+  font-size: 1.08rem;
+}
+
+.purchase-result-toolbar {
+  grid-template-columns: minmax(230px, 2fr) repeat(4, minmax(120px, 1fr));
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--line) 45%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel-2) 60%, transparent);
+}
+
+.purchase-table-wrap {
+  overflow-x: auto;
+  border: 1px solid color-mix(in srgb, var(--line) 42%, transparent);
+  border-radius: 7px;
+}
+
+.purchase-table {
+  width: 100%;
+  min-width: 1280px;
+  border-collapse: collapse;
+}
+
+.purchase-table th {
+  padding: 11px 12px;
+  background: color-mix(in srgb, var(--panel-2) 82%, transparent);
+  color: var(--muted);
+  font-size: .68rem;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.purchase-table td {
+  padding: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 25%, transparent);
+  vertical-align: middle;
+}
+
+.purchase-table td > strong,
+.purchase-table td > small {
+  display: block;
+}
+
+.purchase-table td > small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: .68rem;
+}
+
+.purchase-product {
+  display: grid;
+  grid-template-columns: 48px minmax(190px, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.purchase-product img,
+.purchase-product > .statistics-thumb-empty {
+  width: 48px;
+  height: 48px;
+  padding: 3px;
+  object-fit: contain;
+  aspect-ratio: 1;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.purchase-product span span {
+  display: grid;
+}
+
+.purchase-product small,
+.purchase-product em {
+  display: block;
+  max-width: 320px;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: .68rem;
+  font-style: normal;
+}
+
+.purchase-score {
+  --score: 0;
+  display: grid;
+  place-content: center;
+  width: 58px;
+  height: 58px;
+  border: 3px solid color-mix(in srgb, var(--green) calc(var(--score) * 1%), var(--amber));
+  border-radius: 50%;
+  box-shadow: 0 0 14px color-mix(in srgb, var(--green) 24%, transparent);
+  text-align: center;
+}
+
+.purchase-score strong { font-size: .95rem; }
+.purchase-score small { color: var(--muted); font-size: .58rem; }
+
+.purchase-curves {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.purchase-curves b,
+.purchase-decision {
+  padding: 5px 7px;
+  border: 1px solid currentColor;
+  border-radius: 5px;
+  font-size: .67rem;
+  white-space: nowrap;
+}
+
+.abc-a, .xyz-x, .purchase-positive { color: var(--green) !important; }
+.abc-b, .xyz-y, .purchase-warning { color: var(--amber) !important; }
+.abc-c, .xyz-z, .purchase-negative { color: var(--red) !important; }
+
+.purchase-empty {
+  display: grid;
+  place-items: center;
+  gap: 7px;
+  min-height: 190px;
+  margin-top: 14px;
+  border: 1px dashed color-mix(in srgb, var(--line) 65%, transparent);
+  border-radius: 7px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.purchase-empty strong { color: var(--ink); font-size: 1.08rem; }
+
+.purchase-methodology {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--line) 35%, transparent);
+  border-radius: 7px;
+  color: var(--muted);
+}
+
+.purchase-methodology summary { color: var(--ink); cursor: pointer; font-weight: 900; }
+.purchase-methodology p { margin: 10px 0 0; }
+
+.purchase-calculator-panel { margin-top: 14px; }
+.purchase-calculator-grid { grid-template-columns: repeat(4, minmax(170px, 1fr)); }
+.purchase-calculator-actions { display: flex; align-items: end; gap: 8px; }
+.purchase-calculator-actions button { flex: 1; }
+
+.purchase-calculator-results {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.purchase-calculator-results em {
+  color: var(--muted);
+  font-size: .7rem;
+  font-style: normal;
+}
+
+.purchase-calculator-verdict {
+  border-color: currentColor !important;
+  box-shadow: 0 0 18px color-mix(in srgb, currentColor 17%, transparent);
+}
+
+@media (max-width: 1280px) {
+  .purchase-filter-grid { grid-template-columns: repeat(3, minmax(160px, 1fr)); }
+  .purchase-summary { grid-template-columns: repeat(3, minmax(130px, 1fr)); }
+  .purchase-calculator-grid { grid-template-columns: repeat(3, minmax(160px, 1fr)); }
+  .purchase-calculator-results { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  .purchase-filter-grid,
+  .purchase-result-toolbar,
+  .purchase-calculator-grid,
+  .purchase-summary,
+  .purchase-calculator-results { grid-template-columns: 1fr; }
+  .purchase-table { min-width: 1120px; }
+  .purchase-calculator-actions { align-items: stretch; }
+}
+
 .sidebar nav a.active .nav-icon {
   color: var(--brand);
   background: rgba(255, 214, 0, 0.09);
@@ -4110,7 +4352,7 @@ body {
 
 .brand-report-table {
   width: 100%;
-  min-width: 1660px;
+  min-width: 1900px;
   border-collapse: collapse;
   font-size: .78rem;
 }

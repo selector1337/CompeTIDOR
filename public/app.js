@@ -72,6 +72,17 @@
   brandSalesReportJobId: "",
   brandSalesReportPage: 1,
   brandSalesReportPageSize: 50,
+  purchaseAnalysis: null,
+  purchaseLoading: false,
+  purchaseError: "",
+  purchaseProgress: "",
+  purchaseJobId: "",
+  purchasePage: 1,
+  purchasePageSize: 50,
+  purchaseSearch: "",
+  purchaseAbc: "all",
+  purchaseXyz: "all",
+  purchaseDecision: "all",
   spreadsheetPreview: null,
   spreadsheetProgress: null,
   shippingCostsLoading: false,
@@ -125,6 +136,7 @@ const pageTitles = {
   dashboard: ["Painel unificado", "Dashboard"],
   estatisticas: ["Vendas oficiais", "Estatísticas por SKU"],
   custos: ["Rentabilidade", "Custos por SKU"],
+  compras: ["Inteligência de abastecimento", "Compras"],
   relatorios: ["Vendas e equalização", "Relatórios"],
   contas: ["OAuth oficial", "Contas Mercado Livre"],
   catalogo: ["Catálogo Mercado Livre", "Disputa de catálogo"],
@@ -527,7 +539,8 @@ function tenantLabel(meta, data) {
 
 function setRoute() {
   const route = (location.hash.replace("#/", "") || "dashboard").split("?")[0];
-  state.route = pageTitles[route] ? route : "dashboard";
+  state.route = pageTitles[route] && (route !== "compras" || canManageOAuth()) ? route : "dashboard";
+  if (route === "compras" && !canManageOAuth()) history.replaceState(null, "", "#/dashboard");
   document.querySelectorAll(".page").forEach((page) => page.classList.remove("active"));
   document.querySelector(`#page-${state.route}`).classList.add("active");
   document.querySelectorAll("nav a").forEach((link) => link.classList.toggle("active", link.dataset.route === state.route));
@@ -549,13 +562,14 @@ function render() {
 
 function renderRoute() {
   if (!state.data) return;
-  if (["catalogo", "anuncios", "copiar", "kits", "relatorios", "custos"].includes(state.route) && !state.catalogLoaded) {
+  if (["catalogo", "anuncios", "copiar", "kits", "relatorios", "custos", "compras"].includes(state.route) && !state.catalogLoaded) {
     loadCatalogInBackground();
   }
   const routeRenderers = {
     dashboard: renderDashboard,
     estatisticas: renderStatistics,
     custos: renderCosts,
+    compras: renderPurchases,
     relatorios: () => {
       renderSalesReport();
       renderBrandSalesReport();
@@ -1099,6 +1113,205 @@ function renderCosts() {
         </article>`;
     }).join("")}
     ${paginationHtml("costsPage", pageInfo)}` : `<div class="notice">Nenhum SKU encontrado com essa pesquisa.</div>`;
+}
+
+function purchaseRequestFromForm() {
+  const form = document.querySelector("#purchase-analysis-form");
+  if (!form) return {};
+  return {
+    account: form.elements.account.value,
+    ml_status: form.elements.ml_status.value,
+    abc_basis: form.elements.abc_basis.value,
+    lead_time_days: form.elements.lead_time_days.value,
+    review_days: form.elements.review_days.value,
+    service_level: form.elements.service_level.value,
+    desired_margin: form.elements.desired_margin.value,
+    ...statisticsDateRange(form),
+  };
+}
+
+function updatePurchasePeriodFields() {
+  const form = document.querySelector("#purchase-analysis-form");
+  if (!form) return;
+  form.querySelectorAll("[data-purchase-custom]").forEach((node) => {
+    node.hidden = form.elements.period.value !== "custom";
+  });
+}
+
+function purchaseDecisionTone(decision) {
+  if (["Compra prioritária", "Comprar"].includes(decision)) return "purchase-positive";
+  if (decision === "Não recomendado") return "purchase-negative";
+  return "purchase-warning";
+}
+
+function renderPurchases() {
+  const form = document.querySelector("#purchase-analysis-form");
+  const feedback = document.querySelector("#purchase-feedback");
+  const summary = document.querySelector("#purchase-summary");
+  const toolbar = document.querySelector("#purchase-result-toolbar");
+  const results = document.querySelector("#purchase-results");
+  const methodology = document.querySelector("#purchase-methodology-content");
+  if (!form || !feedback || !summary || !toolbar || !results || !methodology) return;
+  const selected = form.elements.account.value || "all";
+  form.elements.account.innerHTML = `<option value="all">Todas as contas</option>${connectedAccounts()
+    .map((account) => `<option value="${escapeAttr(account.id || account.seller_id)}">${escapeText(account.nickname)}</option>`)
+    .join("")}`;
+  if ([...form.elements.account.options].some((option) => option.value === selected)) form.elements.account.value = selected;
+  const today = new Date();
+  if (!form.elements.date_from.value) form.elements.date_from.value = localDateValue(new Date(today.getFullYear(), today.getMonth(), 1));
+  if (!form.elements.date_to.value) form.elements.date_to.value = localDateValue(today);
+  updatePurchasePeriodFields();
+
+  const skuOptions = document.querySelector("#purchase-sku-options");
+  if (skuOptions && state.catalogLoaded) {
+    const rows = new Map();
+    (state.data.catalog || []).forEach((item) => {
+      const sku = normalizedSkuKey(item.sku);
+      if (sku && sku !== "-" && !rows.has(sku)) rows.set(sku, item.title || sku);
+    });
+    skuOptions.innerHTML = [...rows.entries()].sort(([a], [b]) => a.localeCompare(b, "pt-BR"))
+      .map(([sku, title]) => `<option value="${escapeAttr(sku)}">${escapeText(title)}</option>`).join("");
+  }
+
+  feedback.innerHTML = state.purchaseLoading
+    ? `<div class="statistics-loading"><span></span><strong>${escapeText(state.purchaseProgress || "Calculando o índice econométrico comercial...")}</strong></div>`
+    : state.purchaseError ? `<div class="notice danger-notice">${escapeText(state.purchaseError)}</div>` : "";
+  if (!state.purchaseAnalysis) {
+    summary.innerHTML = "";
+    toolbar.hidden = true;
+    methodology.innerHTML = `<p>O índice combina demanda, margem, retorno do capital, posição no catálogo, estabilidade e qualidade dos dados. A análise só é executada quando você solicitar.</p>`;
+    results.innerHTML = `<div class="purchase-empty"><strong>Decisões de compra com contexto, não apenas giro.</strong><span>Escolha o período, informe o prazo do fornecedor e clique em Analisar compras.</span></div>`;
+    return;
+  }
+  const analysis = state.purchaseAnalysis;
+  const totals = analysis.summary || {};
+  toolbar.hidden = false;
+  summary.innerHTML = `
+    <div><span>SKUs analisados</span><strong>${Number(totals.skus || 0).toLocaleString("pt-BR")}</strong></div>
+    <div class="purchase-positive"><span>Reposição sugerida</span><strong>${Number(totals.suggested_reorder || 0).toLocaleString("pt-BR")} un.</strong></div>
+    <div><span>Capital estimado</span><strong>${money.format(totals.capital_required || 0)}</strong></div>
+    <div class="${Number(totals.profit_amount || 0) >= 0 ? "purchase-positive" : "purchase-negative"}"><span>Resultado no período</span><strong>${money.format(totals.profit_amount || 0)}</strong></div>
+    <div><span>Ruptura iminente</span><strong>${Number(totals.urgent || 0).toLocaleString("pt-BR")}</strong></div>
+    <div><span>Alta confiança</span><strong>${Number(totals.high_confidence || 0).toLocaleString("pt-BR")}</strong></div>`;
+  const term = state.purchaseSearch.trim().toLowerCase();
+  const filtered = (analysis.rows || []).filter((row) => {
+    const haystack = `${row.sku || ""} ${row.product || ""} ${row.brand || ""}`.toLowerCase();
+    return (!term || haystack.includes(term))
+      && (state.purchaseAbc === "all" || row.abc_class === state.purchaseAbc)
+      && (state.purchaseXyz === "all" || row.xyz_class === state.purchaseXyz)
+      && (state.purchaseDecision === "all" || row.decision === state.purchaseDecision);
+  });
+  const pageInfo = paginate(filtered, state.purchasePage, state.purchasePageSize);
+  state.purchasePage = pageInfo.current;
+  results.innerHTML = filtered.length ? `${paginationHtml("purchasePage", pageInfo)}
+    <div class="purchase-table-wrap"><table class="purchase-table">
+      <thead><tr><th>Índice</th><th>SKU / produto</th><th>Curvas</th><th>Vendas</th><th>Estoque</th><th>Reposição</th><th>Resultado</th><th>Decisão</th></tr></thead>
+      <tbody>${pageInfo.items.map((row) => `
+        <tr>
+          <td><span class="purchase-score" style="--score:${Math.round(Number(row.attractiveness_score || 0))}"><strong>${Number(row.attractiveness_score || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}</strong><small>/100</small></span></td>
+          <td><div class="purchase-product">${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}<span><strong>${escapeText(row.sku)}</strong><small>${escapeText(row.product)}</small><em>${escapeText(row.brand || "Sem marca")} · ${escapeText(row.accounts_label || "-")}</em></span></div></td>
+          <td><div class="purchase-curves"><b class="abc-${String(row.abc_class || "c").toLowerCase()}">ABC ${escapeText(row.abc_class || "-")}</b><b class="xyz-${String(row.xyz_class || "z").toLowerCase()}">XYZ ${escapeText(row.xyz_class || "-")}</b></div></td>
+          <td><strong>${Number(row.units || 0).toLocaleString("pt-BR")} un.</strong><small>${Number(row.average_daily_units || 0).toLocaleString("pt-BR", { maximumFractionDigits: 3 })}/dia</small><small>${row.days_since_last_sale == null ? "Sem venda registrada" : `última há ${row.days_since_last_sale} dia(s)`}</small></td>
+          <td><strong>${Number(row.current_stock || 0).toLocaleString("pt-BR")} un.</strong><small>${row.coverage_days == null ? "Sem giro" : `${Number(row.coverage_days).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} dias de cobertura`}</small><small>${escapeText(row.stock_status)}</small></td>
+          <td><strong>${Number(row.suggested_reorder || 0).toLocaleString("pt-BR")} un.</strong><small>Ponto: ${Number(row.reorder_point || 0)} · alvo: ${Number(row.target_stock || 0)}</small><small>Custo máx.: ${row.maximum_purchase_cost == null ? "-" : money.format(row.maximum_purchase_cost)}</small></td>
+          <td class="${Number(row.profit_amount || 0) >= 0 ? "purchase-positive" : "purchase-negative"}"><strong>${row.profit_amount == null ? "Sem custo" : money.format(row.profit_amount)}</strong><small>${row.profit_percentage == null ? "Margem indisponível" : `${Number(row.profit_percentage).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}% de margem`}</small><small>${row.monthly_roi == null ? "ROI indisponível" : `${Number(row.monthly_roi).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}% ROI mensal`}</small></td>
+          <td><span class="purchase-decision ${purchaseDecisionTone(row.decision)}">${escapeText(row.decision)}</span><small>Confiança ${escapeText(String(row.confidence || "-").toLowerCase())}</small><small>${Number(row.confidence_score || 0).toLocaleString("pt-BR", { maximumFractionDigits: 0 })}%</small></td>
+        </tr>`).join("")}</tbody>
+    </table></div>${paginationHtml("purchasePage", pageInfo)}` : `<div class="notice">Nenhum SKU corresponde aos filtros do resultado.</div>`;
+  const method = analysis.methodology || {};
+  methodology.innerHTML = `<p><strong>Índice:</strong> ${escapeText(method.index || "-")}</p><p><strong>ABC:</strong> ${escapeText(method.abc || "-")}</p><p><strong>XYZ:</strong> ${escapeText(method.xyz || "-")}</p><p><strong>Estoque:</strong> ${escapeText(method.stock || "-")}</p>${analysis.truncated ? `<div class="notice warning-notice">A API atingiu o limite da consulta. Reduza o período para elevar a confiança.</div>` : ""}`;
+}
+
+async function loadPurchaseAnalysis() {
+  const form = document.querySelector("#purchase-analysis-form");
+  if (!form || !connectedAccounts().length) return;
+  state.purchaseLoading = true;
+  state.purchaseError = "";
+  state.purchaseProgress = "Preparando a análise no servidor...";
+  const actionId = beginManualAction("Analisando compras", state.purchaseProgress);
+  renderPurchases();
+  try {
+    let job = await api("/api/purchases/query", { method: "POST", manualProgress: false, body: JSON.stringify(purchaseRequestFromForm()) });
+    state.purchaseJobId = job.id || "";
+    while (["queued", "processing"].includes(job.status)) {
+      state.purchaseProgress = job.message || "Calculando demanda, curvas e reposição...";
+      updateManualAction(actionId, { message: state.purchaseProgress, progress: Number(job.progress || 0) });
+      renderPurchases();
+      await new Promise((resolve) => setTimeout(resolve, 1600));
+      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+    }
+    if (job.status !== "completed" || !job.result) throw new Error(job.message || "A análise de compras não foi concluída.");
+    state.purchaseAnalysis = job.result;
+    state.purchasePage = 1;
+    finishManualAction(actionId, "success", "Inteligência de compras concluída.");
+  } catch (error) {
+    state.purchaseAnalysis = null;
+    state.purchaseError = error.message || "Não foi possível analisar as compras.";
+    finishManualAction(actionId, "error", state.purchaseError);
+  } finally {
+    state.purchaseLoading = false;
+    state.purchaseProgress = "";
+    renderPurchases();
+  }
+}
+
+function calculatePurchaseViability(form) {
+  const number = (name, fallback = 0) => {
+    const parsed = parseLocalizedNumber(form.elements[name].value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const supplierCost = number("supplier_cost", NaN);
+  const quantity = Math.max(1, Math.round(number("quantity", 1)));
+  const inboundFreight = Math.max(0, number("inbound_freight"));
+  const additionalRate = Math.max(0, number("additional_percentage")) / 100;
+  const salePrice = number("sale_price", NaN);
+  const feeRate = Math.max(0, Math.min(0.9, number("fee_percentage") / 100));
+  const shipping = Math.max(0, number("ml_shipping"));
+  const monthlyDemand = Math.max(0, number("monthly_demand"));
+  const leadTime = Math.max(1, number("lead_time", 15));
+  const paymentDays = Math.max(0, number("payment_days"));
+  const desiredMargin = Math.max(0, Math.min(0.9, number("desired_margin", 20) / 100));
+  if (!Number.isFinite(supplierCost) || supplierCost < 0 || !Number.isFinite(salePrice) || salePrice <= 0) {
+    throw new Error("Informe custo do fornecedor e preço de venda válidos.");
+  }
+  const acquisitionUnit = supplierCost * (1 + additionalRate) + inboundFreight / quantity;
+  const fee = salePrice * feeRate;
+  const net = salePrice - fee - shipping;
+  const profit = net - acquisitionUnit;
+  const margin = net > 0 ? profit / net * 100 : -100;
+  const roi = acquisitionUnit > 0 ? profit / acquisitionUnit * 100 : null;
+  const breakEven = feeRate < 1 ? (acquisitionUnit + shipping) / (1 - feeRate) : null;
+  const desiredPrice = feeRate < 1 && desiredMargin < 1 ? (acquisitionUnit / (1 - desiredMargin) + shipping) / (1 - feeRate) : null;
+  const capital = acquisitionUnit * quantity;
+  const sellThroughMonths = monthlyDemand > 0 ? quantity / monthlyDemand : null;
+  const monthlyProfit = profit * monthlyDemand;
+  const paybackMonths = monthlyProfit > 0 ? capital / monthlyProfit : null;
+  const cashCycleDays = (sellThroughMonths == null ? 180 : sellThroughMonths * 30) + leadTime - paymentDays;
+  const marginScore = Math.max(0, Math.min(100, (margin + 5) / 35 * 100));
+  const roiScore = Math.max(0, Math.min(100, ((roi || 0) + 5) / 55 * 100));
+  const rotationScore = sellThroughMonths == null ? 10 : Math.max(0, Math.min(100, 120 - sellThroughMonths * 30));
+  const cashScore = Math.max(0, Math.min(100, 100 - Math.max(0, cashCycleDays) / 1.8));
+  const score = Math.max(0, Math.min(100, marginScore * 0.35 + roiScore * 0.30 + rotationScore * 0.20 + cashScore * 0.15));
+  const decision = score >= 75 ? "Compra atrativa" : score >= 55 ? "Negociar e comprar" : score >= 35 ? "Compra cautelosa" : "Não recomendado";
+  return { acquisitionUnit, quantity, fee, net, profit, margin, roi, breakEven, desiredPrice, capital, sellThroughMonths, paybackMonths, cashCycleDays, score, decision };
+}
+
+function renderPurchaseCalculatorResult(values) {
+  const root = document.querySelector("#purchase-calculator-results");
+  if (!root) return;
+  const positive = values.profit >= 0;
+  root.innerHTML = `
+    <div class="purchase-calculator-verdict ${positive ? "purchase-positive" : "purchase-negative"}"><span>Índice de viabilidade</span><strong>${values.score.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}/100</strong><em>${escapeText(values.decision)}</em></div>
+    <div><span>Custo posto unitário</span><strong>${money.format(values.acquisitionUnit)}</strong></div>
+    <div><span>Capital necessário</span><strong>${money.format(values.capital)}</strong></div>
+    <div><span>Tarifa estimada</span><strong>${money.format(values.fee)}</strong></div>
+    <div><span>Valor líquido</span><strong>${money.format(values.net)}</strong></div>
+    <div class="${positive ? "purchase-positive" : "purchase-negative"}"><span>Lucro / prejuízo unitário</span><strong>${money.format(values.profit)}</strong><em>${values.margin.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}% de margem</em></div>
+    <div><span>ROI unitário</span><strong>${values.roi == null ? "-" : `${values.roi.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%`}</strong></div>
+    <div><span>Preço de equilíbrio</span><strong>${values.breakEven == null ? "-" : money.format(values.breakEven)}</strong></div>
+    <div class="purchase-positive"><span>Preço para margem desejada</span><strong>${values.desiredPrice == null ? "-" : money.format(values.desiredPrice)}</strong></div>
+    <div><span>Prazo para vender o lote</span><strong>${values.sellThroughMonths == null ? "Sem demanda" : `${values.sellThroughMonths.toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mês(es)`}</strong></div>
+    <div><span>Payback estimado</span><strong>${values.paybackMonths == null ? "Não recupera" : `${values.paybackMonths.toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mês(es)`}</strong></div>`;
 }
 
 function renderCatalog() {
@@ -2068,6 +2281,8 @@ function statisticsDateRange(form) {
     start.setDate(start.getDate() - 6);
   } else if (period === "fortnight") {
     start.setDate(start.getDate() - 14);
+  } else if (period === "quarter") {
+    start.setDate(start.getDate() - 89);
   } else if (period === "month") {
     start = new Date(today.getFullYear(), today.getMonth(), 1);
   } else if (period === "year") {
@@ -2592,6 +2807,10 @@ function renderSalesReport() {
     <div><span>Itens vendidos</span><strong>${Number(totals.sales || 0).toLocaleString("pt-BR")}</strong></div>
     <div><span>Unidades</span><strong>${Number(totals.units || 0).toLocaleString("pt-BR")}</strong></div>
     <div><span>Valor vendido</span><strong>${money.format(totals.gross_amount || 0)}</strong></div>
+    <div><span>Tarifas de venda</span><strong>${money.format(totals.percentage_fee_amount || 0)}</strong></div>
+    <div><span>Custos fixos</span><strong>${money.format(totals.fixed_fee_amount || 0)}</strong></div>
+    <div><span>Fretes debitados</span><strong>${money.format(totals.shipping_amount || 0)}</strong></div>
+    <div class="profit-positive"><span>Estornos Flex</span><strong>${money.format(totals.shipping_reimbursement_amount || 0)}</strong></div>
     <div><span>Valor líquido</span><strong>${money.format(totals.net_amount || 0)}</strong></div>
     <div class="${Number(totals.profit_amount || 0) >= 0 ? "profit-positive" : "profit-negative"}"><span>Lucro / prejuízo</span><strong>${money.format(totals.profit_amount || 0)}</strong></div>`;
   const pageInfo = paginate(state.salesReport.rows || [], state.salesReportPage, state.salesReportPageSize);
@@ -2604,8 +2823,10 @@ function renderSalesReport() {
           <div class="sales-report-product"><strong>${escapeText(row.product)}</strong><small>${escapeText(row.account)} · SKU ${escapeText(row.sku)} · Pedido ${escapeText(row.order_id)}</small><small>${formatDateBR(row.date)}</small></div>
           <span><small>Qtd.</small><strong>${Number(row.quantity || 0)}</strong></span>
           <span><small>Venda</small><strong>${money.format(row.gross_amount || 0)}</strong></span>
-          <span><small>Tarifa</small><strong>${row.sale_fee_amount == null ? "Não disponível" : money.format(row.sale_fee_amount)}</strong></span>
-          <span><small>Frete</small><strong>${money.format(row.shipping_amount || 0)}</strong></span>
+          <span><small>Tarifa de venda</small><strong>${row.percentage_fee_amount == null ? "Não disponível" : money.format(row.percentage_fee_amount)}</strong></span>
+          <span><small>Custo fixo</small><strong>${row.fixed_fee_amount == null ? "Não disponível" : money.format(row.fixed_fee_amount)}</strong></span>
+          <span><small>Frete</small><strong>${row.shipping_amount == null ? "Não disponível" : money.format(row.shipping_amount)}</strong></span>
+          <span class="${Number(row.shipping_reimbursement_amount || 0) > 0 ? "profit-positive" : ""}"><small>Estorno</small><strong>${money.format(row.shipping_reimbursement_amount || 0)}</strong></span>
           <span><small>Líquido</small><strong>${row.net_amount == null ? "Calculando" : money.format(row.net_amount)}</strong></span>
           <span><small>Custo</small><strong>${row.cost_amount == null ? "Sem custo" : money.format(row.cost_amount)}</strong></span>
           <span class="${row.profit_status === "profit" ? "profit-positive" : row.profit_status === "loss" ? "profit-negative" : ""}"><small>Resultado</small><strong>${row.profit_amount == null ? "Sem custo" : money.format(row.profit_amount)}</strong><em>${row.profit_percentage == null ? "" : `${row.profit_percentage >= 0 ? "+" : ""}${Number(row.profit_percentage).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</em></span>
@@ -2730,7 +2951,7 @@ function renderBrandSalesReport() {
       <table class="brand-report-table">
         <thead><tr>
           <th>SKU / Produto</th><th>Estoque</th><th>Pedidos</th><th>Unidades</th><th>Média/dia</th>
-          <th>Venda</th><th>Tarifas</th><th>Frete</th><th>Líquido</th><th>Custo</th>
+          <th>Venda</th><th>Tarifa</th><th>Custo fixo</th><th>Frete</th><th>Estorno</th><th>Líquido</th><th>Custo</th>
           <th>Resultado</th><th>Margem</th><th>Última venda</th><th>Cobertura</th><th>Reposição</th>
         </tr></thead>
         <tbody>${pageInfo.items.map((row) => `
@@ -2744,8 +2965,10 @@ function renderBrandSalesReport() {
             <td><strong>${Number(row.units || 0).toLocaleString("pt-BR")}</strong></td>
             <td>${Number(row.average_daily_units || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 3 })}</td>
             <td>${money.format(row.gross_amount || 0)}</td>
-            <td>${row.sale_fee_amount == null ? "Incompleta" : money.format(row.sale_fee_amount)}</td>
-            <td>${money.format(row.shipping_amount || 0)}</td>
+            <td>${row.percentage_fee_amount == null ? "Incompleta" : money.format(row.percentage_fee_amount)}</td>
+            <td>${row.fixed_fee_amount == null ? "Incompleto" : money.format(row.fixed_fee_amount)}</td>
+            <td>${row.shipping_amount == null ? "Incompleto" : money.format(row.shipping_amount)}</td>
+            <td class="${Number(row.shipping_reimbursement_amount || 0) > 0 ? "profit-positive" : ""}">${money.format(row.shipping_reimbursement_amount || 0)}</td>
             <td>${row.net_amount == null ? "Incompleto" : money.format(row.net_amount)}</td>
             <td>${row.cost_amount == null ? `<span class="missing-data">Sem custo</span>` : money.format(row.cost_amount)}</td>
             <td class="${row.profit_status === "profit" ? "profit-positive" : row.profit_status === "loss" ? "profit-negative" : ""}">${row.profit_amount == null ? "Sem custo" : money.format(row.profit_amount)}</td>
@@ -2809,6 +3032,9 @@ async function loadBrandSalesReport() {
 }
 
 function currentReportFilters(reportType) {
+  if (reportType === "purchases") {
+    return purchaseRequestFromForm();
+  }
   if (reportType === "sales") {
     const form = document.querySelector("#sales-report-form");
     return { account: form.elements.account.value, ...statisticsDateRange(form) };
@@ -2888,7 +3114,9 @@ async function downloadReport(button) {
             ? state.salesReportJobId
             : reportType === "brand_sales"
               ? state.brandSalesReportJobId
-              : "",
+              : reportType === "purchases"
+                ? state.purchaseJobId
+                : "",
       }),
     });
     if (!response.ok) {
@@ -3700,6 +3928,7 @@ document.addEventListener("click", (event) => {
   if (key === "salesReportPage") renderSalesReport();
   if (key === "equalizationPage") renderEqualizationReports();
   if (key === "costsPage") renderCosts();
+  if (key === "purchasePage") renderPurchases();
   if (["dashboardStockPage", "dashboardCatalogPage", "dashboardShipmentPage", "dashboardSalesPage", "dashboardTopSkuPage"].includes(key)) renderDashboard();
 });
 
@@ -3788,6 +4017,60 @@ document.querySelector("#brand-sales-report-form")?.addEventListener("change", (
 document.querySelector("#brand-sales-report-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   await loadBrandSalesReport();
+});
+
+document.querySelector("#purchase-analysis-form")?.addEventListener("change", (event) => {
+  if (event.target.name === "period") updatePurchasePeriodFields();
+});
+
+document.querySelector("#purchase-analysis-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadPurchaseAnalysis();
+});
+
+[
+  ["#purchase-search", "purchaseSearch"],
+  ["#purchase-abc", "purchaseAbc"],
+  ["#purchase-xyz", "purchaseXyz"],
+  ["#purchase-decision", "purchaseDecision"],
+  ["#purchase-page-size", "purchasePageSize"],
+].forEach(([selector, key]) => {
+  ["input", "change"].forEach((eventName) => document.querySelector(selector)?.addEventListener(eventName, (event) => {
+    state[key] = key === "purchasePageSize" ? Number(event.target.value || 50) : event.target.value;
+    state.purchasePage = 1;
+    renderPurchases();
+  }));
+});
+
+document.querySelector('#purchase-calculator-form input[name="comparable_sku"]')?.addEventListener("change", (event) => {
+  const form = event.target.form;
+  const sku = normalizedSkuKey(event.target.value);
+  const reference = (state.purchaseAnalysis?.rows || []).find((row) => normalizedSkuKey(row.sku) === sku);
+  if (!reference) return;
+  form.elements.product.value = reference.product || "";
+  if (reference.average_unit_price) form.elements.sale_price.value = Number(reference.average_unit_price).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (reference.average_fee_percentage != null) form.elements.fee_percentage.value = Number(reference.average_fee_percentage).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+  if (reference.average_shipping_per_sale != null) form.elements.ml_shipping.value = Number(reference.average_shipping_per_sale).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (reference.average_daily_units != null) form.elements.monthly_demand.value = (Number(reference.average_daily_units) * 30).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+  const cost = state.data?.sku_costs?.[sku]?.cost;
+  if (cost != null) form.elements.supplier_cost.value = Number(cost).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  showToast(`Premissas do SKU ${sku} carregadas como referência.`);
+});
+
+document.querySelector("#purchase-calculator-form")?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  try {
+    renderPurchaseCalculatorResult(calculatePurchaseViability(event.target));
+  } catch (error) {
+    showToast(error.message || "Não foi possível calcular a compra.", "error");
+  }
+});
+
+document.querySelector("#purchase-calculator-form")?.addEventListener("reset", () => {
+  window.setTimeout(() => {
+    const root = document.querySelector("#purchase-calculator-results");
+    if (root) root.innerHTML = "";
+  }, 0);
 });
 
 document.addEventListener("click", (event) => {
