@@ -9123,21 +9123,37 @@ def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price,
     return round(min(total_fee, max(0.0, fixed) * max(1, int(quantity or 1))), 2)
 
 
-def shipment_seller_costs(cost_payload, seller_id=None):
+def shipment_discount_amount(discount):
+    """Return the monetary value represented by one shipment discount."""
+    if not isinstance(discount, dict):
+        return 0.0
+    for key in ("amount", "discount_amount", "compensation"):
+        amount = optional_money(discount.get(key))
+        if amount is not None:
+            return round(max(0.0, amount), 2)
+    promoted = optional_money(discount.get("promoted_amount"))
+    rate = optional_money(discount.get("rate"))
+    if promoted is None:
+        return 0.0
+    if rate is None:
+        return round(max(0.0, promoted), 2)
+    return round(max(0.0, promoted * rate), 2)
+
+
+def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False):
     """Return actual seller debit and reimbursement from shipment costs."""
     if not isinstance(cost_payload, dict):
         return None, 0.0
     senders = cost_payload.get("senders") or []
     if isinstance(senders, dict):
         senders = [senders]
-    selected = next(
-        (
-            sender for sender in senders if isinstance(sender, dict)
-            and seller_id not in (None, "")
-            and str(first_present(sender, ["user_id", "seller_id", "id"], "")) == str(seller_id)
-        ),
-        next((sender for sender in senders if isinstance(sender, dict)), None),
-    )
+    selected = next((
+        sender for sender in senders if isinstance(sender, dict)
+        and seller_id not in (None, "")
+        and str(first_present(sender, ["user_id", "seller_id", "id"], "")) == str(seller_id)
+    ), None)
+    if selected is None and seller_id in (None, ""):
+        selected = next((sender for sender in senders if isinstance(sender, dict)), None)
     if not selected:
         return None, 0.0
     signed_cost = optional_money(selected.get("cost"))
@@ -9150,7 +9166,21 @@ def shipment_seller_costs(cost_payload, seller_id=None):
     reimbursement = max(0.0, compensation or 0.0)
     if reimbursement == 0:
         reimbursement = max(0.0, -signed_cost)
-    return round(max(0.0, signed_cost), 2), round(reimbursement, 2)
+    if is_flex and reimbursement == 0:
+        discounts = selected.get("discounts") or []
+        if isinstance(discounts, dict):
+            discounts = [discounts]
+        reimbursement = sum(
+            shipment_discount_amount(discount)
+            for discount in discounts
+        )
+        gross_amount = optional_money(cost_payload.get("gross_amount"))
+        if gross_amount is not None and gross_amount > 0:
+            reimbursement = min(reimbursement, gross_amount)
+    # Flex is fulfilled by the seller. The costs endpoint can still expose a
+    # quotation/subsidy amount, but it is not a freight debit from the sale.
+    shipping = 0.0 if is_flex else max(0.0, signed_cost)
+    return round(shipping, 2), round(reimbursement, 2)
 
 
 def normalized_billing_text(value):
@@ -9198,9 +9228,11 @@ def flex_billing_detail_amount(detail):
     subtype = normalized_billing_text(charge.get("detail_sub_type"))
     detail_type = normalized_billing_text(charge.get("detail_type"))
     status = normalized_billing_text(charge.get("status"))
-    description = normalized_billing_text(
-        charge.get("transaction_detail") or charge.get("status_description")
-    )
+    discount = detail.get("discount_info") if isinstance(detail.get("discount_info"), dict) else {}
+    description = normalized_billing_text(" ".join(str(value or "") for value in (
+        charge.get("transaction_detail"), charge.get("status_description"),
+        discount.get("discount_reason"),
+    )))
     marketplace = normalized_billing_text(first_present(detail, ["marketplace_info.marketplace"], ""))
     shipping_bonus_description = any(
         term in description
@@ -9210,6 +9242,10 @@ def flex_billing_detail_amount(detail):
             "bonus de envio",
             "bonificacion por envio",
             "shipping bonus",
+            "estorno",
+            "reembolso",
+            "refund",
+            "credito por envio",
         )
     )
     shipping_bonus_detail = marketplace == "shipping" and (
@@ -9225,6 +9261,11 @@ def flex_billing_detail_amount(detail):
     if not is_flex:
         return 0.0
     amount = optional_money(charge.get("detail_amount"))
+    if amount is None or amount == 0:
+        for key in ("discount_amount", "rebate"):
+            amount = optional_money(discount.get(key))
+            if amount not in (None, 0):
+                break
     if amount is None:
         return 0.0
     amount = abs(amount)
@@ -9237,6 +9278,10 @@ def flex_billing_detail_amount(detail):
         or subtype.startswith("bflx")
         or "bonifica" in description
         or "bonus" in description
+        or "estorno" in description
+        or "reembolso" in description
+        or "refund" in description
+        or "credito por envio" in description
     )
     return amount if is_bonus else 0.0
 
@@ -9367,7 +9412,7 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
         return local_cache[key]
     ttl = max(300, int(os.getenv("MELI_STATISTICS_SHIPMENT_CACHE_SECONDS", "86400")))
     now = time.monotonic()
-    global_key = f"seller-compensation-v2:{key}"
+    global_key = f"seller-compensation-v3:{key}"
     with SHIPMENT_COST_CACHE_LOCK:
         cached = SHIPMENT_COST_CACHE.get(global_key)
     if cached and now - cached.get("time", 0) < ttl:
@@ -9376,10 +9421,18 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
         return result
     try:
         payload = client.shipment_costs(shipment_id)
-        shipping, reimbursement = shipment_seller_costs(payload, seller_id)
+        shipping, reimbursement = shipment_seller_costs(payload, seller_id, is_flex=is_flex is True)
         if shipping is None:
             raise RuntimeError("A API não informou o custo do remetente.")
-        result = (shipping, reimbursement, "Custo real do envio")
+        result = (
+            shipping,
+            reimbursement,
+            "Mercado Envios Flex: frete sem débito e bônus oficial do envio"
+            if is_flex is True and reimbursement > 0
+            else "Mercado Envios Flex: frete sem débito confirmado pela API"
+            if is_flex is True
+            else "Custo real do envio",
+        )
     except Exception:
         if is_flex is True:
             result = (0.0, 0.0, "Flex sem débito de frete; estorno não retornado")
