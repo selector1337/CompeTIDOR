@@ -1101,6 +1101,7 @@ function renderCosts() {
   list.innerHTML = rows.length ? `${paginationHtml("costsPage", pageInfo)}
     ${pageInfo.items.map((row) => {
       const record = costs[row.sku] || {};
+      const history = Array.isArray(record.history) ? [...record.history].reverse() : [];
       return `
         <article class="cost-item" data-cost-row="${escapeAttr(row.sku)}">
           ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="${escapeAttr(row.title || row.sku)}" loading="lazy" />` : `<span class="cost-thumb-empty">${escapeText(row.sku.slice(0, 2))}</span>`}
@@ -1110,6 +1111,17 @@ function renderCosts() {
             <button class="mini-button success-button" type="button" data-save-cost="${escapeAttr(row.sku)}">Salvar</button>
             <button class="mini-button danger-button" type="button" data-delete-cost="${escapeAttr(row.sku)}" ${record.cost === undefined ? "disabled" : ""}>Remover</button>
           </div>
+          <details class="cost-history">
+            <summary>Histórico de custos <span>${history.length.toLocaleString("pt-BR")}</span></summary>
+            <div class="cost-history-list">
+              ${history.length ? history.map((entry) => {
+                const action = entry.action === "removed" ? "Custo removido" : entry.action === "created" ? "Custo cadastrado" : "Custo alterado";
+                const before = entry.old_cost == null ? "Sem custo" : money.format(entry.old_cost);
+                const after = entry.new_cost == null ? "Sem custo" : money.format(entry.new_cost);
+                return `<div><strong>${action}</strong><span>${before} → ${after}</span><small>${escapeText(entry.changed_by || "Usuário")} · ${formatDateBR(entry.changed_at)}</small></div>`;
+              }).join("") : `<div class="notice">O histórico será registrado a partir da próxima alteração deste SKU.</div>`}
+            </div>
+          </details>
         </article>`;
     }).join("")}
     ${paginationHtml("costsPage", pageInfo)}` : `<div class="notice">Nenhum SKU encontrado com essa pesquisa.</div>`;
@@ -1120,6 +1132,9 @@ function purchaseRequestFromForm() {
   if (!form) return {};
   return {
     account: form.elements.account.value,
+    brand: form.elements.brand.value,
+    product: form.elements.product.value,
+    sku: form.elements.sku.value,
     ml_status: form.elements.ml_status.value,
     abc_basis: form.elements.abc_basis.value,
     lead_time_days: form.elements.lead_time_days.value,
@@ -1258,7 +1273,7 @@ function renderPurchases() {
     summary.innerHTML = "";
     toolbar.hidden = true;
     methodology.innerHTML = `<p>O índice combina demanda, margem, retorno do capital, posição no catálogo, estabilidade e qualidade dos dados. A análise só é executada quando você solicitar.</p>`;
-    results.innerHTML = `<div class="purchase-empty"><strong>Decisões de compra com contexto, não apenas giro.</strong><span>Escolha o período, informe o prazo do fornecedor e clique em Analisar compras.</span></div>`;
+    results.innerHTML = `<div class="purchase-empty"><span>Configure os filtros e clique em Calcular prioridades de compra.</span></div>`;
     return;
   }
   const analysis = state.purchaseAnalysis;
@@ -1288,7 +1303,7 @@ function renderPurchases() {
         <tr>
           <td><span class="purchase-score" style="--score:${Math.round(Number(row.attractiveness_score || 0))}"><strong>${Number(row.attractiveness_score || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}</strong><small>/100</small></span></td>
           <td><div class="purchase-product">${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}<span><strong>${escapeText(row.sku)}</strong><small>${escapeText(row.product)}</small><em>${escapeText(row.brand || "Sem marca")} · ${escapeText(row.accounts_label || "-")}</em></span></div></td>
-          <td><div class="purchase-curves"><b class="abc-${String(row.abc_class || "c").toLowerCase()}">ABC ${escapeText(row.abc_class || "-")}</b><b class="xyz-${String(row.xyz_class || "z").toLowerCase()}">XYZ ${escapeText(row.xyz_class || "-")}</b></div></td>
+          <td><div class="purchase-curves"><b class="abc-${String(row.abc_class || "c").toLowerCase()}">ABC ${escapeText(row.abc_class || "-")}</b><b class="xyz-${String(row.xyz_class || "z").toLowerCase()}" title="${escapeAttr(row.xyz_reason || "Regularidade da demanda")}">XYZ ${escapeText(row.xyz_class || "-")}</b><small>${Number(row.xyz_frequency || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% dos períodos com venda</small></div></td>
           <td><strong>${Number(row.units || 0).toLocaleString("pt-BR")} un.</strong><small>${Number(row.average_daily_units || 0).toLocaleString("pt-BR", { maximumFractionDigits: 3 })}/dia</small><small>${row.days_since_last_sale == null ? "Sem venda registrada" : `última há ${row.days_since_last_sale} dia(s)`}</small></td>
           <td><strong>${Number(row.current_stock || 0).toLocaleString("pt-BR")} un.</strong><small>${row.coverage_days == null ? "Sem giro" : `${Number(row.coverage_days).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} dias de cobertura`}</small><small>${escapeText(row.stock_status)}</small></td>
           <td><strong>${Number(row.suggested_reorder || 0).toLocaleString("pt-BR")} un.</strong><small>Ponto: ${Number(row.reorder_point || 0)} · alvo: ${Number(row.target_stock || 0)}</small><small>Custo máx.: ${row.maximum_purchase_cost == null ? "-" : money.format(row.maximum_purchase_cost)}</small></td>
@@ -1500,6 +1515,7 @@ function renderCatalog() {
                 <label>Novo preço
                   <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-catalog-price-input="${item.id}" /></span>
                 </label>
+                <button class="icon-button catalog-profit-calculator-button" type="button" data-catalog-profit-calculator="${item.id}" title="Calcular lucro, prejuízo e margem" aria-label="Abrir calculadora de rentabilidade de ${escapeAttr(item.title || item.id)}">${calculatorIcon()}</button>
                 <button class="mini-button" data-save-catalog-price="${item.id}">Salvar preço</button>
                 ${item.price_to_win
                   ? `<button class="mini-button win-button" data-win-catalog="${item.id}">Ganhar catálogo por ${money.format(item.price_to_win)}</button>`
@@ -2687,7 +2703,7 @@ function openStockCalculator(row) {
   calculate();
 }
 
-function openProfitCalculator(item) {
+function openProfitCalculator(item, context = "ads") {
   if (!item) return;
   document.querySelector("#profit-calculator-dialog")?.remove();
   const current = profitSimulationValues(item, item.price);
@@ -2739,7 +2755,7 @@ function openProfitCalculator(item) {
       </div>
       <div class="profit-calculator-actions">
         <button class="ghost" type="button" data-close-profit-calculator>Fechar</button>
-        <button class="primary" type="button" data-use-simulated-price ${feeReady ? "" : "disabled"}>Levar para o ajuste em lote</button>
+        <button class="primary" type="button" data-use-simulated-price ${feeReady ? "" : "disabled"}>${context === "catalog" ? "Usar como novo preço" : "Levar para o ajuste em lote"}</button>
       </div>
     </form>`;
   document.body.appendChild(dialog);
@@ -2801,6 +2817,15 @@ function openProfitCalculator(item) {
     button.addEventListener("click", () => dialog.close());
   });
   useButton.addEventListener("click", () => {
+    if (context === "catalog") {
+      const input = document.querySelector(`[data-catalog-price-input="${CSS.escape(item.id)}"]`);
+      if (!input) return;
+      input.value = simulatedPrice.toFixed(2);
+      input.focus({ preventScroll: true });
+      showToast("Preço simulado preenchido no catálogo. Revise e clique em Salvar preço.", "success");
+      dialog.close();
+      return;
+    }
     const bulkRoot = document.querySelector("#ads-bulk-price");
     const mode = bulkRoot?.querySelector("[data-bulk-price-mode]");
     const value = bulkRoot?.querySelector("[data-bulk-price-value]");
@@ -2937,6 +2962,7 @@ function renderSalesReport() {
     <div><span>Custos fixos</span><strong>${money.format(totals.fixed_fee_amount || 0)}</strong></div>
     <div><span>Fretes debitados</span><strong>${money.format(totals.shipping_amount || 0)}</strong></div>
     <div class="profit-positive"><span>Estornos Flex</span><strong>${money.format(totals.shipping_reimbursement_amount || 0)}</strong></div>
+    <div><span>Transportadora Flex</span><strong>${money.format(totals.flex_carrier_cost_amount || 0)}</strong></div>
     <div><span>Valor líquido</span><strong>${money.format(totals.net_amount || 0)}</strong></div>
     <div class="${Number(totals.profit_amount || 0) >= 0 ? "profit-positive" : "profit-negative"}"><span>Lucro / prejuízo</span><strong>${money.format(totals.profit_amount || 0)}</strong></div>`;
   const pageInfo = paginate(state.salesReport.rows || [], state.salesReportPage, state.salesReportPageSize);
@@ -2955,6 +2981,7 @@ function renderSalesReport() {
           <span><small>Custo fixo</small><strong>${row.fixed_fee_amount == null ? "Não disponível" : money.format(row.fixed_fee_amount)}</strong></span>
           <span><small>Frete</small><strong>${row.shipping_amount == null ? "Não disponível" : money.format(row.shipping_amount)}</strong></span>
           <span class="${reimbursement.className}" title="${escapeAttr(reimbursement.title)}"><small>Estorno</small><strong>${escapeText(reimbursement.label)}</strong></span>
+          <span><small>Transportadora Flex</small><strong>${row.flex ? money.format(row.flex_carrier_cost_amount || 0) : "Não se aplica"}</strong></span>
           <span><small>Líquido</small><strong>${row.net_amount == null ? "Calculando" : money.format(row.net_amount)}</strong></span>
           <span><small>Custo</small><strong>${row.cost_amount == null ? "Sem custo" : money.format(row.cost_amount)}</strong></span>
           <span class="${row.profit_status === "profit" ? "profit-positive" : row.profit_status === "loss" ? "profit-negative" : ""}"><small>Resultado</small><strong>${row.profit_amount == null ? "Sem custo" : money.format(row.profit_amount)}</strong><em>${row.profit_percentage == null ? "" : `${row.profit_percentage >= 0 ? "+" : ""}${Number(row.profit_percentage).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</em></span>
@@ -2976,7 +3003,11 @@ async function loadSalesReport() {
     let job = await api("/api/sales-report/query", {
       method: "POST",
       manualProgress: false,
-      body: JSON.stringify({ account: form.elements.account.value, ...range }),
+      body: JSON.stringify({
+        account: form.elements.account.value,
+        flex_carrier_cost: form.elements.flex_carrier_cost.value,
+        ...range,
+      }),
     });
     state.salesReportJobId = job.id || "";
     while (["queued", "processing"].includes(job.status)) {
@@ -3166,7 +3197,11 @@ function currentReportFilters(reportType) {
   }
   if (reportType === "sales") {
     const form = document.querySelector("#sales-report-form");
-    return { account: form.elements.account.value, ...statisticsDateRange(form) };
+    return {
+      account: form.elements.account.value,
+      flex_carrier_cost: form.elements.flex_carrier_cost.value,
+      ...statisticsDateRange(form),
+    };
   }
   if (reportType === "statistics") {
     const form = document.querySelector("#statistics-form");
@@ -4604,6 +4639,12 @@ document.querySelector("#ads-list")?.addEventListener("submit", async (event) =>
 });
 
 document.querySelector("#catalog-list").addEventListener("click", async (event) => {
+  const calculator = event.target.closest("[data-catalog-profit-calculator]");
+  if (calculator) {
+    const item = state.data.catalog.find((row) => row.id === calculator.dataset.catalogProfitCalculator);
+    if (item) openProfitCalculator(item, "catalog");
+    return;
+  }
   const win = event.target.closest("[data-win-catalog]");
   const price = event.target.closest("[data-save-catalog-price]");
   if (!win && !price) return;

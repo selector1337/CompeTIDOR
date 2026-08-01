@@ -419,6 +419,9 @@
             </div>
             <div class="purchase-filter-grid">
               <label><span>Conta</span><select name="account"></select><small>Consolide todas ou analise uma operação específica.</small></label>
+              <label><span>Marca</span><input name="brand" type="search" placeholder="Todas as marcas" autocomplete="off" /><small>Calcula somente produtos cuja marca contenha este termo.</small></label>
+              <label><span>Produto</span><input name="product" type="search" placeholder="Nome do produto" autocomplete="off" /><small>Restringe a análise pelo título sincronizado do anúncio.</small></label>
+              <label><span>SKU exato</span><input name="sku" type="search" placeholder="Ex.: SKU123" autocomplete="off" /><small>Quando preenchido, analisa exclusivamente este SKU.</small></label>
               <label><span>Período analisado</span>
                 <select name="period">
                   <option value="month">Mês atual</option>
@@ -549,6 +552,10 @@
             <label data-sales-date hidden>Data <input name="specific_date" type="date" /></label>
             <label data-sales-custom hidden>Início <input name="date_from" type="date" /></label>
             <label data-sales-custom hidden>Fim <input name="date_to" type="date" /></label>
+            <label>Valor Transportadora Flex
+              <span class="money-field"><input name="flex_carrier_cost" type="text" inputmode="decimal" placeholder="Opcional" /></span>
+              <small>Valor externo por pedido Flex. O custo é rateado entre os itens do mesmo pedido.</small>
+            </label>
             <label>Por página
               <select name="page_size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select>
             </label>

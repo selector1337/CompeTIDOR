@@ -3803,8 +3803,26 @@ def save_sku_costs(request, actor=None):
             sku = normalized_sku_key((entry or {}).get("sku"))
             if not sku:
                 raise RuntimeError("Informe um SKU válido.")
+            previous = costs.get(sku) if isinstance(costs.get(sku), dict) else {}
+            history = list(previous.get("history") or [])
+            changed_at = now_label()
+            changed_by = (actor or {}).get("name") or (actor or {}).get("email") or "Usuário"
+            previous_cost = optional_money(previous.get("cost"))
             if (entry or {}).get("delete") or (entry or {}).get("cost") in (None, ""):
-                costs.pop(sku, None)
+                if previous_cost is not None:
+                    history.append({
+                        "action": "removed",
+                        "old_cost": previous_cost,
+                        "new_cost": None,
+                        "changed_at": changed_at,
+                        "changed_by": changed_by,
+                    })
+                costs[sku] = {
+                    "sku": sku,
+                    "updated_at": changed_at,
+                    "updated_by": changed_by,
+                    "history": history[-200:],
+                }
                 deleted.append(sku)
                 continue
             try:
@@ -3813,11 +3831,20 @@ def save_sku_costs(request, actor=None):
                 raise RuntimeError(f"Informe um custo válido para o SKU {sku}.")
             if amount < 0:
                 raise RuntimeError("O custo não pode ser negativo.")
+            if previous_cost is None or previous_cost != amount:
+                history.append({
+                    "action": "created" if previous_cost is None else "updated",
+                    "old_cost": previous_cost,
+                    "new_cost": amount,
+                    "changed_at": changed_at,
+                    "changed_by": changed_by,
+                })
             record = {
                 "sku": sku,
                 "cost": amount,
-                "updated_at": now_label(),
-                "updated_by": (actor or {}).get("name") or (actor or {}).get("email") or "Usuário",
+                "updated_at": changed_at,
+                "updated_by": changed_by,
+                "history": history[-200:],
             }
             costs[sku] = record
             saved.append(record)
@@ -8997,6 +9024,7 @@ def query_sku_statistics(payload, request):
         "date_from": start.isoformat(),
         "date_to": end.isoformat(),
         "account": account_filter,
+        "filters": {"sku": sku_filter, "brand": brand_filter, "product": product_filter},
         "flex": flex_filter,
         "rows": rows,
         "summary": {
@@ -9729,6 +9757,12 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
 def query_sales_report(payload, request):
     start, end, _, _ = statistics_date_window(request.get("date_from"), request.get("date_to"))
     account_filter = str(request.get("account") or "all")
+    raw_flex_carrier_cost = (request or {}).get("flex_carrier_cost")
+    if isinstance(raw_flex_carrier_cost, str) and "," in raw_flex_carrier_cost:
+        raw_flex_carrier_cost = raw_flex_carrier_cost.replace(".", "").replace(",", ".")
+    flex_carrier_cost = optional_money(raw_flex_carrier_cost)
+    if flex_carrier_cost is not None:
+        flex_carrier_cost = round(max(0.0, flex_carrier_cost), 2)
     accounts = [
         account for account in payload.get("accounts") or []
         if account.get("official") and account.get("access_token") and account.get("status") == "connected"
@@ -9869,6 +9903,10 @@ def query_sales_report(payload, request):
                 shipping = round(order_shipping * allocation, 2) if order_shipping is not None else None
                 reimbursement = round(order_reimbursement * allocation, 2)
                 sale_is_flex = is_flex is True or order_reimbursement > 0
+                external_flex_carrier = (
+                    round(flex_carrier_cost * allocation, 2)
+                    if sale_is_flex and flex_carrier_cost is not None else 0.0
+                )
                 sku = order_item_sku(order_item, catalog_item) or "-"
                 cost_record = (payload.get("sku_costs") or {}).get(normalized_sku_key(sku))
                 unit_cost = None
@@ -9879,7 +9917,10 @@ def query_sales_report(payload, request):
                     round(line_total - percentage_fee - fixed_fee - shipping + reimbursement, 2)
                     if percentage_fee is not None and fixed_fee is not None and shipping is not None else None
                 )
-                profit = round(net - cost_total, 2) if net is not None and cost_total is not None else None
+                profit = (
+                    round(net - cost_total - external_flex_carrier, 2)
+                    if net is not None and cost_total is not None else None
+                )
                 margin = round((profit / net) * 100, 2) if profit is not None and net and net > 0 else None
                 rows.append(
                     {
@@ -9901,6 +9942,7 @@ def query_sales_report(payload, request):
                         "shipping_reimbursement_amount": reimbursement,
                         "shipping_reimbursement_status": reimbursement_status,
                         "shipping_source": shipping_source,
+                        "flex_carrier_cost_amount": external_flex_carrier,
                         "shipping_method": "Mercado Envios Flex" if sale_is_flex else "Outra modalidade",
                         "net_amount": net,
                         "unit_cost": unit_cost,
@@ -9928,11 +9970,13 @@ def query_sales_report(payload, request):
             "fixed_fee_amount": round(sum(float(row.get("fixed_fee_amount") or 0) for row in rows), 2),
             "shipping_amount": round(sum(float(row.get("shipping_amount") or 0) for row in rows if row.get("shipping_amount") is not None), 2),
             "shipping_reimbursement_amount": round(sum(float(row.get("shipping_reimbursement_amount") or 0) for row in rows), 2),
+            "flex_carrier_cost_amount": round(sum(float(row.get("flex_carrier_cost_amount") or 0) for row in rows), 2),
             "net_amount": round(sum(float(row.get("net_amount") or 0) for row in rows if row.get("net_amount") is not None), 2),
             "profit_amount": round(sum(float(row.get("profit_amount") or 0) for row in rows if row.get("profit_amount") is not None), 2),
         },
         "warnings": warnings,
         "truncated": truncated,
+        "flex_carrier_cost": flex_carrier_cost,
         "generated_at": now_label(),
     }
 
@@ -10232,11 +10276,66 @@ def purchase_price_range(value):
     return "Acima de R$ 1.000"
 
 
+def xyz_demand_profile(daily_units, start, end):
+    """Classify demand regularity in comparable time buckets, not sparse calendar days."""
+    start_date = start.astimezone(APP_TZ).date() if isinstance(start, datetime) else start
+    end_date = end.astimezone(APP_TZ).date() if isinstance(end, datetime) else end
+    period_days = max(1, (end_date - start_date).days + 1)
+    target_buckets = 4 if period_days <= 31 else 6 if period_days <= 90 else 12
+    bucket_days = max(1, int(math.ceil(period_days / target_buckets)))
+    bucket_count = max(1, int(math.ceil(period_days / bucket_days)))
+    buckets = [0.0] * bucket_count
+    for raw_date, raw_units in (daily_units or {}).items():
+        try:
+            sold_date = date.fromisoformat(str(raw_date)[:10])
+            index = min(bucket_count - 1, max(0, (sold_date - start_date).days // bucket_days))
+            buckets[index] += max(0.0, float(raw_units or 0))
+        except (TypeError, ValueError):
+            continue
+    total_units = sum(buckets)
+    if total_units <= 0:
+        return {
+            "class": "Z",
+            "variation": None,
+            "active_ratio": 0.0,
+            "active_buckets": 0,
+            "bucket_count": bucket_count,
+            "bucket_days": bucket_days,
+            "reason": "Sem vendas no período",
+        }
+    average = total_units / bucket_count
+    deviation = math.sqrt(sum((value - average) ** 2 for value in buckets) / bucket_count)
+    variation = deviation / average if average > 0 else None
+    active_buckets = sum(1 for value in buckets if value > 0)
+    active_ratio = active_buckets / bucket_count
+    if active_ratio >= 0.75 and variation is not None and variation <= 0.75:
+        xyz_class = "X"
+        reason = "Demanda regular na maior parte do período"
+    elif active_ratio >= 0.35 and variation is not None and variation <= 1.5:
+        xyz_class = "Y"
+        reason = "Demanda intermediária ou moderadamente variável"
+    else:
+        xyz_class = "Z"
+        reason = "Demanda esporádica ou muito variável"
+    return {
+        "class": xyz_class,
+        "variation": variation,
+        "active_ratio": active_ratio,
+        "active_buckets": active_buckets,
+        "bucket_count": bucket_count,
+        "bucket_days": bucket_days,
+        "reason": reason,
+    }
+
+
 def query_purchase_intelligence(payload, request):
     start, end, _, _ = statistics_date_window(request.get("date_from"), request.get("date_to"))
     period_days = max(1, (end - start).days + 1)
     account_filter = str((request or {}).get("account") or "all")
     status_filter = str((request or {}).get("ml_status") or "active").lower()
+    sku_filter = normalized_sku_key((request or {}).get("sku"))
+    brand_filter = normalized_attribute_label((request or {}).get("brand"))
+    product_filter = normalized_attribute_label((request or {}).get("product"))
     abc_basis = str((request or {}).get("abc_basis") or "profit").lower()
     if abc_basis not in {"profit", "net", "gross", "units"}:
         abc_basis = "profit"
@@ -10292,6 +10391,12 @@ def query_purchase_intelligence(payload, request):
             continue
         sku = normalized_sku_key(item.get("sku"))
         if not sku or sku == "-":
+            continue
+        if sku_filter and sku != sku_filter:
+            continue
+        if brand_filter and brand_filter not in normalized_attribute_label(item.get("brand")):
+            continue
+        if product_filter and product_filter not in normalized_attribute_label(item.get("title")):
             continue
         row = grouped.setdefault(
             sku,
@@ -10408,8 +10513,9 @@ def query_purchase_intelligence(payload, request):
         sum_squares = sum(float(value or 0) ** 2 for value in row["daily_units"].values())
         variance = max(0.0, (sum_squares / period_days) - (daily_average ** 2))
         daily_deviation = math.sqrt(variance)
-        variation = daily_deviation / daily_average if daily_average > 0 else None
-        xyz_class = "X" if variation is not None and variation <= 0.5 else "Y" if variation is not None and variation <= 1.0 else "Z"
+        xyz = xyz_demand_profile(row["daily_units"], start, end)
+        variation = xyz["variation"]
+        xyz_class = xyz["class"]
         safety_stock = int(math.ceil(service_z * daily_deviation * math.sqrt(lead_time_days))) if units else 0
         reorder_point = int(math.ceil(daily_average * lead_time_days + safety_stock)) if units else 0
         target_stock = int(math.ceil(daily_average * (lead_time_days + review_days) + safety_stock)) if units else 0
@@ -10515,6 +10621,11 @@ def query_purchase_intelligence(payload, request):
                 "daily_deviation": round(daily_deviation, 3),
                 "demand_variation": round(variation, 3) if variation is not None else None,
                 "xyz_class": xyz_class,
+                "xyz_reason": xyz["reason"],
+                "xyz_frequency": round(xyz["active_ratio"] * 100, 1),
+                "xyz_active_periods": xyz["active_buckets"],
+                "xyz_periods": xyz["bucket_count"],
+                "xyz_period_days": xyz["bucket_days"],
                 "safety_stock": safety_stock,
                 "reorder_point": reorder_point,
                 "target_stock": target_stock,
@@ -10592,6 +10703,7 @@ def query_purchase_intelligence(payload, request):
         "date_to": end.isoformat(),
         "period_days": period_days,
         "account": account_filter,
+        "filters": {"sku": sku_filter, "brand": brand_filter, "product": product_filter},
         "ml_status": status_filter,
         "abc_basis": abc_basis_used,
         "lead_time_days": lead_time_days,
@@ -10618,7 +10730,7 @@ def query_purchase_intelligence(payload, request):
         "methodology": {
             "index": "Demanda 25%, margem 20%, retorno do capital 20%, catálogo 15%, estabilidade 10% e qualidade dos dados 10%.",
             "abc": "A até 80% da contribuição acumulada, B até 95% e C no restante.",
-            "xyz": "X para demanda estável, Y para variação moderada e Z para demanda irregular ou sem venda.",
+            "xyz": "A demanda é agrupada em 4, 6 ou 12 blocos proporcionais ao período. X exige vendas em pelo menos 75% dos blocos e variação até 0,75; Y exige 35% e variação até 1,50; Z representa demanda esporádica, muito variável ou sem venda.",
             "stock": "O estoque físico usa a maior quantidade válida encontrada entre anúncios espelhados do mesmo SKU.",
         },
         "generated_at": now_label(),
@@ -11126,6 +11238,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             ("fixed_fee_amount", "Custo fixo", "currency"),
             ("shipping_amount", "Frete debitado", "currency"),
             ("shipping_reimbursement_amount", "Estorno Flex", "currency"),
+            ("flex_carrier_cost_amount", "Transportadora Flex", "currency"),
             ("shipping_reimbursement_status", "Situação do estorno", "text"),
             ("shipping_source", "Origem do frete", "text"),
             ("net_amount", "Valor líquido", "currency"),
@@ -11140,6 +11253,10 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             {
                 "Período": f"{result.get('date_from')} a {result.get('date_to')}",
                 "Conta": filters.get("account") or "Todas",
+                "Transportadora Flex por pedido": (
+                    f"R$ {float(result.get('flex_carrier_cost')):.2f}"
+                    if result.get("flex_carrier_cost") is not None else "Não informado"
+                ),
                 "Gerado em": now_label(),
             },
         )
