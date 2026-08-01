@@ -10819,7 +10819,7 @@ def statistics_job_signature(request):
     keys = (
         "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
         "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
-        "date_from", "date_to",
+        "date_from", "date_to", "flex_carrier_cost",
     )
     normalized = {key: str((request or {}).get(key) or "") for key in keys}
     return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
@@ -10845,7 +10845,7 @@ def start_statistics_job(request):
         for key in (
             "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
             "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
-            "date_from", "date_to",
+            "date_from", "date_to", "flex_carrier_cost",
         )
     }
     signature = statistics_job_signature(safe_request)

@@ -4376,7 +4376,8 @@ body {
   box-shadow: var(--neon);
 }
 
-.ad-profit-calculator-button svg {
+.ad-profit-calculator-button svg,
+.catalog-profit-calculator-button svg {
   width: 18px;
   height: 18px;
   fill: none;
