@@ -13686,9 +13686,6 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/statistics/query":
             try:
-                if str(request.get("kind") or "").lower() == "purchase_intelligence" and not is_master(self.current_user(payload)):
-                    self.send_json({"error": "A inteligência de compras está temporariamente disponível apenas para o usuário master."}, status=403)
-                    return
                 job = start_statistics_job(request)
                 self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
@@ -13713,9 +13710,6 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/purchases/query":
             try:
-                if not is_master(self.current_user(payload)):
-                    self.send_json({"error": "A inteligência de compras está temporariamente disponível apenas para o usuário master."}, status=403)
-                    return
                 job = start_statistics_job({**request, "kind": "purchase_intelligence"})
                 self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
@@ -13724,9 +13718,6 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/reports/export":
             try:
-                if str(request.get("report_type") or "").lower() == "purchases" and not is_master(self.current_user(payload)):
-                    self.send_json({"error": "A exportação de Compras está temporariamente disponível apenas para o usuário master."}, status=403)
-                    return
                 job = start_report_job(request)
                 self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:

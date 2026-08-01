@@ -539,8 +539,7 @@ function tenantLabel(meta, data) {
 
 function setRoute() {
   const route = (location.hash.replace("#/", "") || "dashboard").split("?")[0];
-  state.route = pageTitles[route] && (route !== "compras" || canManageOAuth()) ? route : "dashboard";
-  if (route === "compras" && !canManageOAuth()) history.replaceState(null, "", "#/dashboard");
+  state.route = pageTitles[route] ? route : "dashboard";
   document.querySelectorAll(".page").forEach((page) => page.classList.remove("active"));
   document.querySelector(`#page-${state.route}`).classList.add("active");
   document.querySelectorAll("nav a").forEach((link) => link.classList.toggle("active", link.dataset.route === state.route));
