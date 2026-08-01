@@ -1144,6 +1144,84 @@ function purchaseDecisionTone(decision) {
   return "purchase-warning";
 }
 
+function purchaseRecommendationText(row) {
+  const reasons = [];
+  if (Number(row.suggested_reorder || 0) > 0) reasons.push(`reposição sugerida de ${Number(row.suggested_reorder).toLocaleString("pt-BR")} unidade(s)`);
+  if (row.stock_status) reasons.push(String(row.stock_status).toLowerCase());
+  if (row.abc_class === "A") reasons.push("alta contribuição econômica (curva A)");
+  if (row.xyz_class === "Z") reasons.push("demanda irregular, exigindo cautela no lote");
+  if (row.profit_percentage != null && Number(row.profit_percentage) < 0) reasons.push("resultado negativo no período");
+  if (row.confidence === "Baixa") reasons.push("amostra pequena ou dados financeiros incompletos");
+  return reasons.length ? reasons.join("; ") : "sem evidência suficiente para recomendar aumento de estoque";
+}
+
+function purchaseReferenceForSku(rawSku) {
+  const sku = normalizedSkuKey(rawSku);
+  if (!sku || sku === "-") return null;
+  const analyzed = (state.purchaseAnalysis?.rows || []).find((row) => normalizedSkuKey(row.sku) === sku);
+  if (analyzed) {
+    return {
+      sku,
+      product: analyzed.product || "",
+      salePrice: analyzed.average_unit_price,
+      feePercentage: analyzed.average_fee_percentage,
+      fixedFee: analyzed.average_fixed_fee_per_sale,
+      shipping: analyzed.average_shipping_per_sale,
+      reimbursement: analyzed.average_shipping_reimbursement_per_sale,
+      monthlyDemand: Number(analyzed.average_daily_units || 0) * 30,
+      cost: state.data?.sku_costs?.[sku]?.cost,
+      source: `Histórico oficial de ${Number(state.purchaseAnalysis?.period_days || 0).toLocaleString("pt-BR")} dia(s)`,
+      confidence: analyzed.confidence || "-",
+    };
+  }
+  const listings = (state.data.catalog || []).filter((item) => normalizedSkuKey(item.sku) === sku);
+  const listing = listings.sort((a, b) => Number(normalizedMlStatus(b.meli_status) === "active") - Number(normalizedMlStatus(a.meli_status) === "active"))[0];
+  if (!listing) return null;
+  const price = Number(listing.price || 0);
+  const totalFee = listing.sale_fee_status === "ok" ? Number(listing.sale_fee_amount || 0) : null;
+  return {
+    sku,
+    product: listing.title || "",
+    salePrice: price || null,
+    feePercentage: totalFee != null && price > 0 ? totalFee / price * 100 : null,
+    fixedFee: 0,
+    shipping: listing.shipping_cost_status === "ok" ? Number(listing.shipping_cost || 0) : null,
+    reimbursement: 0,
+    monthlyDemand: null,
+    cost: state.data?.sku_costs?.[sku]?.cost,
+    source: "Anúncio sincronizado; tarifa exibida como taxa efetiva no preço atual",
+    confidence: "Referência inicial",
+  };
+}
+
+function setPurchaseCalculatorValue(form, name, value, digits = 2) {
+  if (value == null || !Number.isFinite(Number(value)) || !form.elements[name]) return;
+  form.elements[name].value = Number(value).toLocaleString("pt-BR", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function applyPurchaseReference(rawSku) {
+  const form = document.querySelector("#purchase-calculator-form");
+  const status = document.querySelector("#purchase-reference-status");
+  if (!form || !status) return;
+  const reference = purchaseReferenceForSku(rawSku);
+  if (!reference) {
+    status.className = "purchase-reference-status purchase-warning";
+    status.textContent = "SKU não encontrado na análise ou nos anúncios sincronizados. Preencha as premissas manualmente.";
+    return;
+  }
+  form.elements.product.value = reference.product || "";
+  setPurchaseCalculatorValue(form, "sale_price", reference.salePrice);
+  setPurchaseCalculatorValue(form, "fee_percentage", reference.feePercentage);
+  setPurchaseCalculatorValue(form, "fixed_fee", reference.fixedFee);
+  setPurchaseCalculatorValue(form, "ml_shipping", reference.shipping);
+  setPurchaseCalculatorValue(form, "ml_shipping_reimbursement", reference.reimbursement);
+  setPurchaseCalculatorValue(form, "monthly_demand", reference.monthlyDemand);
+  setPurchaseCalculatorValue(form, "supplier_cost", reference.cost);
+  status.className = "purchase-reference-status purchase-positive";
+  status.innerHTML = `<strong>${escapeText(reference.sku)}</strong><span>${escapeText(reference.source)} · Confiança: ${escapeText(reference.confidence)}</span>`;
+  showToast(`Premissas do SKU ${reference.sku} carregadas como referência.`);
+}
+
 function renderPurchases() {
   const form = document.querySelector("#purchase-analysis-form");
   const feedback = document.querySelector("#purchase-feedback");
@@ -1215,11 +1293,19 @@ function renderPurchases() {
           <td><strong>${Number(row.current_stock || 0).toLocaleString("pt-BR")} un.</strong><small>${row.coverage_days == null ? "Sem giro" : `${Number(row.coverage_days).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} dias de cobertura`}</small><small>${escapeText(row.stock_status)}</small></td>
           <td><strong>${Number(row.suggested_reorder || 0).toLocaleString("pt-BR")} un.</strong><small>Ponto: ${Number(row.reorder_point || 0)} · alvo: ${Number(row.target_stock || 0)}</small><small>Custo máx.: ${row.maximum_purchase_cost == null ? "-" : money.format(row.maximum_purchase_cost)}</small></td>
           <td class="${Number(row.profit_amount || 0) >= 0 ? "purchase-positive" : "purchase-negative"}"><strong>${row.profit_amount == null ? "Sem custo" : money.format(row.profit_amount)}</strong><small>${row.profit_percentage == null ? "Margem indisponível" : `${Number(row.profit_percentage).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}% de margem`}</small><small>${row.monthly_roi == null ? "ROI indisponível" : `${Number(row.monthly_roi).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}% ROI mensal`}</small></td>
-          <td><span class="purchase-decision ${purchaseDecisionTone(row.decision)}">${escapeText(row.decision)}</span><small>Confiança ${escapeText(String(row.confidence || "-").toLowerCase())}</small><small>${Number(row.confidence_score || 0).toLocaleString("pt-BR", { maximumFractionDigits: 0 })}%</small></td>
+          <td><span class="purchase-decision ${purchaseDecisionTone(row.decision)}">${escapeText(row.decision)}</span><small>Confiança ${escapeText(String(row.confidence || "-").toLowerCase())} · ${Number(row.confidence_score || 0).toLocaleString("pt-BR", { maximumFractionDigits: 0 })}%</small><details class="purchase-row-reason"><summary>Entender decisão</summary><p>${escapeText(purchaseRecommendationText(row))}.</p></details></td>
         </tr>`).join("")}</tbody>
     </table></div>${paginationHtml("purchasePage", pageInfo)}` : `<div class="notice">Nenhum SKU corresponde aos filtros do resultado.</div>`;
   const method = analysis.methodology || {};
-  methodology.innerHTML = `<p><strong>Índice:</strong> ${escapeText(method.index || "-")}</p><p><strong>ABC:</strong> ${escapeText(method.abc || "-")}</p><p><strong>XYZ:</strong> ${escapeText(method.xyz || "-")}</p><p><strong>Estoque:</strong> ${escapeText(method.stock || "-")}</p>${analysis.truncated ? `<div class="notice warning-notice">A API atingiu o limite da consulta. Reduza o período para elevar a confiança.</div>` : ""}`;
+  methodology.innerHTML = `
+    <div class="purchase-methodology-grid">
+      <section><strong>Índice de atratividade</strong><p>${escapeText(method.index || "-")}</p></section>
+      <section><strong>Curvas ABC e XYZ</strong><p>${escapeText(method.abc || "-")} ${escapeText(method.xyz || "-")}</p></section>
+      <section><strong>Premissas desta análise</strong><p>Reposição em ${Number(analysis.lead_time_days || 0)} dias, revisão a cada ${Number(analysis.review_days || 0)} dias, serviço de ${Number(analysis.service_level || 0).toLocaleString("pt-BR")}% e margem alvo de ${Number(analysis.desired_margin || 0).toLocaleString("pt-BR")}%.</p></section>
+      <section><strong>Estoque físico</strong><p>${escapeText(method.stock || "-")}</p></section>
+    </div>
+    <div class="purchase-formulas"><span><b>Segurança</b> = fator de serviço × desvio diário × raiz do prazo</span><span><b>Ponto de reposição</b> = demanda durante o prazo + segurança</span><span><b>Estoque alvo</b> = demanda no prazo e ciclo + segurança</span><span><b>Custo máximo</b> = líquido médio × (1 − margem desejada)</span></div>
+    ${analysis.truncated ? `<div class="notice warning-notice">A API atingiu o limite da consulta. Reduza o período para elevar a confiança.</div>` : ""}`;
 }
 
 async function loadPurchaseAnalysis() {
@@ -1266,24 +1352,33 @@ function calculatePurchaseViability(form) {
   const additionalRate = Math.max(0, number("additional_percentage")) / 100;
   const salePrice = number("sale_price", NaN);
   const feeRate = Math.max(0, Math.min(0.9, number("fee_percentage") / 100));
+  const fixedFee = Math.max(0, number("fixed_fee"));
   const shipping = Math.max(0, number("ml_shipping"));
+  const shippingReimbursement = Math.max(0, number("ml_shipping_reimbursement"));
   const monthlyDemand = Math.max(0, number("monthly_demand"));
   const leadTime = Math.max(1, number("lead_time", 15));
   const paymentDays = Math.max(0, number("payment_days"));
   const desiredMargin = Math.max(0, Math.min(0.9, number("desired_margin", 20) / 100));
+  const coverageMonths = Math.max(0.25, number("coverage_months", 1.5));
   if (!Number.isFinite(supplierCost) || supplierCost < 0 || !Number.isFinite(salePrice) || salePrice <= 0) {
     throw new Error("Informe custo do fornecedor e preço de venda válidos.");
   }
   const acquisitionUnit = supplierCost * (1 + additionalRate) + inboundFreight / quantity;
-  const fee = salePrice * feeRate;
-  const net = salePrice - fee - shipping;
+  const percentageFee = salePrice * feeRate;
+  const fee = percentageFee + fixedFee;
+  const net = salePrice - percentageFee - fixedFee - shipping + shippingReimbursement;
   const profit = net - acquisitionUnit;
   const margin = net > 0 ? profit / net * 100 : -100;
   const roi = acquisitionUnit > 0 ? profit / acquisitionUnit * 100 : null;
-  const breakEven = feeRate < 1 ? (acquisitionUnit + shipping) / (1 - feeRate) : null;
-  const desiredPrice = feeRate < 1 && desiredMargin < 1 ? (acquisitionUnit / (1 - desiredMargin) + shipping) / (1 - feeRate) : null;
+  const breakEven = feeRate < 1 ? Math.max(0, acquisitionUnit + fixedFee + shipping - shippingReimbursement) / (1 - feeRate) : null;
+  const desiredPrice = feeRate < 1 && desiredMargin < 1 ? Math.max(0, acquisitionUnit / (1 - desiredMargin) + fixedFee + shipping - shippingReimbursement) / (1 - feeRate) : null;
+  const maximumAcquisitionUnit = Math.max(0, net * (1 - desiredMargin));
+  const maximumSupplierCost = Math.max(0, (maximumAcquisitionUnit - inboundFreight / quantity) / Math.max(0.0001, 1 + additionalRate));
+  const discountRequired = supplierCost > maximumSupplierCost && supplierCost > 0 ? (supplierCost - maximumSupplierCost) / supplierCost * 100 : 0;
   const capital = acquisitionUnit * quantity;
   const sellThroughMonths = monthlyDemand > 0 ? quantity / monthlyDemand : null;
+  const recommendedLot = monthlyDemand > 0 ? Math.max(1, Math.ceil(monthlyDemand * coverageMonths)) : null;
+  const excessUnits = recommendedLot == null ? null : Math.max(0, quantity - recommendedLot);
   const monthlyProfit = profit * monthlyDemand;
   const paybackMonths = monthlyProfit > 0 ? capital / monthlyProfit : null;
   const cashCycleDays = (sellThroughMonths == null ? 180 : sellThroughMonths * 30) + leadTime - paymentDays;
@@ -1292,26 +1387,47 @@ function calculatePurchaseViability(form) {
   const rotationScore = sellThroughMonths == null ? 10 : Math.max(0, Math.min(100, 120 - sellThroughMonths * 30));
   const cashScore = Math.max(0, Math.min(100, 100 - Math.max(0, cashCycleDays) / 1.8));
   const score = Math.max(0, Math.min(100, marginScore * 0.35 + roiScore * 0.30 + rotationScore * 0.20 + cashScore * 0.15));
-  const decision = score >= 75 ? "Compra atrativa" : score >= 55 ? "Negociar e comprar" : score >= 35 ? "Compra cautelosa" : "Não recomendado";
-  return { acquisitionUnit, quantity, fee, net, profit, margin, roi, breakEven, desiredPrice, capital, sellThroughMonths, paybackMonths, cashCycleDays, score, decision };
+  let decision = score >= 75 ? "Compra atrativa" : score >= 55 ? "Negociar e comprar" : score >= 35 ? "Compra cautelosa" : "Não recomendado";
+  if (profit <= 0) decision = "Não recomendado";
+  else if (margin < desiredMargin * 100) decision = "Negociar custo";
+  else if (monthlyDemand <= 0) decision = "Validar demanda";
+  else if (excessUnits != null && recommendedLot && quantity > recommendedLot * 1.5) decision = "Reduzir lote";
+  const notes = [];
+  if (supplierCost > maximumSupplierCost) notes.push(`Negocie o custo unitário para até ${money.format(maximumSupplierCost)} (${discountRequired.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}% abaixo da proposta).`);
+  else notes.push(`O custo ofertado está ${money.format(maximumSupplierCost - supplierCost)} abaixo do limite para a margem desejada.`);
+  if (recommendedLot == null) notes.push("A demanda ainda não foi validada; trate o lote como capital de risco.");
+  else if (excessUnits > 0) notes.push(`O lote mínimo supera a cobertura desejada em ${excessUnits.toLocaleString("pt-BR")} unidade(s).`);
+  else notes.push(`O lote mínimo cabe na referência de ${coverageMonths.toLocaleString("pt-BR", { maximumFractionDigits: 2 })} mês(es) de demanda.`);
+  if (cashCycleDays > 0) notes.push(`O caixa fica exposto por aproximadamente ${Math.ceil(cashCycleDays).toLocaleString("pt-BR")} dia(s).`);
+  else notes.push("O prazo de pagamento cobre o ciclo estimado de venda e reposição.");
+  return { acquisitionUnit, quantity, percentageFee, fixedFee, fee, shipping, shippingReimbursement, net, profit, margin, roi, breakEven, desiredPrice, maximumSupplierCost, discountRequired, capital, sellThroughMonths, recommendedLot, excessUnits, paybackMonths, cashCycleDays, coverageMonths, score, decision, notes };
 }
 
 function renderPurchaseCalculatorResult(values) {
   const root = document.querySelector("#purchase-calculator-results");
   if (!root) return;
-  const positive = values.profit >= 0;
+  const positive = values.profit >= 0 && values.decision !== "Não recomendado";
   root.innerHTML = `
-    <div class="purchase-calculator-verdict ${positive ? "purchase-positive" : "purchase-negative"}"><span>Índice de viabilidade</span><strong>${values.score.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}/100</strong><em>${escapeText(values.decision)}</em></div>
-    <div><span>Custo posto unitário</span><strong>${money.format(values.acquisitionUnit)}</strong></div>
-    <div><span>Capital necessário</span><strong>${money.format(values.capital)}</strong></div>
-    <div><span>Tarifa estimada</span><strong>${money.format(values.fee)}</strong></div>
-    <div><span>Valor líquido</span><strong>${money.format(values.net)}</strong></div>
-    <div class="${positive ? "purchase-positive" : "purchase-negative"}"><span>Lucro / prejuízo unitário</span><strong>${money.format(values.profit)}</strong><em>${values.margin.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}% de margem</em></div>
-    <div><span>ROI unitário</span><strong>${values.roi == null ? "-" : `${values.roi.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%`}</strong></div>
-    <div><span>Preço de equilíbrio</span><strong>${values.breakEven == null ? "-" : money.format(values.breakEven)}</strong></div>
-    <div class="purchase-positive"><span>Preço para margem desejada</span><strong>${values.desiredPrice == null ? "-" : money.format(values.desiredPrice)}</strong></div>
-    <div><span>Prazo para vender o lote</span><strong>${values.sellThroughMonths == null ? "Sem demanda" : `${values.sellThroughMonths.toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mês(es)`}</strong></div>
-    <div><span>Payback estimado</span><strong>${values.paybackMonths == null ? "Não recupera" : `${values.paybackMonths.toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mês(es)`}</strong></div>`;
+    <div class="purchase-decision-board">
+      <div class="purchase-calculator-verdict ${positive ? "purchase-positive" : "purchase-negative"}"><span>Decisão sugerida</span><strong>${escapeText(values.decision)}</strong><em>Índice ${values.score.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}/100</em></div>
+      <div class="purchase-positive"><span>Custo máximo no fornecedor</span><strong>${money.format(values.maximumSupplierCost)}</strong><em>Para preservar a margem informada</em></div>
+      <div class="${values.excessUnits > 0 ? "purchase-warning" : "purchase-positive"}"><span>Lote coerente com a demanda</span><strong>${values.recommendedLot == null ? "Não calculado" : `${values.recommendedLot.toLocaleString("pt-BR")} un.`}</strong><em>${values.excessUnits > 0 ? `${values.excessUnits.toLocaleString("pt-BR")} acima da referência` : `${values.coverageMonths.toLocaleString("pt-BR", { maximumFractionDigits: 2 })} mês(es) de cobertura`}</em></div>
+    </div>
+    <div class="purchase-result-grid">
+      <div><span>Custo posto unitário</span><strong>${money.format(values.acquisitionUnit)}</strong></div>
+      <div><span>Capital necessário</span><strong>${money.format(values.capital)}</strong></div>
+      <div><span>Tarifa percentual</span><strong>${money.format(values.percentageFee)}</strong></div>
+      <div><span>Custo fixo</span><strong>${money.format(values.fixedFee)}</strong></div>
+      <div><span>Frete − crédito</span><strong>${money.format(values.shipping - values.shippingReimbursement)}</strong></div>
+      <div><span>Valor líquido</span><strong>${money.format(values.net)}</strong></div>
+      <div class="${values.profit >= 0 ? "purchase-positive" : "purchase-negative"}"><span>Lucro / prejuízo unitário</span><strong>${money.format(values.profit)}</strong><em>${values.margin.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}% de margem</em></div>
+      <div><span>ROI unitário</span><strong>${values.roi == null ? "-" : `${values.roi.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%`}</strong></div>
+      <div><span>Preço de equilíbrio</span><strong>${values.breakEven == null ? "-" : money.format(values.breakEven)}</strong></div>
+      <div class="purchase-positive"><span>Preço para margem desejada</span><strong>${values.desiredPrice == null ? "-" : money.format(values.desiredPrice)}</strong></div>
+      <div><span>Prazo para vender o lote</span><strong>${values.sellThroughMonths == null ? "Sem demanda" : `${values.sellThroughMonths.toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mês(es)`}</strong></div>
+      <div><span>Payback estimado</span><strong>${values.paybackMonths == null ? "Não recupera" : `${values.paybackMonths.toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mês(es)`}</strong></div>
+    </div>
+    <div class="purchase-negotiation-notes"><strong>Pontos para a negociação</strong><ul>${values.notes.map((note) => `<li>${escapeText(note)}</li>`).join("")}</ul></div>`;
 }
 
 function renderCatalog() {
@@ -4041,6 +4157,20 @@ document.querySelector("#purchase-analysis-form")?.addEventListener("submit", as
   await loadPurchaseAnalysis();
 });
 
+document.querySelectorAll("[data-purchase-profile]").forEach((button) => button.addEventListener("click", () => {
+  const form = document.querySelector("#purchase-analysis-form");
+  if (!form) return;
+  const profiles = {
+    lean: { review: 7, service: 90 },
+    balanced: { review: 15, service: 95 },
+    protected: { review: 30, service: 99 },
+  };
+  const profile = profiles[button.dataset.purchaseProfile] || profiles.balanced;
+  form.elements.review_days.value = profile.review;
+  form.elements.service_level.value = profile.service;
+  document.querySelectorAll("[data-purchase-profile]").forEach((current) => current.classList.toggle("active", current === button));
+}));
+
 [
   ["#purchase-search", "purchaseSearch"],
   ["#purchase-abc", "purchaseAbc"],
@@ -4056,18 +4186,7 @@ document.querySelector("#purchase-analysis-form")?.addEventListener("submit", as
 });
 
 document.querySelector('#purchase-calculator-form input[name="comparable_sku"]')?.addEventListener("change", (event) => {
-  const form = event.target.form;
-  const sku = normalizedSkuKey(event.target.value);
-  const reference = (state.purchaseAnalysis?.rows || []).find((row) => normalizedSkuKey(row.sku) === sku);
-  if (!reference) return;
-  form.elements.product.value = reference.product || "";
-  if (reference.average_unit_price) form.elements.sale_price.value = Number(reference.average_unit_price).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  if (reference.average_fee_percentage != null) form.elements.fee_percentage.value = Number(reference.average_fee_percentage).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
-  if (reference.average_shipping_per_sale != null) form.elements.ml_shipping.value = Number(reference.average_shipping_per_sale).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  if (reference.average_daily_units != null) form.elements.monthly_demand.value = (Number(reference.average_daily_units) * 30).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
-  const cost = state.data?.sku_costs?.[sku]?.cost;
-  if (cost != null) form.elements.supplier_cost.value = Number(cost).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  showToast(`Premissas do SKU ${sku} carregadas como referência.`);
+  applyPurchaseReference(event.target.value);
 });
 
 document.querySelector("#purchase-calculator-form")?.addEventListener("submit", (event) => {
@@ -4082,7 +4201,12 @@ document.querySelector("#purchase-calculator-form")?.addEventListener("submit", 
 document.querySelector("#purchase-calculator-form")?.addEventListener("reset", () => {
   window.setTimeout(() => {
     const root = document.querySelector("#purchase-calculator-results");
+    const status = document.querySelector("#purchase-reference-status");
     if (root) root.innerHTML = "";
+    if (status) {
+      status.className = "purchase-reference-status";
+      status.textContent = "Nenhuma referência selecionada. Preencha as premissas manualmente ou escolha um SKU comparável.";
+    }
   }, 0);
 });
 

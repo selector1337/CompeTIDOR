@@ -9218,10 +9218,17 @@ def shipment_discount_amount(discount):
     return round(max(0.0, promoted), 2)
 
 
-def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False):
+def flex_full_shipping_coverage(sale_amount):
+    """Return whether MLB covers the complete Flex tariff for this sale."""
+    amount = optional_money(sale_amount)
+    return amount is not None and 19.0 <= amount < 79.0
+
+
+def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False, sale_amount=None):
     """Return actual seller debit and reimbursement from shipment costs."""
     if not isinstance(cost_payload, dict):
         return None, 0.0
+    gross_amount = optional_money(cost_payload.get("gross_amount"))
     senders = cost_payload.get("senders") or []
     if isinstance(senders, dict):
         senders = [senders]
@@ -9230,12 +9237,27 @@ def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False):
         and seller_id not in (None, "")
         and str(first_present(sender, ["user_id", "seller_id", "id"], "")) == str(seller_id)
     ), None)
-    if selected is None and seller_id in (None, ""):
-        selected = next((sender for sender in senders if isinstance(sender, dict)), None)
+    if selected is None:
+        # The costs resource belongs to one concrete shipment and older/newer
+        # response variants do not always expose the connected Seller ID in
+        # the same field. Keep the exact match above for multi-seller packs,
+        # then use the only available sender instead of discarding official
+        # compensation data solely because its identifier shape changed.
+        valid_senders = [sender for sender in senders if isinstance(sender, dict)]
+        if len(valid_senders) == 1 or seller_id in (None, ""):
+            selected = valid_senders[0] if valid_senders else None
     if not selected:
+        if is_flex and flex_full_shipping_coverage(sale_amount) and gross_amount is not None and gross_amount > 0:
+            return 0.0, round(gross_amount, 2)
         return None, 0.0
     signed_cost = optional_money(selected.get("cost"))
     if signed_cost is None:
+        # Some shipment-cost responses omit the sender debit while still
+        # exposing the official gross tariff. For Flex sales fully subsidized
+        # by MLB, that gross tariff is the exact reimbursement and the seller
+        # debit remains zero.
+        if is_flex and flex_full_shipping_coverage(sale_amount) and gross_amount is not None and gross_amount > 0:
+            return 0.0, round(gross_amount, 2)
         return None, 0.0
     compensation = optional_money(selected.get("compensation"))
     # In the current shipment-cost contract, Flex bonuses are returned as a
@@ -9252,17 +9274,33 @@ def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False):
             shipment_discount_amount(discount)
             for discount in discounts
         )
-        gross_amount = optional_money(cost_payload.get("gross_amount"))
         if gross_amount is not None and gross_amount > 0:
             reimbursement = min(reimbursement, gross_amount)
+    # On MLB Flex sales from R$ 19.00 through R$ 78.99 the official commercial
+    # rule covers 100% of the shipping tariff. `gross_amount` is the tariff of
+    # this concrete shipment, so it is a deterministic reconciliation source
+    # when compensation/discount fields are omitted from the response.
+    if (
+        is_flex
+        and reimbursement == 0
+        and flex_full_shipping_coverage(sale_amount)
+        and gross_amount is not None
+        and gross_amount > 0
+    ):
+        reimbursement = gross_amount
     # Flex is fulfilled by the seller. The costs endpoint can still expose a
     # quotation/subsidy amount, but it is not a freight debit from the sale.
     shipping = 0.0 if is_flex else max(0.0, signed_cost)
     return round(shipping, 2), round(reimbursement, 2)
 
 
-def shipment_payment_reimbursement(payments_payload, seller_id):
-    """Return approved shipping credits paid to the connected seller."""
+def shipment_payment_reimbursement(payments_payload, seller_id=None):
+    """Return all approved payments associated with this shipment.
+
+    Mercado Livre documents `user_id` as data of the shipment payment, not as
+    a guaranteed recipient Seller ID. Filtering by the connected seller drops
+    valid Flex credits paid/subsidized by another party.
+    """
     payments = payments_payload or []
     if isinstance(payments, dict):
         payments = payments.get("results") or payments.get("payments") or [payments]
@@ -9275,9 +9313,6 @@ def shipment_payment_reimbursement(payments_payload, seller_id):
             continue
         status = str(payment.get("status") or "").strip().lower()
         if status not in {"approved", "accredited"}:
-            continue
-        recipient_id = first_present(payment, ["user_id", "seller_id", "collector_id"], None)
-        if seller_id in (None, "") or str(recipient_id) != str(seller_id):
             continue
         payment_id = first_present(payment, ["payment_id", "id"], None)
         fingerprint = str(payment_id) if payment_id not in (None, "") else str(id(payment))
@@ -9631,7 +9666,7 @@ def fetch_flex_billing_reimbursements(client, order_ids, order_periods=None):
     return amounts, warnings
 
 
-def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_cache):
+def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_cache, sale_amount=None):
     shipment_id = shipment_id_from_order(order)
     if shipment_id in (None, "", 0, "0"):
         return 0.0, 0.0, "Sem cobrança de Mercado Envios"
@@ -9642,7 +9677,7 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
     now = time.monotonic()
     # Versioned because older cache entries used promoted_amount * rate and
     # could persist a value ten times smaller than the official reimbursement.
-    global_key = f"seller-compensation-v5:{key}"
+    global_key = f"seller-compensation-v7:{key}"
     with SHIPMENT_COST_CACHE_LOCK:
         cached = SHIPMENT_COST_CACHE.get(global_key)
     if cached and now - cached.get("time", 0) < ttl:
@@ -9651,7 +9686,12 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
         return result
     try:
         payload = client.shipment_costs(shipment_id)
-        shipping, reimbursement = shipment_seller_costs(payload, seller_id, is_flex=is_flex is True)
+        shipping, reimbursement = shipment_seller_costs(
+            payload,
+            seller_id,
+            is_flex=is_flex is True,
+            sale_amount=sale_amount,
+        )
         if shipping is None:
             raise RuntimeError("A API não informou o custo do remetente.")
         reimbursement_source = ""
@@ -9661,7 +9701,7 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
                 payment_reimbursement = shipment_payment_reimbursement(payment_payload, seller_id)
                 if payment_reimbursement > 0:
                     reimbursement = payment_reimbursement
-                    reimbursement_source = "Pagamento aprovado do envio Flex ao vendedor"
+                    reimbursement_source = "Pagamento oficial associado ao envio Flex"
             except Exception:
                 pass
         result = (
@@ -9779,7 +9819,13 @@ def query_sales_report(payload, request):
                 else:
                     order_fee_total += line_fee
             order_shipping, order_reimbursement, shipping_source = shipment_financials(
-                client, order, account.get("seller_id"), is_flex, first_catalog_item, shipment_cost_cache
+                client,
+                order,
+                account.get("seller_id"),
+                is_flex,
+                first_catalog_item,
+                shipment_cost_cache,
+                sale_amount=order_gross,
             )
             billing_reimbursement = float(billing_reimbursements.get(order_id) or 0)
             if billing_reimbursement > order_reimbursement:
@@ -10397,8 +10443,19 @@ def query_purchase_intelligence(payload, request):
             round(average_net_unit * (1 - desired_margin / 100), 2)
             if average_net_unit is not None else None
         )
-        fee_percentage = round((fee_amount / gross_amount) * 100, 2) if fee_amount is not None and gross_amount > 0 else None
+        fee_percentage = (
+            round((row["percentage_fee_amount"] / gross_amount) * 100, 2)
+            if all_fees_known and gross_amount > 0 else None
+        )
         average_shipping = round(row["shipping_amount"] / sales_count, 2) if sales_count else 0.0
+        average_fixed_fee = (
+            round(row["fixed_fee_amount"] / sales_count, 2)
+            if all_fees_known and sales_count else 0.0
+        )
+        average_shipping_reimbursement = (
+            round(row["shipping_reimbursement_amount"] / sales_count, 2)
+            if sales_count else 0.0
+        )
         parsed_last_sale = parse_meli_datetime(row.get("last_sale_at"))
         days_since_last_sale = (
             max(0, (datetime.now(APP_TZ).date() - parsed_last_sale.astimezone(APP_TZ).date()).days)
@@ -10451,7 +10508,9 @@ def query_purchase_intelligence(payload, request):
                 "average_unit_price": average_price,
                 "average_net_unit": average_net_unit,
                 "average_fee_percentage": fee_percentage,
+                "average_fixed_fee_per_sale": average_fixed_fee,
                 "average_shipping_per_sale": average_shipping,
+                "average_shipping_reimbursement_per_sale": average_shipping_reimbursement,
                 "average_daily_units": round(daily_average, 3),
                 "daily_deviation": round(daily_deviation, 3),
                 "demand_variation": round(variation, 3) if variation is not None else None,

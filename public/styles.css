@@ -3541,9 +3541,69 @@ body {
   padding-top: 18px;
 }
 
+.panel-intro {
+  max-width: 760px;
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: .82rem;
+  line-height: 1.55;
+}
+
+.purchase-guide {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 1px;
+  margin: 16px 0;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--brand) 48%, var(--line));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--brand) 36%, var(--line));
+}
+
+.purchase-guide > div {
+  display: grid;
+  gap: 5px;
+  min-height: 76px;
+  padding: 12px 14px;
+  background: var(--panel-2);
+}
+
+.purchase-guide b { color: var(--brand); font-size: .76rem; text-transform: uppercase; }
+.purchase-guide span { color: var(--muted); font-size: .74rem; line-height: 1.45; }
+
+.purchase-policy-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border-left: 3px solid var(--brand);
+  background: color-mix(in srgb, var(--brand) 6%, var(--panel-2));
+}
+
+.purchase-policy-bar > div:first-child { display: grid; gap: 3px; }
+.purchase-policy-bar strong { color: var(--ink); font-size: .82rem; }
+.purchase-policy-bar span { color: var(--muted); font-size: .72rem; line-height: 1.4; }
+.purchase-policy-options { display: flex; gap: 6px; flex: 0 0 auto; }
+.purchase-policy-options button {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font-weight: 850;
+}
+.purchase-policy-options button.active {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: #111;
+  box-shadow: 0 0 14px color-mix(in srgb, var(--brand) 24%, transparent);
+}
+
 .purchase-filter-grid,
-.purchase-result-toolbar,
-.purchase-calculator-grid {
+.purchase-result-toolbar {
   display: grid;
   grid-template-columns: repeat(5, minmax(150px, 1fr));
   gap: 12px;
@@ -3551,7 +3611,7 @@ body {
 
 .purchase-filter-grid label,
 .purchase-result-toolbar label,
-.purchase-calculator-grid label {
+.purchase-calculator-fields label {
   display: grid;
   align-content: start;
   gap: 6px;
@@ -3559,6 +3619,15 @@ body {
   color: var(--muted);
   font-size: .76rem;
   font-weight: 800;
+}
+
+.purchase-filter-grid label > small,
+.purchase-calculator-fields label > small {
+  min-height: 2.8em;
+  color: color-mix(in srgb, var(--muted) 88%, transparent);
+  font-size: .65rem;
+  font-weight: 650;
+  line-height: 1.4;
 }
 
 .purchase-run-button {
@@ -3574,7 +3643,8 @@ body {
 }
 
 .purchase-summary > div,
-.purchase-calculator-results > div {
+.purchase-decision-board > div,
+.purchase-result-grid > div {
   display: grid;
   gap: 5px;
   min-height: 76px;
@@ -3585,7 +3655,8 @@ body {
 }
 
 .purchase-summary span,
-.purchase-calculator-results span {
+.purchase-decision-board span,
+.purchase-result-grid span {
   color: var(--muted);
   font-size: .7rem;
   font-weight: 900;
@@ -3593,7 +3664,8 @@ body {
 }
 
 .purchase-summary strong,
-.purchase-calculator-results strong {
+.purchase-decision-board strong,
+.purchase-result-grid strong {
   font-size: 1.08rem;
 }
 
@@ -3707,6 +3779,10 @@ body {
   white-space: nowrap;
 }
 
+.purchase-row-reason { margin-top: 8px; }
+.purchase-row-reason summary { color: var(--brand); cursor: pointer; font-size: .67rem; font-weight: 850; }
+.purchase-row-reason p { max-width: 250px; margin: 6px 0 0; color: var(--muted); font-size: .68rem; line-height: 1.45; }
+
 .abc-a, .xyz-x, .purchase-positive { color: var(--green) !important; }
 .abc-b, .xyz-y, .purchase-warning { color: var(--amber) !important; }
 .abc-c, .xyz-z, .purchase-negative { color: var(--red) !important; }
@@ -3736,16 +3812,89 @@ body {
 .purchase-methodology summary { color: var(--ink); cursor: pointer; font-weight: 900; }
 .purchase-methodology p { margin: 10px 0 0; }
 
+.purchase-methodology-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(180px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.purchase-methodology-grid section {
+  padding: 11px 12px;
+  border-left: 2px solid var(--brand);
+  background: color-mix(in srgb, var(--panel-2) 78%, transparent);
+}
+
+.purchase-methodology-grid strong { color: var(--ink); font-size: .76rem; }
+.purchase-methodology-grid p { color: var(--muted); font-size: .7rem; line-height: 1.5; }
+.purchase-formulas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+.purchase-formulas span {
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: .67rem;
+}
+.purchase-formulas b { color: var(--brand); }
+
 .purchase-calculator-panel { margin-top: 14px; }
-.purchase-calculator-grid { grid-template-columns: repeat(4, minmax(170px, 1fr)); }
+.purchase-calculator-form { display: grid; gap: 12px; }
+.purchase-calculator-section {
+  min-width: 0;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--line) 48%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel-2) 66%, transparent);
+}
+.purchase-calculator-section legend {
+  padding: 0 8px;
+  color: var(--brand);
+  font-size: .72rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+.purchase-reference-section { border-color: color-mix(in srgb, var(--brand) 48%, var(--line)); }
+.purchase-calculator-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+}
+.purchase-reference-status {
+  margin-top: 10px;
+  padding: 9px 11px;
+  border-left: 2px solid var(--muted);
+  background: color-mix(in srgb, var(--surface) 74%, transparent);
+  color: var(--muted);
+  font-size: .7rem;
+  line-height: 1.45;
+}
+.purchase-reference-status.purchase-positive { border-left-color: var(--green); }
+.purchase-reference-status.purchase-warning { border-left-color: var(--amber); }
 .purchase-calculator-actions { display: flex; align-items: end; gap: 8px; }
 .purchase-calculator-actions button { flex: 1; }
 
 .purchase-calculator-results {
   display: grid;
-  grid-template-columns: repeat(5, minmax(150px, 1fr));
-  gap: 10px;
+  gap: 12px;
   margin-top: 16px;
+}
+
+.purchase-decision-board {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(190px, 1fr));
+  gap: 10px;
+}
+
+.purchase-result-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 10px;
 }
 
 .purchase-calculator-results em {
@@ -3759,21 +3908,39 @@ body {
   box-shadow: 0 0 18px color-mix(in srgb, currentColor 17%, transparent);
 }
 
+.purchase-negotiation-notes {
+  padding: 13px 15px;
+  border-left: 3px solid var(--brand);
+  background: color-mix(in srgb, var(--brand) 5%, var(--panel-2));
+}
+.purchase-negotiation-notes > strong { color: var(--brand); font-size: .77rem; text-transform: uppercase; }
+.purchase-negotiation-notes ul { display: grid; gap: 6px; margin: 9px 0 0; padding-left: 18px; }
+.purchase-negotiation-notes li { color: var(--ink); font-size: .73rem; line-height: 1.45; }
+
 @media (max-width: 1280px) {
   .purchase-filter-grid { grid-template-columns: repeat(3, minmax(160px, 1fr)); }
   .purchase-summary { grid-template-columns: repeat(3, minmax(130px, 1fr)); }
-  .purchase-calculator-grid { grid-template-columns: repeat(3, minmax(160px, 1fr)); }
-  .purchase-calculator-results { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
+  .purchase-guide { grid-template-columns: repeat(2, minmax(160px, 1fr)); }
+  .purchase-methodology-grid { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
+  .purchase-result-grid { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
 }
 
 @media (max-width: 760px) {
   .purchase-filter-grid,
   .purchase-result-toolbar,
-  .purchase-calculator-grid,
   .purchase-summary,
-  .purchase-calculator-results { grid-template-columns: 1fr; }
+  .purchase-guide,
+  .purchase-methodology-grid,
+  .purchase-decision-board,
+  .purchase-result-grid { grid-template-columns: 1fr; }
+  .purchase-policy-bar { align-items: stretch; flex-direction: column; }
+  .purchase-policy-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .purchase-policy-options button { padding: 0 7px; }
+  .purchase-calculator-fields { grid-template-columns: 1fr; }
+  .purchase-filter-grid label > small,
+  .purchase-calculator-fields label > small { min-height: 0; }
   .purchase-table { min-width: 1120px; }
-  .purchase-calculator-actions { align-items: stretch; }
+  .purchase-calculator-actions { align-items: stretch; flex-direction: column; }
 }
 
 .sidebar nav a.active .nav-icon {

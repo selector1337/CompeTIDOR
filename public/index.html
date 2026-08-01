@@ -393,18 +393,33 @@
         <div class="panel purchases-panel">
           <div class="panel-heading">
             <div>
-              <p class="eyebrow">Abastecimento orientado por dados</p>
-              <h2>Índice de atratividade de compras</h2>
+              <p class="eyebrow">Planejamento de estoque</p>
+              <h2>Compras com demanda, margem e risco</h2>
+              <p class="panel-intro">Use o histórico oficial para decidir o que repor, quanto comprar e até quanto pagar.</p>
             </div>
             <div class="report-actions" aria-label="Exportar inteligência de compras">
               <button class="mini-button" type="button" data-export-report="purchases" data-export-format="pdf">PDF</button>
               <button class="mini-button" type="button" data-export-report="purchases" data-export-format="xlsx">Excel</button>
             </div>
           </div>
+          <div class="purchase-guide" aria-label="Leitura rápida da análise">
+            <div><b>ABC</b><span>Importância econômica do SKU no período.</span></div>
+            <div><b>XYZ</b><span>Regularidade da demanda: X é estável; Z é irregular.</span></div>
+            <div><b>Ponto de reposição</b><span>Estoque mínimo para comprar antes de faltar.</span></div>
+            <div><b>Estoque alvo</b><span>Quantidade para cobrir reposição e próxima revisão.</span></div>
+          </div>
           <form id="purchase-analysis-form" class="purchase-analysis-form">
+            <div class="purchase-policy-bar">
+              <div><strong>Perfil de abastecimento</strong><span>Ajusta ciclo de revisão e proteção contra ruptura. O prazo do fornecedor continua editável.</span></div>
+              <div class="purchase-policy-options" role="group" aria-label="Perfil de abastecimento">
+                <button type="button" data-purchase-profile="lean">Enxuto</button>
+                <button type="button" data-purchase-profile="balanced" class="active">Equilibrado</button>
+                <button type="button" data-purchase-profile="protected">Protegido</button>
+              </div>
+            </div>
             <div class="purchase-filter-grid">
-              <label>Conta <select name="account"></select></label>
-              <label>Período
+              <label><span>Conta</span><select name="account"></select><small>Consolide todas ou analise uma operação específica.</small></label>
+              <label><span>Período analisado</span>
                 <select name="period">
                   <option value="month">Mês atual</option>
                   <option value="week">Últimos 7 dias</option>
@@ -413,23 +428,27 @@
                   <option value="year">Ano atual</option>
                   <option value="custom">Período personalizado</option>
                 </select>
+                <small>Períodos maiores elevam a confiança em produtos sazonais.</small>
               </label>
               <label data-purchase-custom hidden>Início <input name="date_from" type="date" /></label>
               <label data-purchase-custom hidden>Fim <input name="date_to" type="date" /></label>
-              <label>Status ML
+              <label><span>Status dos anúncios</span>
                 <select name="ml_status"><option value="active">Ativos</option><option value="all">Todos</option><option value="paused">Pausados</option></select>
+                <small>Ativos é o padrão para uma decisão de reposição operacional.</small>
               </label>
-              <label>Curva ABC por
+              <label><span>Curva ABC por</span>
                 <select name="abc_basis"><option value="profit">Lucro</option><option value="net">Valor líquido</option><option value="gross">Faturamento</option><option value="units">Unidades</option></select>
+                <small>Define qual contribuição econômica ordena as classes A, B e C.</small>
               </label>
-              <label>Prazo de reposição <span class="unit-field"><input name="lead_time_days" type="number" min="1" max="365" value="15" /><span>dias</span></span></label>
-              <label>Ciclo de revisão <span class="unit-field"><input name="review_days" type="number" min="1" max="365" value="15" /><span>dias</span></span></label>
-              <label>Nível de serviço
+              <label><span>Prazo de reposição</span><span class="unit-field"><input name="lead_time_days" type="number" min="1" max="365" value="15" /><span>dias</span></span><small>Do pedido ao fornecedor até o produto estar disponível para venda.</small></label>
+              <label><span>Ciclo de revisão</span><span class="unit-field"><input name="review_days" type="number" min="1" max="365" value="15" /><span>dias</span></span><small>Intervalo planejado até revisar e comprar este estoque novamente.</small></label>
+              <label><span>Nível de serviço</span>
                 <select name="service_level"><option value="90">90%</option><option value="95" selected>95%</option><option value="97">97%</option><option value="99">99%</option></select>
+                <small>Probabilidade desejada de não faltar produto durante a reposição.</small>
               </label>
-              <label>Margem desejada <span class="unit-field"><input name="desired_margin" type="number" min="0" max="90" step="0.1" value="20" /><span>%</span></span></label>
+              <label><span>Margem líquida desejada</span><span class="unit-field"><input name="desired_margin" type="number" min="0" max="90" step="0.1" value="20" /><span>%</span></span><small>Usada para calcular o custo máximo de compra por unidade.</small></label>
             </div>
-            <button class="primary purchase-run-button" type="submit">Analisar compras</button>
+            <button class="primary purchase-run-button" type="submit">Calcular prioridades de compra</button>
           </form>
           <div id="purchase-feedback"></div>
           <div id="purchase-summary" class="purchase-summary"></div>
@@ -444,7 +463,7 @@
           </div>
           <div id="purchase-results"></div>
           <details class="purchase-methodology">
-            <summary>Como o índice é calculado</summary>
+            <summary>Fórmulas, pesos e interpretação do índice</summary>
             <div id="purchase-methodology-content"></div>
           </details>
         </div>
@@ -453,24 +472,49 @@
           <div class="panel-heading">
             <div>
               <p class="eyebrow">Negociação com fornecedores</p>
-              <h2>Calculadora de nova compra</h2>
+              <h2>Simulador de nova compra</h2>
+              <p class="panel-intro">Compare uma proposta com um SKU real e descubra o custo máximo antes de negociar.</p>
             </div>
           </div>
-          <form id="purchase-calculator-form" class="purchase-calculator-grid">
-            <label>Produto <input name="product" type="text" placeholder="Nome do produto" /></label>
-            <label>Usar SKU como referência <input name="comparable_sku" list="purchase-sku-options" placeholder="SKU opcional" /><datalist id="purchase-sku-options"></datalist></label>
-            <label>Custo do fornecedor <span class="money-field"><input name="supplier_cost" inputmode="decimal" placeholder="0,00" required /></span></label>
-            <label>Quantidade mínima <input name="quantity" type="number" min="1" step="1" value="1" required /></label>
-            <label>Frete de entrada total <span class="money-field"><input name="inbound_freight" inputmode="decimal" value="0" /></span></label>
-            <label>Custos adicionais <span class="unit-field"><input name="additional_percentage" inputmode="decimal" value="0" /><span>%</span></span></label>
-            <label>Preço de venda previsto <span class="money-field"><input name="sale_price" inputmode="decimal" placeholder="0,00" required /></span></label>
-            <label>Tarifa Mercado Livre <span class="unit-field"><input name="fee_percentage" inputmode="decimal" placeholder="0" /><span>%</span></span></label>
-            <label>Frete estimado ML <span class="money-field"><input name="ml_shipping" inputmode="decimal" value="0" /></span></label>
-            <label>Demanda mensal prevista <input name="monthly_demand" type="number" min="0" step="0.1" value="1" /></label>
-            <label>Prazo de reposição <span class="unit-field"><input name="lead_time" type="number" min="1" value="15" /><span>dias</span></span></label>
-            <label>Prazo para pagamento <span class="unit-field"><input name="payment_days" type="number" min="0" value="0" /><span>dias</span></span></label>
-            <label>Margem desejada <span class="unit-field"><input name="desired_margin" inputmode="decimal" value="20" /><span>%</span></span></label>
-            <div class="purchase-calculator-actions"><button class="primary" type="submit">Calcular viabilidade</button><button class="ghost" type="reset">Limpar</button></div>
+          <form id="purchase-calculator-form" class="purchase-calculator-form">
+            <fieldset class="purchase-calculator-section purchase-reference-section">
+              <legend>1. Produto e referência comparável</legend>
+              <div class="purchase-calculator-fields">
+                <label><span>Produto em negociação</span><input name="product" type="text" placeholder="Nome do novo produto" /><small>Nome livre para identificar a simulação.</small></label>
+                <label><span>SKU semelhante já vendido</span><input name="comparable_sku" list="purchase-sku-options" placeholder="Digite um SKU de referência" /><datalist id="purchase-sku-options"></datalist><small>Importa preço, tarifa, frete e giro observados no Mercado Livre.</small></label>
+              </div>
+              <div id="purchase-reference-status" class="purchase-reference-status">Nenhuma referência selecionada. Preencha as premissas manualmente ou escolha um SKU comparável.</div>
+            </fieldset>
+            <fieldset class="purchase-calculator-section">
+              <legend>2. Proposta do fornecedor</legend>
+              <div class="purchase-calculator-fields">
+                <label><span>Custo unitário ofertado</span><span class="money-field"><input name="supplier_cost" inputmode="decimal" placeholder="0,00" required /></span><small>Preço de uma unidade antes de frete e custos adicionais.</small></label>
+                <label><span>Lote mínimo</span><input name="quantity" type="number" min="1" step="1" value="1" required /><small>Quantidade mínima exigida pelo fornecedor.</small></label>
+                <label><span>Frete de entrada do lote</span><span class="money-field"><input name="inbound_freight" inputmode="decimal" value="0" /></span><small>Valor total para trazer o lote até sua operação.</small></label>
+                <label><span>Impostos e outros custos</span><span class="unit-field"><input name="additional_percentage" inputmode="decimal" value="0" /><span>%</span></span><small>Percentual adicional aplicado ao custo do fornecedor.</small></label>
+                <label><span>Prazo para pagamento</span><span class="unit-field"><input name="payment_days" type="number" min="0" value="0" /><span>dias</span></span><small>Ajuda a medir a pressão da compra sobre o caixa.</small></label>
+              </div>
+            </fieldset>
+            <fieldset class="purchase-calculator-section">
+              <legend>3. Receita e custos do Mercado Livre</legend>
+              <div class="purchase-calculator-fields">
+                <label><span>Preço de venda previsto</span><span class="money-field"><input name="sale_price" inputmode="decimal" placeholder="0,00" required /></span><small>Preço que você pretende praticar no anúncio.</small></label>
+                <label><span>Tarifa percentual</span><span class="unit-field"><input name="fee_percentage" inputmode="decimal" placeholder="0" /><span>%</span></span><small>Percentual do anúncio Clássico ou Premium.</small></label>
+                <label><span>Custo fixo por venda</span><span class="money-field"><input name="fixed_fee" inputmode="decimal" value="0" /></span><small>Quando aplicável, normalmente em vendas abaixo do limite vigente.</small></label>
+                <label><span>Frete debitado do vendedor</span><span class="money-field"><input name="ml_shipping" inputmode="decimal" value="0" /></span><small>Use o custo efetivo após descontos; no Flex sem débito, use zero.</small></label>
+                <label><span>Crédito de envio / Flex</span><span class="money-field"><input name="ml_shipping_reimbursement" inputmode="decimal" value="0" /></span><small>Crédito oficial associado ao envio, quando houver.</small></label>
+                <label><span>Margem líquida desejada</span><span class="unit-field"><input name="desired_margin" inputmode="decimal" value="20" /><span>%</span></span><small>Meta de lucro sobre o valor líquido recebido.</small></label>
+              </div>
+            </fieldset>
+            <fieldset class="purchase-calculator-section">
+              <legend>4. Demanda, reposição e exposição de caixa</legend>
+              <div class="purchase-calculator-fields">
+                <label><span>Demanda mensal prevista</span><input name="monthly_demand" type="number" min="0" step="0.1" value="1" /><small>Unidades que espera vender em 30 dias.</small></label>
+                <label><span>Prazo de reposição</span><span class="unit-field"><input name="lead_time" type="number" min="1" value="15" /><span>dias</span></span><small>Tempo até uma nova compra chegar e poder ser vendida.</small></label>
+                <label><span>Cobertura desejada do lote</span><span class="unit-field"><input name="coverage_months" type="number" min="0.25" max="24" step="0.25" value="1.5" /><span>meses</span></span><small>Horizonte de estoque usado para comparar o lote mínimo.</small></label>
+              </div>
+            </fieldset>
+            <div class="purchase-calculator-actions"><button class="primary" type="submit">Avaliar proposta</button><button class="ghost" type="reset">Limpar simulação</button></div>
           </form>
           <div id="purchase-calculator-results" class="purchase-calculator-results"></div>
         </div>
