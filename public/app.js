@@ -1774,6 +1774,31 @@ function renderAdDescriptionEditor(item) {
   `;
 }
 
+function reportPackageNumber(field, value) {
+  const text = String(value || "").trim().toLowerCase();
+  const match = text.match(/[-+]?\d[\d.,]*/);
+  if (!match) return null;
+  let number = parseLocalizedNumber(match[0]);
+  if (!Number.isFinite(number)) return null;
+  if (field === "package_weight") {
+    if (/\bmg\b/.test(text)) number /= 1000000;
+    else if (/\b(g|gr|grama|gramas)\b/.test(text) && !/\bkg\b/.test(text)) number /= 1000;
+  } else if (/\bmm\b/.test(text)) number /= 10;
+  else if (/\b(m|metro|metros)\b/.test(text) && !/\bcm\b/.test(text)) number *= 100;
+  return Math.round(number * 1000) / 1000;
+}
+
+function reportPackageSignature(item) {
+  return ["package_weight", "package_height", "package_width", "package_length"]
+    .map((field) => reportPackageNumber(field, item[field]))
+    .map((value) => value === null ? "?" : String(value)).join("|");
+}
+
+function reportGtinSignature(value) {
+  return [...new Set(String(value || "").split(/[,;|\s]+/).map((part) => part.replace(/\D/g, "")).filter(Boolean))]
+    .sort().join("|");
+}
+
 function renderEqualizationReports() {
   const container = document.querySelector("#equalization-report");
   if (!container) return;
@@ -1784,6 +1809,81 @@ function renderEqualizationReports() {
   }
   const accounts = connectedAccounts().map((account) => account.nickname).filter(Boolean);
   setOptions("#equalization-account-filter", ["all", ...accounts], state.equalizationAccount, "Todas as contas");
+  const mediaActions = document.querySelector("#equalization-media-actions");
+  if (mediaActions) mediaActions.hidden = state.equalizationType !== "missing_clips";
+  const sourceItems = (state.data.catalog || []).filter((item) => {
+    const account = item.account || "";
+    const sku = String(item.sku || "").trim().toUpperCase();
+    const status = String(item.meli_status || "").toLowerCase() === "inactive" ? "paused" : String(item.meli_status || "").toLowerCase();
+    return accounts.includes(account) && sku && sku !== "-"
+      && (state.equalizationAccount === "all" || account === state.equalizationAccount)
+      && (state.equalizationStatus === "all" || status === state.equalizationStatus);
+  });
+  const mediaModes = new Set(["package_discrepancy", "gtin_discrepancy", "missing_clips", "photo_coverage"]);
+  if (mediaModes.has(state.equalizationType)) {
+    const bySku = new Map();
+    sourceItems.forEach((item) => {
+      const sku = String(item.sku || "").trim().toUpperCase();
+      if (!bySku.has(sku)) bySku.set(sku, []);
+      bySku.get(sku).push(item);
+    });
+    let rows = [];
+    if (["package_discrepancy", "gtin_discrepancy"].includes(state.equalizationType)) {
+      const signature = state.equalizationType === "package_discrepancy"
+        ? reportPackageSignature : (item) => reportGtinSignature(item.gtin);
+      bySku.forEach((items, sku) => {
+        const signatures = new Set(items.map(signature));
+        if (items.length < 2 || signatures.size < 2) return;
+        items.forEach((item) => rows.push({ ...item, sku, distinctValues: signatures.size }));
+      });
+    } else if (state.equalizationType === "photo_coverage") {
+      rows = sourceItems.filter((item) => Number.isFinite(Number(item.picture_count)) && Number(item.picture_count) < 12);
+    } else {
+      rows = sourceItems.filter((item) => item.clips_status === "missing");
+    }
+    const search = state.equalizationSearch.trim().toLowerCase();
+    if (search) rows = rows.filter((row) => `${row.sku} ${row.title || ""} ${row.account || ""} ${row.id || ""}`.toLowerCase().includes(search));
+    rows.sort((a, b) => `${a.sku}|${a.account}|${a.id}`.localeCompare(`${b.sku}|${b.account}|${b.id}`, "pt-BR"));
+    const pageInfo = paginate(rows, state.equalizationPage, state.equalizationPageSize);
+    state.equalizationPage = pageInfo.current;
+    const checkedClips = sourceItems.filter((item) => item.clips_status && item.clips_status !== "unavailable").length;
+    const unknownPhotos = sourceItems.filter((item) => item.picture_count === null || item.picture_count === undefined).length;
+    const summary = document.querySelector("#equalization-summary");
+    const objective = state.equalizationType === "package_discrepancy" ? "Padronizar medidas e peso"
+      : state.equalizationType === "gtin_discrepancy" ? "Padronizar códigos universais"
+        : state.equalizationType === "missing_clips" ? "Completar Clips confirmados como pendentes"
+          : "Completar 12 fotos por anúncio";
+    if (summary) summary.innerHTML = `
+      <div><span>Ocorrências encontradas</span><strong>${rows.length.toLocaleString("pt-BR")}</strong></div>
+      <div><span>Anúncios analisados</span><strong>${sourceItems.length.toLocaleString("pt-BR")}</strong></div>
+      <div class="inventory-value"><span>Objetivo</span><strong>${objective}</strong></div>
+      ${state.equalizationType === "missing_clips" ? `<div><span>Clips conferidos pela API</span><strong>${checkedClips.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "photo_coverage" && unknownPhotos ? `<div><span>Aguardando sincronização de fotos</span><strong>${unknownPhotos.toLocaleString("pt-BR")}</strong></div>` : ""}`;
+    if (!rows.length) {
+      const text = state.equalizationType === "missing_clips" && !checkedClips
+        ? "Clique em Conferir Clips na API oficial para iniciar a verificação dos anúncios filtrados."
+        : "Nenhuma ocorrência encontrada com estes filtros.";
+      container.innerHTML = `<div class="notice success-notice">${text}</div>`;
+      return;
+    }
+    let headings = "";
+    let cells = () => "";
+    if (state.equalizationType === "package_discrepancy") {
+      headings = "<th>SKU</th><th>Produto</th><th>Conta</th><th>Anúncio ML</th><th>Peso</th><th>Altura</th><th>Largura</th><th>Comprimento</th>";
+      cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td>${escapeText(row.package_weight || "Não informado")}</td><td>${escapeText(row.package_height || "Não informado")}</td><td>${escapeText(row.package_width || "Não informado")}</td><td>${escapeText(row.package_length || "Não informado")}</td>`;
+    } else if (state.equalizationType === "gtin_discrepancy") {
+      headings = "<th>SKU</th><th>Produto</th><th>Conta</th><th>Anúncio ML</th><th>EAN / UPC / GTIN</th>";
+      cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td><span class="${row.gtin ? "report-ok" : "report-missing"}">${escapeText(row.gtin || "Não informado")}</span></td>`;
+    } else if (state.equalizationType === "photo_coverage") {
+      headings = "<th>SKU</th><th>Produto</th><th>Conta</th><th>Anúncio ML</th><th>Fotos atuais</th><th>Faltam para 12</th>";
+      cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td>${Number(row.picture_count)}</td><td><span class="report-missing">${12 - Number(row.picture_count)}</span></td>`;
+    } else {
+      headings = "<th>SKU</th><th>Produto</th><th>Conta</th><th>Anúncio ML</th><th>Situação</th><th>Conferido em</th>";
+      cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td><span class="report-missing">Clip pendente confirmado</span></td><td>${escapeText(formatDateTime(row.clips_checked_at) || row.clips_checked_at || "-")}</td>`;
+    }
+    container.innerHTML = `${paginationHtml("equalizationPage", pageInfo)}<div class="equalization-table-wrap"><table class="equalization-table"><thead><tr>${headings}</tr></thead><tbody>${pageInfo.items.map((row) => `<tr>${cells(row)}</tr>`).join("")}</tbody></table></div>${paginationHtml("equalizationPage", pageInfo)}`;
+    return;
+  }
   const matrix = new Map();
   for (const item of state.data.catalog || []) {
     const mlStatus = String(item.meli_status || "").toLowerCase();
@@ -3337,6 +3437,37 @@ async function downloadReport(button) {
   }
 }
 
+async function refreshClipsReport(button) {
+  const progress = document.querySelector("#clips-report-progress");
+  button.disabled = true;
+  if (progress) {
+    progress.hidden = false;
+    progress.innerHTML = `<strong>Conferindo Clips</strong><span>Preparando anúncios filtrados...</span><div><i style="width:0%"></i></div>`;
+  }
+  try {
+    const queued = await api("/api/reports/clips/refresh", {
+      method: "POST",
+      body: JSON.stringify({
+        account: state.equalizationAccount,
+        ml_status: state.equalizationStatus,
+        search: state.equalizationSearch,
+      }),
+    });
+    const result = await waitForAsyncOperation(queued, (message, job) => {
+      const percent = Math.max(0, Math.min(100, Number(job?.percent || 0)));
+      if (progress) progress.innerHTML = `<strong>Conferindo Clips · ${percent.toLocaleString("pt-BR")}%</strong><span>${escapeText(message || "Processando...")}</span><div><i style="width:${percent}%"></i></div>`;
+    }, 4 * 60 * 60 * 1000);
+    await loadCatalogInBackground(true);
+    renderEqualizationReports();
+    showToast(`${Number(result.missing || 0).toLocaleString("pt-BR")} anúncio(s) com Clip pendente confirmado(s).`);
+  } catch (error) {
+    showToast(error.message || "Não foi possível conferir os Clips.", "error");
+  } finally {
+    button.disabled = false;
+    if (progress) progress.hidden = true;
+  }
+}
+
 async function downloadBulkSpreadsheet() {
   const button = document.querySelector("#download-bulk-sheet");
   const original = button.textContent;
@@ -4252,6 +4383,8 @@ document.addEventListener("click", (event) => {
   }
   const button = event.target.closest("[data-export-report]");
   if (button) downloadReport(button);
+  const clipsButton = event.target.closest("#refresh-clips-report");
+  if (clipsButton) refreshClipsReport(clipsButton);
 });
 
 [

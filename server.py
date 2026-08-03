@@ -221,6 +221,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/items/[^/]+/description(\?|$)"),
     re.compile(r"^/items/[^/]+/price_to_win(\?|$)"),
     re.compile(r"^/items/[^/]+/sale_price(\?|$)"),
+    re.compile(r"^/item/[A-Z]{3}[0-9]+/performance(\?|$)"),
     re.compile(r"^/categories/[^/]+/attributes(\?|$)"),
     re.compile(r"^/products/[^/]+(\?|$)"),
     re.compile(r"^/products/[^/]+/items(\?|$)"),
@@ -513,7 +514,7 @@ CATALOG_ITEM_FIELDS = {
     "title", "thumbnail", "sku", "brand", "gtin", "variation_count", "catalog_product_id",
     "catalog_listing", "listing_type_id", "shipping_logistic_type", "shipping_mode", "free_shipping",
     "package_weight", "package_height", "package_width", "package_length", "price", "stock",
-    "meli_status", "permalink", "item_data_checked_at",
+    "meli_status", "permalink", "picture_count", "picture_count_status", "item_data_checked_at",
 }
 CATALOG_SHIPPING_FIELDS = {
     "shipping_cost", "shipping_cost_currency", "shipping_billable_weight", "shipping_cost_source",
@@ -1699,6 +1700,9 @@ class MercadoLivreClient:
 
     def item(self, item_id):
         return self.get(f"/items/{item_id}")
+
+    def item_performance(self, item_id):
+        return self.get(f"/item/{item_id}/performance", retries=2, timeout=15)
 
     def item_for_clone(self, item_id):
         return self.get(f"/items/{item_id}?include_attributes=all", **interactive_request_options())
@@ -3646,6 +3650,7 @@ def synced_catalog_item(account, item, competition=None):
     package_values = package_values_from_item(item)
     identifier_values = source_clone_identifiers(item, {})
     official_store = item.get("official_store") if isinstance(item.get("official_store"), dict) else {}
+    pictures = item.get("pictures") if isinstance(item.get("pictures"), list) else None
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
@@ -3655,6 +3660,8 @@ def synced_catalog_item(account, item, competition=None):
         "official_source": True,
         "item_data_checked_at": now_label(),
         "thumbnail": item_thumbnail(item),
+        "picture_count": len(pictures) if pictures is not None else None,
+        "picture_count_status": "confirmed" if pictures is not None else "unknown",
         "sku": item_sku(item),
         "brand": source_attribute_value(item, ["BRAND"]),
         "official_store_id": item.get("official_store_id") or official_store.get("id"),
@@ -4209,6 +4216,14 @@ def preserve_identifier_snapshot(target, previous):
     return target
 
 
+def preserve_clips_snapshot(target, previous):
+    """Keep the last official Clips diagnosis across a full item synchronization."""
+    for key in ("clips_status", "clips_checked_at", "clips_error"):
+        if previous.get(key) not in (None, ""):
+            target[key] = previous.get(key)
+    return target
+
+
 def refresh_identifiers_for_items(payload, item_ids):
     maximum = max(1, int(os.getenv("MELI_GTIN_ON_DEMAND_LIMIT", "15")))
     requested = list(dict.fromkeys(str(item_id) for item_id in (item_ids or []) if item_id))[:maximum]
@@ -4298,6 +4313,112 @@ def refresh_item_metadata_operation(kind, item_ids):
     if results:
         write_payload(payload)
     return {"items": results}
+
+
+def clip_status_from_performance(performance):
+    matches = []
+
+    def visit(value):
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, dict):
+            return
+        identity_parts = []
+        for key in ("key", "id", "name", "title", "label", "description"):
+            raw = value.get(key)
+            if isinstance(raw, (str, int, float)):
+                identity_parts.append(str(raw))
+        wordings = value.get("wordings")
+        if isinstance(wordings, dict):
+            identity_parts.extend(str(raw) for raw in wordings.values() if isinstance(raw, (str, int, float)))
+        identity = normalized_attribute_label(" ".join(identity_parts))
+        if re.search(r"\bclip(?:s)?\b", identity):
+            status = normalized_attribute_label(value.get("status") or "")
+            progress = value.get("progress")
+            missing = status in {"pending", "incomplete", "warning"}
+            if progress is not None:
+                try:
+                    missing = missing or float(progress) < 100
+                except (TypeError, ValueError):
+                    pass
+            matches.append("missing" if missing else "present")
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                visit(child)
+
+    visit(performance)
+    if "missing" in matches:
+        return "missing"
+    if "present" in matches:
+        return "present"
+    return "not_exposed"
+
+
+def refresh_clips_report_operation(request):
+    payload = read_payload(include_catalog=True)
+    rows = equalization_source_items(payload, request or {})
+    search = normalized_attribute_label((request or {}).get("search") or "")
+    if search:
+        rows = [
+            item for item in rows
+            if search in normalized_attribute_label(f"{item.get('sku', '')} {item.get('title', '')} {item.get('id', '')}")
+        ]
+    ttl_seconds = max(3600, int(os.getenv("MELI_CLIPS_CACHE_SECONDS", "604800")))
+    now = datetime.now(APP_TZ)
+    pending = []
+    for item in rows:
+        checked = parse_meli_datetime(item.get("clips_checked_at"))
+        if checked and (now - checked).total_seconds() < ttl_seconds:
+            continue
+        pending.append(item)
+    total = len(pending)
+    update_async_operation_progress("Preparando conferência oficial de Clips.", 0, total)
+    accounts = {
+        str(account.get("id") or ""): account
+        for account in payload.get("accounts") or []
+        if account.get("official") and account.get("access_token")
+    }
+
+    def check(item):
+        account = accounts.get(str(item.get("account_id") or ""))
+        if not account:
+            return item.get("id"), "unavailable", "Conta OAuth não encontrada."
+        try:
+            performance = account_client(account).item_performance(item.get("id"))
+            return item.get("id"), clip_status_from_performance(performance), ""
+        except Exception as exc:
+            return item.get("id"), "unavailable", str(exc)[:240]
+
+    by_id = {str(item.get("id") or ""): item for item in payload.get("catalog") or []}
+    workers = max(1, min(8, int(os.getenv("MELI_CLIPS_REPORT_WORKERS", "4"))))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meli-clips") as executor:
+        futures = [executor.submit(run_meli_work, "background", check, item) for item in pending]
+        for future in as_completed(futures):
+            item_id, status, error = future.result()
+            item = by_id.get(str(item_id or ""))
+            if item is not None:
+                item["clips_status"] = status
+                item["clips_checked_at"] = now_label()
+                item["clips_error"] = error
+            completed += 1
+            if completed == total or completed % 10 == 0:
+                update_async_operation_progress(
+                    f"Conferindo Clips: {completed} de {total} anúncios.", completed, total,
+                )
+    if pending:
+        write_payload(payload)
+    considered = [item for item in rows if item.get("clips_status")]
+    return {
+        "checked": completed,
+        "cached": len(rows) - total,
+        "missing": sum(1 for item in considered if item.get("clips_status") == "missing"),
+        "present": sum(1 for item in considered if item.get("clips_status") == "present"),
+        "not_exposed": sum(1 for item in considered if item.get("clips_status") == "not_exposed"),
+        "unavailable": sum(1 for item in considered if item.get("clips_status") == "unavailable"),
+    }
 
 
 def refresh_item_prices_operation(item_ids):
@@ -5210,6 +5331,7 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
                 preserve_shipping_cost_snapshot(row, previous)
                 preserve_sale_fee_snapshot(row, previous)
                 preserve_identifier_snapshot(row, previous)
+                preserve_clips_snapshot(row, previous)
                 row["first_seen_at"] = previous.get("first_seen_at") or now_label()
                 imported.append(row)
             fetched_count += planned_count
@@ -11241,6 +11363,105 @@ def report_filtered_catalog(payload, report_type, filters):
     return rows
 
 
+def normalized_gtin_signature(value):
+    values = []
+    for part in re.split(r"[,;|\s]+", str(value or "")):
+        code = re.sub(r"\D", "", part)
+        if code and code not in values:
+            values.append(code)
+    return tuple(sorted(values))
+
+
+def normalized_package_signature(item):
+    signature = []
+    for field in ("package_weight", "package_height", "package_width", "package_length"):
+        number = package_value_number(field, item.get(field))
+        signature.append(None if number is None else round(float(number), 3))
+    return tuple(signature)
+
+
+def equalization_source_items(payload, filters):
+    account_filter = str(filters.get("account") or "all")
+    ml_status_filter = str(filters.get("ml_status") or "all").lower()
+    accounts = {
+        str(account.get("nickname") or "")
+        for account in payload.get("accounts") or []
+        if account.get("official") and account.get("nickname")
+    }
+    rows = []
+    for item in payload.get("catalog") or []:
+        account_name = str(item.get("account") or "")
+        sku = str(item.get("sku") or "").strip().upper()
+        if account_name not in accounts or not sku or sku == "-":
+            continue
+        if account_filter != "all" and account_filter not in {account_name, str(item.get("account_id") or "")}:
+            continue
+        if ml_status_filter != "all" and normalized_meli_status(item.get("meli_status")) != ml_status_filter:
+            continue
+        rows.append(item)
+    return rows
+
+
+def media_consistency_report_rows(payload, filters, report_mode):
+    items = equalization_source_items(payload, filters)
+    grouped = {}
+    for item in items:
+        grouped.setdefault(str(item.get("sku") or "").strip().upper(), []).append(item)
+    rows = []
+    if report_mode in {"package_discrepancy", "gtin_discrepancy"}:
+        signature_for = normalized_package_signature if report_mode == "package_discrepancy" else lambda item: normalized_gtin_signature(item.get("gtin"))
+        for sku, group in grouped.items():
+            signatures = {signature_for(item) for item in group}
+            if len(group) < 2 or len(signatures) < 2:
+                continue
+            for item in group:
+                rows.append({
+                    "sku": sku,
+                    "product": item.get("title") or "",
+                    "account": item.get("account") or "",
+                    "item_id": item.get("id") or "",
+                    "package_weight": item.get("package_weight") or "Não informado",
+                    "package_height": item.get("package_height") or "Não informado",
+                    "package_width": item.get("package_width") or "Não informado",
+                    "package_length": item.get("package_length") or "Não informado",
+                    "gtin": item.get("gtin") or "Não informado",
+                    "distinct_values": len(signatures),
+                })
+    elif report_mode == "photo_coverage":
+        for item in items:
+            count = item.get("picture_count")
+            if count is None:
+                continue
+            count = max(0, int(count))
+            if count >= 12:
+                continue
+            rows.append({
+                "sku": str(item.get("sku") or "").strip().upper(),
+                "product": item.get("title") or "",
+                "account": item.get("account") or "",
+                "item_id": item.get("id") or "",
+                "picture_count": count,
+                "pictures_missing": 12 - count,
+            })
+    elif report_mode == "missing_clips":
+        for item in items:
+            if item.get("clips_status") != "missing":
+                continue
+            rows.append({
+                "sku": str(item.get("sku") or "").strip().upper(),
+                "product": item.get("title") or "",
+                "account": item.get("account") or "",
+                "item_id": item.get("id") or "",
+                "clips_status_label": "Clip pendente confirmado pela API",
+                "clips_checked_at": item.get("clips_checked_at") or "",
+            })
+    search = normalized_attribute_label(filters.get("search") or "")
+    if search:
+        rows = [row for row in rows if search in normalized_attribute_label(" ".join(str(value) for value in row.values()))]
+    rows.sort(key=lambda row: (str(row.get("sku") or ""), str(row.get("account") or ""), str(row.get("item_id") or "")))
+    return rows
+
+
 def report_dataset(payload, report_type, filters, statistics_result=None):
     if report_type == "purchases":
         result = statistics_result or query_purchase_intelligence(payload, filters)
@@ -11439,6 +11660,49 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
     if report_type == "equalization":
         accounts = [str(account.get("nickname") or "") for account in payload.get("accounts") or [] if account.get("official")]
         ml_status_filter = str(filters.get("ml_status") or "all").lower()
+        report_mode = str(filters.get("report_mode") or "listing_type_gap")
+        account_filter = str(filters.get("account") or "all")
+        if report_mode in {"package_discrepancy", "gtin_discrepancy", "missing_clips", "photo_coverage"}:
+            output = media_consistency_report_rows(payload, filters, report_mode)
+            if report_mode == "package_discrepancy":
+                title = "Divergências de medidas e peso por SKU"
+                columns = [
+                    ("sku", "SKU", "text"), ("product", "Produto", "text"),
+                    ("account", "Conta", "text"), ("item_id", "Anúncio ML", "text"),
+                    ("package_weight", "Peso", "text"), ("package_height", "Altura", "text"),
+                    ("package_width", "Largura", "text"), ("package_length", "Comprimento", "text"),
+                    ("distinct_values", "Configurações encontradas", "integer"),
+                ]
+            elif report_mode == "gtin_discrepancy":
+                title = "Divergências de EAN, UPC ou GTIN por SKU"
+                columns = [
+                    ("sku", "SKU", "text"), ("product", "Produto", "text"),
+                    ("account", "Conta", "text"), ("item_id", "Anúncio ML", "text"),
+                    ("gtin", "EAN / UPC / GTIN", "text"),
+                    ("distinct_values", "Códigos distintos", "integer"),
+                ]
+            elif report_mode == "missing_clips":
+                title = "Anúncios com Clip pendente"
+                columns = [
+                    ("sku", "SKU", "text"), ("product", "Produto", "text"),
+                    ("account", "Conta", "text"), ("item_id", "Anúncio ML", "text"),
+                    ("clips_status_label", "Situação", "text"), ("clips_checked_at", "Conferido em", "text"),
+                ]
+            else:
+                title = "Anúncios com menos de 12 fotos"
+                columns = [
+                    ("sku", "SKU", "text"), ("product", "Produto", "text"),
+                    ("account", "Conta", "text"), ("item_id", "Anúncio ML", "text"),
+                    ("picture_count", "Fotos atuais", "integer"),
+                    ("pictures_missing", "Fotos para completar 12", "integer"),
+                ]
+            metadata = {
+                "Conta": account_filter if account_filter != "all" else "Todas",
+                "Status do anúncio": {"active": "Ativos", "paused": "Pausados"}.get(ml_status_filter, "Todos"),
+                "Busca": filters.get("search") or "Todos",
+                "Gerado em": now_label(),
+            }
+            return title, columns, output, metadata
         matrix = {}
         for item in payload.get("catalog") or []:
             if ml_status_filter != "all" and normalized_meli_status(item.get("meli_status")) != ml_status_filter:
@@ -11451,8 +11715,6 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             row = matrix.setdefault(key, {"account": account_name, "sku": sku, "product": item.get("title") or "", "classic": False, "premium": False})
             row["classic"] = row["classic"] or item.get("listing_type_id") == "gold_special"
             row["premium"] = row["premium"] or item.get("listing_type_id") == "gold_pro"
-        report_mode = str(filters.get("report_mode") or "listing_type_gap")
-        account_filter = str(filters.get("account") or "all")
         search = normalized_attribute_label(filters.get("search") or "")
         output = []
         if report_mode == "listing_type_gap":
@@ -13836,6 +14098,20 @@ class App(BaseHTTPRequestHandler):
             try:
                 job = start_report_job(request)
                 self.send_json({"ok": True, **job}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/reports/clips/refresh":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "clips_report",
+                    lambda: refresh_clips_report_operation(request_copy),
+                    "Conferência de Clips adicionada à fila de segundo plano.",
+                    priority="background",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return

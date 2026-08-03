@@ -630,6 +630,10 @@
               <select id="equalization-report-type">
                 <option value="listing_type_gap">Clássico sem Premium e vice-versa</option>
                 <option value="account_gap">SKU ausente em outras contas</option>
+                <option value="package_discrepancy">Divergência de medidas ou peso por SKU</option>
+                <option value="gtin_discrepancy">Divergência de EAN / UPC / GTIN por SKU</option>
+                <option value="missing_clips">Anúncios sem Clips confirmados</option>
+                <option value="photo_coverage">Anúncios com menos de 12 fotos</option>
               </select>
             </label>
             <label>Conta de referência <select id="equalization-account-filter"></select></label>
@@ -644,6 +648,10 @@
             <label>Por página
               <select id="equalization-page-size"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>
             </label>
+          </div>
+          <div id="equalization-media-actions" class="report-media-actions" hidden>
+            <button class="mini-button success-button" id="refresh-clips-report" type="button">Conferir Clips na API oficial</button>
+            <div id="clips-report-progress" class="report-inline-progress" hidden></div>
           </div>
           <div id="equalization-summary" class="inventory-summary"></div>
           <div id="equalization-report" class="equalization-report"></div>
