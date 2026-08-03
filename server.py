@@ -222,6 +222,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/items/[^/]+/price_to_win(\?|$)"),
     re.compile(r"^/items/[^/]+/sale_price(\?|$)"),
     re.compile(r"^/item/[A-Z]{3}[0-9]+/performance(\?|$)"),
+    re.compile(r"^/user-product/[^/]+/performance(\?|$)"),
     re.compile(r"^/categories/[^/]+/attributes(\?|$)"),
     re.compile(r"^/products/[^/]+(\?|$)"),
     re.compile(r"^/products/[^/]+/items(\?|$)"),
@@ -1703,6 +1704,9 @@ class MercadoLivreClient:
 
     def item_performance(self, item_id):
         return self.get(f"/item/{item_id}/performance", retries=2, timeout=15)
+
+    def user_product_performance(self, user_product_id):
+        return self.get(f"/user-product/{user_product_id}/performance", retries=2, timeout=15)
 
     def item_for_clone(self, item_id):
         return self.get(f"/items/{item_id}?include_attributes=all", **interactive_request_options())
@@ -4228,7 +4232,9 @@ def preserve_identifier_snapshot(target, previous):
 
 def preserve_clips_snapshot(target, previous):
     """Keep the last official Clips diagnosis across a full item synchronization."""
-    for key in ("clips_status", "clips_checked_at", "clips_error"):
+    for key in (
+        "clips_status", "clips_checked_at", "clips_error", "clips_source", "clips_parser_version",
+    ):
         if previous.get(key) not in (None, ""):
             target[key] = previous.get(key)
     return target
@@ -4325,7 +4331,10 @@ def refresh_item_metadata_operation(kind, item_ids):
     return {"items": results}
 
 
-def clip_status_from_performance(performance):
+CLIPS_PARSER_VERSION = 2
+
+
+def clip_diagnosis_from_performance(performance):
     matches = []
 
     def visit(value):
@@ -4336,7 +4345,7 @@ def clip_status_from_performance(performance):
         if not isinstance(value, dict):
             return
         identity_parts = []
-        for key in ("key", "id", "name", "title", "label", "description"):
+        for key in ("key", "id", "name", "title", "label", "description", "link"):
             raw = value.get(key)
             if isinstance(raw, (str, int, float)):
                 identity_parts.append(str(raw))
@@ -4344,26 +4353,40 @@ def clip_status_from_performance(performance):
         if isinstance(wordings, dict):
             identity_parts.extend(str(raw) for raw in wordings.values() if isinstance(raw, (str, int, float)))
         identity = normalized_attribute_label(" ".join(identity_parts))
-        if re.search(r"\bclip(?:s)?\b", identity):
+        # Since YouTube videos were retired, Mercado Livre may expose the Clips
+        # opportunity as CLIP(S), VIDEO or HAS_VIDEO depending on the entity.
+        if re.search(r"\b(?:clip(?:s)?|video|videos)\b", identity):
             status = normalized_attribute_label(value.get("status") or "")
             progress = value.get("progress")
-            missing = status in {"pending", "incomplete", "warning"}
-            if progress is not None:
+            if status in {"pending", "incomplete", "warning"}:
+                matches.append({"status": "missing", "identity": identity})
+            elif status in {"completed", "complete", "done"}:
+                matches.append({"status": "present", "identity": identity})
+            elif progress is not None:
                 try:
-                    missing = missing or float(progress) < 100
+                    # /performance documents progress as a fraction (0..1),
+                    # although a few responses historically used percentages.
+                    progress_value = float(progress)
+                    completion_target = 100 if progress_value > 1 else 1
+                    matches.append({
+                        "status": "present" if progress_value >= completion_target else "missing",
+                        "identity": identity,
+                    })
                 except (TypeError, ValueError):
                     pass
-            matches.append("missing" if missing else "present")
         for child in value.values():
             if isinstance(child, (dict, list)):
                 visit(child)
 
     visit(performance)
-    if "missing" in matches:
-        return "missing"
-    if "present" in matches:
-        return "present"
-    return "not_exposed"
+    statuses = [match.get("status") for match in matches]
+    status = "missing" if "missing" in statuses else ("present" if "present" in statuses else "not_exposed")
+    sources = list(dict.fromkeys(match.get("identity") for match in matches if match.get("identity")))
+    return {"status": status, "source": " | ".join(sources)[:500]}
+
+
+def clip_status_from_performance(performance):
+    return clip_diagnosis_from_performance(performance)["status"]
 
 
 def refresh_clips_report_operation(request):
@@ -4380,7 +4403,10 @@ def refresh_clips_report_operation(request):
     pending = []
     for item in rows:
         checked = parse_meli_datetime(item.get("clips_checked_at"))
-        if checked and (now - checked).total_seconds() < ttl_seconds:
+        parser_current = int(item.get("clips_parser_version") or 0) >= CLIPS_PARSER_VERSION
+        retry_ttl = max(60, int(os.getenv("MELI_CLIPS_ERROR_CACHE_SECONDS", "900")))
+        effective_ttl = retry_ttl if item.get("clips_status") == "unavailable" else ttl_seconds
+        if parser_current and checked and (now - checked).total_seconds() < effective_ttl:
             continue
         pending.append(item)
     total = len(pending)
@@ -4394,12 +4420,24 @@ def refresh_clips_report_operation(request):
     def check(item):
         account = accounts.get(str(item.get("account_id") or ""))
         if not account:
-            return item.get("id"), "unavailable", "Conta OAuth não encontrada."
+            return item.get("id"), "unavailable", "", "Conta OAuth não encontrada."
         try:
-            performance = account_client(account).item_performance(item.get("id"))
-            return item.get("id"), clip_status_from_performance(performance), ""
+            client = account_client(account)
+            diagnosis = clip_diagnosis_from_performance(client.item_performance(item.get("id")))
+            source = f"item: {diagnosis.get('source') or 'sem variável de vídeo'}"
+            if diagnosis["status"] == "not_exposed" and item.get("user_product_id"):
+                try:
+                    user_product = clip_diagnosis_from_performance(
+                        client.user_product_performance(item.get("user_product_id"))
+                    )
+                    if user_product["status"] != "not_exposed":
+                        diagnosis = user_product
+                    source = f"user_product: {user_product.get('source') or 'sem variável de vídeo'}"
+                except Exception as fallback_error:
+                    source = f"{source}; user_product indisponível: {str(fallback_error)[:120]}"
+            return item.get("id"), diagnosis["status"], source, ""
         except Exception as exc:
-            return item.get("id"), "unavailable", str(exc)[:240]
+            return item.get("id"), "unavailable", "", str(exc)[:240]
 
     by_id = {str(item.get("id") or ""): item for item in payload.get("catalog") or []}
     workers = max(1, min(8, int(os.getenv("MELI_CLIPS_REPORT_WORKERS", "4"))))
@@ -4407,12 +4445,14 @@ def refresh_clips_report_operation(request):
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meli-clips") as executor:
         futures = [executor.submit(run_meli_work, "background", check, item) for item in pending]
         for future in as_completed(futures):
-            item_id, status, error = future.result()
+            item_id, status, source, error = future.result()
             item = by_id.get(str(item_id or ""))
             if item is not None:
                 item["clips_status"] = status
                 item["clips_checked_at"] = now_label()
                 item["clips_error"] = error
+                item["clips_source"] = source
+                item["clips_parser_version"] = CLIPS_PARSER_VERSION
             completed += 1
             if completed == total or completed % 10 == 0:
                 update_async_operation_progress(

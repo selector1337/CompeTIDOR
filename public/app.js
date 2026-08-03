@@ -1856,7 +1856,11 @@ function renderEqualizationReports() {
     rows.sort((a, b) => `${a.sku}|${a.account}|${a.id}`.localeCompare(`${b.sku}|${b.account}|${b.id}`, "pt-BR"));
     const pageInfo = paginate(rows, state.equalizationPage, state.equalizationPageSize);
     state.equalizationPage = pageInfo.current;
-    const checkedClips = sourceItems.filter((item) => item.clips_status && item.clips_status !== "unavailable").length;
+    const missingClips = sourceItems.filter((item) => item.clips_status === "missing").length;
+    const presentClips = sourceItems.filter((item) => item.clips_status === "present").length;
+    const checkedClips = missingClips + presentClips;
+    const unknownClips = sourceItems.filter((item) => item.clips_status === "not_exposed").length;
+    const failedClips = sourceItems.filter((item) => item.clips_status === "unavailable").length;
     const unknownPhotos = sourceItems.filter((item) => item.picture_count === null || item.picture_count === undefined).length;
     const summary = document.querySelector("#equalization-summary");
     const objective = state.equalizationType === "package_discrepancy" ? "Padronizar medidas e peso"
@@ -1868,12 +1872,19 @@ function renderEqualizationReports() {
       <div><span>Anúncios analisados</span><strong>${sourceItems.length.toLocaleString("pt-BR")}</strong></div>
       <div class="inventory-value"><span>Objetivo</span><strong>${objective}</strong></div>
       ${state.equalizationType === "missing_clips" ? `<div><span>Clips conferidos pela API</span><strong>${checkedClips.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "missing_clips" && unknownClips ? `<div><span>API sem diagnóstico de Clips</span><strong>${unknownClips.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "missing_clips" && failedClips ? `<div><span>Falhas temporárias</span><strong>${failedClips.toLocaleString("pt-BR")}</strong></div>` : ""}
       ${state.equalizationType === "photo_coverage" && unknownPhotos ? `<div><span>Aguardando sincronização de fotos</span><strong>${unknownPhotos.toLocaleString("pt-BR")}</strong></div>` : ""}`;
     if (!rows.length) {
-      const text = state.equalizationType === "missing_clips" && !checkedClips
-        ? "Clique em Conferir Clips na API oficial para iniciar a verificação dos anúncios filtrados."
-        : "Nenhuma ocorrência encontrada com estes filtros.";
-      container.innerHTML = `<div class="notice success-notice">${text}</div>`;
+      let text = "Nenhuma ocorrência encontrada com estes filtros.";
+      let noticeClass = "success-notice";
+      if (state.equalizationType === "missing_clips" && !checkedClips && !unknownClips && !failedClips) {
+        text = "Clique em Conferir Clips na API oficial para iniciar a verificação dos anúncios filtrados.";
+      } else if (state.equalizationType === "missing_clips" && (unknownClips || failedClips)) {
+        text = `A conferência ainda não produziu um diagnóstico conclusivo para ${(unknownClips + failedClips).toLocaleString("pt-BR")} anúncio(s). Execute novamente para tentar as falhas temporárias; anúncios sem variável de Clips não são contabilizados como se tivessem Clip.`;
+        noticeClass = "warning-notice";
+      }
+      container.innerHTML = `<div class="notice ${noticeClass}">${text}</div>`;
       return;
     }
     let headings = "";
