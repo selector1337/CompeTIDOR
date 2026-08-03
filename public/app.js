@@ -1723,10 +1723,10 @@ function renderAds() {
           <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
           <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
           <label>EAN / UPC / GTIN <input type="text" inputmode="numeric" value="${escapeAttr(item.gtin || "")}" data-original-gtin="${escapeAttr(item.gtin || "")}" data-gtin-input="${item.id}" placeholder="Código universal" /></label>
-          <label>Peso <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_weight))}" placeholder="0,6" data-weight-input="${item.id}" /><span>kg</span></span></label>
-          <label>Altura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_height))}" placeholder="13" data-height-input="${item.id}" /><span>cm</span></span></label>
-          <label>Largura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_width))}" placeholder="18" data-width-input="${item.id}" /><span>cm</span></span></label>
-          <label>Comprimento <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_length))}" placeholder="13" data-length-input="${item.id}" /><span>cm</span></span></label>
+          <label>Peso <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_weight))}" data-original-value="${escapeAttr(measureInputValue(item.package_weight))}" placeholder="0,6" data-weight-input="${item.id}" /><span>kg</span></span></label>
+          <label>Altura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_height))}" data-original-value="${escapeAttr(measureInputValue(item.package_height))}" placeholder="13" data-height-input="${item.id}" /><span>cm</span></span></label>
+          <label>Largura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_width))}" data-original-value="${escapeAttr(measureInputValue(item.package_width))}" placeholder="18" data-width-input="${item.id}" /><span>cm</span></span></label>
+          <label>Comprimento <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_length))}" data-original-value="${escapeAttr(measureInputValue(item.package_length))}" placeholder="13" data-length-input="${item.id}" /><span>cm</span></span></label>
           <div class="ad-actions">
             <button class="mini-button" data-save-ad="${item.id}">Salvar</button>
             ${normalizedMlStatus(item.meli_status) === "paused" || item.status === "paused"
@@ -4725,10 +4725,18 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   if (button.dataset.saveAd) {
     payload.price = Number(document.querySelector(`[data-price-input="${id}"]`).value);
     payload.available_quantity = Number(document.querySelector(`[data-stock-input="${id}"]`).value);
-    payload.package_weight = withUnit(document.querySelector(`[data-weight-input="${id}"]`).value, "kg");
-    payload.package_height = withUnit(document.querySelector(`[data-height-input="${id}"]`).value, "cm");
-    payload.package_width = withUnit(document.querySelector(`[data-width-input="${id}"]`).value, "cm");
-    payload.package_length = withUnit(document.querySelector(`[data-length-input="${id}"]`).value, "cm");
+    const packageInputs = [
+      ["package_weight", `[data-weight-input="${id}"]`, "kg"],
+      ["package_height", `[data-height-input="${id}"]`, "cm"],
+      ["package_width", `[data-width-input="${id}"]`, "cm"],
+      ["package_length", `[data-length-input="${id}"]`, "cm"],
+    ];
+    for (const [field, selector, unit] of packageInputs) {
+      const input = document.querySelector(selector);
+      if ((input?.value || "").trim().replace(",", ".") !== (input?.dataset.originalValue || "").trim().replace(",", ".")) {
+        payload[field] = withUnit(input?.value || "", unit);
+      }
+    }
     const gtinInput = document.querySelector(`[data-gtin-input="${id}"]`);
     if ((gtinInput?.value || "").trim() !== (gtinInput?.dataset.originalGtin || "").trim()) {
       payload.gtin = (gtinInput?.value || "").trim();
@@ -4747,12 +4755,13 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
     if (button.dataset.pauseAd) showToast("Anúncio pausado com sucesso.");
     else if (button.dataset.activateAd) showToast("Anúncio ativado com sucesso.");
     else {
-      const propagated = result?.propagated_dimensions || [];
+      const propagated = result?.propagated_sku_updates || result?.propagated_dimensions || [];
       const updated = propagated.filter((row) => row.status === "updated").length;
       const failed = propagated.filter((row) => row.status === "error").length;
+      const propagatedLabel = result?.propagated_label || "Dados do SKU";
       showToast(
         updated || failed
-          ? `Anúncio atualizado. Medidas aplicadas em mais ${updated} anúncio(s) do mesmo SKU${failed ? `; ${failed} não aceitaram a alteração` : ""}.`
+          ? `Anúncio atualizado. ${propagatedLabel} aplicados em mais ${updated} anúncio(s) do mesmo SKU${failed ? `; ${failed} não aceitaram a alteração` : ""}.`
           : "Anúncio atualizado com sucesso.",
         failed ? "error" : "success",
       );

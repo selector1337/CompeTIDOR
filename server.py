@@ -1986,20 +1986,25 @@ def account_client(account):
 
 
 def item_sku(item):
-    if item.get("seller_custom_field"):
-        return item["seller_custom_field"]
-    for key in ("seller_sku", "seller_custom_field", "sku"):
+    # SELLER_SKU is the current official field. seller_custom_field is a
+    # legacy mirror and can remain stale after a SKU is edited in Mercado Livre.
+    for key in ("seller_sku",):
         if item.get(key):
             return item[key]
     for attribute in item.get("attributes", []) or []:
         if attribute.get("id") in {"SELLER_SKU", "SKU"} and attribute.get("value_name"):
             return attribute["value_name"]
     for variation in item.get("variations", []) or []:
-        if variation.get("seller_custom_field"):
-            return variation["seller_custom_field"]
         for attribute in variation.get("attributes", []) or []:
             if attribute.get("id") in {"SELLER_SKU", "SKU"} and attribute.get("value_name"):
                 return attribute["value_name"]
+    if item.get("seller_custom_field"):
+        return item["seller_custom_field"]
+    for variation in item.get("variations", []) or []:
+        if variation.get("seller_custom_field"):
+            return variation["seller_custom_field"]
+    if item.get("sku"):
+        return item["sku"]
     return "-"
 
 
@@ -4777,6 +4782,53 @@ def hydrate_sale_thumbnails(rows, client):
     return hydrated
 
 
+def reconcile_order_sku_alias(payload, item_id, official_sku):
+    """Repair a stale legacy SKU when an official order exposes its full value."""
+    official_key = normalized_sku_key(official_sku)
+    source_item = next(
+        (
+            row for row in payload.get("catalog", [])
+            if str(row.get("id") or "") == str(item_id or "")
+        ),
+        None,
+    )
+    if not source_item or int(source_item.get("variation_count") or 0) > 1:
+        return 0
+    legacy_key = normalized_sku_key(source_item.get("sku"))
+    if (
+        not official_key
+        or official_key == "-"
+        or not legacy_key
+        or legacy_key == "-"
+        or official_key == legacy_key
+        or len(official_key) <= len(legacy_key)
+        or not official_key.endswith(legacy_key)
+    ):
+        return 0
+
+    changed = 0
+    for row in payload.get("catalog", []):
+        if normalized_sku_key(row.get("sku")) != legacy_key:
+            continue
+        previous = row.get("sku")
+        row["sku"] = official_key
+        row["sku_reconciled_at"] = now_label()
+        append_item_log(
+            payload,
+            row,
+            {"name": "Sincronização oficial"},
+            "SKU reconciliado pela venda oficial",
+            {"sku": {"from": previous, "to": official_key}},
+        )
+        changed += 1
+
+    costs = payload.get("sku_costs") or {}
+    if legacy_key in costs and official_key not in costs:
+        costs[official_key] = json.loads(json.dumps(costs[legacy_key], ensure_ascii=False))
+        payload["sku_costs"] = costs
+    return changed
+
+
 def sync_recent_sales(payload, account, client):
     period, date_from, date_to = current_month_window()
     try:
@@ -4810,6 +4862,8 @@ def sync_recent_sales(payload, account, client):
         order_items = order.get("order_items") or []
         for order_item in order_items or [{}]:
             item = order_item.get("item") or {}
+            official_sku = item.get("seller_sku") or item.get("seller_custom_field") or "-"
+            reconcile_order_sku_alias(payload, item.get("id"), official_sku)
             quantity = order_item.get("quantity") or 1
             unit_price = order_item.get("unit_price") or order_item.get("full_unit_price") or 0
             line_total = round(float(unit_price or 0) * int(quantity or 1), 2)
@@ -4820,7 +4874,7 @@ def sync_recent_sales(payload, account, client):
                 "product": item.get("title") or "Produto sem título",
                 "item_id": item.get("id") or "",
                 "thumbnail": item.get("thumbnail") or item.get("secure_thumbnail") or (catalog_by_id.get(item.get("id")) or {}).get("thumbnail") or "",
-                "sku": item.get("seller_sku") or item.get("seller_custom_field") or "-",
+                "sku": official_sku,
                 "quantity": quantity,
                 "unit_price": unit_price,
                 "total": line_total,
@@ -5933,8 +5987,8 @@ def update_item_operation(request, actor=None):
         break
     if not updated_item:
         raise RuntimeError("Anúncio não encontrado na conta informada.")
-    propagated_dimensions = []
-    if expected_package_values and updated_item.get("sku") not in (None, "", "-"):
+    propagated_sku_updates = []
+    if (expected_package_values or expected_gtin_codes) and updated_item.get("sku") not in (None, "", "-"):
         source_sku = str(updated_item.get("sku")).strip().upper()
         siblings = [
             row for row in payload.get("catalog", [])
@@ -5956,33 +6010,84 @@ def update_item_operation(request, actor=None):
             try:
                 if not sibling_account or not sibling_account.get("official"):
                     raise RuntimeError("Conta oficial não encontrada.")
+                sibling_client = account_client(sibling_account)
+                sibling_update = {}
+                if dimension_attrs:
+                    sibling_update["attributes"] = json.loads(json.dumps(dimension_attrs, ensure_ascii=False))
+                sibling_expected_gtin = []
+                if expected_gtin_codes:
+                    gtin_fragment, sibling_expected_gtin = run_interactive_meli_call(
+                        item_gtin_update_fragment,
+                        sibling_client,
+                        sibling.get("id"),
+                        request.get("gtin"),
+                    )
+                    if gtin_fragment.get("attributes"):
+                        sibling_update["attributes"] = [
+                            *(sibling_update.get("attributes") or []),
+                            *gtin_fragment["attributes"],
+                        ]
+                    if gtin_fragment.get("variations"):
+                        sibling_update["variations"] = gtin_fragment["variations"]
                 run_interactive_meli_call(
-                    account_client(sibling_account).update_item,
+                    sibling_client.update_item,
                     sibling.get("id"),
-                    {"attributes": dimension_attrs},
+                    sibling_update,
                 )
+                sibling_verified = run_interactive_meli_call(
+                    verify_package_update,
+                    sibling_client,
+                    sibling.get("id"),
+                    expected_package_values,
+                ) if expected_package_values else {}
+                if sibling_expected_gtin:
+                    gtin_verified = run_interactive_meli_call(
+                        verify_gtin_update,
+                        sibling_client,
+                        sibling.get("id"),
+                        sibling_expected_gtin,
+                    )
+                    if not sibling_verified:
+                        sibling_verified = gtin_verified
+                sibling_package_values = package_values_from_item(sibling_verified) if sibling_verified else {}
                 changes = {}
                 for request_key in dimension_map:
                     if request_key not in expected_package_values:
                         continue
-                    normalized_value = verified_package_values.get(request_key) or normalize_package_value(
+                    normalized_value = sibling_package_values.get(request_key) or normalize_package_value(
                         expected_package_values[request_key],
                         [dimension_map[request_key]],
                     )
                     changes[request_key] = {"from": sibling.get(request_key), "to": normalized_value}
                     sibling[request_key] = normalized_value
-                sibling["shipping_cost_status"] = "pending"
-                sibling["shipping_cost_updated_at"] = ""
-                sibling["shipping_cost_basis"] = ""
+                if expected_package_values:
+                    sibling["shipping_cost_status"] = "pending"
+                    sibling["shipping_cost_updated_at"] = ""
+                    sibling["shipping_cost_basis"] = ""
+                if sibling_expected_gtin:
+                    new_gtin = ", ".join(sibling_expected_gtin)
+                    changes["gtin"] = {"from": sibling.get("gtin") or "", "to": new_gtin}
+                    sibling["gtin"] = new_gtin
                 sibling["updated_at"] = now_label()
                 apply_item_net_values(sibling)
-                append_item_log(payload, sibling, actor or {}, "Medidas propagadas pelo SKU", changes)
+                changed_labels = []
+                if expected_package_values:
+                    changed_labels.append("peso e medidas")
+                if sibling_expected_gtin:
+                    changed_labels.append("EAN/UPC/GTIN")
+                append_item_log(
+                    payload,
+                    sibling,
+                    actor or {},
+                    f"{' e '.join(changed_labels).capitalize()} propagados pelo SKU",
+                    changes,
+                )
                 result["status"] = "updated"
             except Exception as exc:
                 result.update({"status": "error", "error": str(exc)})
-            propagated_dimensions.append(result)
+            propagated_sku_updates.append(result)
             update_async_operation_progress(
-                f"Aplicando medidas do SKU em {index} de {total_siblings} anúncios.",
+                f"Aplicando dados do SKU em {index} de {total_siblings} anúncios.",
                 index,
                 total_siblings,
                 result,
@@ -5992,12 +6097,23 @@ def update_item_operation(request, actor=None):
         alert = stock_alert(alert_id, account, stock_transition[2])
         payload.setdefault("alerts", []).insert(0, alert)
         notify_alert(payload, alert)
+    propagated_labels = []
+    if "package_weight" in expected_package_values:
+        propagated_labels.append("Peso")
+    if any(field in expected_package_values for field in ("package_height", "package_width", "package_length")):
+        propagated_labels.append("medidas")
+    if expected_gtin_codes:
+        propagated_labels.append("código universal")
     write_payload(payload)
     return {
         "ok": True,
         "official": official,
         "item": updated_item,
-        "propagated_dimensions": propagated_dimensions,
+        "propagated_sku_updates": propagated_sku_updates,
+        "propagated_dimensions": propagated_sku_updates,
+        "propagated_label": ", ".join(propagated_labels[:-1]) + (
+            f" e {propagated_labels[-1]}" if len(propagated_labels) > 1 else (propagated_labels[0] if propagated_labels else "")
+        ),
     }
 
 
