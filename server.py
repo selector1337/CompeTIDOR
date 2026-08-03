@@ -1717,6 +1717,16 @@ class MercadoLivreClient:
                 items.append(body)
         return items
 
+    def item_pictures_bulk(self, item_ids):
+        ids = ",".join(str(item_id) for item_id in item_ids if item_id)
+        rows = self.get(f"/items?ids={ids}&attributes=id,pictures")
+        items = []
+        for row in rows if isinstance(rows, list) else []:
+            body = row.get("body") if isinstance(row, dict) else None
+            if isinstance(body, dict) and body.get("id"):
+                items.append(body)
+        return items
+
     def item_description(self, item_id, interactive=False):
         options = interactive_request_options() if interactive else {}
         return self.get(f"/items/{item_id}/description", **options)
@@ -4418,6 +4428,85 @@ def refresh_clips_report_operation(request):
         "present": sum(1 for item in considered if item.get("clips_status") == "present"),
         "not_exposed": sum(1 for item in considered if item.get("clips_status") == "not_exposed"),
         "unavailable": sum(1 for item in considered if item.get("clips_status") == "unavailable"),
+    }
+
+
+def refresh_photos_report_operation(request):
+    payload = read_payload(include_catalog=True)
+    rows = equalization_source_items(payload, request or {})
+    search = normalized_attribute_label((request or {}).get("search") or "")
+    if search:
+        rows = [
+            item for item in rows
+            if search in normalized_attribute_label(f"{item.get('sku', '')} {item.get('title', '')} {item.get('id', '')}")
+        ]
+    # The manual report fills legacy records only. New/changed listings are kept current by normal synchronization.
+    pending = [item for item in rows if item.get("picture_count") is None]
+    accounts = {
+        str(account.get("id") or ""): account
+        for account in payload.get("accounts") or []
+        if account.get("official") and account.get("access_token")
+    }
+    grouped = {}
+    for item in pending:
+        grouped.setdefault(str(item.get("account_id") or ""), []).append(str(item.get("id") or ""))
+    batches = []
+    batch_size = max(1, min(20, int(os.getenv("MELI_PHOTOS_REPORT_BATCH_SIZE", "20"))))
+    for account_id, item_ids in grouped.items():
+        for start in range(0, len(item_ids), batch_size):
+            batches.append((account_id, item_ids[start:start + batch_size]))
+    total = len(pending)
+    update_async_operation_progress("Preparando contagem oficial de fotos.", 0, total)
+    by_id = {str(item.get("id") or ""): item for item in payload.get("catalog") or []}
+
+    def fetch(batch):
+        account_id, item_ids = batch
+        account = accounts.get(account_id)
+        if not account:
+            return item_ids, [], "Conta OAuth não encontrada."
+        try:
+            return item_ids, account_client(account).item_pictures_bulk(item_ids), ""
+        except Exception as exc:
+            return item_ids, [], str(exc)[:240]
+
+    workers = max(1, min(6, int(os.getenv("MELI_PHOTOS_REPORT_WORKERS", "4"))))
+    completed = 0
+    confirmed = 0
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meli-photos") as executor:
+        futures = [executor.submit(run_meli_work, "background", fetch, batch) for batch in batches]
+        for future in as_completed(futures):
+            requested_ids, official_items, error = future.result()
+            returned = {str(item.get("id") or ""): item for item in official_items}
+            for item_id in requested_ids:
+                target = by_id.get(item_id)
+                official = returned.get(item_id)
+                if target is None:
+                    continue
+                pictures = official.get("pictures") if isinstance(official, dict) else None
+                if isinstance(pictures, list):
+                    target["picture_count"] = len(pictures)
+                    target["picture_count_status"] = "confirmed"
+                    target["pictures_checked_at"] = now_label()
+                    target.pop("pictures_error", None)
+                    confirmed += 1
+                else:
+                    target["picture_count_status"] = "error"
+                    target["pictures_error"] = error or "A API não retornou a lista de fotos."
+            completed += len(requested_ids)
+            update_async_operation_progress(
+                f"Sincronizando fotos: {min(completed, total)} de {total} anúncios.",
+                min(completed, total), total,
+            )
+    if pending:
+        write_payload(payload)
+    return {
+        "checked": completed,
+        "confirmed": confirmed,
+        "remaining": sum(1 for item in rows if item.get("picture_count") is None),
+        "below_twelve": sum(
+            1 for item in rows
+            if item.get("picture_count") is not None and int(item.get("picture_count") or 0) < 12
+        ),
     }
 
 
@@ -14109,6 +14198,20 @@ class App(BaseHTTPRequestHandler):
                     "clips_report",
                     lambda: refresh_clips_report_operation(request_copy),
                     "Conferência de Clips adicionada à fila de segundo plano.",
+                    priority="background",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/reports/photos/refresh":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "photos_report",
+                    lambda: refresh_photos_report_operation(request_copy),
+                    "Sincronização da contagem de fotos adicionada à fila de segundo plano.",
                     priority="background",
                 )
                 self.send_json({"ok": True, **operation}, status=202)

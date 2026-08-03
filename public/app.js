@@ -1810,7 +1810,17 @@ function renderEqualizationReports() {
   const accounts = connectedAccounts().map((account) => account.nickname).filter(Boolean);
   setOptions("#equalization-account-filter", ["all", ...accounts], state.equalizationAccount, "Todas as contas");
   const mediaActions = document.querySelector("#equalization-media-actions");
-  if (mediaActions) mediaActions.hidden = state.equalizationType !== "missing_clips";
+  const clipsAction = document.querySelector("#refresh-clips-report");
+  const photosAction = document.querySelector("#refresh-photos-report");
+  const mediaHelp = document.querySelector("#equalization-media-help");
+  const isClipsReport = state.equalizationType === "missing_clips";
+  const isPhotosReport = state.equalizationType === "photo_coverage";
+  if (mediaActions) mediaActions.hidden = !isClipsReport && !isPhotosReport;
+  if (clipsAction) clipsAction.hidden = !isClipsReport;
+  if (photosAction) photosAction.hidden = !isPhotosReport;
+  if (mediaHelp) mediaHelp.textContent = isClipsReport
+    ? "Confere as pendências de Clips diretamente na qualidade de cada anúncio."
+    : isPhotosReport ? "Preenche em segundo plano a contagem oficial dos anúncios ainda não conferidos." : "";
   const sourceItems = (state.data.catalog || []).filter((item) => {
     const account = item.account || "";
     const sku = String(item.sku || "").trim().toUpperCase();
@@ -3437,15 +3447,17 @@ async function downloadReport(button) {
   }
 }
 
-async function refreshClipsReport(button) {
-  const progress = document.querySelector("#clips-report-progress");
+async function refreshMediaReport(button, kind) {
+  const progress = document.querySelector("#media-report-progress");
+  const isPhotos = kind === "photos";
+  const title = isPhotos ? "Sincronizando fotos" : "Conferindo Clips";
   button.disabled = true;
   if (progress) {
     progress.hidden = false;
-    progress.innerHTML = `<strong>Conferindo Clips</strong><span>Preparando anúncios filtrados...</span><div><i style="width:0%"></i></div>`;
+    progress.innerHTML = `<strong>${title}</strong><span>Preparando anúncios filtrados...</span><div><i style="width:0%"></i></div>`;
   }
   try {
-    const queued = await api("/api/reports/clips/refresh", {
+    const queued = await api(`/api/reports/${kind}/refresh`, {
       method: "POST",
       body: JSON.stringify({
         account: state.equalizationAccount,
@@ -3455,13 +3467,15 @@ async function refreshClipsReport(button) {
     });
     const result = await waitForAsyncOperation(queued, (message, job) => {
       const percent = Math.max(0, Math.min(100, Number(job?.percent || 0)));
-      if (progress) progress.innerHTML = `<strong>Conferindo Clips · ${percent.toLocaleString("pt-BR")}%</strong><span>${escapeText(message || "Processando...")}</span><div><i style="width:${percent}%"></i></div>`;
+      if (progress) progress.innerHTML = `<strong>${title} · ${percent.toLocaleString("pt-BR")}%</strong><span>${escapeText(message || "Processando...")}</span><div><i style="width:${percent}%"></i></div>`;
     }, 4 * 60 * 60 * 1000);
     await loadCatalogInBackground(true);
     renderEqualizationReports();
-    showToast(`${Number(result.missing || 0).toLocaleString("pt-BR")} anúncio(s) com Clip pendente confirmado(s).`);
+    showToast(isPhotos
+      ? `${Number(result.below_twelve || 0).toLocaleString("pt-BR")} anúncio(s) possuem menos de 12 fotos.`
+      : `${Number(result.missing || 0).toLocaleString("pt-BR")} anúncio(s) com Clip pendente confirmado(s).`);
   } catch (error) {
-    showToast(error.message || "Não foi possível conferir os Clips.", "error");
+    showToast(error.message || (isPhotos ? "Não foi possível sincronizar as fotos." : "Não foi possível conferir os Clips."), "error");
   } finally {
     button.disabled = false;
     if (progress) progress.hidden = true;
@@ -4384,7 +4398,9 @@ document.addEventListener("click", (event) => {
   const button = event.target.closest("[data-export-report]");
   if (button) downloadReport(button);
   const clipsButton = event.target.closest("#refresh-clips-report");
-  if (clipsButton) refreshClipsReport(clipsButton);
+  if (clipsButton) refreshMediaReport(clipsButton, "clips");
+  const photosButton = event.target.closest("#refresh-photos-report");
+  if (photosButton) refreshMediaReport(photosButton, "photos");
 });
 
 [
