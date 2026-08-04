@@ -1861,6 +1861,17 @@ function renderEqualizationReports() {
     const checkedClips = missingClips + presentClips;
     const unknownClips = sourceItems.filter((item) => item.clips_status === "not_exposed").length;
     const failedClips = sourceItems.filter((item) => item.clips_status === "unavailable").length;
+    const clipFailures = sourceItems
+      .filter((item) => item.clips_status === "unavailable")
+      .reduce((counts, item) => {
+        const kind = item.clips_error_kind || "other";
+        counts[kind] = (counts[kind] || 0) + 1;
+        return counts;
+      }, {});
+    const transientClipFailures = ["rate_limit", "meli_unstable", "timeout", "network"]
+      .reduce((total, kind) => total + (clipFailures[kind] || 0), 0);
+    const accessClipFailures = ["auth", "permission", "account"]
+      .reduce((total, kind) => total + (clipFailures[kind] || 0), 0);
     const unknownPhotos = sourceItems.filter((item) => item.picture_count === null || item.picture_count === undefined).length;
     const summary = document.querySelector("#equalization-summary");
     const objective = state.equalizationType === "package_discrepancy" ? "Padronizar medidas e peso"
@@ -1872,8 +1883,10 @@ function renderEqualizationReports() {
       <div><span>Anúncios analisados</span><strong>${sourceItems.length.toLocaleString("pt-BR")}</strong></div>
       <div class="inventory-value"><span>Objetivo</span><strong>${objective}</strong></div>
       ${state.equalizationType === "missing_clips" ? `<div><span>Clips conferidos pela API</span><strong>${checkedClips.toLocaleString("pt-BR")}</strong></div>` : ""}
-      ${state.equalizationType === "missing_clips" && unknownClips ? `<div><span>API sem diagnóstico de Clips</span><strong>${unknownClips.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "missing_clips" && unknownClips ? `<div><span>ML não gerou diagnóstico</span><strong>${unknownClips.toLocaleString("pt-BR")}</strong></div>` : ""}
       ${state.equalizationType === "missing_clips" && failedClips ? `<div><span>Consultas não concluídas</span><strong>${failedClips.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "missing_clips" && transientClipFailures ? `<div><span>Limite ou instabilidade</span><strong>${transientClipFailures.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "missing_clips" && accessClipFailures ? `<div><span>OAuth ou permissão</span><strong>${accessClipFailures.toLocaleString("pt-BR")}</strong></div>` : ""}
       ${state.equalizationType === "photo_coverage" && unknownPhotos ? `<div><span>Aguardando sincronização de fotos</span><strong>${unknownPhotos.toLocaleString("pt-BR")}</strong></div>` : ""}`;
     if (!rows.length) {
       let text = "Nenhuma ocorrência encontrada com estes filtros.";
@@ -1881,7 +1894,13 @@ function renderEqualizationReports() {
       if (state.equalizationType === "missing_clips" && !checkedClips && !unknownClips && !failedClips) {
         text = "Clique em Conferir Clips na API oficial para iniciar a verificação dos anúncios filtrados.";
       } else if (state.equalizationType === "missing_clips" && (unknownClips || failedClips)) {
-        text = `A conferência ainda não produziu um diagnóstico conclusivo para ${(unknownClips + failedClips).toLocaleString("pt-BR")} anúncio(s). Execute novamente para tentar as consultas não concluídas; anúncios sem variável de Clips não são contabilizados como se tivessem Clip.`;
+        const parts = [];
+        if (unknownClips) parts.push(`${unknownClips.toLocaleString("pt-BR")} sem diagnóstico gerado pelo Mercado Livre`);
+        if (transientClipFailures) parts.push(`${transientClipFailures.toLocaleString("pt-BR")} com limite ou instabilidade temporária`);
+        if (accessClipFailures) parts.push(`${accessClipFailures.toLocaleString("pt-BR")} com OAuth ou permissão pendente`);
+        const otherFailures = Math.max(0, failedClips - transientClipFailures - accessClipFailures);
+        if (otherFailures) parts.push(`${otherFailures.toLocaleString("pt-BR")} com outra falha`);
+        text = `Cobertura ainda não conclusiva: ${parts.join("; ")}. O botão repete as consultas recuperáveis; ausência de diagnóstico oficial não é tratada como Clip existente nem como Clip ausente.`;
         noticeClass = "warning-notice";
       }
       container.innerHTML = `<div class="notice ${noticeClass}">${text}</div>`;

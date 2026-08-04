@@ -1703,10 +1703,18 @@ class MercadoLivreClient:
         return self.get(f"/items/{item_id}")
 
     def item_performance(self, item_id):
-        return self.get(f"/item/{item_id}/performance", retries=2, timeout=15)
+        return self.get(
+            f"/item/{item_id}/performance",
+            retries=max(3, int(os.getenv("MELI_CLIPS_REQUEST_RETRIES", "5"))),
+            timeout=max(8.0, float(os.getenv("MELI_CLIPS_REQUEST_TIMEOUT_SECONDS", "20"))),
+        )
 
     def user_product_performance(self, user_product_id):
-        return self.get(f"/user-product/{user_product_id}/performance", retries=2, timeout=15)
+        return self.get(
+            f"/user-product/{user_product_id}/performance",
+            retries=max(3, int(os.getenv("MELI_CLIPS_REQUEST_RETRIES", "5"))),
+            timeout=max(8.0, float(os.getenv("MELI_CLIPS_REQUEST_TIMEOUT_SECONDS", "20"))),
+        )
 
     def item_for_clone(self, item_id):
         return self.get(f"/items/{item_id}?include_attributes=all", **interactive_request_options())
@@ -4233,7 +4241,8 @@ def preserve_identifier_snapshot(target, previous):
 def preserve_clips_snapshot(target, previous):
     """Keep the last official Clips diagnosis across a full item synchronization."""
     for key in (
-        "clips_status", "clips_checked_at", "clips_error", "clips_source", "clips_parser_version",
+        "clips_status", "clips_checked_at", "clips_error", "clips_error_kind",
+        "clips_source", "clips_parser_version",
     ):
         if previous.get(key) not in (None, ""):
             target[key] = previous.get(key)
@@ -4334,6 +4343,27 @@ def refresh_item_metadata_operation(kind, item_ids):
 CLIPS_PARSER_VERSION = 2
 
 
+def clip_error_kind(error):
+    text = str(error or "").lower()
+    if not text:
+        return ""
+    if "http 401" in text:
+        return "auth"
+    if "http 403" in text:
+        return "permission"
+    if "http 429" in text or "rate limit" in text or "rate_limit" in text:
+        return "rate_limit"
+    if any(token in text for token in ("http 500", "http 502", "http 503", "http 504")):
+        return "meli_unstable"
+    if any(token in text for token in ("não respondeu", "timeout", "timed out")):
+        return "timeout"
+    if any(token in text for token in ("falha temporária de conexão", "connection", "ssl", "socket")):
+        return "network"
+    if "conta oauth não encontrada" in text:
+        return "account"
+    return "other"
+
+
 def clip_diagnosis_from_performance(performance):
     matches = []
 
@@ -4420,7 +4450,8 @@ def refresh_clips_report_operation(request):
     def check(item):
         account = accounts.get(str(item.get("account_id") or ""))
         if not account:
-            return item.get("id"), "unavailable", "", "Conta OAuth não encontrada."
+            error = "Conta OAuth não encontrada."
+            return item.get("id"), "unavailable", "", error, clip_error_kind(error), ""
         client = account_client(account)
         try:
             diagnosis = clip_diagnosis_from_performance(client.item_performance(item.get("id")))
@@ -4428,13 +4459,25 @@ def refresh_clips_report_operation(request):
         except Exception as exc:
             error = str(exc)
             if "HTTP 404" not in error:
-                return item.get("id"), "unavailable", "", error[:240]
+                return item.get("id"), "unavailable", "", error[:240], clip_error_kind(error), ""
             diagnosis = {"status": "not_exposed", "source": ""}
             source = "item: dados de desempenho ainda não gerados"
-        if diagnosis["status"] == "not_exposed" and item.get("user_product_id"):
+        user_product_id = item.get("user_product_id") or ""
+        if diagnosis["status"] == "not_exposed" and not user_product_id:
+            try:
+                official_item = client.item(item.get("id"))
+                user_product_id = official_item.get("user_product_id") or ""
+            except Exception as item_error:
+                item_error_text = str(item_error)
+                if "HTTP 404" not in item_error_text:
+                    return (
+                        item.get("id"), "unavailable", source, item_error_text[:240],
+                        clip_error_kind(item_error_text), "",
+                    )
+        if diagnosis["status"] == "not_exposed" and user_product_id:
             try:
                 user_product = clip_diagnosis_from_performance(
-                    client.user_product_performance(item.get("user_product_id"))
+                    client.user_product_performance(user_product_id)
                 )
                 if user_product["status"] != "not_exposed":
                     diagnosis = user_product
@@ -4444,8 +4487,11 @@ def refresh_clips_report_operation(request):
                 if "HTTP 404" in fallback_text:
                     source = f"{source}; user_product: dados de desempenho ainda não gerados"
                 else:
-                    return item.get("id"), "unavailable", source, fallback_text[:240]
-        return item.get("id"), diagnosis["status"], source, ""
+                    return (
+                        item.get("id"), "unavailable", source, fallback_text[:240],
+                        clip_error_kind(fallback_text), user_product_id,
+                    )
+        return item.get("id"), diagnosis["status"], source, "", "", user_product_id
 
     by_id = {str(item.get("id") or ""): item for item in payload.get("catalog") or []}
     workers = max(1, min(8, int(os.getenv("MELI_CLIPS_REPORT_WORKERS", "4"))))
@@ -4453,14 +4499,17 @@ def refresh_clips_report_operation(request):
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meli-clips") as executor:
         futures = [executor.submit(run_meli_work, "background", check, item) for item in pending]
         for future in as_completed(futures):
-            item_id, status, source, error = future.result()
+            item_id, status, source, error, error_kind, user_product_id = future.result()
             item = by_id.get(str(item_id or ""))
             if item is not None:
                 item["clips_status"] = status
                 item["clips_checked_at"] = now_label()
                 item["clips_error"] = error
+                item["clips_error_kind"] = error_kind
                 item["clips_source"] = source
                 item["clips_parser_version"] = CLIPS_PARSER_VERSION
+                if user_product_id and not item.get("user_product_id"):
+                    item["user_product_id"] = user_product_id
             completed += 1
             if completed == total or completed % 10 == 0:
                 update_async_operation_progress(
@@ -4476,6 +4525,13 @@ def refresh_clips_report_operation(request):
         "present": sum(1 for item in considered if item.get("clips_status") == "present"),
         "not_exposed": sum(1 for item in considered if item.get("clips_status") == "not_exposed"),
         "unavailable": sum(1 for item in considered if item.get("clips_status") == "unavailable"),
+        "errors": {
+            kind: sum(
+                1 for item in considered
+                if item.get("clips_status") == "unavailable" and item.get("clips_error_kind") == kind
+            )
+            for kind in ("rate_limit", "meli_unstable", "timeout", "network", "auth", "permission", "account", "other")
+        },
     }
 
 
