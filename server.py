@@ -4421,23 +4421,31 @@ def refresh_clips_report_operation(request):
         account = accounts.get(str(item.get("account_id") or ""))
         if not account:
             return item.get("id"), "unavailable", "", "Conta OAuth não encontrada."
+        client = account_client(account)
         try:
-            client = account_client(account)
             diagnosis = clip_diagnosis_from_performance(client.item_performance(item.get("id")))
             source = f"item: {diagnosis.get('source') or 'sem variável de vídeo'}"
-            if diagnosis["status"] == "not_exposed" and item.get("user_product_id"):
-                try:
-                    user_product = clip_diagnosis_from_performance(
-                        client.user_product_performance(item.get("user_product_id"))
-                    )
-                    if user_product["status"] != "not_exposed":
-                        diagnosis = user_product
-                    source = f"user_product: {user_product.get('source') or 'sem variável de vídeo'}"
-                except Exception as fallback_error:
-                    source = f"{source}; user_product indisponível: {str(fallback_error)[:120]}"
-            return item.get("id"), diagnosis["status"], source, ""
         except Exception as exc:
-            return item.get("id"), "unavailable", "", str(exc)[:240]
+            error = str(exc)
+            if "HTTP 404" not in error:
+                return item.get("id"), "unavailable", "", error[:240]
+            diagnosis = {"status": "not_exposed", "source": ""}
+            source = "item: dados de desempenho ainda não gerados"
+        if diagnosis["status"] == "not_exposed" and item.get("user_product_id"):
+            try:
+                user_product = clip_diagnosis_from_performance(
+                    client.user_product_performance(item.get("user_product_id"))
+                )
+                if user_product["status"] != "not_exposed":
+                    diagnosis = user_product
+                source = f"user_product: {user_product.get('source') or 'sem variável de vídeo'}"
+            except Exception as fallback_error:
+                fallback_text = str(fallback_error)
+                if "HTTP 404" in fallback_text:
+                    source = f"{source}; user_product: dados de desempenho ainda não gerados"
+                else:
+                    return item.get("id"), "unavailable", source, fallback_text[:240]
+        return item.get("id"), diagnosis["status"], source, ""
 
     by_id = {str(item.get("id") or ""): item for item in payload.get("catalog") or []}
     workers = max(1, min(8, int(os.getenv("MELI_CLIPS_REPORT_WORKERS", "4"))))

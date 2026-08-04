@@ -1873,7 +1873,7 @@ function renderEqualizationReports() {
       <div class="inventory-value"><span>Objetivo</span><strong>${objective}</strong></div>
       ${state.equalizationType === "missing_clips" ? `<div><span>Clips conferidos pela API</span><strong>${checkedClips.toLocaleString("pt-BR")}</strong></div>` : ""}
       ${state.equalizationType === "missing_clips" && unknownClips ? `<div><span>API sem diagnóstico de Clips</span><strong>${unknownClips.toLocaleString("pt-BR")}</strong></div>` : ""}
-      ${state.equalizationType === "missing_clips" && failedClips ? `<div><span>Falhas temporárias</span><strong>${failedClips.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "missing_clips" && failedClips ? `<div><span>Consultas não concluídas</span><strong>${failedClips.toLocaleString("pt-BR")}</strong></div>` : ""}
       ${state.equalizationType === "photo_coverage" && unknownPhotos ? `<div><span>Aguardando sincronização de fotos</span><strong>${unknownPhotos.toLocaleString("pt-BR")}</strong></div>` : ""}`;
     if (!rows.length) {
       let text = "Nenhuma ocorrência encontrada com estes filtros.";
@@ -1881,7 +1881,7 @@ function renderEqualizationReports() {
       if (state.equalizationType === "missing_clips" && !checkedClips && !unknownClips && !failedClips) {
         text = "Clique em Conferir Clips na API oficial para iniciar a verificação dos anúncios filtrados.";
       } else if (state.equalizationType === "missing_clips" && (unknownClips || failedClips)) {
-        text = `A conferência ainda não produziu um diagnóstico conclusivo para ${(unknownClips + failedClips).toLocaleString("pt-BR")} anúncio(s). Execute novamente para tentar as falhas temporárias; anúncios sem variável de Clips não são contabilizados como se tivessem Clip.`;
+        text = `A conferência ainda não produziu um diagnóstico conclusivo para ${(unknownClips + failedClips).toLocaleString("pt-BR")} anúncio(s). Execute novamente para tentar as consultas não concluídas; anúncios sem variável de Clips não são contabilizados como se tivessem Clip.`;
         noticeClass = "warning-notice";
       }
       container.innerHTML = `<div class="notice ${noticeClass}">${text}</div>`;
@@ -1900,7 +1900,7 @@ function renderEqualizationReports() {
       cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td>${Number(row.picture_count)}</td><td><span class="report-missing">${12 - Number(row.picture_count)}</span></td>`;
     } else {
       headings = "<th>SKU</th><th>Produto</th><th>Conta</th><th>Anúncio ML</th><th>Situação</th><th>Conferido em</th>";
-      cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td><span class="report-missing">Clip pendente confirmado</span></td><td>${escapeText(formatDateTime(row.clips_checked_at) || row.clips_checked_at || "-")}</td>`;
+      cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td><span class="report-missing">Clip pendente confirmado</span></td><td>${escapeText(formatDateBR(row.clips_checked_at) || "-")}</td>`;
     }
     container.innerHTML = `${paginationHtml("equalizationPage", pageInfo)}<div class="equalization-table-wrap"><table class="equalization-table"><thead><tr>${headings}</tr></thead><tbody>${pageInfo.items.map((row) => `<tr>${cells(row)}</tr>`).join("")}</tbody></table></div>${paginationHtml("equalizationPage", pageInfo)}`;
     return;
