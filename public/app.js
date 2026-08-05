@@ -1840,6 +1840,20 @@ function renderAdPictureEditor(item) {
     </details>`;
 }
 
+function refreshAdPictureEditor(itemId) {
+  const item = state.data.catalog.find((row) => row.id === itemId);
+  const current = [...document.querySelectorAll("#ads-list [data-picture-details]")]
+    .find((node) => node.dataset.pictureDetails === itemId);
+  if (!item || !current) return;
+  const topBefore = current.getBoundingClientRect().top;
+  current.outerHTML = renderAdPictureEditor(item);
+  const replacement = [...document.querySelectorAll("#ads-list [data-picture-details]")]
+    .find((node) => node.dataset.pictureDetails === itemId);
+  if (!replacement) return;
+  const delta = replacement.getBoundingClientRect().top - topBefore;
+  if (Math.abs(delta) > 1) window.scrollBy({ top: delta, left: 0, behavior: "auto" });
+}
+
 function reportPackageNumber(field, value) {
   const text = String(value || "").trim().toLowerCase();
   const match = text.match(/[-+]?\d[\d.,]*/);
@@ -4792,7 +4806,7 @@ document.querySelector("#ads-list")?.addEventListener("change", async (event) =>
     return;
   }
   cached.loading = true;
-  renderAds();
+  refreshAdPictureEditor(itemId);
   try {
     for (const file of files) {
       if (!/^image\/(jpeg|png)$/i.test(file.type || "")) throw new Error(`${file.name}: formato não aceito. Use JPG ou PNG.`);
@@ -4834,7 +4848,7 @@ document.querySelector("#ads-list")?.addEventListener("change", async (event) =>
     showToast(cached.error, "error");
   } finally {
     cached.loading = false;
-    renderAds();
+    refreshAdPictureEditor(itemId);
   }
 });
 
@@ -5050,13 +5064,15 @@ document.querySelector("#catalog-list").addEventListener("click", async (event) 
 document.querySelector("#ads-list")?.addEventListener("click", async (event) => {
   const load = event.target.closest("[data-load-pictures]");
   if (load) {
+    event.preventDefault();
     const itemId = load.dataset.loadPictures;
     if (state.openPictures.has(itemId)) state.openPictures.delete(itemId);
     else state.openPictures.add(itemId);
     const cached = state.itemPictures[itemId];
-    if (cached?.loaded || cached?.loading) return;
+    refreshAdPictureEditor(itemId);
+    if (cached?.loaded || cached?.loading || !state.openPictures.has(itemId)) return;
     state.itemPictures[itemId] = { loading: true, loaded: false, pictures: [], error: "" };
-    renderAds();
+    refreshAdPictureEditor(itemId);
     try {
       const queued = await api("/api/meli/item/pictures", {
         method: "POST",
@@ -5078,7 +5094,7 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
       };
       showToast(state.itemPictures[itemId].error, "error");
     }
-    renderAds();
+    refreshAdPictureEditor(itemId);
     return;
   }
 
@@ -5096,7 +5112,7 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
       if (target < 0 || target >= cached.pictures.length) return;
       [cached.pictures[index], cached.pictures[target]] = [cached.pictures[target], cached.pictures[index]];
     }
-    renderAds();
+    refreshAdPictureEditor(itemId);
     return;
   }
 
@@ -5139,7 +5155,7 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
   } finally {
     save.disabled = false;
     save.textContent = original;
-    renderAds();
+    refreshAdPictureEditor(itemId);
   }
 });
 

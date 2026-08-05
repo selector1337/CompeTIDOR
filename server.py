@@ -2178,17 +2178,35 @@ def package_values_from_item(item):
 
 def item_manufacturing_time(item):
     """Return the official MANUFACTURING_TIME sale term as whole days."""
-    for term in item.get("sale_terms") or []:
+    candidates = [
+        item.get("manufacturing_time"),
+        first_present(item, ["shipping.manufacturing_time", "shipping.handling_time"], None),
+    ]
+    terms = [
+        *(item.get("sale_terms") or []),
+        *(item.get("attributes") or []),
+    ]
+    for term in terms:
         if str(term.get("id") or "").upper() != "MANUFACTURING_TIME":
             continue
         struct = term.get("value_struct") or {}
         raw = struct.get("number")
         if raw in (None, ""):
-            raw = term.get("value_name") or term.get("value_id")
+            values = term.get("values") or []
+            first_value = values[0] if values and isinstance(values[0], dict) else {}
+            raw = (
+                first_present(first_value, ["struct.number", "name", "id"], None)
+                or term.get("value_name")
+                or term.get("value_id")
+            )
+        candidates.append(raw)
+    for raw in candidates:
+        if raw in (None, ""):
+            continue
         try:
-            return max(0, min(60, int(round(parse_decimal_number(raw)))))
+            return max(0, min(45, int(round(parse_decimal_number(raw)))))
         except (TypeError, ValueError):
-            return 0
+            continue
     return 0
 
 
@@ -6411,7 +6429,7 @@ def update_item_operation(request, actor=None):
         try:
             manufacturing_time = max(0, min(45, int(float(request.get("manufacturing_time") or 0))))
         except (TypeError, ValueError):
-            raise RuntimeError("Informe a disponibilidade em dias, entre 0 e 60.")
+            raise RuntimeError("Informe a disponibilidade em dias, entre 0 e 45.")
         update["sale_terms"] = [{
             "id": "MANUFACTURING_TIME",
             "value_name": f"{manufacturing_time} dias" if manufacturing_time else None,
@@ -9392,10 +9410,17 @@ def flex_hint_from_payload(value):
         ),
     ]
     tags = {str(tag).strip().lower() for tag in value.get("tags") or [] if str(tag).strip()}
-    normalized_candidates = {str(candidate or "").strip().lower() for candidate in candidates if str(candidate or "").strip()}
-    if "self_service" in normalized_candidates or tags.intersection({"self_service", "self_service_in"}):
+    normalized_candidates = {
+        re.sub(r"[^a-z0-9]+", "_", str(candidate or "").strip().lower()).strip("_")
+        for candidate in candidates if str(candidate or "").strip()
+    }
+    if any(candidate == "self_service" or candidate.startswith("self_service_") for candidate in normalized_candidates) \
+            or tags.intersection({"self_service", "self_service_in"}):
         return True
-    if normalized_candidates or tags.intersection({"self_service_out", "self_service_available"}):
+    known_non_flex = {
+        "cross_docking", "drop_off", "fulfillment", "xd_drop_off", "custom", "not_specified",
+    }
+    if normalized_candidates.intersection(known_non_flex) or tags.intersection({"self_service_out", "self_service_available"}):
         return False
     return None
 
@@ -9833,7 +9858,7 @@ def order_item_fee_amount(order_item, catalog_item, line_total, quantity=1):
     return None
 
 
-def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price, quantity, total_fee):
+def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price, quantity, total_fee, cache=None):
     if total_fee is None:
         return None
     fixed = optional_money(first_present(order_item, ["sale_fee_details.fixed_fee", "fees.fixed_fee"], None))
@@ -9843,26 +9868,30 @@ def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price,
     # that total between percentage and fixed fee. Ask the official pricing
     # endpoint at the historical unit price only for the composition, while
     # retaining the order total as the financial source of truth.
+    listing_type_id = catalog_item.get("listing_type_id") or order_item.get("listing_type_id") or "gold_special"
+    cache_key = (
+        account.get("site_id") or "MLB",
+        round(float(unit_price or 0), 2),
+        listing_type_id,
+        catalog_item.get("category_id") or "",
+    )
     try:
-        details = catalog_item.get("sale_fee_details") or {}
-        projected_fixed = optional_money(first_present(
-            details,
-            ["fixed_fee", "fixed_fee_amount", "sale_fee_details.fixed_fee", "sale_fee_details.fixed_fee_amount"],
-            None,
-        ))
+        projected_fixed = cache.get(cache_key) if isinstance(cache, dict) and cache_key in cache else None
         if projected_fixed is None:
             response = client.listing_prices(
                 account.get("site_id") or "MLB",
                 unit_price,
-                catalog_item.get("listing_type_id") or order_item.get("listing_type_id") or "gold_special",
+                listing_type_id,
                 category_id=catalog_item.get("category_id") or "",
             )
-            _amount, details = sale_fee_values(response, catalog_item.get("listing_type_id"))
+            _amount, details = sale_fee_values(response, listing_type_id)
             projected_fixed = optional_money(first_present(
                 details,
                 ["fixed_fee", "fixed_fee_amount", "sale_fee_details.fixed_fee", "sale_fee_details.fixed_fee_amount"],
                 None,
             ))
+            if isinstance(cache, dict):
+                cache[cache_key] = projected_fixed
         if projected_fixed is not None:
             return round(min(total_fee, max(0.0, projected_fixed) * max(1, int(quantity or 1))), 2)
     except Exception:
@@ -10438,6 +10467,7 @@ def query_sales_report(payload, request):
     ignored_statuses = {"cancelled", "canceled", "invalid"}
     for account in accounts:
         client = account_client(account)
+        sale_fee_split_cache = {}
         shipment_mode_cache = {}
         shipment_cost_cache = {}
         shipment_lookup_state = {"count": 0, "maximum": os.getenv("MELI_STATISTICS_SHIPMENT_LOOKUPS", "5000")}
@@ -10543,15 +10573,19 @@ def query_sales_report(payload, request):
                 unit_price = float(order_item.get("unit_price") or order_item.get("full_unit_price") or 0)
                 line_total = round(unit_price * quantity, 2)
                 fee = order_item_fee_amount(order_item, catalog_item, line_total, quantity)
-                fixed_fee = sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price, quantity, fee)
+                fixed_fee = sale_fee_fixed_amount(
+                    client, account, order_item, catalog_item, unit_price, quantity, fee,
+                    cache=sale_fee_split_cache,
+                )
                 percentage_fee = round(fee - fixed_fee, 2) if fee is not None and fixed_fee is not None else None
                 allocation = line_total / order_gross if order_gross > 0 else 1.0 / max(1, len(order_lines))
                 shipping = round(order_shipping * allocation, 2) if order_shipping is not None else None
                 reimbursement = round(order_reimbursement * allocation, 2)
-                sale_is_flex = is_flex is True or order_reimbursement > 0
+                sale_is_flex = is_flex is True or (is_flex is None and order_reimbursement > 0)
+                sale_is_confirmed_non_flex = is_flex is False
                 if shipping_method_filter == "flex" and not sale_is_flex:
                     continue
-                if shipping_method_filter == "non_flex" and sale_is_flex:
+                if shipping_method_filter == "non_flex" and not sale_is_confirmed_non_flex:
                     continue
                 external_flex_carrier = (
                     round(flex_carrier_cost * allocation, 2)
@@ -11480,7 +11514,7 @@ def statistics_job_signature(request):
     keys = (
         "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
         "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
-        "date_from", "date_to", "flex_carrier_cost",
+        "date_from", "date_to", "flex_carrier_cost", "shipping_method",
     )
     normalized = {key: str((request or {}).get(key) or "") for key in keys}
     return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
@@ -11506,7 +11540,7 @@ def start_statistics_job(request):
         for key in (
             "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
             "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
-            "date_from", "date_to", "flex_carrier_cost",
+            "date_from", "date_to", "flex_carrier_cost", "shipping_method",
         )
     }
     signature = statistics_job_signature(safe_request)
