@@ -96,7 +96,9 @@
   costsRegistration: "all",
   costsPage: 1,
   costsPageSize: 50,
-  equalizationType: "listing_type_gap",
+  reportsSection: "",
+  equalizationType: "",
+  equalizationReady: false,
   equalizationAccount: "all",
   equalizationStatus: "all",
   equalizationSearch: "",
@@ -104,6 +106,8 @@
   equalizationPageSize: 20,
   openDescriptions: new Set(),
   itemDescriptions: {},
+  openPictures: new Set(),
+  itemPictures: {},
   cloneSourceCache: {},
   cloneSourceRequestToken: 0,
   cloneSourceLoading: false,
@@ -189,6 +193,10 @@ function calculatorIcon() {
     <rect x="7" y="5.5" width="10" height="3.5" rx="0.5"></rect>
     <path d="M8 13h.01M12 13h.01M16 13h.01M8 17h.01M12 17h.01M16 17h.01"></path>
   </svg>`;
+}
+
+function copyIcon() {
+  return `<svg class="copy-affordance" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"></path></svg>`;
 }
 
 function manualActionLabel(path) {
@@ -561,7 +569,7 @@ function render() {
 
 function renderRoute() {
   if (!state.data) return;
-  if (["catalogo", "anuncios", "copiar", "kits", "relatorios", "custos", "compras"].includes(state.route) && !state.catalogLoaded) {
+  if (["catalogo", "anuncios", "copiar", "kits", "custos", "compras"].includes(state.route) && !state.catalogLoaded) {
     loadCatalogInBackground();
   }
   const routeRenderers = {
@@ -569,11 +577,7 @@ function renderRoute() {
     estatisticas: renderStatistics,
     custos: renderCosts,
     compras: renderPurchases,
-    relatorios: () => {
-      renderSalesReport();
-      renderBrandSalesReport();
-      renderEqualizationReports();
-    },
+    relatorios: renderReportsHub,
     contas: () => {
       renderAccounts();
       renderMeliConfig();
@@ -591,6 +595,24 @@ function renderRoute() {
     usuarios: renderUsers,
   };
   (routeRenderers[state.route] || renderDashboard)();
+}
+
+function renderReportsHub() {
+  const selector = document.querySelector("#reports-section-select");
+  if (!selector) return;
+  selector.value = state.reportsSection || "";
+  document.querySelectorAll("[data-report-section]").forEach((section) => {
+    section.hidden = section.dataset.reportSection !== state.reportsSection;
+  });
+  if (state.reportsSection === "sales") renderSalesReport();
+  if (state.reportsSection === "brand") {
+    if (!state.catalogLoaded) loadCatalogInBackground();
+    renderBrandSalesReport();
+  }
+  if (state.reportsSection === "equalization") {
+    if (!state.catalogLoaded && state.equalizationReady) loadCatalogInBackground();
+    renderEqualizationReports();
+  }
 }
 
 function scheduleRender(key, callback, delay = 120) {
@@ -883,7 +905,8 @@ function profitFact(item) {
   const margin = commercial.profitPercentage === null
     ? ""
     : `<em>${commercial.profitPercentage >= 0 ? "+" : ""}${commercial.profitPercentage.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%</em>`;
-  return `<div class="fact ${tone}"><small>Lucro / prejuízo</small><strong>${profitLabel(item)}</strong>${margin}</div>`;
+  const label = `${profitLabel(item)}${commercial.profitPercentage === null ? "" : ` (${commercial.profitPercentage >= 0 ? "+" : ""}${commercial.profitPercentage.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%)`}`;
+  return `<button class="fact copy-neon ${tone}" type="button" data-copy="${escapeAttr(label)}" title="Copiar lucro ou prejuízo"><small>Lucro / prejuízo</small><strong>${profitLabel(item)}</strong>${margin}${copyIcon()}</button>`;
 }
 
 function scheduleForItem(item) {
@@ -1704,7 +1727,7 @@ function renderAds() {
             <span class="badge ${normalizedMlStatus(item.meli_status) === "paused" ? "paused" : "winning"}">${statusLabel(item.meli_status || item.status)}</span>
           </div>
         </div>
-        <div class="ad-facts">
+        <div class="ad-facts ad-facts-general" aria-label="Dados gerais do anúncio">
           ${fact("Conta", item.account)}
           ${fact("Código do anúncio", item.id)}
           ${fact("SKU", item.sku || "-")}
@@ -1712,21 +1735,34 @@ function renderAds() {
           ${fact("Tipo", listingTypeLabel(item.listing_type_id))}
           ${fact("Modalidade", isCatalogItem(item) ? "Catálogo" : "Tradicional")}
           ${flexStatusBadge(item.shipping_logistic_type)}
+          ${fact("Status do anúncio", statusLabel(item.meli_status || item.status))}
+        </div>
+        <div class="ad-facts ad-commercial-facts" aria-label="Valores do anúncio">
           ${fact("Frete estimado ML", shippingCostLabel(item))}
           ${fact("Tarifa de venda", saleFeeLabel(item))}
           ${fact("Valor líquido por venda", netSaleLabel(item))}
           ${fact("Custo do SKU", costLabel(item))}
           ${profitFact(item)}
-          ${fact("Status do anúncio", statusLabel(item.meli_status || item.status))}
         </div>
         <div class="inline-edit">
-          <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
-          <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
-          <label>EAN / UPC / GTIN <input type="text" inputmode="numeric" value="${escapeAttr(item.gtin || "")}" data-original-gtin="${escapeAttr(item.gtin || "")}" data-gtin-input="${item.id}" placeholder="Código universal" /></label>
-          <label>Peso <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_weight))}" data-original-value="${escapeAttr(measureInputValue(item.package_weight))}" placeholder="0,6" data-weight-input="${item.id}" /><span>kg</span></span></label>
-          <label>Altura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_height))}" data-original-value="${escapeAttr(measureInputValue(item.package_height))}" placeholder="13" data-height-input="${item.id}" /><span>cm</span></span></label>
-          <label>Largura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_width))}" data-original-value="${escapeAttr(measureInputValue(item.package_width))}" placeholder="18" data-width-input="${item.id}" /><span>cm</span></span></label>
-          <label>Comprimento <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_length))}" data-original-value="${escapeAttr(measureInputValue(item.package_length))}" placeholder="13" data-length-input="${item.id}" /><span>cm</span></span></label>
+          <div class="inline-edit-row ad-stock-row">
+            <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
+            <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
+            <label>Disponibilidade <span class="unit-field"><input type="number" min="0" max="45" step="1" value="${Number(item.manufacturing_time || 0)}" data-original-value="${Number(item.manufacturing_time || 0)}" data-manufacturing-time-input="${item.id}" /><span>dias</span></span><small>Use 0 para disponibilidade imediata.</small></label>
+          </div>
+          <div class="inline-edit-row ad-package-row">
+            <label>Tipo de embalagem
+              <select data-package-mode-input="${item.id}" data-original-value="${escapeAttr(item.package_mode || "factory")}">
+                <option value="factory" ${(item.package_mode || "factory") === "factory" ? "selected" : ""}>Embalagem de fábrica</option>
+                <option value="additional" ${item.package_mode === "additional" ? "selected" : ""}>Com proteção adicional</option>
+              </select>
+            </label>
+            <label>EAN / UPC / GTIN <input type="text" inputmode="numeric" value="${escapeAttr(item.gtin || "")}" data-original-gtin="${escapeAttr(item.gtin || "")}" data-gtin-input="${item.id}" placeholder="Código universal" /></label>
+            <label>Peso <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_weight))}" data-original-value="${escapeAttr(measureInputValue(item.package_weight))}" placeholder="0,6" data-weight-input="${item.id}" /><span>kg</span></span></label>
+            <label>Altura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_height))}" data-original-value="${escapeAttr(measureInputValue(item.package_height))}" placeholder="13" data-height-input="${item.id}" /><span>cm</span></span></label>
+            <label>Largura <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_width))}" data-original-value="${escapeAttr(measureInputValue(item.package_width))}" placeholder="18" data-width-input="${item.id}" /><span>cm</span></span></label>
+            <label>Comprimento <span class="unit-field"><input type="text" inputmode="decimal" value="${escapeAttr(measureInputValue(item.package_length))}" data-original-value="${escapeAttr(measureInputValue(item.package_length))}" placeholder="13" data-length-input="${item.id}" /><span>cm</span></span></label>
+          </div>
           <div class="ad-actions">
             <button class="mini-button" data-save-ad="${item.id}">Salvar</button>
             ${normalizedMlStatus(item.meli_status) === "paused" || item.status === "paused"
@@ -1742,6 +1778,7 @@ function renderAds() {
         </div>
         ${priceScheduleHtml(item)}
         ${renderAdDescriptionEditor(item)}
+        ${renderAdPictureEditor(item)}
         ${renderItemLog(item)}
       </div>
     </article>
@@ -1774,6 +1811,35 @@ function renderAdDescriptionEditor(item) {
   `;
 }
 
+function renderAdPictureEditor(item) {
+  const itemId = item.id || "";
+  const open = state.openPictures.has(itemId);
+  const cached = state.itemPictures[itemId] || {};
+  const editable = !isCatalogItem(item);
+  const pictures = cached.pictures || [];
+  return `
+    <details class="ad-picture-editor" data-picture-details="${escapeAttr(itemId)}" ${open ? "open" : ""}>
+      <summary data-load-pictures="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}">${editable ? "Editar fotos" : "Ver fotos"}<small>${editable ? "Até 12 fotos, mínimo 500 x 500 px" : "Anúncios de catálogo são somente leitura"}</small></summary>
+      <div class="ad-picture-editor-body">
+        <div class="ad-picture-list" data-picture-list="${escapeAttr(itemId)}">
+          ${cached.loading ? `<div class="notice">Carregando fotos oficiais...</div>` : pictures.map((picture, index) => `
+            <article class="ad-picture-tile" data-picture-index="${index}">
+              <img src="${escapeAttr(picture.secure_url || picture.source)}" alt="Foto ${index + 1}" />
+              <span>${index + 1}</span>
+              ${editable ? `<div><button type="button" data-picture-move="up" data-item-id="${escapeAttr(itemId)}" data-index="${index}" title="Mover para cima" ${index === 0 ? "disabled" : ""}>↑</button><button type="button" data-picture-move="down" data-item-id="${escapeAttr(itemId)}" data-index="${index}" title="Mover para baixo" ${index === pictures.length - 1 ? "disabled" : ""}>↓</button><button type="button" data-picture-remove data-item-id="${escapeAttr(itemId)}" data-index="${index}" title="Excluir foto">×</button></div>` : ""}
+            </article>`).join("")}
+        </div>
+        ${cached.error ? `<div class="notice danger-notice">${escapeText(cached.error)}</div>` : ""}
+        ${editable ? `<div class="ad-picture-actions">
+          <label class="mini-button picture-upload-button">Adicionar fotos<input type="file" accept="image/jpeg,image/png" multiple data-picture-upload="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" /></label>
+          <small>${pictures.length}/12 fotos</small>
+          <button class="mini-button" type="button" data-save-pictures="item" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar só neste anúncio</button>
+          <button class="mini-button success-button" type="button" data-save-pictures="sku" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar nos tradicionais do mesmo SKU</button>
+        </div>` : ""}
+      </div>
+    </details>`;
+}
+
 function reportPackageNumber(field, value) {
   const text = String(value || "").trim().toLowerCase();
   const match = text.match(/[-+]?\d[\d.,]*/);
@@ -1802,6 +1868,14 @@ function reportGtinSignature(value) {
 function renderEqualizationReports() {
   const container = document.querySelector("#equalization-report");
   if (!container) return;
+  const summary = document.querySelector("#equalization-summary");
+  const mediaActions = document.querySelector("#equalization-media-actions");
+  if (!state.equalizationType || !state.equalizationReady) {
+    if (summary) summary.innerHTML = "";
+    if (mediaActions) mediaActions.hidden = true;
+    container.innerHTML = `<div class="notice">Selecione o relatório e clique em “Consultar relatório”. Nenhuma análise pesada será iniciada antes disso.</div>`;
+    return;
+  }
   if (!state.catalogLoaded) {
     container.innerHTML = `<div class="notice">Carregando os anúncios para comparar as contas...</div>`;
     loadCatalogInBackground();
@@ -1809,7 +1883,6 @@ function renderEqualizationReports() {
   }
   const accounts = connectedAccounts().map((account) => account.nickname).filter(Boolean);
   setOptions("#equalization-account-filter", ["all", ...accounts], state.equalizationAccount, "Todas as contas");
-  const mediaActions = document.querySelector("#equalization-media-actions");
   const clipsAction = document.querySelector("#refresh-clips-report");
   const photosAction = document.querySelector("#refresh-photos-report");
   const mediaHelp = document.querySelector("#equalization-media-help");
@@ -1967,7 +2040,6 @@ function renderEqualizationReports() {
   rows.sort((a, b) => String(a.sku).localeCompare(String(b.sku), "pt-BR"));
   const pageInfo = paginate(rows, state.equalizationPage, state.equalizationPageSize);
   state.equalizationPage = pageInfo.current;
-  const summary = document.querySelector("#equalization-summary");
   if (summary) summary.innerHTML = `
     <div><span>Inconsistências encontradas</span><strong>${rows.length.toLocaleString("pt-BR")}</strong></div>
     <div><span>Contas comparadas</span><strong>${accounts.length}</strong></div>
@@ -2878,12 +2950,12 @@ function openProfitCalculator(item, context = "ads") {
       <div class="profit-calculator-fields">
         <label>
           Preço de venda simulado
-          <span class="money-field"><input name="sale_price" type="text" inputmode="decimal" value="${current.currentPrice.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}" ${feeReady ? "" : "disabled"} /></span>
+          <span class="money-field clearable-field"><input name="sale_price" type="text" inputmode="decimal" value="${current.currentPrice.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}" ${feeReady ? "" : "disabled"} /><button type="button" data-clear-calculator="sale_price" aria-label="Limpar preço simulado">×</button></span>
           <small>Digite qualquer preço para atualizar a simulação imediatamente.</small>
         </label>
         <label>
           Margem líquida desejada
-          <span class="percent-field"><input name="desired_margin" type="text" inputmode="decimal" placeholder="Ex.: 20" ${feeReady && costReady ? "" : "disabled"} /><span>%</span></span>
+          <span class="percent-field clearable-field"><input name="desired_margin" type="text" inputmode="decimal" placeholder="Ex.: 20" ${feeReady && costReady ? "" : "disabled"} /><span>%</span><button type="button" data-clear-calculator="desired_margin" aria-label="Limpar margem desejada">×</button></span>
           <small>Preenche automaticamente o preço necessário. Aceita valores entre 0% e 99,99%.</small>
         </label>
       </div>
@@ -2943,6 +3015,16 @@ function openProfitCalculator(item, context = "ads") {
         <span class="${tone}"><small>Lucro / prejuízo</small><strong>${values.profit === null ? "Sem custo cadastrado" : money.format(values.profit)}</strong><em>${values.profitPercentage === null ? "" : `${values.profitPercentage >= 0 ? "+" : ""}${values.profitPercentage.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</em></span>
       </div>`;
   };
+
+  dialog.addEventListener("click", (event) => {
+    const clear = event.target.closest("[data-clear-calculator]");
+    if (!clear) return;
+    const input = form.elements[clear.dataset.clearCalculator];
+    if (!input || input.disabled) return;
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.focus({ preventScroll: true });
+  });
 
   priceInput?.addEventListener("input", () => renderSimulation("price"));
   marginInput?.addEventListener("input", () => {
@@ -3094,16 +3176,21 @@ function renderSalesReport() {
   }
   const totals = state.salesReport.summary || {};
   summary.innerHTML = `
-    <div><span>Itens vendidos</span><strong>${Number(totals.sales || 0).toLocaleString("pt-BR")}</strong></div>
-    <div><span>Unidades</span><strong>${Number(totals.units || 0).toLocaleString("pt-BR")}</strong></div>
-    <div><span>Valor vendido</span><strong>${money.format(totals.gross_amount || 0)}</strong></div>
-    <div><span>Tarifas de venda</span><strong>${money.format(totals.percentage_fee_amount || 0)}</strong></div>
-    <div><span>Custos fixos</span><strong>${money.format(totals.fixed_fee_amount || 0)}</strong></div>
-    <div><span>Fretes debitados</span><strong>${money.format(totals.shipping_amount || 0)}</strong></div>
-    <div class="profit-positive"><span>Estornos Flex</span><strong>${money.format(totals.shipping_reimbursement_amount || 0)}</strong></div>
-    <div><span>Transportadora Flex</span><strong>${money.format(totals.flex_carrier_cost_amount || 0)}</strong></div>
-    <div><span>Valor líquido</span><strong>${money.format(totals.net_amount || 0)}</strong></div>
-    <div class="${Number(totals.profit_amount || 0) >= 0 ? "profit-positive" : "profit-negative"}"><span>Lucro / prejuízo</span><strong>${money.format(totals.profit_amount || 0)}</strong></div>`;
+    <div class="sales-summary-row sales-summary-counts">
+      <div><span>Itens vendidos</span><strong>${Number(totals.sales || 0).toLocaleString("pt-BR")}</strong></div>
+      <div><span>Unidades</span><strong>${Number(totals.units || 0).toLocaleString("pt-BR")}</strong></div>
+    </div>
+    <div class="sales-summary-row sales-summary-money">
+      <div><span>Valor vendido</span><strong>${money.format(totals.gross_amount || 0)}</strong></div>
+      <div><span>Tarifas de venda</span><strong>${money.format(totals.percentage_fee_amount || 0)}</strong></div>
+      <div><span>Custos fixos</span><strong>${money.format(totals.fixed_fee_amount || 0)}</strong></div>
+      <div><span>Fretes debitados</span><strong>${money.format(totals.shipping_amount || 0)}</strong></div>
+      <div class="profit-positive"><span>Estornos Flex</span><strong>${money.format(totals.shipping_reimbursement_amount || 0)}</strong></div>
+      <div><span>Transportadora Flex</span><strong>${money.format(totals.flex_carrier_cost_amount || 0)}</strong></div>
+      <div><span>Custo dos produtos</span><strong>${money.format(totals.cost_amount || 0)}</strong></div>
+      <div><span>Valor líquido</span><strong>${money.format(totals.net_amount || 0)}</strong></div>
+      <div class="${Number(totals.profit_amount || 0) >= 0 ? "profit-positive" : "profit-negative"}"><span>Lucro / prejuízo</span><strong>${money.format(totals.profit_amount || 0)}</strong><em>${totals.profit_percentage == null ? "Sem margem consolidada" : `${Number(totals.profit_percentage) >= 0 ? "+" : ""}${Number(totals.profit_percentage).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`}</em></div>
+    </div>`;
   const pageInfo = paginate(state.salesReport.rows || [], state.salesReportPage, state.salesReportPageSize);
   state.salesReportPage = pageInfo.current;
   results.innerHTML = `${paginationHtml("salesReportPage", pageInfo)}
@@ -3145,6 +3232,9 @@ async function loadSalesReport() {
       body: JSON.stringify({
         account: form.elements.account.value,
         flex_carrier_cost: form.elements.flex_carrier_cost.value,
+        shipping_method: form.elements.shipping_method.value,
+        brand: form.elements.brand.value,
+        sku: form.elements.sku.value,
         ...range,
       }),
     });
@@ -3339,6 +3429,9 @@ function currentReportFilters(reportType) {
     return {
       account: form.elements.account.value,
       flex_carrier_cost: form.elements.flex_carrier_cost.value,
+      shipping_method: form.elements.shipping_method.value,
+      brand: form.elements.brand.value,
+      sku: form.elements.sku.value,
       ...statisticsDateRange(form),
     };
   }
@@ -4027,6 +4120,7 @@ function fact(label, value) {
     <button class="fact copy-neon" type="button" data-copy="${escapeAttr(value)}" title="Copiar ${label}">
       <small>${label}</small>
       <strong>${value}</strong>
+      ${copyIcon()}
     </button>
   `;
 }
@@ -4064,7 +4158,7 @@ function timeLeftBR(value, fallback = "-") {
 }
 
 function copyChip(label, value) {
-  return `<button class="copy-chip" type="button" data-copy="${escapeAttr(value)}" title="Copiar ${label}"><small>${label}</small><strong>${value}</strong></button>`;
+  return `<button class="copy-chip" type="button" data-copy="${escapeAttr(value)}" title="Copiar ${label}"><small>${label}</small><strong>${value}</strong>${copyIcon()}</button>`;
 }
 
 function escapeAttr(value) {
@@ -4343,6 +4437,23 @@ document.querySelector("#sales-report-form")?.addEventListener("submit", async (
   await loadSalesReport();
 });
 
+document.querySelector("#reports-section-select")?.addEventListener("change", (event) => {
+  state.reportsSection = event.target.value;
+  state.equalizationReady = false;
+  renderReportsHub();
+});
+
+document.querySelector("#run-equalization-report")?.addEventListener("click", () => {
+  if (!state.equalizationType) {
+    showToast("Selecione qual relatório deseja consultar.", "error");
+    return;
+  }
+  state.equalizationReady = true;
+  state.equalizationPage = 1;
+  if (!state.catalogLoaded) loadCatalogInBackground();
+  renderEqualizationReports();
+});
+
 document.querySelector("#brand-sales-report-form")?.addEventListener("change", (event) => {
   if (event.target.name === "period") updateBrandSalesReportPeriodFields();
   if (event.target.name === "page_size") {
@@ -4420,6 +4531,16 @@ document.querySelector("#purchase-calculator-form")?.addEventListener("reset", (
 });
 
 document.addEventListener("click", (event) => {
+  const clearButton = event.target.closest("[data-clear-input]");
+  if (clearButton) {
+    const input = document.getElementById(clearButton.dataset.clearInput);
+    if (input) {
+      input.value = "";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus({ preventScroll: true });
+    }
+    return;
+  }
   const calculator = event.target.closest("[data-stock-calculator]");
   if (calculator) {
     openStockCalculator((state.statistics?.rows || [])[Number(calculator.dataset.stockCalculator)]);
@@ -4486,6 +4607,9 @@ document.addEventListener("click", (event) => {
     }
     if (key.startsWith("equalization")) {
       state.equalizationPage = 1;
+      if (["equalizationType", "equalizationAccount", "equalizationStatus"].includes(key)) {
+        state.equalizationReady = false;
+      }
       scheduleRender("equalization", renderEqualizationReports);
     }
     if (key.startsWith("costs")) {
@@ -4511,6 +4635,9 @@ document.addEventListener("click", (event) => {
     }
     if (key.startsWith("equalization")) {
       state.equalizationPage = 1;
+      if (["equalizationType", "equalizationAccount", "equalizationStatus"].includes(key)) {
+        state.equalizationReady = false;
+      }
       renderEqualizationReports();
     }
     if (key.startsWith("costs")) {
@@ -4643,13 +4770,72 @@ document.querySelector("#ads-inventory-summary")?.addEventListener("toggle", (ev
   state.kitInventoryOpen = event.target.open;
 }, true);
 
-document.querySelector("#ads-list")?.addEventListener("change", (event) => {
+document.querySelector("#ads-list")?.addEventListener("change", async (event) => {
   const checkbox = event.target.closest("[data-select-ad]");
-  if (!checkbox) return;
-  if (checkbox.checked) state.adsSelectedIds.add(checkbox.dataset.selectAd);
-  else state.adsSelectedIds.delete(checkbox.dataset.selectAd);
-  checkbox.closest(".ad-item")?.classList.toggle("selected", checkbox.checked);
-  updateBulkPriceBar();
+  if (checkbox) {
+    if (checkbox.checked) state.adsSelectedIds.add(checkbox.dataset.selectAd);
+    else state.adsSelectedIds.delete(checkbox.dataset.selectAd);
+    checkbox.closest(".ad-item")?.classList.toggle("selected", checkbox.checked);
+    updateBulkPriceBar();
+    return;
+  }
+
+  const upload = event.target.closest("[data-picture-upload]");
+  if (!upload) return;
+  const itemId = upload.dataset.pictureUpload;
+  const cached = state.itemPictures[itemId];
+  const files = [...(upload.files || [])];
+  upload.value = "";
+  if (!cached?.loaded || !files.length) return;
+  if ((cached.pictures?.length || 0) + files.length > 12) {
+    showToast("O Mercado Livre permite no máximo 12 fotos por anúncio.", "error");
+    return;
+  }
+  cached.loading = true;
+  renderAds();
+  try {
+    for (const file of files) {
+      if (!/^image\/(jpeg|png)$/i.test(file.type || "")) throw new Error(`${file.name}: formato não aceito. Use JPG ou PNG.`);
+      if (file.size > 10 * 1024 * 1024) throw new Error(`${file.name}: a imagem deve ter no máximo 10 MB.`);
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error(`Não foi possível ler ${file.name}.`));
+        reader.readAsDataURL(file);
+      });
+      const dimensions = await new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+        image.onerror = () => reject(new Error(`${file.name}: imagem inválida.`));
+        image.src = dataUrl;
+      });
+      if (dimensions.width < 500 || dimensions.height < 500) {
+        throw new Error(`${file.name}: use no mínimo 500 x 500 px.`);
+      }
+      const queued = await api("/api/meli/item/pictures", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "upload",
+          item_id: itemId,
+          account_id: upload.dataset.accountId,
+          filename: file.name,
+          data_url: dataUrl,
+          width: dimensions.width,
+          height: dimensions.height,
+        }),
+      });
+      const result = await waitForAsyncOperation(queued);
+      cached.pictures.push(result.picture);
+    }
+    cached.error = "";
+    showToast(`${files.length} foto(s) adicionada(s). Salve para aplicar no Mercado Livre.`, "success");
+  } catch (error) {
+    cached.error = error.message || "Não foi possível adicionar as fotos.";
+    showToast(cached.error, "error");
+  } finally {
+    cached.loading = false;
+    renderAds();
+  }
 });
 
 document.querySelector("#ads-bulk-price")?.addEventListener("click", async (event) => {
@@ -4861,6 +5047,102 @@ document.querySelector("#catalog-list").addEventListener("click", async (event) 
   }
 });
 
+document.querySelector("#ads-list")?.addEventListener("click", async (event) => {
+  const load = event.target.closest("[data-load-pictures]");
+  if (load) {
+    const itemId = load.dataset.loadPictures;
+    if (state.openPictures.has(itemId)) state.openPictures.delete(itemId);
+    else state.openPictures.add(itemId);
+    const cached = state.itemPictures[itemId];
+    if (cached?.loaded || cached?.loading) return;
+    state.itemPictures[itemId] = { loading: true, loaded: false, pictures: [], error: "" };
+    renderAds();
+    try {
+      const queued = await api("/api/meli/item/pictures", {
+        method: "POST",
+        body: JSON.stringify({ action: "read", item_id: itemId, account_id: load.dataset.accountId }),
+      });
+      const result = await waitForAsyncOperation(queued);
+      state.itemPictures[itemId] = {
+        loading: false,
+        loaded: true,
+        pictures: result.pictures || [],
+        error: "",
+      };
+    } catch (error) {
+      state.itemPictures[itemId] = {
+        loading: false,
+        loaded: false,
+        pictures: [],
+        error: error.message || "Não foi possível carregar as fotos oficiais.",
+      };
+      showToast(state.itemPictures[itemId].error, "error");
+    }
+    renderAds();
+    return;
+  }
+
+  const move = event.target.closest("[data-picture-move]");
+  const remove = event.target.closest("[data-picture-remove]");
+  if (move || remove) {
+    const control = move || remove;
+    const itemId = control.dataset.itemId;
+    const index = Number(control.dataset.index);
+    const cached = state.itemPictures[itemId];
+    if (!cached?.pictures?.[index]) return;
+    if (remove) cached.pictures.splice(index, 1);
+    else {
+      const target = move.dataset.pictureMove === "up" ? index - 1 : index + 1;
+      if (target < 0 || target >= cached.pictures.length) return;
+      [cached.pictures[index], cached.pictures[target]] = [cached.pictures[target], cached.pictures[index]];
+    }
+    renderAds();
+    return;
+  }
+
+  const save = event.target.closest("[data-save-pictures]");
+  if (!save) return;
+  const itemId = save.dataset.itemId;
+  const cached = state.itemPictures[itemId];
+  if (!cached?.loaded || cached.loading) return;
+  if (!cached.pictures.length) {
+    showToast("O anúncio precisa manter pelo menos uma foto.", "error");
+    return;
+  }
+  save.disabled = true;
+  const original = save.textContent;
+  try {
+    const queued = await api("/api/meli/item/pictures", {
+      method: "POST",
+      body: JSON.stringify({
+        action: "save",
+        item_id: itemId,
+        account_id: save.dataset.accountId,
+        scope: save.dataset.savePictures,
+        pictures: cached.pictures,
+      }),
+    });
+    const result = await waitForAsyncOperation(queued, (message) => { save.textContent = message || "Salvando fotos..."; });
+    cached.pictures = result.pictures || cached.pictures;
+    mergeCatalogItem(result.item);
+    const updated = (result.propagated || []).filter((row) => row.status === "updated").length;
+    const failed = (result.propagated || []).filter((row) => row.status === "error").length;
+    showToast(
+      updated || failed
+        ? `Fotos salvas; ${updated} anúncio(s) do SKU atualizados${failed ? ` e ${failed} falharam` : ""}.`
+        : "Fotos salvas no Mercado Livre.",
+      failed ? "error" : "success",
+    );
+  } catch (error) {
+    cached.error = error.message || "Não foi possível salvar as fotos.";
+    showToast(cached.error, "error");
+  } finally {
+    save.disabled = false;
+    save.textContent = original;
+    renderAds();
+  }
+});
+
 document.querySelector("#ads-list").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-save-ad], [data-pause-ad], [data-activate-ad], [data-remove-flex], [data-activate-flex]");
   if (!button) return;
@@ -4919,6 +5201,14 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
     const gtinInput = document.querySelector(`[data-gtin-input="${id}"]`);
     if ((gtinInput?.value || "").trim() !== (gtinInput?.dataset.originalGtin || "").trim()) {
       payload.gtin = (gtinInput?.value || "").trim();
+    }
+    const manufacturingInput = document.querySelector(`[data-manufacturing-time-input="${id}"]`);
+    if (Number(manufacturingInput?.value || 0) !== Number(manufacturingInput?.dataset.originalValue || 0)) {
+      payload.manufacturing_time = Number(manufacturingInput?.value || 0);
+    }
+    const packageModeInput = document.querySelector(`[data-package-mode-input="${id}"]`);
+    if ((packageModeInput?.value || "factory") !== (packageModeInput?.dataset.originalValue || "factory")) {
+      payload.package_mode = packageModeInput.value;
     }
   }
   if (button.dataset.pauseAd) payload.status_action = "pause";

@@ -338,7 +338,7 @@
           </div>
           <div class="filter-bar">
             <label>Conta <select id="catalog-account-filter"></select></label>
-            <label>Busca <input id="catalog-search" placeholder="Produto, SKU ou MLB..." /></label>
+            <label>Busca <span class="clearable-input"><input id="catalog-search" type="search" placeholder="Produto, SKU ou MLB..." /><button type="button" data-clear-input="catalog-search" aria-label="Limpar busca">×</button></span></label>
             <label>Status ML <select id="catalog-ml-status-filter"></select></label>
             <label>Estoque <select id="catalog-stock-filter"><option value="all">Todos</option><option value="zero">Sem estoque</option><option value="available">Com estoque</option></select></label>
             <label>Vendas do SKU
@@ -524,7 +524,22 @@
       </section>
 
       <section class="page" id="page-relatorios">
-        <div class="panel catalog-panel sales-report-panel">
+        <div class="panel reports-hub">
+          <div>
+            <p class="eyebrow">Central de relatórios</p>
+            <h2>Escolha a análise que deseja consultar</h2>
+            <small>Nenhuma consulta pesada é iniciada automaticamente.</small>
+          </div>
+          <label>Relatório
+            <select id="reports-section-select">
+              <option value="">Selecione um relatório</option>
+              <option value="sales">Vendas por período</option>
+              <option value="brand">Vendas e reposição por marca</option>
+              <option value="equalization">Cobertura e consistência por SKU</option>
+            </select>
+          </label>
+        </div>
+        <div class="panel catalog-panel sales-report-panel" data-report-section="sales" hidden>
           <div class="panel-heading">
             <div>
               <p class="eyebrow">Vendas oficiais Mercado Livre</p>
@@ -552,6 +567,15 @@
             <label data-sales-date hidden>Data <input name="specific_date" type="date" /></label>
             <label data-sales-custom hidden>Início <input name="date_from" type="date" /></label>
             <label data-sales-custom hidden>Fim <input name="date_to" type="date" /></label>
+            <label>Modalidade de envio
+              <select name="shipping_method">
+                <option value="all">Todas</option>
+                <option value="flex">Somente Mercado Envios Flex</option>
+                <option value="non_flex">Exceto Mercado Envios Flex</option>
+              </select>
+            </label>
+            <label>Marca <input name="brand" type="search" placeholder="Todas as marcas" autocomplete="off" /></label>
+            <label>SKU <input name="sku" type="search" placeholder="SKU exato" autocomplete="off" /></label>
             <label>Valor Transportadora Flex
               <span class="money-field"><input name="flex_carrier_cost" type="text" inputmode="decimal" placeholder="Opcional" /></span>
               <small>Valor externo por pedido Flex. O custo é rateado entre os itens do mesmo pedido.</small>
@@ -565,7 +589,7 @@
           <div id="sales-report-summary" class="inventory-summary"></div>
           <div id="sales-report-results"></div>
         </div>
-        <div class="panel catalog-panel brand-sales-report-panel">
+        <div class="panel catalog-panel brand-sales-report-panel" data-report-section="brand" hidden>
           <div class="panel-heading">
             <div>
               <p class="eyebrow">Rentabilidade e reposição</p>
@@ -614,7 +638,7 @@
           <div id="brand-sales-report-summary" class="inventory-summary brand-report-summary"></div>
           <div id="brand-sales-report-results"></div>
         </div>
-        <div class="panel catalog-panel">
+        <div class="panel catalog-panel" data-report-section="equalization" hidden>
           <div class="panel-heading">
             <div>
               <p class="eyebrow">Equalização de contas</p>
@@ -628,6 +652,7 @@
           <div class="filter-bar report-filter-bar">
             <label>Relatório
               <select id="equalization-report-type">
+                <option value="">Selecione o relatório</option>
                 <option value="listing_type_gap">Clássico sem Premium e vice-versa</option>
                 <option value="account_gap">SKU ausente em outras contas</option>
                 <option value="package_discrepancy">Divergência de medidas ou peso por SKU</option>
@@ -648,6 +673,7 @@
             <label>Por página
               <select id="equalization-page-size"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select>
             </label>
+            <button class="primary" id="run-equalization-report" type="button">Consultar relatório</button>
           </div>
           <div id="equalization-media-actions" class="report-media-actions" hidden>
             <button class="mini-button success-button" id="refresh-clips-report" type="button" hidden>Conferir Clips na API oficial</button>

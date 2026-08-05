@@ -6802,3 +6802,341 @@ textarea:focus {
     grid-template-columns: 1fr;
   }
 }
+
+/* Ads hierarchy, on-demand media and report workspace */
+.fact[data-copy],
+.copy-chip[data-copy] {
+  position: relative;
+  padding-right: 34px;
+  cursor: copy;
+}
+
+.copy-affordance {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  color: var(--muted);
+  opacity: .7;
+  pointer-events: none;
+  transition: color .16s ease, opacity .16s ease, transform .16s ease;
+}
+
+.fact[data-copy]:hover .copy-affordance,
+.copy-chip[data-copy]:hover .copy-affordance {
+  color: var(--brand);
+  opacity: 1;
+  transform: translateY(-1px);
+}
+
+.ad-facts-general {
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.ad-commercial-facts {
+  grid-template-columns: repeat(5, minmax(135px, 1fr));
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+}
+
+.inline-edit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.inline-edit-row {
+  display: grid;
+  gap: 12px;
+  align-items: end;
+  min-width: 0;
+}
+
+.ad-stock-row {
+  grid-template-columns: repeat(3, minmax(150px, 1fr));
+}
+
+.ad-package-row {
+  grid-template-columns: repeat(6, minmax(130px, 1fr));
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 75%, transparent);
+}
+
+.inline-edit select {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  padding: 0 10px;
+}
+
+.inline-edit label > small {
+  display: block;
+  color: var(--muted);
+  font-size: .7rem;
+  line-height: 1.35;
+}
+
+.ad-picture-editor {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: clip;
+}
+
+.ad-picture-editor > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  padding: 0 12px;
+  color: var(--brand);
+  font-weight: 900;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.ad-picture-editor > summary small {
+  color: var(--muted);
+  font-size: .7rem;
+  font-weight: 700;
+}
+
+.ad-picture-editor-body {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel-2) 80%, transparent);
+}
+
+.ad-picture-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  gap: 10px;
+}
+
+.ad-picture-tile {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 7px;
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.ad-picture-tile img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: contain;
+  padding: 4px;
+  box-sizing: border-box;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.ad-picture-tile > span {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(7, 13, 20, .82);
+  color: #fff;
+  font-size: .7rem;
+  font-weight: 900;
+}
+
+.ad-picture-tile > div,
+.ad-picture-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.ad-picture-tile button {
+  flex: 1;
+  min-width: 30px;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font-weight: 900;
+}
+
+.ad-picture-actions small {
+  margin-right: auto;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.picture-upload-button {
+  position: relative;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.picture-upload-button input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.clearable-input,
+.clearable-field {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+
+.clearable-input input,
+.clearable-field input {
+  width: 100%;
+  padding-right: 36px;
+}
+
+.clearable-input > button,
+.clearable-field > button {
+  position: absolute;
+  top: 50%;
+  right: 7px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  padding: 0;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.money-field.clearable-field input {
+  padding-left: 38px;
+  padding-right: 36px;
+}
+
+.percent-field.clearable-field > span {
+  right: 38px;
+}
+
+.reports-hub {
+  border-left: 3px solid var(--brand);
+}
+
+.reports-hub label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 900;
+}
+
+.reports-hub select {
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  padding: 0 12px;
+}
+
+#sales-report-summary.inventory-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+
+#sales-report-summary .sales-summary-row {
+  display: grid;
+  gap: 10px;
+}
+
+#sales-report-summary .sales-summary-counts {
+  grid-template-columns: repeat(2, minmax(130px, 1fr));
+}
+
+#sales-report-summary .sales-summary-money {
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+}
+
+#sales-report-summary .sales-summary-row > div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  min-height: 82px;
+  align-content: center;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+#sales-report-summary .sales-summary-row span {
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+#sales-report-summary .sales-summary-row strong {
+  overflow-wrap: anywhere;
+  font-size: 1.05rem;
+}
+
+@media (max-width: 1180px) {
+  .ad-commercial-facts {
+    grid-template-columns: repeat(3, minmax(135px, 1fr));
+  }
+
+  .ad-package-row {
+    grid-template-columns: repeat(3, minmax(150px, 1fr));
+  }
+}
+
+@media (max-width: 780px) {
+  .ad-commercial-facts,
+  .ad-stock-row,
+  .ad-package-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ad-picture-editor > summary,
+  .ad-picture-actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 520px) {
+  .ad-commercial-facts,
+  .ad-stock-row,
+  .ad-package-row,
+  #sales-report-summary .sales-summary-counts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ad-picture-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -514,7 +514,8 @@ CATALOG_COMPETITION_FIELDS = {
 CATALOG_ITEM_FIELDS = {
     "title", "thumbnail", "sku", "brand", "gtin", "variation_count", "catalog_product_id",
     "catalog_listing", "listing_type_id", "shipping_logistic_type", "shipping_mode", "free_shipping",
-    "package_weight", "package_height", "package_width", "package_length", "price", "stock",
+    "package_weight", "package_height", "package_width", "package_length", "package_mode",
+    "manufacturing_time", "price", "stock",
     "meli_status", "permalink", "picture_count", "picture_count_status", "item_data_checked_at",
 }
 CATALOG_SHIPPING_FIELDS = {
@@ -2175,6 +2176,22 @@ def package_values_from_item(item):
     }
 
 
+def item_manufacturing_time(item):
+    """Return the official MANUFACTURING_TIME sale term as whole days."""
+    for term in item.get("sale_terms") or []:
+        if str(term.get("id") or "").upper() != "MANUFACTURING_TIME":
+            continue
+        struct = term.get("value_struct") or {}
+        raw = struct.get("number")
+        if raw in (None, ""):
+            raw = term.get("value_name") or term.get("value_id")
+        try:
+            return max(0, min(60, int(round(parse_decimal_number(raw)))))
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
 def package_value_number(field, value):
     normalized = normalize_package_value(value, ["SELLER_PACKAGE_WEIGHT" if field == "package_weight" else "SELLER_PACKAGE_LENGTH"])
     match = re.search(r"[\d.,]+", normalized or "")
@@ -3702,6 +3719,7 @@ def synced_catalog_item(account, item, competition=None):
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
         "free_shipping": bool(first_present(item, ["shipping.free_shipping"], False)),
+        "manufacturing_time": item_manufacturing_time(item),
         **package_values,
         "status": status,
         "share": competition_share(competition.get("competition_status"), competition.get("visit_share")) if is_catalog else 100,
@@ -6188,6 +6206,182 @@ def item_description_operation(request, actor=None):
     return {"ok": True, "description": text, "official": official}
 
 
+def normalized_item_pictures(item):
+    rows = []
+    for index, picture in enumerate(item.get("pictures") or []):
+        if not isinstance(picture, dict):
+            continue
+        source = picture.get("secure_url") or picture.get("url") or picture.get("source") or ""
+        rows.append(
+            {
+                "id": picture.get("id") or "",
+                "source": source,
+                "secure_url": source,
+                "width": int(picture.get("max_width") or picture.get("width") or 0),
+                "height": int(picture.get("max_height") or picture.get("height") or 0),
+                "position": index,
+            }
+        )
+    return rows
+
+
+def item_pictures_operation(request, actor=None):
+    payload = read_payload()
+    item_id = str(request.get("item_id") or "").strip()
+    account_id = str(request.get("account_id") or "").strip()
+    item = next(
+        (
+            row for row in payload.get("catalog", [])
+            if row.get("id") == item_id
+            and (not account_id or str(row.get("account_id") or "") == account_id)
+        ),
+        None,
+    )
+    if not item:
+        raise RuntimeError("Anúncio não encontrado na conta informada.")
+    account = next(
+        (
+            row for row in payload.get("accounts", [])
+            if row.get("id") == item.get("account_id") or row.get("nickname") == item.get("account")
+        ),
+        None,
+    )
+    if not account or not account.get("official") or not account.get("access_token"):
+        raise RuntimeError("Conta oficial não encontrada para acessar as fotos.")
+    client = account_client(account)
+    action = str(request.get("action") or "read").lower()
+
+    if action == "read":
+        official_item = run_interactive_meli_call(client.item, item_id)
+        pictures = normalized_item_pictures(official_item)
+        item["picture_count"] = len(pictures)
+        item["picture_count_status"] = "confirmed"
+        item["pictures_checked_at"] = now_label()
+        write_payload(payload)
+        return {
+            "ok": True,
+            "pictures": pictures,
+            "catalog": is_catalog_listing(item),
+            "editable": not is_catalog_listing(item),
+            "maximum": 12,
+        }
+
+    if is_catalog_listing(item):
+        raise RuntimeError("O Mercado Livre não permite alterar fotos de anúncios de catálogo.")
+
+    if action == "upload":
+        data_url = str(request.get("data_url") or "")
+        match = re.match(r"^data:(image/(?:jpeg|png));base64,(.+)$", data_url, flags=re.I | re.S)
+        if not match:
+            raise RuntimeError("Envie uma imagem JPG, PNG ou WebP válida.")
+        width = int(request.get("width") or 0)
+        height = int(request.get("height") or 0)
+        if width < 500 or height < 500:
+            raise RuntimeError("A imagem precisa ter pelo menos 500 x 500 pixels.")
+        content = base64.b64decode(match.group(2), validate=True)
+        if not content or len(content) > 10 * 1024 * 1024:
+            raise RuntimeError("A imagem deve ter no máximo 10 MB.")
+        extension = {"image/jpeg": "jpg", "image/png": "png"}[match.group(1).lower()]
+        uploaded = run_interactive_meli_call(
+            client.upload_item_picture,
+            content,
+            f"{item_id}-{uuid.uuid4().hex[:8]}.{extension}",
+            match.group(1).lower(),
+        )
+        picture = normalized_item_pictures({"pictures": [uploaded]})
+        if not picture:
+            picture = [{
+                "id": uploaded.get("id") or "",
+                "source": uploaded.get("secure_url") or uploaded.get("url") or "",
+                "secure_url": uploaded.get("secure_url") or uploaded.get("url") or "",
+                "width": width,
+                "height": height,
+                "position": 0,
+            }]
+        return {"ok": True, "picture": picture[0], "uploaded": uploaded}
+
+    if action != "save":
+        raise RuntimeError("Ação de fotos inválida.")
+    requested = request.get("pictures") or []
+    if not isinstance(requested, list) or not requested:
+        raise RuntimeError("O anúncio precisa manter pelo menos uma foto.")
+    if len(requested) > 12:
+        raise RuntimeError("O Mercado Livre permite no máximo 12 fotos por anúncio.")
+    official_payload = []
+    for picture in requested:
+        if not isinstance(picture, dict):
+            continue
+        if picture.get("id"):
+            official_payload.append({"id": picture["id"]})
+        elif picture.get("source") or picture.get("secure_url"):
+            official_payload.append({"source": picture.get("source") or picture.get("secure_url")})
+    if not official_payload:
+        raise RuntimeError("Nenhuma foto válida foi informada.")
+
+    run_interactive_meli_call(client.update_item, item_id, {"pictures": official_payload})
+    verified = run_interactive_meli_call(client.item, item_id)
+    verified_pictures = normalized_item_pictures(verified)
+    if not verified_pictures:
+        raise RuntimeError("O Mercado Livre não confirmou as fotos salvas.")
+    item["thumbnail"] = verified_pictures[0].get("secure_url") or item.get("thumbnail")
+    item["picture_count"] = len(verified_pictures)
+    item["picture_count_status"] = "confirmed"
+    item["pictures_checked_at"] = now_label()
+    item["updated_at"] = now_label()
+    append_item_log(
+        payload, item, actor or {}, "Fotos alteradas",
+        {"pictures": {"from": "Conjunto anterior", "to": f"{len(verified_pictures)} foto(s)"}},
+    )
+
+    propagated = []
+    if request.get("scope") == "sku" and item.get("sku") not in (None, "", "-"):
+        sku_key = str(item.get("sku")).strip().upper()
+        siblings = [
+            row for row in payload.get("catalog", [])
+            if row.get("id") != item_id
+            and str(row.get("sku") or "").strip().upper() == sku_key
+            and row.get("official_source")
+            and not is_catalog_listing(row)
+        ]
+        sources = [
+            {"source": picture.get("secure_url") or picture.get("source")}
+            for picture in verified_pictures
+            if picture.get("secure_url") or picture.get("source")
+        ]
+        for index, sibling in enumerate(siblings, 1):
+            result = {"item_id": sibling.get("id"), "account": sibling.get("account")}
+            try:
+                sibling_account = next(
+                    (row for row in payload.get("accounts", []) if row.get("id") == sibling.get("account_id")),
+                    None,
+                )
+                if not sibling_account or not sibling_account.get("official"):
+                    raise RuntimeError("Conta oficial não encontrada.")
+                sibling_client = account_client(sibling_account)
+                run_interactive_meli_call(sibling_client.update_item, sibling.get("id"), {"pictures": sources})
+                sibling_verified = run_interactive_meli_call(sibling_client.item, sibling.get("id"))
+                sibling_pictures = normalized_item_pictures(sibling_verified)
+                sibling["thumbnail"] = sibling_pictures[0].get("secure_url") if sibling_pictures else sibling.get("thumbnail")
+                sibling["picture_count"] = len(sibling_pictures)
+                sibling["picture_count_status"] = "confirmed"
+                sibling["pictures_checked_at"] = now_label()
+                sibling["updated_at"] = now_label()
+                append_item_log(
+                    payload, sibling, actor or {}, "Fotos propagadas pelo SKU",
+                    {"pictures": {"from": "Conjunto anterior", "to": f"{len(sibling_pictures)} foto(s)"}},
+                )
+                result["status"] = "updated"
+            except Exception as exc:
+                result.update({"status": "error", "error": str(exc)})
+            propagated.append(result)
+            update_async_operation_progress(
+                f"Aplicando fotos em {index} de {len(siblings)} anúncios do SKU.",
+                index, len(siblings), result,
+            )
+    write_payload(payload)
+    return {"ok": True, "pictures": verified_pictures, "item": item, "propagated": propagated}
+
+
 def update_item_operation(request, actor=None):
     payload = read_payload()
     item_id = str(request.get("item_id") or "")
@@ -6210,6 +6404,18 @@ def update_item_operation(request, actor=None):
         update["status"] = "paused"
     if request.get("status_action") == "activate":
         update["status"] = "active"
+
+    manufacturing_time_requested = "manufacturing_time" in request
+    manufacturing_time = None
+    if manufacturing_time_requested:
+        try:
+            manufacturing_time = max(0, min(45, int(float(request.get("manufacturing_time") or 0))))
+        except (TypeError, ValueError):
+            raise RuntimeError("Informe a disponibilidade em dias, entre 0 e 60.")
+        update["sale_terms"] = [{
+            "id": "MANUFACTURING_TIME",
+            "value_name": f"{manufacturing_time} dias" if manufacturing_time else None,
+        }]
 
     dimension_attrs = []
     expected_package_values = {}
@@ -6236,10 +6442,13 @@ def update_item_operation(request, actor=None):
             update["attributes"] = [*(update.get("attributes") or []), *gtin_fragment["attributes"]]
         if gtin_fragment.get("variations"):
             update["variations"] = gtin_fragment["variations"]
-    if not update:
+    package_mode = str(request.get("package_mode") or "").strip().lower()
+    if package_mode and package_mode not in {"factory", "additional"}:
+        raise RuntimeError("Tipo de embalagem inválido.")
+    if not update and not package_mode:
         raise RuntimeError("Nenhum campo informado para atualizar.")
 
-    official = run_interactive_meli_call(client.update_item, item_id, update)
+    official = run_interactive_meli_call(client.update_item, item_id, update) if update else {"local_only": True}
     verified_item = run_interactive_meli_call(
         verify_package_update, client, item_id, expected_package_values
     ) if expected_package_values else {}
@@ -6271,6 +6480,12 @@ def update_item_operation(request, actor=None):
         if "title" in update:
             changes["title"] = {"from": item.get("title"), "to": update["title"]}
             item["title"] = update["title"]
+        if manufacturing_time_requested:
+            changes["manufacturing_time"] = {"from": item.get("manufacturing_time") or 0, "to": manufacturing_time}
+            item["manufacturing_time"] = manufacturing_time
+        if package_mode:
+            changes["package_mode"] = {"from": item.get("package_mode") or "factory", "to": package_mode}
+            item["package_mode"] = package_mode
         for request_key in dimension_map:
             if clean_attribute_value(request.get(request_key)):
                 normalized_value = verified_package_values.get(request_key) or normalize_package_value(
@@ -9624,41 +9839,38 @@ def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price,
     fixed = optional_money(first_present(order_item, ["sale_fee_details.fixed_fee", "fees.fixed_fee"], None))
     if fixed is not None:
         return round(min(total_fee, max(0.0, fixed) * max(1, int(quantity or 1))), 2)
-
-    listing_type = catalog_item.get("listing_type_id") or first_present(order_item, ["item.listing_type_id"], "")
-    if not listing_type or unit_price <= 0:
-        return 0.0
-    cache_key = (
-        account.get("site_id") or catalog_item.get("site_id") or "MLB",
-        round(float(unit_price), 2),
-        listing_type,
-        catalog_item.get("category_id") or first_present(order_item, ["item.category_id"], ""),
-        catalog_item.get("shipping_logistic_type") or "",
-        catalog_item.get("shipping_mode") or "",
-    )
+    # Orders exposes the exact total charged, but older payloads do not split
+    # that total between percentage and fixed fee. Ask the official pricing
+    # endpoint at the historical unit price only for the composition, while
+    # retaining the order total as the financial source of truth.
     try:
-        with SALE_FEE_CACHE_LOCK:
-            cached = SALE_FEE_CACHE.get(cache_key)
-        if cached and time.monotonic() - cached.get("created", 0) < 21600:
-            details = cached.get("details") or {}
-        else:
+        details = catalog_item.get("sale_fee_details") or {}
+        projected_fixed = optional_money(first_present(
+            details,
+            ["fixed_fee", "fixed_fee_amount", "sale_fee_details.fixed_fee", "sale_fee_details.fixed_fee_amount"],
+            None,
+        ))
+        if projected_fixed is None:
             response = client.listing_prices(
-                cache_key[0], cache_key[1], cache_key[2], category_id=cache_key[3],
-                logistic_type=cache_key[4], shipping_mode=cache_key[5],
+                account.get("site_id") or "MLB",
+                unit_price,
+                catalog_item.get("listing_type_id") or order_item.get("listing_type_id") or "gold_special",
+                category_id=catalog_item.get("category_id") or "",
             )
-            _, details = sale_fee_values(response, listing_type)
-            with SALE_FEE_CACHE_LOCK:
-                SALE_FEE_CACHE[cache_key] = {
-                    "amount": optional_money(details.get("sale_fee_amount")),
-                    "details": details,
-                    "created": time.monotonic(),
-                }
-        fixed = optional_money(first_present(details, ["sale_fee_details.fixed_fee", "fixed_fee"], None))
+            _amount, details = sale_fee_values(response, catalog_item.get("listing_type_id"))
+            projected_fixed = optional_money(first_present(
+                details,
+                ["fixed_fee", "fixed_fee_amount", "sale_fee_details.fixed_fee", "sale_fee_details.fixed_fee_amount"],
+                None,
+            ))
+        if projected_fixed is not None:
+            return round(min(total_fee, max(0.0, projected_fixed) * max(1, int(quantity or 1))), 2)
     except Exception:
-        fixed = None
-    if fixed is None:
-        return 0.0
-    return round(min(total_fee, max(0.0, fixed) * max(1, int(quantity or 1))), 2)
+        # A report must still be available if the composition endpoint is
+        # temporarily unavailable. In that case the exact charged total stays
+        # under the percentage-fee column instead of inventing a fixed fee.
+        pass
+    return 0.0
 
 
 def shipment_discount_amount(discount):
@@ -10188,6 +10400,9 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
 def query_sales_report(payload, request):
     start, end, _, _ = statistics_date_window(request.get("date_from"), request.get("date_to"))
     account_filter = str(request.get("account") or "all")
+    shipping_method_filter = str(request.get("shipping_method") or "all").lower()
+    brand_filter = normalized_attribute_label(request.get("brand") or "")
+    sku_filter = normalized_sku_key(request.get("sku") or "")
     raw_flex_carrier_cost = (request or {}).get("flex_carrier_cost")
     if isinstance(raw_flex_carrier_cost, str) and "," in raw_flex_carrier_cost:
         raw_flex_carrier_cost = raw_flex_carrier_cost.replace(".", "").replace(",", ".")
@@ -10334,11 +10549,20 @@ def query_sales_report(payload, request):
                 shipping = round(order_shipping * allocation, 2) if order_shipping is not None else None
                 reimbursement = round(order_reimbursement * allocation, 2)
                 sale_is_flex = is_flex is True or order_reimbursement > 0
+                if shipping_method_filter == "flex" and not sale_is_flex:
+                    continue
+                if shipping_method_filter == "non_flex" and sale_is_flex:
+                    continue
                 external_flex_carrier = (
                     round(flex_carrier_cost * allocation, 2)
                     if sale_is_flex and flex_carrier_cost is not None else 0.0
                 )
                 sku = order_item_sku(order_item, catalog_item) or "-"
+                if sku_filter and normalized_sku_key(sku) != sku_filter:
+                    continue
+                item_brand = catalog_item.get("brand") or ""
+                if brand_filter and brand_filter not in normalized_attribute_label(item_brand):
+                    continue
                 cost_record = (payload.get("sku_costs") or {}).get(normalized_sku_key(sku))
                 unit_cost = None
                 if isinstance(cost_record, dict) and cost_record.get("cost") not in (None, ""):
@@ -10360,7 +10584,7 @@ def query_sales_report(payload, request):
                         "order_id": order_id,
                         "item_id": item_id,
                         "sku": sku,
-                        "brand": catalog_item.get("brand") or "",
+                        "brand": item_brand,
                         "product": source.get("title") or catalog_item.get("title") or "Produto vendido",
                         "thumbnail": source.get("thumbnail") or catalog_item.get("thumbnail") or "",
                         "quantity": quantity,
@@ -10387,6 +10611,10 @@ def query_sales_report(payload, request):
     if not rows and warnings:
         raise RuntimeError(" ".join(warnings))
     rows.sort(key=lambda row: str(row.get("date") or ""), reverse=True)
+    total_net = round(sum(float(row.get("net_amount") or 0) for row in rows if row.get("net_amount") is not None), 2)
+    total_profit = round(sum(float(row.get("profit_amount") or 0) for row in rows if row.get("profit_amount") is not None), 2)
+    total_cost = round(sum(float(row.get("cost_amount") or 0) for row in rows if row.get("cost_amount") is not None), 2)
+    total_margin = round(total_profit / total_net * 100, 2) if total_net > 0 else None
     return {
         "ok": True,
         "date_from": start.isoformat(),
@@ -10402,8 +10630,10 @@ def query_sales_report(payload, request):
             "shipping_amount": round(sum(float(row.get("shipping_amount") or 0) for row in rows if row.get("shipping_amount") is not None), 2),
             "shipping_reimbursement_amount": round(sum(float(row.get("shipping_reimbursement_amount") or 0) for row in rows), 2),
             "flex_carrier_cost_amount": round(sum(float(row.get("flex_carrier_cost_amount") or 0) for row in rows), 2),
-            "net_amount": round(sum(float(row.get("net_amount") or 0) for row in rows if row.get("net_amount") is not None), 2),
-            "profit_amount": round(sum(float(row.get("profit_amount") or 0) for row in rows if row.get("profit_amount") is not None), 2),
+            "net_amount": total_net,
+            "cost_amount": total_cost,
+            "profit_amount": total_profit,
+            "profit_percentage": total_margin,
         },
         "warnings": warnings,
         "truncated": truncated,
@@ -13882,6 +14112,7 @@ class App(BaseHTTPRequestHandler):
             "/api/notifications/test",
             "/api/meli/item/clone-source",
             "/api/meli/item/description",
+            "/api/meli/item/pictures",
             "/api/meli/item/update",
             "/api/meli/item/win_catalog",
             "/api/meli/item/remove_flex",
@@ -14680,6 +14911,27 @@ class App(BaseHTTPRequestHandler):
                     "item_description",
                     lambda: item_description_operation(request_copy, actor),
                     action_label,
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/item/pictures":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                action = str(request_copy.get("action") or "read").lower()
+                labels = {
+                    "read": "Carregando fotos oficiais.",
+                    "upload": "Enviando foto ao Mercado Livre.",
+                    "save": "Salvando fotos no Mercado Livre.",
+                }
+                operation = start_async_operation(
+                    "item_pictures",
+                    lambda: item_pictures_operation(request_copy, actor),
+                    labels.get(action, "Processando fotos oficiais."),
+                    priority="manual" if action == "save" else "interactive",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
