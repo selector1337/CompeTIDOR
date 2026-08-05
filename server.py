@@ -9947,7 +9947,15 @@ def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price,
                 if 0 <= normalized_rate <= 1:
                     projected_percentage = float(unit_price or 0) * max(1, int(quantity or 1)) * normalized_rate
         if projected_percentage is not None:
-            return round(max(0.0, min(total_fee, total_fee - projected_percentage)), 2)
+            residual = max(0.0, min(total_fee, total_fee - projected_percentage))
+            # Mercado Livre rounds the percentage fee and the charged total at
+            # different stages. That can leave a one-cent residue even when the
+            # sale has no fixed fee. Real fixed fees are materially larger, so
+            # discard only the cent-level rounding noise.
+            rounding_tolerance = max(0.02, 0.01 * max(1, int(quantity or 1)))
+            if residual <= rounding_tolerance:
+                return 0.0
+            return round(residual, 2)
     except Exception:
         # A report must still be available if the composition endpoint is
         # temporarily unavailable. In that case the exact charged total stays
