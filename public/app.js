@@ -1831,14 +1831,10 @@ function renderAdPictureEditor(item) {
         </div>
         ${cached.error ? `<div class="notice danger-notice">${escapeText(cached.error)}</div>` : ""}
         ${editable ? `<div class="ad-picture-actions">
-          <div class="ad-picture-upload-row">
-            <label class="mini-button picture-upload-button">Adicionar fotos<input type="file" accept="image/jpeg,image/png" multiple data-picture-upload="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" /></label>
-            <small>${pictures.length}/12 fotos</small>
-          </div>
-          <div class="ad-picture-save-row">
-            <button class="mini-button" type="button" data-save-pictures="item" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar só neste anúncio</button>
-            <button class="mini-button success-button" type="button" data-save-pictures="sku" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar nos tradicionais do mesmo SKU</button>
-          </div>
+          <label class="mini-button picture-upload-button">Adicionar fotos<input type="file" accept="image/jpeg,image/png" multiple data-picture-upload="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" /></label>
+          <small>${pictures.length}/12 fotos</small>
+          <button class="mini-button" type="button" data-save-pictures="item" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar só neste anúncio</button>
+          <button class="mini-button success-button" type="button" data-save-pictures="sku" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar nos tradicionais do mesmo SKU</button>
         </div>` : ""}
       </div>
     </details>`;

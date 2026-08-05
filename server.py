@@ -9932,7 +9932,10 @@ def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price,
         if not isinstance(composition, dict):
             composition = {"fixed": composition, "rate": None, "percentage_amount": None}
         projected_fixed = optional_money(composition.get("fixed"))
-        if projected_fixed is not None:
+        # The pricing endpoint can itself expose fixed_fee=0 together with the
+        # correct percentage for low-price sales. Zero is therefore only
+        # conclusive after trying to decompose the exact fee total by rate.
+        if projected_fixed is not None and projected_fixed > 0:
             return round(min(total_fee, max(0.0, projected_fixed) * max(1, int(quantity or 1))), 2)
         projected_percentage = optional_money(composition.get("percentage_amount"))
         if projected_percentage is not None:

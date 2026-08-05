@@ -7042,6 +7042,17 @@ textarea:focus {
   display: none;
 }
 
+.clearable-input > button {
+  right: 10px;
+  width: 18px;
+  height: 18px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 900;
+}
+
 .catalog-profit-calculator-button {
   display: grid;
   place-items: center;
@@ -7105,22 +7116,20 @@ textarea:focus {
 }
 
 .ad-picture-actions {
-  display: grid;
-  justify-items: center;
+  display: flex;
+  justify-content: flex-start;
   width: 100%;
 }
 
 .ad-picture-actions small {
-  margin-right: 0;
+  margin-right: auto;
 }
 
-.ad-picture-upload-row,
-.ad-picture-save-row {
-  display: flex;
+.picture-upload-button {
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  text-align: center;
 }
 
 .inline-created-code {
