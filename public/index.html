@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-    <link rel="stylesheet" href="/styles.css?v=20260805-flex-report-ui-v1" />
+    <link rel="stylesheet" href="/styles.css?v=20260805-report-polish-v2" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -338,7 +338,7 @@
           </div>
           <div class="filter-bar">
             <label>Conta <select id="catalog-account-filter"></select></label>
-            <label>Busca <span class="clearable-input"><input id="catalog-search" type="search" placeholder="Produto, SKU ou MLB..." /><button type="button" data-clear-input="catalog-search" aria-label="Limpar busca">×</button></span></label>
+            <label>Busca <span class="clearable-input"><input id="catalog-search" type="text" placeholder="Produto, SKU ou MLB..." autocomplete="off" /><button type="button" data-clear-input="catalog-search" aria-label="Limpar busca">×</button></span></label>
             <label>Status ML <select id="catalog-ml-status-filter"></select></label>
             <label>Estoque <select id="catalog-stock-filter"><option value="all">Todos</option><option value="zero">Sem estoque</option><option value="available">Com estoque</option></select></label>
             <label>Vendas do SKU
@@ -578,7 +578,7 @@
             <label>SKU <input name="sku" type="search" placeholder="SKU exato" autocomplete="off" /></label>
             <label>Valor Transportadora Flex
               <span class="money-field"><input name="flex_carrier_cost" type="text" inputmode="decimal" placeholder="Opcional" /></span>
-              <small>Valor externo por pedido Flex. O custo é rateado entre os itens do mesmo pedido.</small>
+              <small>Por pedido Flex; rateado entre os itens.</small>
             </label>
             <label>Por página
               <select name="page_size"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select>
@@ -1084,6 +1084,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-    <script src="/app.js?v=20260805-flex-report-ui-v1"></script>
+    <script src="/app.js?v=20260805-report-polish-v2"></script>
   </body>
 </html>

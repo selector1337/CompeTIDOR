@@ -9862,27 +9862,42 @@ def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price,
     if total_fee is None:
         return None
     fixed = optional_money(first_present(order_item, ["sale_fee_details.fixed_fee", "fees.fixed_fee"], None))
-    if fixed is not None:
+    # A positive split coming from the order is conclusive. A zero is not:
+    # some Orders payloads return zero even when historical pricing included
+    # a fixed charge, so confirm zero against the official pricing endpoint.
+    if fixed is not None and fixed > 0:
         return round(min(total_fee, max(0.0, fixed) * max(1, int(quantity or 1))), 2)
     # Orders exposes the exact total charged, but older payloads do not split
     # that total between percentage and fixed fee. Ask the official pricing
     # endpoint at the historical unit price only for the composition, while
     # retaining the order total as the financial source of truth.
-    listing_type_id = catalog_item.get("listing_type_id") or order_item.get("listing_type_id") or "gold_special"
+    source_item = order_item.get("item") if isinstance(order_item.get("item"), dict) else {}
+    listing_type_id = (
+        catalog_item.get("listing_type_id")
+        or order_item.get("listing_type_id")
+        or source_item.get("listing_type_id")
+        or "gold_special"
+    )
+    category_id = (
+        catalog_item.get("category_id")
+        or order_item.get("category_id")
+        or source_item.get("category_id")
+        or ""
+    )
     cache_key = (
         account.get("site_id") or "MLB",
         round(float(unit_price or 0), 2),
         listing_type_id,
-        catalog_item.get("category_id") or "",
+        category_id,
     )
     try:
-        projected_fixed = cache.get(cache_key) if isinstance(cache, dict) and cache_key in cache else None
-        if projected_fixed is None:
+        composition = cache.get(cache_key) if isinstance(cache, dict) and cache_key in cache else None
+        if composition is None:
             response = client.listing_prices(
                 account.get("site_id") or "MLB",
                 unit_price,
                 listing_type_id,
-                category_id=catalog_item.get("category_id") or "",
+                category_id=category_id,
             )
             _amount, details = sale_fee_values(response, listing_type_id)
             projected_fixed = optional_money(first_present(
@@ -9890,16 +9905,52 @@ def sale_fee_fixed_amount(client, account, order_item, catalog_item, unit_price,
                 ["fixed_fee", "fixed_fee_amount", "sale_fee_details.fixed_fee", "sale_fee_details.fixed_fee_amount"],
                 None,
             ))
+            percentage_rate = optional_money(first_present(
+                details,
+                [
+                    "meli_percentage_fee", "percentage_fee", "sale_fee_percentage",
+                    "sale_fee_details.meli_percentage_fee", "sale_fee_details.percentage_fee",
+                    "sale_fee_details.sale_fee_percentage",
+                ],
+                None,
+            ))
+            percentage_amount = optional_money(first_present(
+                details,
+                [
+                    "percentage_fee_amount", "sale_fee_details.percentage_fee_amount",
+                    "sale_fee_details.meli_percentage_fee_amount",
+                ],
+                None,
+            ))
+            composition = {
+                "fixed": projected_fixed,
+                "rate": percentage_rate,
+                "percentage_amount": percentage_amount,
+            }
             if isinstance(cache, dict):
-                cache[cache_key] = projected_fixed
+                cache[cache_key] = composition
+        if not isinstance(composition, dict):
+            composition = {"fixed": composition, "rate": None, "percentage_amount": None}
+        projected_fixed = optional_money(composition.get("fixed"))
         if projected_fixed is not None:
             return round(min(total_fee, max(0.0, projected_fixed) * max(1, int(quantity or 1))), 2)
+        projected_percentage = optional_money(composition.get("percentage_amount"))
+        if projected_percentage is not None:
+            projected_percentage *= max(1, int(quantity or 1))
+        else:
+            percentage_rate = optional_money(composition.get("rate"))
+            if percentage_rate is not None:
+                normalized_rate = percentage_rate / 100.0 if percentage_rate > 1 else percentage_rate
+                if 0 <= normalized_rate <= 1:
+                    projected_percentage = float(unit_price or 0) * max(1, int(quantity or 1)) * normalized_rate
+        if projected_percentage is not None:
+            return round(max(0.0, min(total_fee, total_fee - projected_percentage)), 2)
     except Exception:
         # A report must still be available if the composition endpoint is
         # temporarily unavailable. In that case the exact charged total stays
         # under the percentage-fee column instead of inventing a fixed fee.
         pass
-    return 0.0
+    return round(max(0.0, fixed or 0.0), 2)
 
 
 def shipment_discount_amount(discount):

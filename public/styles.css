@@ -7038,6 +7038,10 @@ textarea:focus {
   line-height: 0;
 }
 
+.clearable-input input:placeholder-shown + button {
+  display: none;
+}
+
 .catalog-profit-calculator-button {
   display: grid;
   place-items: center;
@@ -7047,19 +7051,110 @@ textarea:focus {
 
 #catalog-list .catalog-item > .product-media {
   align-self: start;
-  width: 112px;
-  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 112px !important;
+  height: 112px !important;
+  min-width: 112px;
+  padding: 8px;
+  aspect-ratio: 1 / 1;
   overflow: hidden;
+  box-sizing: border-box;
+  background: #fff;
+  border-radius: 7px;
 }
 
 #catalog-list .catalog-item > .product-media > img {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: 100% !important;
+  max-height: 100% !important;
+  padding: 0 !important;
+  aspect-ratio: auto !important;
+  object-fit: contain !important;
+  object-position: center !important;
+  box-sizing: border-box !important;
+  clip-path: none !important;
+  transform: none !important;
+  background: transparent;
+  filter: none;
+}
+
+#sales-report-form.report-filter-bar {
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  align-items: end;
+}
+
+#sales-report-form > label {
+  align-content: end;
+}
+
+#sales-report-form > label:has([name="flex_carrier_cost"]) small {
+  max-width: 210px;
+  line-height: 1.3;
+}
+
+#sales-report-form > button[type="submit"] {
+  justify-self: start;
+  width: auto;
+  min-width: 170px;
+  min-height: 40px;
+  padding: 0 18px;
+}
+
+.ad-picture-actions {
+  display: grid;
+  justify-items: center;
   width: 100%;
-  height: 100%;
-  padding: 7px;
-  box-sizing: border-box;
-  object-fit: contain;
-  object-position: center;
-  background: #fff;
+}
+
+.ad-picture-actions small {
+  margin-right: 0;
+}
+
+.ad-picture-upload-row,
+.ad-picture-save-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inline-created-code {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 3px;
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--brand) 52%, var(--line));
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--brand) 7%, var(--panel));
+  color: var(--ink);
+  font: inherit;
+  font-weight: 900;
+  cursor: copy;
+}
+
+.inline-created-code .copy-affordance {
+  position: static;
+  width: 13px;
+  height: 13px;
+  opacity: .8;
+}
+
+@media (max-width: 1100px) {
+  #sales-report-form.report-filter-bar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 620px) {
+  #sales-report-form.report-filter-bar {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .money-field.clearable-field input {

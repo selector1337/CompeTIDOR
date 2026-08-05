@@ -1831,10 +1831,14 @@ function renderAdPictureEditor(item) {
         </div>
         ${cached.error ? `<div class="notice danger-notice">${escapeText(cached.error)}</div>` : ""}
         ${editable ? `<div class="ad-picture-actions">
-          <label class="mini-button picture-upload-button">Adicionar fotos<input type="file" accept="image/jpeg,image/png" multiple data-picture-upload="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" /></label>
-          <small>${pictures.length}/12 fotos</small>
-          <button class="mini-button" type="button" data-save-pictures="item" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar só neste anúncio</button>
-          <button class="mini-button success-button" type="button" data-save-pictures="sku" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar nos tradicionais do mesmo SKU</button>
+          <div class="ad-picture-upload-row">
+            <label class="mini-button picture-upload-button">Adicionar fotos<input type="file" accept="image/jpeg,image/png" multiple data-picture-upload="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" /></label>
+            <small>${pictures.length}/12 fotos</small>
+          </div>
+          <div class="ad-picture-save-row">
+            <button class="mini-button" type="button" data-save-pictures="item" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar só neste anúncio</button>
+            <button class="mini-button success-button" type="button" data-save-pictures="sku" data-item-id="${escapeAttr(itemId)}" data-account-id="${escapeAttr(item.account_id || "")}" ${!cached.loaded || cached.loading ? "disabled" : ""}>Salvar nos tradicionais do mesmo SKU</button>
+          </div>
         </div>` : ""}
       </div>
     </details>`;
@@ -3809,7 +3813,7 @@ function renderClone() {
           <div>
             <strong>${job.source} -> ${job.target}</strong>
             <div class="meta-row"><span>${job.items} anúncio(s)</span><span>${escapeText(job.variant_label || "Mesmo tipo")}</span><span>${(job.item_ids || []).join(", ")}</span></div>
-            <p>${job.note}</p>
+            <p>${cloneJobNoteHtml(job.note)}</p>
             ${job.created_details?.length ? cloneCreatedHtml(job.created_details) : ""}
             ${job.errors?.length ? cloneErrorsHtml(job.errors, job.validation_version) : ""}
             ${["preview_ready", "review_required", "partial_error", "error"].includes(job.status) ? `<button class="mini-button" data-execute-clone="${job.id}">${!job.validation_version ? "Revalidar e copiar" : job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button>` : ""}
@@ -3834,6 +3838,19 @@ function cloneCreatedHtml(items) {
       `).join("")}
     </div>
   `;
+}
+
+function cloneJobNoteHtml(note) {
+  const value = String(note || "");
+  const codePattern = /\bMLB\d+\b/g;
+  let cursor = 0;
+  let html = "";
+  for (const match of value.matchAll(codePattern)) {
+    html += escapeText(value.slice(cursor, match.index));
+    html += `<button class="inline-created-code" type="button" data-copy="${escapeAttr(match[0])}" title="Copiar código ${escapeAttr(match[0])}">${escapeText(match[0])}${copyIcon()}</button>`;
+    cursor = Number(match.index) + match[0].length;
+  }
+  return html + escapeText(value.slice(cursor));
 }
 
 function cloneJobStatusLabel(status) {
