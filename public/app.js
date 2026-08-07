@@ -1824,7 +1824,7 @@ function renderAdPictureEditor(item) {
         <div class="ad-picture-list" data-picture-list="${escapeAttr(itemId)}">
           ${cached.loading ? `<div class="notice">Carregando fotos oficiais...</div>` : pictures.map((picture, index) => `
             <article class="ad-picture-tile" data-picture-index="${index}">
-              <img src="${escapeAttr(picture.secure_url || picture.source)}" alt="Foto ${index + 1}" />
+              <img src="${escapeAttr(picture.preview || picture.secure_url || picture.source)}" alt="Foto ${index + 1}" />
               <span>${index + 1}</span>
               ${editable ? `<div><button type="button" data-picture-move="up" data-item-id="${escapeAttr(itemId)}" data-index="${index}" title="Mover para cima" ${index === 0 ? "disabled" : ""}>↑</button><button type="button" data-picture-move="down" data-item-id="${escapeAttr(itemId)}" data-index="${index}" title="Mover para baixo" ${index === pictures.length - 1 ? "disabled" : ""}>↓</button><button type="button" data-picture-remove data-item-id="${escapeAttr(itemId)}" data-index="${index}" title="Excluir foto">×</button></div>` : ""}
             </article>`).join("")}
@@ -4852,7 +4852,7 @@ document.querySelector("#ads-list")?.addEventListener("change", async (event) =>
         }),
       });
       const result = await waitForAsyncOperation(queued);
-      cached.pictures.push(result.picture);
+      cached.pictures.push({ ...(result.picture || {}), preview: dataUrl });
     }
     cached.error = "";
     showToast(`${files.length} foto(s) adicionada(s). Salve para aplicar no Mercado Livre.`, "success");

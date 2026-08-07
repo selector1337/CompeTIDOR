@@ -9661,11 +9661,15 @@ def query_sku_statistics(payload, request):
         from_cache = False
 
     sku_filter = normalized_attribute_label(request.get("sku") or "")
+    brand_filter = normalized_attribute_label(request.get("brand") or "")
+    product_filter = normalized_attribute_label(request.get("product") or "")
     flex_filter = str(request.get("flex") or "all")
     rows = []
     selected_order_ids = set()
     for original in base.get("rows") or []:
         if sku_filter and sku_filter not in normalized_attribute_label(original.get("sku") or ""):
+            continue
+        if product_filter and product_filter not in normalized_attribute_label(original.get("product") or ""):
             continue
         row = dict(original)
         row["total_units"] = row.get("units") or 0
