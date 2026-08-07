@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-    <link rel="stylesheet" href="/styles.css?v=20260805-report-polish-v3" />
+    <link rel="stylesheet" href="/styles.css?v=20260807-no-sales-brand-theme-v1" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -43,7 +43,6 @@
         <a href="#/anuncios" data-route="anuncios" aria-label="Anúncios" title="Anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16v4H4V5Zm0 6h16v8H4v-8Zm3 2v2h7v-2H7Zm0 3v1h10v-1H7Z"/></svg></span><strong>Anúncios</strong></a>
         <a href="#/copiar" data-route="copiar" aria-label="Copiar anúncios" title="Copiar anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 8h11v13H8V8Zm-3 8H3V3h13v2H5v11Z"/></svg></span><strong>Copiar anúncios</strong></a>
         <a href="#/kits" data-route="kits" aria-label="Anunciar Kits" title="Anunciar Kits"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Zm-7 9 7 4 7-4v6l-7 4-7-4v-6Zm7-1.3L16.9 7 12 4.3 7.1 7 12 9.7Z"/></svg></span><strong>Anunciar Kits</strong></a>
-        <a href="#/concorrentes" data-route="concorrentes" aria-label="Concorrentes" title="Concorrentes"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 5c5.5 0 9 5.2 9 7s-3.5 7-9 7-9-5.2-9-7 3.5-7 9-7Zm0 10.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/></svg></span><strong>Concorrentes</strong></a>
         <a href="#/scan" data-route="scan" aria-label="Scan" title="Scan"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2Zm1 1v10l7.1 7.1 1.4-1.4-6.5-6.5V3h-2Zm-1 5a4 4 0 1 0 4 4h-2a2 2 0 1 1-2-2V8Z"/></svg></span><strong>Scan</strong></a>
         <a href="#/alertas" data-route="alertas" aria-label="Alertas" title="Alertas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22a2.5 2.5 0 0 0 2.4-2h-4.8A2.5 2.5 0 0 0 12 22Zm7-5-2-2V9a5 5 0 0 0-4-4.9V2h-2v2.1A5 5 0 0 0 7 9v6l-2 2v1h14v-1Z"/></svg></span><strong>Alertas</strong></a>
         <a href="#/usuarios" data-route="usuarios" aria-label="Usuários" title="Usuários"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M9 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8.5 1a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7ZM2 21v-2.2A5.8 5.8 0 0 1 7.8 13h2.4a5.8 5.8 0 0 1 5.8 5.8V21H2Zm14.8 0v-2.2a7.7 7.7 0 0 0-1.1-4h1.8a4.5 4.5 0 0 1 4.5 4.5V21h-5.2Z"/></svg></span><strong>Usuários</strong></a>
@@ -209,6 +208,10 @@
             </label>
             <label>SKU
               <input name="sku" type="search" placeholder="Todos os SKUs" />
+            </label>
+            <label data-statistics-brand hidden>Marca
+              <input name="brand" type="search" list="statistics-brand-options" placeholder="Todas as marcas" autocomplete="off" />
+              <datalist id="statistics-brand-options"></datalist>
             </label>
             <label>Período
               <select name="period">
@@ -1084,6 +1087,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-    <script src="/app.js?v=20260807-statistics-photo-preview-v1"></script>
+    <script src="/app.js?v=20260807-no-sales-brand-theme-v1"></script>
   </body>
 </html>

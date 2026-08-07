@@ -9726,6 +9726,7 @@ def query_sku_statistics(payload, request):
 def active_skus_without_sales_rows(payload, request, sold_rows):
     account_filter = str((request or {}).get("account") or "all")
     sku_filter = normalized_attribute_label((request or {}).get("sku") or "")
+    brand_filter = normalized_attribute_label((request or {}).get("brand") or "")
     accounts = [
         account
         for account in payload.get("accounts") or []
@@ -9764,11 +9765,15 @@ def active_skus_without_sales_rows(payload, request, sold_rows):
             continue
         if sku_filter and sku_filter not in normalized_attribute_label(sku):
             continue
+        item_brand = str(item.get("brand") or "").strip()
+        if brand_filter and brand_filter not in normalized_attribute_label(item_brand):
+            continue
         row = grouped.setdefault(
             sku,
             {
                 "sku": sku,
                 "product": item.get("title") or "",
+                "brand": item_brand,
                 "thumbnail": item.get("thumbnail") or "",
                 "accounts": set(),
                 "item_ids": [],
@@ -9821,6 +9826,10 @@ def query_active_skus_without_sales(payload, request):
         "date_from": sales.get("date_from"),
         "date_to": sales.get("date_to"),
         "account": str((request or {}).get("account") or "all"),
+        "filters": {
+            "sku": normalized_attribute_label((request or {}).get("sku") or ""),
+            "brand": normalized_attribute_label((request or {}).get("brand") or ""),
+        },
         "rows": rows,
         "summary": {
             "skus": len(rows),

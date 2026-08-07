@@ -5356,12 +5356,34 @@ nav a.active .nav-icon {
 .theme-button {
   width: 44px;
   min-height: 42px;
-  margin: auto 4px 0;
+  flex: 0 0 42px;
+  margin: 0 4px;
   border: 1px solid #2c3743;
   border-radius: 7px;
   background: #171e26;
   color: #d5dbe3;
   box-shadow: none;
+}
+
+/* Keep the theme control visible while the expanded desktop menu scrolls independently. */
+@media (min-width: 781px) {
+  .sidebar nav {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #394552 transparent;
+  }
+
+  .sidebar nav::-webkit-scrollbar {
+    width: 5px;
+  }
+
+  .sidebar nav::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: #394552;
+  }
 }
 
 main {

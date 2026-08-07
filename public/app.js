@@ -2679,6 +2679,12 @@ function updateStatisticsReportFields() {
   if (title) title.textContent = noSales ? "SKUs ativos sem venda" : skuHistory ? "Histórico detalhado do SKU" : "Desempenho por SKU";
   const flexField = form.querySelector("[data-statistics-flex]");
   if (flexField) flexField.hidden = noSales;
+  const brandField = form.querySelector("[data-statistics-brand]");
+  if (brandField) brandField.hidden = !noSales;
+  if (form.elements.brand) {
+    form.elements.brand.disabled = !noSales;
+    if (!noSales) form.elements.brand.value = "";
+  }
   if (form.elements.flex) {
     form.elements.flex.disabled = noSales;
     if (noSales) form.elements.flex.value = "all";
@@ -2704,6 +2710,14 @@ function renderStatistics() {
     .join("")}`;
   if ([...form.elements.account.options].some((option) => option.value === currentAccount)) {
     form.elements.account.value = currentAccount;
+  }
+  const brandOptions = document.querySelector("#statistics-brand-options");
+  if (brandOptions) {
+    const brands = [...new Set((state.data?.catalog || [])
+      .map((item) => String(item.brand || "").trim())
+      .filter(Boolean))]
+      .sort((a, b) => a.localeCompare(b, "pt-BR"));
+    brandOptions.innerHTML = brands.map((brand) => `<option value="${escapeAttr(brand)}"></option>`).join("");
   }
   const today = new Date();
   if (!form.elements.specific_date.value) form.elements.specific_date.value = localDateValue(today);
@@ -3108,6 +3122,7 @@ async function loadStatistics() {
         kind: form.elements.report_type?.value || "sku_sales",
         account: form.elements.account.value,
         sku: form.elements.sku.value,
+        brand: form.elements.brand?.value || "",
         flex: form.elements.flex.value,
         ...range,
       }),
@@ -4420,7 +4435,7 @@ document.querySelector("#spreadsheet-preview")?.addEventListener("click", (event
 
 document.querySelector("#statistics-form")?.addEventListener("change", (event) => {
   if (event.target.name === "period") updateStatisticsPeriodFields();
-  if (["account", "sku", "period", "flex", "specific_date", "specific_month", "date_from", "date_to"].includes(event.target.name)) {
+  if (["account", "sku", "brand", "period", "flex", "specific_date", "specific_month", "date_from", "date_to"].includes(event.target.name)) {
     state.statistics = null;
     state.statisticsJobId = "";
     state.statisticsAttempted = false;
