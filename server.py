@@ -8008,6 +8008,11 @@ CLONE_INTERNAL_READ_ONLY_ATTRIBUTES = {
     "SYI_PYMES_ID",
 }
 CLONE_ALWAYS_ALLOWED_ATTRIBUTES = {
+    # The category schema endpoint can temporarily omit product identifiers
+    # even when /items requires them. Never discard an identifier explicitly
+    # supplied by the user because of an incomplete cached schema.
+    "GTIN",
+    "EMPTY_GTIN_REASON",
     "SELLER_SKU",
     "SKU",
     "SELLER_PACKAGE_HEIGHT",
