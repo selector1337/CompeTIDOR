@@ -119,6 +119,24 @@
   kitPictures: [],
   kitDragIndex: null,
   kitLoading: false,
+  returnsData: null,
+  returnsLoading: false,
+  returnsError: "",
+  returnsSyncProgress: null,
+  returnsPage: 1,
+  returnsPageSize: 20,
+  returnsFilters: {
+    account: "all",
+    period: "90",
+    dateFrom: "",
+    dateTo: "",
+    status: "all",
+    defect: "all",
+    cost: "all",
+    sku: "",
+    query: "",
+    sort: "date_desc",
+  },
 };
 
 const PAGE_SIZE = 100;
@@ -149,6 +167,7 @@ const pageTitles = {
   kits: ["Composição de produtos", "Anunciar Kits"],
   concorrentes: ["Monitoramento", "Concorrentes"],
   scan: ["Scan", "Acompanhar preços"],
+  devolucoes: ["Pós-venda oficial", "Central de Devoluções"],
   alertas: ["Alertas oficiais", "Canais e prioridades"],
   usuarios: ["SaaS e equipe", "Usuários"],
 };
@@ -547,7 +566,11 @@ function tenantLabel(meta, data) {
 
 function setRoute() {
   const route = (location.hash.replace("#/", "") || "dashboard").split("?")[0];
-  state.route = pageTitles[route] ? route : "dashboard";
+  const requestedRoute = pageTitles[route] ? route : "dashboard";
+  state.route = requestedRoute === "devolucoes" && !canManageOAuth() ? "dashboard" : requestedRoute;
+  if (requestedRoute !== state.route && location.hash !== "#/dashboard") {
+    history.replaceState(null, "", "#/dashboard");
+  }
   document.querySelectorAll(".page").forEach((page) => page.classList.remove("active"));
   document.querySelector(`#page-${state.route}`).classList.add("active");
   document.querySelectorAll("nav a").forEach((link) => link.classList.toggle("active", link.dataset.route === state.route));
@@ -588,6 +611,7 @@ function renderRoute() {
     kits: renderKits,
     concorrentes: renderCompetitors,
     scan: renderScan,
+    devolucoes: renderReturns,
     alertas: () => {
       renderAlerts();
       renderNotificationForm();
@@ -2618,6 +2642,393 @@ function renderScan() {
   }).join("") + paginationHtml("scanPage", pageInfo) : `<div class="notice">Nenhum produto em Scan ainda. Cadastre um produto padrão e cole o link do anúncio para começar.</div>`;
 }
 
+function returnsDateRange(filters = state.returnsFilters) {
+  if (filters.period === "custom") {
+    if (!filters.dateFrom || !filters.dateTo) {
+      throw new Error("Informe as datas inicial e final do período personalizado.");
+    }
+    if (filters.dateFrom > filters.dateTo) {
+      throw new Error("A data inicial não pode ser posterior à data final.");
+    }
+    return { date_from: filters.dateFrom, date_to: filters.dateTo, days: "" };
+  }
+  const days = Math.max(1, Number(filters.period || 90));
+  const end = new Date();
+  const start = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  start.setDate(start.getDate() - (days - 1));
+  return { date_from: localDateValue(start), date_to: localDateValue(end), days };
+}
+
+function returnsQueryString() {
+  const filters = state.returnsFilters;
+  const range = returnsDateRange(filters);
+  const query = new URLSearchParams({
+    account: filters.account || "all",
+    status: filters.status || "all",
+    defect: filters.defect || "all",
+    cost: filters.cost || "all",
+    sku: filters.sku || "",
+    q: filters.query || "",
+    sort: filters.sort || "date_desc",
+    page: String(state.returnsPage || 1),
+    per_page: String(state.returnsPageSize || 20),
+    date_from: range.date_from,
+    date_to: range.date_to,
+  });
+  return query.toString();
+}
+
+async function loadReturns(force = false) {
+  if (!canManageOAuth() || state.returnsLoading) return;
+  if (state.returnsData && !force) {
+    renderReturns();
+    return;
+  }
+  state.returnsLoading = true;
+  state.returnsError = "";
+  renderReturns();
+  try {
+    state.returnsData = await api(`/api/returns?${returnsQueryString()}`);
+  } catch (error) {
+    state.returnsError = error.message || "Não foi possível consultar as devoluções sincronizadas.";
+  } finally {
+    state.returnsLoading = false;
+    renderReturns();
+  }
+}
+
+function setReturnsSelectOptions(select, options, allLabel, selected) {
+  if (!select) return;
+  const rows = Array.isArray(options) ? options : [];
+  select.innerHTML = `<option value="all">${allLabel}</option>${rows
+    .map((row) => `<option value="${escapeAttr(row.id)}">${escapeText(row.name || row.label || row.id)}</option>`)
+    .join("")}`;
+  select.value = [...select.options].some((option) => option.value === selected) ? selected : "all";
+}
+
+function hydrateReturnsFilters(data = state.returnsData) {
+  const form = document.querySelector("#returns-filters");
+  if (!form) return;
+  const filters = state.returnsFilters;
+  const connected = connectedAccounts().map((account) => ({
+    id: String(account.id || account.seller_id),
+    name: account.nickname || `Seller ${account.seller_id}`,
+  }));
+  const storedAccounts = data?.options?.accounts || [];
+  const accountMap = new Map([...connected, ...storedAccounts].map((row) => [String(row.id), row]));
+  setReturnsSelectOptions(form.elements.account, [...accountMap.values()], "Todas as contas", filters.account);
+  setReturnsSelectOptions(form.elements.status, data?.options?.statuses, "Todos os status", filters.status);
+  setReturnsSelectOptions(form.elements.defect, data?.options?.defects, "Todos os motivos", filters.defect);
+  form.elements.period.value = filters.period;
+  form.elements.date_from.value = filters.dateFrom;
+  form.elements.date_to.value = filters.dateTo;
+  form.elements.cost.value = filters.cost;
+  form.elements.sku.value = filters.sku;
+  form.elements.q.value = filters.query;
+  form.elements.sort.value = filters.sort;
+  form.elements.per_page.value = String(state.returnsPageSize);
+  form.querySelectorAll(".returns-custom-date").forEach((node) => {
+    node.hidden = filters.period !== "custom";
+  });
+}
+
+function returnSummaryCard(label, value, description, tone = "neutral") {
+  return `
+    <article class="return-summary-card ${tone}">
+      <small>${escapeText(label)}</small>
+      <strong>${escapeText(value)}</strong>
+      <span>${escapeText(description)}</span>
+    </article>
+  `;
+}
+
+function renderReturnsSummary(summary = {}) {
+  const target = document.querySelector("#returns-summary");
+  if (!target) return;
+  target.innerHTML = [
+    returnSummaryCard("Devoluções", Number(summary.returns || 0).toLocaleString("pt-BR"), "Ocorrências no período"),
+    returnSummaryCard("Unidades devolvidas", Number(summary.units || 0).toLocaleString("pt-BR"), "Quantidade total de produtos"),
+    returnSummaryCard("Custo confirmado", money.format(summary.cost || 0), "Cobranças oficiais de retorno", Number(summary.cost || 0) > 0 ? "danger" : "positive"),
+    returnSummaryCard("Custo médio", money.format(summary.average_cost || 0), "Por devolução encontrada"),
+    returnSummaryCard("Exigem ação", Number(summary.action_required || 0).toLocaleString("pt-BR"), "Pendências para tratar", Number(summary.action_required || 0) ? "warning" : "positive"),
+    returnSummaryCard("Defeitos", Number(summary.defects || 0).toLocaleString("pt-BR"), "Motivo associado a defeito", Number(summary.defects || 0) ? "danger" : "positive"),
+    returnSummaryCard("Em trânsito", Number(summary.in_transit || 0).toLocaleString("pt-BR"), "Retornos ainda a caminho"),
+    returnSummaryCard("Recebidas / concluídas", `${Number(summary.received || 0).toLocaleString("pt-BR")} / ${Number(summary.closed || 0).toLocaleString("pt-BR")}`, "Triagem e encerramento"),
+  ].join("");
+}
+
+function returnBreakdownRows(rows, valueLabel = "devoluções") {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) return `<div class="returns-analysis-empty">Sem dados suficientes neste período.</div>`;
+  const max = Math.max(...list.map((row) => Number(row.returns || 0)), 1);
+  return `<div class="returns-breakdown-list">${list.map((row) => `
+    <div class="returns-breakdown-row">
+      <div><strong>${escapeText(row.label || row.name || row.id || "Não informado")}</strong><span>${Number(row.returns || 0).toLocaleString("pt-BR")} ${valueLabel} · ${Number(row.units || 0).toLocaleString("pt-BR")} un.</span></div>
+      <strong>${money.format(row.cost || 0)}</strong>
+      <span class="returns-bar"><i style="width:${Math.max(4, Number(row.returns || 0) / max * 100)}%"></i></span>
+    </div>
+  `).join("")}</div>`;
+}
+
+function renderReturnsAnalysis(analysis = {}) {
+  const target = document.querySelector("#returns-analysis");
+  if (!target) return;
+  const topSkus = Array.isArray(analysis.top_skus) ? analysis.top_skus : [];
+  const trend = Array.isArray(analysis.trend) ? analysis.trend : [];
+  const trendMax = Math.max(...trend.map((row) => Number(row.returns || 0)), 1);
+  target.innerHTML = `
+    <section class="returns-analysis-block returns-top-products">
+      <header><span>Produtos mais devolvidos</span><small>Quantidade, custo e valor vendido</small></header>
+      <div class="returns-product-ranking">
+        ${topSkus.length ? topSkus.map((row, index) => `
+          <article>
+            <span class="returns-rank">${index + 1}</span>
+            ${row.thumbnail ? `<img class="sale-thumb return-rank-thumb" src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="sale-thumb sale-thumb-empty return-rank-thumb"></span>`}
+            <div><strong>${escapeText(row.sku || "Sem SKU")}</strong><span>${escapeText(row.title || "Produto devolvido")}</span></div>
+            <div class="returns-rank-numbers"><strong>${Number(row.units || 0).toLocaleString("pt-BR")} un.</strong><span>${Number(row.returns || 0).toLocaleString("pt-BR")} devoluções</span><small>${money.format(row.cost || 0)} de custo</small></div>
+          </article>
+        `).join("") : `<div class="returns-analysis-empty">A sincronização ainda não encontrou produtos devolvidos.</div>`}
+      </div>
+    </section>
+    <section class="returns-analysis-block">
+      <header><span>Causas classificadas</span><small>Defeitos e demais motivos</small></header>
+      ${returnBreakdownRows(analysis.defects)}
+    </section>
+    <section class="returns-analysis-block">
+      <header><span>Etapa operacional</span><small>Onde cada devolução está</small></header>
+      ${returnBreakdownRows(analysis.statuses)}
+    </section>
+    <section class="returns-analysis-block">
+      <header><span>Impacto por conta</span><small>Distribuição entre lojas</small></header>
+      ${returnBreakdownRows(analysis.accounts)}
+    </section>
+    <section class="returns-analysis-block returns-trend-block">
+      <header><span>Evolução mensal</span><small>Volume de devoluções sincronizadas</small></header>
+      <div class="returns-trend">
+        ${trend.length ? trend.map((row) => `
+          <div title="${Number(row.returns || 0)} devoluções em ${escapeAttr(row.period)}">
+            <strong>${Number(row.returns || 0)}</strong>
+            <span><i style="height:${Math.max(8, Number(row.returns || 0) / trendMax * 100)}%"></i></span>
+            <small>${escapeText(String(row.period || "").replace(/^(\d{4})-(\d{2})$/, "$2/$1"))}</small>
+          </div>
+        `).join("") : `<div class="returns-analysis-empty">Sem histórico mensal no período.</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function returnStatusTone(record) {
+  if (record.action_required) return "action";
+  const status = String(record.workflow_status || "");
+  if (status === "concluida") return "completed";
+  if (status === "recebida") return "received";
+  if (status === "transito") return "transit";
+  return "open";
+}
+
+function returnItemHtml(item) {
+  return `
+    <article class="return-product-row">
+      ${item.thumbnail ? `<img class="sale-thumb return-thumb" src="${escapeAttr(item.thumbnail)}" alt="${escapeAttr(item.title || "Produto devolvido")}" loading="lazy" />` : `<span class="sale-thumb sale-thumb-empty return-thumb"></span>`}
+      <div class="return-product-copy">
+        <strong>${escapeText(item.title || "Produto devolvido")}</strong>
+        <div class="return-copy-row">
+          ${copyChip("SKU", item.sku || "-")}
+          ${copyChip("Anúncio", item.item_id || "-")}
+          <span class="return-info-chip"><small>Quantidade</small><strong>${Number(item.quantity || 0).toLocaleString("pt-BR")}</strong></span>
+          <span class="return-info-chip"><small>Valor da venda</small><strong>${money.format(item.sale_amount || 0)}</strong></span>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function returnDetail(label, value, emphasis = false) {
+  return `<div class="return-detail ${emphasis ? "emphasis" : ""}"><small>${escapeText(label)}</small><strong>${escapeText(value || "-")}</strong></div>`;
+}
+
+function renderReturnRecord(record) {
+  const items = Array.isArray(record.items) ? record.items : [];
+  const shipment = record.shipment || {};
+  const review = record.review || {};
+  const errors = Array.isArray(record.sync_errors) ? record.sync_errors.filter(Boolean) : [];
+  const tone = returnStatusTone(record);
+  const statusLabelText = record.workflow_label || "Em acompanhamento";
+  return `
+    <article class="return-record ${tone}">
+      <header class="return-record-head">
+        <div>
+          <span class="return-state-dot"></span>
+          <div><small>${escapeText(record.account || "Conta Mercado Livre")}</small><h3>${escapeText(items[0]?.title || `Devolução ${record.return_id || record.claim_id || ""}`)}</h3></div>
+        </div>
+        <div class="return-record-status">
+          ${record.action_required ? `<span class="return-action-badge">Ação necessária</span>` : ""}
+          <span class="return-status-badge">${escapeText(statusLabelText)}</span>
+          <small>${formatDateBR(record.created_at || record.last_updated || "-")}</small>
+        </div>
+      </header>
+      <div class="return-id-strip">
+        ${copyChip("Pedido", record.order_id || "-")}
+        ${copyChip("Reclamação", record.claim_id || "-")}
+        ${copyChip("Devolução", record.return_id || "-")}
+        ${shipment.id ? copyChip("Envio", shipment.id) : ""}
+        ${shipment.tracking_number ? copyChip("Rastreio", shipment.tracking_number) : ""}
+      </div>
+      <div class="return-products">${items.length ? items.map(returnItemHtml).join("") : `<div class="notice">A API não retornou os itens associados a esta devolução.</div>`}</div>
+      <div class="return-operational-grid">
+        <section>
+          <header>Motivo e responsabilidade</header>
+          ${returnDetail("Motivo informado", record.reason || record.problem || "Não informado")}
+          ${returnDetail("Classificação", record.defect_label || "Outros motivos")}
+          ${returnDetail("Responsável pela ação", record.action_responsible || "Não informado")}
+          ${returnDetail("Atendimento", record.fulfilled === true ? "Atendido" : record.fulfilled === false ? "Pendente" : "Não informado")}
+        </section>
+        <section>
+          <header>Logística reversa</header>
+          ${returnDetail("Status do envio", shipment.status || record.return_status || "Não informado")}
+          ${returnDetail("Substatus", shipment.substatus || "-")}
+          ${returnDetail("Modalidade", shipment.tracking_method || record.return_type || "Não informada")}
+          ${returnDetail("Última atualização", formatDateBR(shipment.last_updated || record.last_updated || "-"))}
+        </section>
+        <section>
+          <header>Revisão do produto</header>
+          ${returnDetail("Etapa", review.stage || "Ainda sem revisão")}
+          ${returnDetail("Condição recebida", review.product_condition || "Não informada")}
+          ${returnDetail("Destino", review.product_destination || "Não informado")}
+          ${returnDetail("Resultado para o vendedor", review.seller_status || review.seller_reason || "Não informado")}
+        </section>
+        <section class="return-financial-section">
+          <header>Impacto financeiro</header>
+          ${returnDetail("Custo da devolução", record.cost_status === "confirmed" || Number(record.cost || 0) > 0 ? money.format(record.cost || 0) : "Sem cobrança confirmada", Number(record.cost || 0) > 0)}
+          ${returnDetail("Valor relacionado", money.format(record.sale_amount || 0))}
+          ${returnDetail("Escopo da cobrança", record.cost_scope || "Não informado")}
+          ${returnDetail("Unidades", Number(record.total_quantity || 0).toLocaleString("pt-BR"))}
+        </section>
+      </div>
+      ${record.action_required ? `<div class="return-action-callout"><strong>Prioridade operacional</strong><span>Esta devolução possui uma ação pendente na API oficial. Confira a reclamação no painel do Mercado Livre.</span></div>` : ""}
+      ${errors.length ? `<details class="return-sync-warning"><summary>Dados oficiais parcialmente indisponíveis (${errors.length})</summary><p>${errors.map(escapeText).join(" · ")}</p></details>` : ""}
+    </article>
+  `;
+}
+
+function renderReturnsSync() {
+  const progress = state.returnsSyncProgress;
+  const box = document.querySelector("#returns-sync-progress");
+  const button = document.querySelector("#returns-sync");
+  const freshness = document.querySelector("#returns-last-sync");
+  const sync = state.returnsData?.sync || {};
+  if (freshness) {
+    freshness.textContent = sync.last_sync_at ? `Última sincronização: ${formatDateBR(sync.last_sync_at)}` : "Ainda não sincronizado";
+  }
+  if (button) button.disabled = progress?.status === "running";
+  if (!box) return;
+  box.hidden = !progress;
+  if (!progress) return;
+  const percent = Math.max(0, Math.min(100, Number(progress.percent || 0)));
+  box.classList.toggle("error", progress.status === "error");
+  box.classList.toggle("completed", progress.status === "completed");
+  box.querySelector("strong").textContent = progress.status === "completed" ? "Sincronização concluída" : progress.status === "error" ? "Sincronização interrompida" : "Consultando devoluções oficiais";
+  box.querySelector("span").style.width = `${percent}%`;
+  box.querySelector("small").textContent = progress.message || "Processando dados oficiais do Mercado Livre";
+}
+
+function renderReturns() {
+  if (!canManageOAuth()) return;
+  hydrateReturnsFilters();
+  renderReturnsSync();
+  const summary = document.querySelector("#returns-summary");
+  const analysis = document.querySelector("#returns-analysis");
+  const list = document.querySelector("#returns-list");
+  const empty = document.querySelector("#returns-empty");
+  const pagination = document.querySelector("#returns-pagination");
+  const title = document.querySelector("#returns-result-title");
+  const generated = document.querySelector("#returns-generated-at");
+  if (!summary || !analysis || !list || !empty || !pagination) return;
+
+  if (!state.returnsData && !state.returnsLoading && !state.returnsError) {
+    loadReturns();
+  }
+  if (state.returnsLoading && !state.returnsData) {
+    summary.innerHTML = Array.from({ length: 8 }, () => `<article class="return-summary-card loading"><span></span><strong></strong><small></small></article>`).join("");
+    analysis.innerHTML = `<div class="returns-loading-state"><span></span><strong>Organizando devoluções sincronizadas...</strong></div>`;
+    list.innerHTML = "";
+    empty.hidden = true;
+    pagination.innerHTML = "";
+    return;
+  }
+  if (state.returnsError && !state.returnsData) {
+    summary.innerHTML = "";
+    analysis.innerHTML = `<div class="notice danger-notice">${escapeText(state.returnsError)}</div>`;
+    list.innerHTML = "";
+    empty.hidden = true;
+    pagination.innerHTML = "";
+    return;
+  }
+
+  const data = state.returnsData || {};
+  hydrateReturnsFilters(data);
+  renderReturnsSummary(data.summary || {});
+  renderReturnsAnalysis(data.analysis || {});
+  const records = Array.isArray(data.records) ? data.records : [];
+  list.innerHTML = records.map(renderReturnRecord).join("");
+  empty.hidden = records.length > 0;
+  if (title) title.textContent = `${Number(data.total || 0).toLocaleString("pt-BR")} devolução(ões) no período`;
+  if (generated) generated.textContent = data.generated_at ? `Atualizado em ${formatDateBR(data.generated_at)}` : "";
+  pagination.innerHTML = paginationHtml("returnsPage", {
+    total: Number(data.total || 0),
+    current: Number(data.page || 1),
+    pages: Number(data.pages || 1),
+    pageSize: Number(data.per_page || state.returnsPageSize),
+  });
+}
+
+async function syncReturns() {
+  if (!canManageOAuth() || state.returnsSyncProgress?.status === "running") return;
+  let range;
+  try {
+    range = returnsDateRange();
+  } catch (error) {
+    showToast(error.message, "error");
+    return;
+  }
+  const accountIds = state.returnsFilters.account === "all" ? [] : [state.returnsFilters.account];
+  state.returnsSyncProgress = { status: "running", percent: 2, message: "Adicionando a sincronização à fila oficial..." };
+  renderReturnsSync();
+  try {
+    const queued = await api("/api/returns/sync", {
+      method: "POST",
+      body: JSON.stringify({
+        account_ids: accountIds,
+        date_from: range.date_from,
+        date_to: range.date_to,
+        days: range.days || 90,
+      }),
+    });
+    const result = await waitForAsyncOperation(queued, (message, job = {}) => {
+      const detail = job.detail || {};
+      let percent = Number(job.percent || 0);
+      if (!percent && detail.claims_total) {
+        percent = Math.min(96, Number(detail.claims_completed || 0) / Math.max(1, Number(detail.claims_total)) * 100);
+      }
+      state.returnsSyncProgress = { status: "running", percent: Math.max(3, percent), message: message || "Consultando devoluções..." };
+      renderReturnsSync();
+    }, 30 * 60 * 1000);
+    state.returnsSyncProgress = {
+      status: "completed",
+      percent: 100,
+      message: `${Number(result.returns_found || 0).toLocaleString("pt-BR")} devolução(ões) encontrada(s) em ${Number(result.accounts || 0).toLocaleString("pt-BR")} conta(s).`,
+    };
+    state.returnsPage = 1;
+    await loadReturns(true);
+    showToast("Central de Devoluções atualizada com os dados oficiais disponíveis.");
+  } catch (error) {
+    state.returnsSyncProgress = { status: "error", percent: 100, message: error.message || "Não foi possível concluir a sincronização." };
+    showToast(state.returnsSyncProgress.message, "error");
+  } finally {
+    renderReturnsSync();
+  }
+}
+
 function localDateValue(value) {
   const date = value instanceof Date ? value : new Date(value);
   const year = date.getFullYear();
@@ -4403,6 +4814,7 @@ document.addEventListener("click", (event) => {
   if (key === "equalizationPage") renderEqualizationReports();
   if (key === "costsPage") renderCosts();
   if (key === "purchasePage") renderPurchases();
+  if (key === "returnsPage") loadReturns(true);
   if (["dashboardStockPage", "dashboardCatalogPage", "dashboardShipmentPage", "dashboardSalesPage", "dashboardTopSkuPage"].includes(key)) renderDashboard();
 });
 
@@ -4478,6 +4890,68 @@ document.querySelector("#sales-report-form")?.addEventListener("submit", async (
   event.preventDefault();
   await loadSalesReport();
 });
+
+document.querySelector("#returns-filters")?.addEventListener("change", (event) => {
+  if (event.target.name === "period") {
+    document.querySelectorAll(".returns-custom-date").forEach((node) => {
+      node.hidden = event.target.value !== "custom";
+    });
+  }
+});
+
+document.querySelector("#returns-filters")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  Object.assign(state.returnsFilters, {
+    account: form.elements.account.value || "all",
+    period: form.elements.period.value || "90",
+    dateFrom: form.elements.date_from.value || "",
+    dateTo: form.elements.date_to.value || "",
+    status: form.elements.status.value || "all",
+    defect: form.elements.defect.value || "all",
+    cost: form.elements.cost.value || "all",
+    sku: form.elements.sku.value.trim(),
+    query: form.elements.q.value.trim(),
+    sort: form.elements.sort.value || "date_desc",
+  });
+  state.returnsPageSize = Number(form.elements.per_page.value || 20);
+  state.returnsPage = 1;
+  try {
+    returnsDateRange();
+    await loadReturns(true);
+  } catch (error) {
+    showToast(error.message || "Revise os filtros da Central de Devoluções.", "error");
+  }
+});
+
+document.querySelectorAll("[data-clear-return-field]").forEach((button) => button.addEventListener("click", () => {
+  const form = document.querySelector("#returns-filters");
+  const input = form?.elements?.[button.dataset.clearReturnField];
+  if (!input) return;
+  input.value = "";
+  input.focus({ preventScroll: true });
+}));
+
+document.querySelector("#returns-clear-filters")?.addEventListener("click", async () => {
+  Object.assign(state.returnsFilters, {
+    account: "all",
+    period: "90",
+    dateFrom: "",
+    dateTo: "",
+    status: "all",
+    defect: "all",
+    cost: "all",
+    sku: "",
+    query: "",
+    sort: "date_desc",
+  });
+  state.returnsPage = 1;
+  state.returnsPageSize = 20;
+  hydrateReturnsFilters();
+  await loadReturns(true);
+});
+
+document.querySelector("#returns-sync")?.addEventListener("click", syncReturns);
 
 document.querySelector("#reports-section-select")?.addEventListener("change", (event) => {
   state.reportsSection = event.target.value;

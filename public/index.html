@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-    <link rel="stylesheet" href="/styles.css?v=20260807-no-sales-brand-theme-v1" />
+    <link rel="stylesheet" href="/styles.css?v=20260808-returns-center-v1" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -44,6 +44,7 @@
         <a href="#/copiar" data-route="copiar" aria-label="Copiar anúncios" title="Copiar anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 8h11v13H8V8Zm-3 8H3V3h13v2H5v11Z"/></svg></span><strong>Copiar anúncios</strong></a>
         <a href="#/kits" data-route="kits" aria-label="Anunciar Kits" title="Anunciar Kits"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Zm-7 9 7 4 7-4v6l-7 4-7-4v-6Zm7-1.3L16.9 7 12 4.3 7.1 7 12 9.7Z"/></svg></span><strong>Anunciar Kits</strong></a>
         <a href="#/scan" data-route="scan" aria-label="Scan" title="Scan"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2Zm1 1v10l7.1 7.1 1.4-1.4-6.5-6.5V3h-2Zm-1 5a4 4 0 1 0 4 4h-2a2 2 0 1 1-2-2V8Z"/></svg></span><strong>Scan</strong></a>
+        <a href="#/devolucoes" data-route="devolucoes" data-master-only aria-label="Central de Devoluções" title="Central de Devoluções"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 4h10v2H6v12h12v-5h2v7H4V4Zm12.6 1.4L19.2 8H11v2h8.2l-2.6 2.6L18 14l5-5-5-5-1.4 1.4ZM8 13h6v2H8v-2Z"/></svg></span><strong>Devoluções</strong></a>
         <a href="#/alertas" data-route="alertas" aria-label="Alertas" title="Alertas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22a2.5 2.5 0 0 0 2.4-2h-4.8A2.5 2.5 0 0 0 12 22Zm7-5-2-2V9a5 5 0 0 0-4-4.9V2h-2v2.1A5 5 0 0 0 7 9v6l-2 2v1h14v-1Z"/></svg></span><strong>Alertas</strong></a>
         <a href="#/usuarios" data-route="usuarios" aria-label="Usuários" title="Usuários"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M9 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8.5 1a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7ZM2 21v-2.2A5.8 5.8 0 0 1 7.8 13h2.4a5.8 5.8 0 0 1 5.8 5.8V21H2Zm14.8 0v-2.2a7.7 7.7 0 0 0-1.1-4h1.8a4.5 4.5 0 0 1 4.5 4.5V21h-5.2Z"/></svg></span><strong>Usuários</strong></a>
       </nav>
@@ -979,6 +980,107 @@
         </div>
       </section>
 
+      <section class="page returns-page" id="page-devolucoes" data-master-only>
+        <div class="panel returns-command-panel">
+          <div class="panel-heading returns-heading">
+            <div>
+              <p class="eyebrow">Pós-venda oficial Mercado Livre</p>
+              <h2>Operação, custos e causas das devoluções</h2>
+              <p class="returns-heading-copy">Consolidação por conta, pedido, SKU, motivo, logística e revisão do produto devolvido.</p>
+            </div>
+            <div class="returns-heading-actions">
+              <span id="returns-last-sync" class="returns-freshness">Ainda não sincronizado</span>
+              <button id="returns-sync" class="primary" type="button">Sincronizar devoluções</button>
+            </div>
+          </div>
+
+          <div id="returns-sync-progress" class="manual-progress returns-sync-progress" hidden>
+            <strong>Consultando o Mercado Livre</strong>
+            <div><span></span></div>
+            <small>Preparando a sincronização oficial</small>
+          </div>
+
+          <form id="returns-filters" class="returns-filter-grid">
+            <label>Conta
+              <select name="account"><option value="all">Todas as contas</option></select>
+            </label>
+            <label>Período
+              <select name="period">
+                <option value="30">Últimos 30 dias</option>
+                <option value="90" selected>Últimos 90 dias</option>
+                <option value="180">Últimos 180 dias</option>
+                <option value="365">Últimos 12 meses</option>
+                <option value="custom">Período personalizado</option>
+              </select>
+            </label>
+            <label class="returns-custom-date" hidden>Data inicial <input name="date_from" type="date" /></label>
+            <label class="returns-custom-date" hidden>Data final <input name="date_to" type="date" /></label>
+            <label>Status
+              <select name="status"><option value="all">Todos os status</option></select>
+            </label>
+            <label>Motivo classificado
+              <select name="defect"><option value="all">Todos os motivos</option></select>
+            </label>
+            <label>Custo de devolução
+              <select name="cost">
+                <option value="all">Com e sem cobrança</option>
+                <option value="with">Com custo confirmado</option>
+                <option value="without">Sem custo cobrado</option>
+              </select>
+            </label>
+            <label>SKU exato
+              <span class="clearable-field"><input name="sku" placeholder="Ex.: MXL990" /><button type="button" data-clear-return-field="sku" aria-label="Limpar SKU" title="Limpar SKU">×</button></span>
+            </label>
+            <label class="returns-query-field">Busca geral
+              <span class="clearable-field"><input name="q" placeholder="Produto, pedido, reclamação, devolução..." /><button type="button" data-clear-return-field="q" aria-label="Limpar busca" title="Limpar busca">×</button></span>
+            </label>
+            <label>Ordenar
+              <select name="sort">
+                <option value="date_desc">Mais recentes</option>
+                <option value="cost_desc">Maior custo</option>
+                <option value="sku">SKU</option>
+              </select>
+            </label>
+            <label>Por página
+              <select name="per_page">
+                <option value="20" selected>20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
+            </label>
+            <div class="returns-filter-actions">
+              <button class="primary" type="submit">Aplicar filtros</button>
+              <button id="returns-clear-filters" class="ghost" type="button">Limpar filtros</button>
+            </div>
+          </form>
+        </div>
+
+        <section id="returns-summary" class="returns-summary-grid" aria-label="Resumo das devoluções"></section>
+
+        <section class="panel returns-analysis-panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Diagnóstico</p>
+              <h2>Produtos, causas e impacto operacional</h2>
+            </div>
+          </div>
+          <div id="returns-analysis" class="returns-analysis-grid"></div>
+        </section>
+
+        <section class="panel returns-records-panel">
+          <div class="panel-heading compact returns-list-heading">
+            <div>
+              <p class="eyebrow">Devoluções encontradas</p>
+              <h2 id="returns-result-title">Histórico detalhado</h2>
+            </div>
+            <span id="returns-generated-at" class="returns-freshness"></span>
+          </div>
+          <div id="returns-empty" class="notice" hidden>Nenhuma devolução encontrada com os filtros selecionados.</div>
+          <div id="returns-list" class="returns-list"></div>
+          <div id="returns-pagination"></div>
+        </section>
+      </section>
+
       <section class="page" id="page-alertas">
         <div class="workspace">
           <div class="panel alerts-panel">
@@ -1087,6 +1189,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-    <script src="/app.js?v=20260807-no-sales-brand-theme-v1"></script>
+    <script src="/app.js?v=20260808-returns-center-v1"></script>
   </body>
 </html>

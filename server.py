@@ -111,8 +111,12 @@ CATALOG_DATA_FILE = "catalog.json"
 SKU_COSTS_FILE = "sku_costs.json"
 SKU_LAST_SALES_FILE = "sku_last_sales.json"
 SYNC_PROGRESS_FILE = "sync_progress.json"
+RETURNS_DATA_FILE = "returns.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
+RETURNS_DATA_LOCK = threading.RLock()
+RETURNS_SYNC_LOCK = threading.RLock()
+ACTIVE_RETURN_SYNCS = set()
 ACTIVE_SYNC_ACCOUNTS = set()
 SYNC_PROGRESS_LOCK = threading.RLock()
 SYNC_PROGRESS = {}
@@ -235,7 +239,11 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/claims/search(\?|$)"),
     re.compile(r"^/v1/claims/search(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/search(\?|$)"),
+    re.compile(r"^/post-purchase/v1/claims/[^/]+(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/[^/]+/detail(\?|$)"),
+    re.compile(r"^/post-purchase/v1/claims/[^/]+/charges/return-cost(\?|$)"),
+    re.compile(r"^/post-purchase/v2/claims/[^/]+/returns(\?|$)"),
+    re.compile(r"^/post-purchase/v1/returns/[^/]+/reviews(\?|$)"),
     re.compile(r"^/sites/[^/]+/listing_prices(\?|$)"),
     re.compile(r"^/pictures/items/upload$"),
     SAFE_ML_BILLING_ORDER_DETAILS_PATH,
@@ -317,7 +325,7 @@ def write_json(name, payload):
     with DATA_LOCK:
         path = DATA / name
         temporary = DATA / f".{name}.{uuid.uuid4().hex}.tmp"
-        compact = name == CATALOG_DATA_FILE
+        compact = name in {CATALOG_DATA_FILE, RETURNS_DATA_FILE}
         with temporary.open("w", encoding="utf-8") as stream:
             json.dump(
                 payload,
@@ -1940,19 +1948,36 @@ class MercadoLivreClient:
     def shipment_sla(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}/sla")
 
-    def seller_claims(self, seller_id, limit=50, offset=0):
+    def seller_claims(self, seller_id, limit=50, offset=0, status="opened"):
         params = {
             "players.user_id": seller_id,
             "players.role": "respondent",
-            "status": "opened",
             "sort": "last_updated:desc",
             "limit": min(int(limit or 50), 100),
             "offset": max(int(offset or 0), 0),
         }
+        if status:
+            params["status"] = status
         return self.get(f"/post-purchase/v1/claims/search?{urlencode(params)}")
+
+    def claim(self, claim_id):
+        return self.get(f"/post-purchase/v1/claims/{claim_id}", retries=2, timeout=15)
 
     def claim_detail(self, claim_id):
         return self.get(f"/post-purchase/v1/claims/{claim_id}/detail")
+
+    def claim_return(self, claim_id):
+        return self.get(f"/post-purchase/v2/claims/{claim_id}/returns", retries=2, timeout=15)
+
+    def claim_return_cost(self, claim_id):
+        return self.get(
+            f"/post-purchase/v1/claims/{claim_id}/charges/return-cost",
+            retries=2,
+            timeout=15,
+        )
+
+    def return_reviews(self, return_id):
+        return self.get(f"/post-purchase/v1/returns/{return_id}/reviews", retries=2, timeout=15)
 
 
 class Notifier:
@@ -5323,6 +5348,770 @@ def sync_claims(payload, account, client):
     payload["claims"] = claims
     account["claims_sync_status"] = f"{len(details)} reclamações sincronizadas"
     return details
+
+
+def default_returns_store():
+    return {
+        "version": 1,
+        "records": [],
+        "sync": {"last_sync_at": "", "accounts": {}},
+    }
+
+
+def read_returns_store():
+    with RETURNS_DATA_LOCK:
+        stored = read_json(RETURNS_DATA_FILE, default_returns_store())
+    if not isinstance(stored, dict):
+        return default_returns_store()
+    records = stored.get("records")
+    sync = stored.get("sync")
+    stored["records"] = records if isinstance(records, list) else []
+    stored["sync"] = sync if isinstance(sync, dict) else {"last_sync_at": "", "accounts": {}}
+    stored["sync"].setdefault("last_sync_at", "")
+    stored["sync"].setdefault("accounts", {})
+    return stored
+
+
+def write_returns_store(store):
+    with RETURNS_DATA_LOCK:
+        write_json(RETURNS_DATA_FILE, store)
+
+
+def returns_rows(payload, *keys):
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in (*keys, "data", "results", "returns", "reviews"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, dict)]
+        if isinstance(value, dict):
+            nested = returns_rows(value, *keys)
+            if nested:
+                return nested
+    if payload.get("id") or payload.get("return_id"):
+        return [payload]
+    return []
+
+
+def return_number(value, default=0.0):
+    if value in (None, "", False):
+        return float(default)
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(parse_decimal_number(value))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def return_date_value(*payloads):
+    keys = (
+        "date_created",
+        "created_at",
+        "last_updated",
+        "date_last_updated",
+        "date_closed",
+        "shipment.date_created",
+        "shipment.last_updated",
+    )
+    for payload in payloads:
+        if isinstance(payload, dict):
+            value = first_present(payload, keys, "")
+            if value:
+                return str(value)
+    return ""
+
+
+def return_relation_values(value):
+    values = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            values.append(str(key))
+            values.extend(return_relation_values(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            values.extend(return_relation_values(nested))
+    elif value not in (None, ""):
+        values.append(str(value))
+    return values
+
+
+def claim_explicitly_has_return(claim):
+    if not isinstance(claim, dict) or "related_entities" not in claim:
+        return None
+    text = " ".join(return_relation_values(claim.get("related_entities"))).lower()
+    return any(token in text for token in ("return", "devolu", "shipment"))
+
+
+def return_cost_data(payload):
+    if not isinstance(payload, dict):
+        return 0.0, "BRL"
+    candidates = (
+        "amount",
+        "cost.amount",
+        "return_cost.amount",
+        "charge.amount",
+        "total.amount",
+        "value",
+    )
+    amount = return_number(first_present(payload, candidates, 0), 0)
+    currency = first_present(
+        payload,
+        ("currency_id", "currency", "cost.currency_id", "return_cost.currency_id", "total.currency_id"),
+        "BRL",
+    )
+    return round(max(0.0, amount), 2), str(currency or "BRL")
+
+
+def return_review_data(payload):
+    reviews = returns_rows(payload, "reviews")
+    if not reviews and isinstance(payload, dict) and payload:
+        reviews = [payload]
+    review = reviews[-1] if reviews else {}
+    return {
+        "review_id": str(review.get("id") or ""),
+        "stage": str(review.get("stage") or ""),
+        "status": str(review.get("status") or ""),
+        "method": str(review.get("method") or review.get("triage") or ""),
+        "product_condition": str(
+            first_present(review, ("product_condition", "product.condition", "condition"), "") or ""
+        ),
+        "product_destination": str(
+            first_present(review, ("product_destination", "product.destination", "destination"), "") or ""
+        ),
+        "reason_id": str(review.get("reason_id") or ""),
+        "seller_status": str(review.get("seller_status") or ""),
+        "seller_reason": str(review.get("seller_reason") or ""),
+        "missing_quantity": int(return_number(review.get("missing_quantity"), 0)),
+        "benefited": str(review.get("benefited") or ""),
+        "date_created": str(review.get("date_created") or ""),
+        "last_updated": str(review.get("last_updated") or ""),
+    }
+
+
+def return_reason_text(claim, review):
+    values = [
+        claim.get("reason_id"),
+        claim.get("reason"),
+        claim.get("type"),
+        claim.get("title"),
+        claim.get("description"),
+        claim.get("problem"),
+        review.get("seller_reason"),
+        review.get("reason_id"),
+        review.get("product_condition"),
+    ]
+    return " · ".join(str(value).strip() for value in values if str(value or "").strip())
+
+
+def classify_return_reason(reason):
+    normalized = unicodedata.normalize("NFKD", str(reason or "")).encode("ascii", "ignore").decode().lower()
+    groups = (
+        ("defeito", "Defeito ou falha", ("defeit", "nao funciona", "falha", "problema tecnico", "mal funcionamento")),
+        ("avaria", "Avaria ou dano", ("avari", "danific", "quebrad", "amassad", "rachad")),
+        ("incompleto", "Produto incompleto", ("incomplet", "faltando", "peca falt", "acessorio falt")),
+        ("incorreto", "Produto incorreto", ("produto errado", "diferente do", "nao corresponde", "modelo errado")),
+        ("arrependimento", "Arrependimento", ("arrepend", "desist", "nao quero", "nao serviu")),
+        ("logistica", "Problema logístico", ("transport", "entrega", "embalagem", "endereco")),
+    )
+    for key, label, tokens in groups:
+        if any(token in normalized for token in tokens):
+            return key, label
+    return "outros", "Outros motivos"
+
+
+def return_workflow_status(claim, returned, review):
+    values = " ".join(
+        str(value or "").lower()
+        for value in (
+            returned.get("status"),
+            first_present(returned, ("shipment.status", "shipments.status"), ""),
+            review.get("status"),
+            claim.get("status"),
+        )
+    )
+    if any(token in values for token in ("cancel", "rejected", "failed")):
+        return "cancelada", "Cancelada"
+    if any(token in values for token in ("closed", "resolved", "completed", "refunded")):
+        return "concluida", "Concluída"
+    if any(token in values for token in ("delivered", "received", "review", "triage")):
+        return "recebida", "Recebida / em análise"
+    if any(token in values for token in ("shipped", "transit", "ready_to_ship")):
+        return "transito", "Em trânsito"
+    if any(token in values for token in ("opened", "open", "pending", "waiting")):
+        return "aberta", "Aberta"
+    return "acompanhamento", "Em acompanhamento"
+
+
+def return_order_id(claim, returned):
+    resource = str(claim.get("resource") or "").lower()
+    if resource == "order" and claim.get("resource_id"):
+        return str(claim.get("resource_id"))
+    orders = returned.get("orders") or []
+    if isinstance(orders, dict):
+        orders = [orders]
+    for order in orders:
+        if isinstance(order, dict):
+            value = order.get("id") or order.get("order_id")
+        else:
+            value = order
+        if value:
+            return str(value)
+    return str(first_present(returned, ("order_id", "order.id"), "") or "")
+
+
+def return_shipment_data(returned):
+    shipments = returned.get("shipments") or returned.get("shipment") or {}
+    if isinstance(shipments, list):
+        shipment = next((item for item in shipments if isinstance(item, dict)), {})
+    else:
+        shipment = shipments if isinstance(shipments, dict) else {}
+    return {
+        "id": str(shipment.get("id") or shipment.get("shipment_id") or ""),
+        "status": str(shipment.get("status") or ""),
+        "substatus": str(shipment.get("substatus") or ""),
+        "tracking_number": str(shipment.get("tracking_number") or shipment.get("tracking_id") or ""),
+        "tracking_method": str(shipment.get("tracking_method") or ""),
+        "destination": str(
+            first_present(shipment, ("destination.type", "destination", "receiver_address.type"), "") or ""
+        ),
+        "date_created": str(shipment.get("date_created") or ""),
+        "last_updated": str(shipment.get("last_updated") or ""),
+    }
+
+
+def return_order_items(order, claim, returned):
+    rows = []
+    order_items = order.get("order_items") or [] if isinstance(order, dict) else []
+    for line in order_items:
+        if not isinstance(line, dict):
+            continue
+        item = line.get("item") or {}
+        quantity = max(1, int(return_number(line.get("quantity"), 1)))
+        unit_price = return_number(line.get("unit_price") or line.get("full_unit_price"), 0)
+        rows.append(
+            {
+                "item_id": str(item.get("id") or ""),
+                "sku": order_item_sku(line, {}) or "-",
+                "title": str(item.get("title") or "Produto devolvido"),
+                "thumbnail": item_thumbnail(item),
+                "quantity": quantity,
+                "unit_price": round(unit_price, 2),
+                "sale_amount": round(unit_price * quantity, 2),
+            }
+        )
+    if rows:
+        return rows
+    related = returned.get("orders") or []
+    if isinstance(related, dict):
+        related = [related]
+    candidate = next((item for item in related if isinstance(item, dict)), {})
+    item_id = str(first_present(candidate, ("item_id", "item.id"), "") or "")
+    quantity = max(1, int(return_number(claim.get("claimed_quantity"), 1)))
+    return [
+        {
+            "item_id": item_id,
+            "sku": str(first_present(candidate, ("seller_sku", "item.seller_sku"), "-") or "-"),
+            "title": str(first_present(candidate, ("title", "item.title"), "Produto devolvido")),
+            "thumbnail": item_thumbnail(candidate.get("item") or candidate),
+            "quantity": quantity,
+            "unit_price": 0.0,
+            "sale_amount": 0.0,
+        }
+    ]
+
+
+def normalize_return_record(account, claim, returned, cost_payload, review_payload, order, errors=None):
+    review = return_review_data(review_payload)
+    reason = return_reason_text(claim, review)
+    defect_key, defect_label = classify_return_reason(reason)
+    workflow_status, workflow_label = return_workflow_status(claim, returned, review)
+    shipment = return_shipment_data(returned)
+    items = return_order_items(order, claim, returned)
+    cost, currency = return_cost_data(cost_payload)
+    order_id = return_order_id(claim, returned)
+    claim_id = str(claim.get("id") or claim.get("claim_id") or "")
+    return_id = str(returned.get("id") or returned.get("return_id") or claim_id)
+    responsible = str(first_present(claim, ("detail.action_responsible", "action_responsible"), "") or "")
+    action_required = responsible.lower() in {"seller", "respondent", "vendedor"}
+    total_quantity = sum(int(item.get("quantity") or 0) for item in items)
+    sale_amount = round(sum(float(item.get("sale_amount") or 0) for item in items), 2)
+    created_at = return_date_value(returned, claim, order) or now_label()
+    record = {
+        "key": f"{account.get('seller_id') or account.get('id')}:{claim_id}:{return_id}",
+        "account_id": str(account.get("id") or ""),
+        "account": str(account.get("nickname") or account.get("name") or "Conta Mercado Livre"),
+        "seller_id": str(account.get("seller_id") or ""),
+        "claim_id": claim_id,
+        "return_id": return_id,
+        "order_id": order_id,
+        "items": items,
+        "total_quantity": total_quantity,
+        "sale_amount": sale_amount,
+        "currency_id": currency,
+        "claim_status": str(claim.get("status") or ""),
+        "claim_type": str(claim.get("type") or ""),
+        "claim_stage": str(claim.get("stage") or ""),
+        "reason_id": str(claim.get("reason_id") or review.get("reason_id") or ""),
+        "reason": reason or "Motivo não detalhado pelo Mercado Livre",
+        "problem": str(claim.get("problem") or claim.get("description") or ""),
+        "fulfilled": bool(claim.get("fulfilled")),
+        "claimed_quantity": int(return_number(claim.get("claimed_quantity"), total_quantity)),
+        "action_responsible": responsible,
+        "action_required": action_required,
+        "return_type": str(returned.get("type") or ""),
+        "return_status": str(returned.get("status") or shipment.get("status") or ""),
+        "workflow_status": workflow_status,
+        "workflow_label": workflow_label,
+        "defect_category": defect_key,
+        "defect_label": defect_label,
+        "shipment": shipment,
+        "review": review,
+        "cost": cost,
+        "cost_status": "confirmed" if cost > 0 else "not_charged",
+        "cost_scope": "claim",
+        "created_at": created_at,
+        "last_updated": str(returned.get("last_updated") or claim.get("last_updated") or created_at),
+        "closed_at": str(claim.get("date_closed") or ""),
+        "sync_status": "partial" if errors else "complete",
+        "sync_errors": [str(error) for error in (errors or []) if str(error)],
+        "synced_at": now_label(),
+    }
+    return record
+
+
+def claim_search_rows(payload):
+    rows = returns_rows(payload, "claims")
+    paging = payload.get("paging") if isinstance(payload, dict) else {}
+    total = int(return_number((paging or {}).get("total"), len(rows)))
+    return rows, total
+
+
+def return_record_in_period(record, date_from, date_to):
+    parsed = parse_meli_datetime(record.get("created_at") or record.get("last_updated"))
+    if not parsed:
+        return True
+    if date_from and parsed.date() < date_from:
+        return False
+    if date_to and parsed.date() > date_to:
+        return False
+    return True
+
+
+def collect_claim_return_records(account, client, claim):
+    claim_id = claim.get("id") or claim.get("claim_id")
+    if not claim_id:
+        return []
+    errors = []
+    detailed_claim = dict(claim)
+    try:
+        detailed_claim = {**claim, **(client.claim(claim_id) or {})}
+    except Exception as exc:
+        errors.append(f"Detalhe da reclamação: {exc}")
+    has_return = claim_explicitly_has_return(detailed_claim)
+    if has_return is False:
+        return []
+    try:
+        returned_payload = client.claim_return(claim_id) or {}
+    except Exception as exc:
+        if "404" in str(exc) or "not_found" in str(exc).lower() or "resource not found" in str(exc).lower():
+            return []
+        errors.append(f"Devolução: {exc}")
+        return []
+    returned_rows = returns_rows(returned_payload, "returns")
+    if not returned_rows:
+        return []
+    try:
+        cost_payload = client.claim_return_cost(claim_id) or {}
+    except Exception as exc:
+        cost_payload = {}
+        if "404" not in str(exc):
+            errors.append(f"Custo da devolução: {exc}")
+    order_id = return_order_id(detailed_claim, returned_rows[0])
+    try:
+        order = client.order(order_id) if order_id else {}
+    except Exception as exc:
+        order = {}
+        errors.append(f"Pedido: {exc}")
+    records = []
+    for index, returned in enumerate(returned_rows):
+        return_id = returned.get("id") or returned.get("return_id")
+        try:
+            review_payload = client.return_reviews(return_id) if return_id else {}
+        except Exception as exc:
+            review_payload = {}
+            local_errors = [*errors, f"Revisão: {exc}"]
+        else:
+            local_errors = list(errors)
+        record = normalize_return_record(
+            account,
+            detailed_claim,
+            returned,
+            cost_payload if index == 0 else {},
+            review_payload,
+            order,
+            local_errors,
+        )
+        if index > 0 and return_number(first_present(cost_payload, ("amount", "cost.amount"), 0), 0) > 0:
+            record["cost_status"] = "included_in_claim"
+        records.append(record)
+    return records
+
+
+def parse_return_sync_dates(date_from="", date_to="", days=90):
+    today = datetime.now(APP_TZ).date()
+    try:
+        end = date.fromisoformat(str(date_to or "")) if date_to else today
+    except ValueError:
+        raise RuntimeError("Data final inválida. Use o formato AAAA-MM-DD.")
+    try:
+        start = date.fromisoformat(str(date_from or "")) if date_from else end - timedelta(days=max(1, int(days or 90)) - 1)
+    except ValueError:
+        raise RuntimeError("Data inicial inválida. Use o formato AAAA-MM-DD.")
+    if start > end:
+        raise RuntimeError("A data inicial não pode ser posterior à data final.")
+    if (end - start).days > 730:
+        raise RuntimeError("Consulte no máximo 731 dias por sincronização.")
+    return start, end
+
+
+def list_account_return_claims(account, client, date_from, date_to):
+    limit = 100
+    maximum = max(100, min(10000, int(os.getenv("MELI_RETURNS_MAX_CLAIMS", "3000"))))
+    maximum_pages = max(1, min(100, int(os.getenv("MELI_RETURNS_MAX_PAGES", "50"))))
+    rows = []
+    offset = 0
+    for _page in range(maximum_pages):
+        response = client.seller_claims(account.get("seller_id"), limit, offset, status="") or {}
+        page_rows, total = claim_search_rows(response)
+        if not page_rows:
+            break
+        rows.extend(page_rows)
+        dated = [parse_meli_datetime(return_date_value(item)) for item in page_rows]
+        dated = [value for value in dated if value]
+        if dated and max(value.date() for value in dated) < date_from:
+            break
+        offset += len(page_rows)
+        if offset >= total or len(page_rows) < limit or len(rows) >= maximum:
+            break
+    selected = []
+    for claim in rows[:maximum]:
+        parsed = parse_meli_datetime(return_date_value(claim))
+        if parsed and not (date_from <= parsed.date() <= date_to):
+            continue
+        selected.append(claim)
+    return selected
+
+
+def merge_return_records(store, account, records, sync_meta):
+    existing = {str(item.get("key") or ""): item for item in store.get("records", []) if item.get("key")}
+    for record in records:
+        existing[record["key"]] = record
+    maximum = max(1000, min(100000, int(os.getenv("MELI_RETURNS_MAX_RECORDS", "30000"))))
+    merged = sorted(
+        existing.values(),
+        key=lambda item: parse_meli_datetime(item.get("created_at") or item.get("last_updated"))
+        or datetime.min.replace(tzinfo=APP_TZ),
+        reverse=True,
+    )[:maximum]
+    store["records"] = merged
+    store["sync"]["last_sync_at"] = now_label()
+    store["sync"]["accounts"][str(account.get("id") or account.get("seller_id"))] = sync_meta
+    return store
+
+
+def sync_official_returns(account_ids=None, date_from="", date_to="", days=90):
+    start, end = parse_return_sync_dates(date_from, date_to, days)
+    payload = read_payload(include_catalog=False)
+    requested = {str(value) for value in account_ids or [] if str(value)}
+    accounts = [
+        account
+        for account in payload.get("accounts", [])
+        if account.get("official")
+        and account.get("status") == "connected"
+        and (
+            not requested
+            or str(account.get("id")) in requested
+            or str(account.get("seller_id")) in requested
+        )
+    ]
+    if not accounts:
+        raise RuntimeError("Nenhuma conta oficial conectada foi selecionada.")
+    active_keys = {str(account.get("id") or account.get("seller_id")) for account in accounts}
+    with RETURNS_SYNC_LOCK:
+        duplicated = active_keys.intersection(ACTIVE_RETURN_SYNCS)
+        if duplicated:
+            raise RuntimeError("Já existe uma sincronização de devoluções em andamento para uma das contas selecionadas.")
+        ACTIVE_RETURN_SYNCS.update(active_keys)
+    store = read_returns_store()
+    total_records = 0
+    warnings = []
+    completed_accounts = 0
+    try:
+        for account in accounts:
+            account_key = str(account.get("id") or account.get("seller_id"))
+            account_name = account.get("nickname") or "Conta Mercado Livre"
+            update_async_operation_progress(
+                f"Listando devoluções de {account_name}...",
+                completed=completed_accounts,
+                total=len(accounts),
+                detail={"account": account_name, "stage": "claims"},
+            )
+            started_at = now_label()
+            try:
+                client = account_client(account)
+                claims = list_account_return_claims(account, client, start, end)
+                records = []
+                workers = max(1, min(6, int(os.getenv("MELI_RETURNS_WORKERS", "4"))))
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = [executor.submit(collect_claim_return_records, account, client, claim) for claim in claims]
+                    for index, future in enumerate(as_completed(futures), 1):
+                        try:
+                            records.extend(future.result())
+                        except Exception as exc:
+                            warnings.append(f"{account_name}: {exc}")
+                        update_async_operation_progress(
+                            f"Conferindo devoluções de {account_name}: {index} de {len(claims)} reclamações",
+                            completed=completed_accounts,
+                            total=len(accounts),
+                            detail={
+                                "account": account_name,
+                                "stage": "details",
+                                "claims_completed": index,
+                                "claims_total": len(claims),
+                                "returns_found": len(records),
+                            },
+                        )
+                records = [record for record in records if return_record_in_period(record, start, end)]
+                total_records += len(records)
+                sync_meta = {
+                    "account": account_name,
+                    "status": "completed",
+                    "started_at": started_at,
+                    "finished_at": now_label(),
+                    "date_from": start.isoformat(),
+                    "date_to": end.isoformat(),
+                    "claims_checked": len(claims),
+                    "returns_found": len(records),
+                    "error": "",
+                }
+                store = merge_return_records(store, account, records, sync_meta)
+                write_returns_store(store)
+            except Exception as exc:
+                warning = f"{account_name}: {exc}"
+                warnings.append(warning)
+                store["sync"]["accounts"][account_key] = {
+                    "account": account_name,
+                    "status": "error",
+                    "started_at": started_at,
+                    "finished_at": now_label(),
+                    "date_from": start.isoformat(),
+                    "date_to": end.isoformat(),
+                    "error": str(exc),
+                }
+                write_returns_store(store)
+            completed_accounts += 1
+            update_async_operation_progress(
+                f"{account_name} concluída.",
+                completed=completed_accounts,
+                total=len(accounts),
+                detail={"account": account_name, "stage": "completed", "returns_found": total_records},
+            )
+        write_payload(payload)
+        return {
+            "ok": True,
+            "accounts": len(accounts),
+            "returns_found": total_records,
+            "date_from": start.isoformat(),
+            "date_to": end.isoformat(),
+            "warnings": warnings[:20],
+        }
+    finally:
+        with RETURNS_SYNC_LOCK:
+            ACTIVE_RETURN_SYNCS.difference_update(active_keys)
+
+
+def return_filter_options(records):
+    return {
+        "accounts": sorted(
+            ({"id": str(row.get("account_id") or ""), "name": row.get("account") or "Conta"} for row in records),
+            key=lambda row: row["name"],
+        ),
+        "statuses": sorted(
+            ({"id": row.get("workflow_status") or "acompanhamento", "name": row.get("workflow_label") or "Em acompanhamento"} for row in records),
+            key=lambda row: row["name"],
+        ),
+        "defects": sorted(
+            ({"id": row.get("defect_category") or "outros", "name": row.get("defect_label") or "Outros motivos"} for row in records),
+            key=lambda row: row["name"],
+        ),
+    }
+
+
+def unique_option_rows(rows):
+    unique = {}
+    for row in rows:
+        unique[str(row.get("id") or row.get("name") or "")] = row
+    return list(unique.values())
+
+
+def return_record_search_text(record):
+    values = [
+        record.get("account"), record.get("claim_id"), record.get("return_id"), record.get("order_id"),
+        record.get("reason"), record.get("problem"), record.get("defect_label"),
+    ]
+    for item in record.get("items") or []:
+        values.extend((item.get("sku"), item.get("item_id"), item.get("title")))
+    return " ".join(str(value or "") for value in values).lower()
+
+
+def returns_breakdown(records, key, label_key, limit=8):
+    grouped = {}
+    for row in records:
+        group_key = str(row.get(key) or "Não informado")
+        current = grouped.setdefault(
+            group_key,
+            {"id": group_key, "label": row.get(label_key) or group_key, "returns": 0, "units": 0, "cost": 0.0},
+        )
+        current["returns"] += 1
+        current["units"] += int(row.get("total_quantity") or 0)
+        current["cost"] = round(current["cost"] + float(row.get("cost") or 0), 2)
+    return sorted(grouped.values(), key=lambda row: (row["returns"], row["cost"]), reverse=True)[:limit]
+
+
+def returns_sku_breakdown(records, limit=10):
+    grouped = {}
+    for row in records:
+        allocated_cost = float(row.get("cost") or 0)
+        total_units = max(1, sum(int(item.get("quantity") or 0) for item in row.get("items") or []))
+        for item in row.get("items") or []:
+            sku = str(item.get("sku") or "-")
+            current = grouped.setdefault(
+                sku,
+                {
+                    "sku": sku,
+                    "title": item.get("title") or "Produto devolvido",
+                    "thumbnail": item.get("thumbnail") or "",
+                    "returns": 0,
+                    "units": 0,
+                    "cost": 0.0,
+                    "sale_amount": 0.0,
+                },
+            )
+            quantity = int(item.get("quantity") or 0)
+            current["returns"] += 1
+            current["units"] += quantity
+            current["cost"] = round(current["cost"] + allocated_cost * quantity / total_units, 2)
+            current["sale_amount"] = round(current["sale_amount"] + float(item.get("sale_amount") or 0), 2)
+    return sorted(grouped.values(), key=lambda row: (row["returns"], row["units"]), reverse=True)[:limit]
+
+
+def returns_monthly_trend(records, limit=12):
+    grouped = {}
+    for row in records:
+        parsed = parse_meli_datetime(row.get("created_at") or row.get("last_updated"))
+        if not parsed:
+            continue
+        key = parsed.strftime("%Y-%m")
+        current = grouped.setdefault(key, {"period": key, "returns": 0, "units": 0, "cost": 0.0})
+        current["returns"] += 1
+        current["units"] += int(row.get("total_quantity") or 0)
+        current["cost"] = round(current["cost"] + float(row.get("cost") or 0), 2)
+    return [grouped[key] for key in sorted(grouped)[-limit:]]
+
+
+def query_returns(params):
+    store = read_returns_store()
+    all_records = store.get("records") or []
+    options = return_filter_options(all_records)
+    options = {key: unique_option_rows(value) for key, value in options.items()}
+    account = str(params.get("account", ["all"])[0] or "all")
+    status = str(params.get("status", ["all"])[0] or "all")
+    defect = str(params.get("defect", ["all"])[0] or "all")
+    cost_filter = str(params.get("cost", ["all"])[0] or "all")
+    search = str(params.get("q", [""])[0] or "").strip().lower()
+    sku = str(params.get("sku", [""])[0] or "").strip().upper()
+    date_from_text = str(params.get("date_from", [""])[0] or "")
+    date_to_text = str(params.get("date_to", [""])[0] or "")
+    try:
+        date_from = date.fromisoformat(date_from_text) if date_from_text else None
+        date_to = date.fromisoformat(date_to_text) if date_to_text else None
+    except ValueError:
+        raise RuntimeError("Período inválido para a consulta de devoluções.")
+    records = []
+    for row in all_records:
+        if account != "all" and account not in {str(row.get("account_id")), str(row.get("seller_id")), str(row.get("account"))}:
+            continue
+        if status != "all" and str(row.get("workflow_status")) != status:
+            continue
+        if defect != "all" and str(row.get("defect_category")) != defect:
+            continue
+        if cost_filter == "with" and float(row.get("cost") or 0) <= 0:
+            continue
+        if cost_filter == "without" and float(row.get("cost") or 0) > 0:
+            continue
+        if not return_record_in_period(row, date_from, date_to):
+            continue
+        if sku and not any(str(item.get("sku") or "").upper() == sku for item in row.get("items") or []):
+            continue
+        if search and search not in return_record_search_text(row):
+            continue
+        records.append(row)
+    sort_mode = str(params.get("sort", ["date_desc"])[0] or "date_desc")
+    if sort_mode == "cost_desc":
+        records.sort(key=lambda row: float(row.get("cost") or 0), reverse=True)
+    elif sort_mode == "sku":
+        records.sort(key=lambda row: str((row.get("items") or [{}])[0].get("sku") or ""))
+    else:
+        records.sort(
+            key=lambda row: parse_meli_datetime(row.get("created_at") or row.get("last_updated"))
+            or datetime.min.replace(tzinfo=APP_TZ),
+            reverse=True,
+        )
+    unique_claim_costs = {}
+    for row in records:
+        key = f"{row.get('account_id')}:{row.get('claim_id')}"
+        unique_claim_costs[key] = max(unique_claim_costs.get(key, 0.0), float(row.get("cost") or 0))
+    summary = {
+        "returns": len(records),
+        "units": sum(int(row.get("total_quantity") or 0) for row in records),
+        "cost": round(sum(unique_claim_costs.values()), 2),
+        "sale_amount": round(sum(float(row.get("sale_amount") or 0) for row in records), 2),
+        "open": sum(1 for row in records if row.get("workflow_status") == "aberta"),
+        "action_required": sum(1 for row in records if row.get("action_required")),
+        "in_transit": sum(1 for row in records if row.get("workflow_status") == "transito"),
+        "received": sum(1 for row in records if row.get("workflow_status") == "recebida"),
+        "closed": sum(1 for row in records if row.get("workflow_status") == "concluida"),
+        "defects": sum(1 for row in records if row.get("defect_category") == "defeito"),
+    }
+    summary["average_cost"] = round(summary["cost"] / summary["returns"], 2) if summary["returns"] else 0.0
+    page = max(1, int(return_number(params.get("page", [1])[0], 1)))
+    per_page = max(10, min(100, int(return_number(params.get("per_page", [20])[0], 20))))
+    pages = max(1, math.ceil(len(records) / per_page))
+    page = min(page, pages)
+    start = (page - 1) * per_page
+    return {
+        "ok": True,
+        "records": records[start:start + per_page],
+        "total": len(records),
+        "page": page,
+        "pages": pages,
+        "per_page": per_page,
+        "summary": summary,
+        "analysis": {
+            "top_skus": returns_sku_breakdown(records),
+            "reasons": returns_breakdown(records, "reason_id", "reason", 8),
+            "defects": returns_breakdown(records, "defect_category", "defect_label", 8),
+            "statuses": returns_breakdown(records, "workflow_status", "workflow_label", 8),
+            "accounts": returns_breakdown(records, "account_id", "account", 8),
+            "trend": returns_monthly_trend(records),
+        },
+        "options": options,
+        "sync": store.get("sync") or {},
+        "generated_at": now_label(),
+    }
 
 
 def sync_pending_shipments_from_orders(payload, account, orders):
@@ -9048,7 +9837,19 @@ def friendly_clone_error(exc):
     return " ".join(dict.fromkeys(messages)) or str(exc)
 
 
-def create_item_with_clone_retries(target_client, create_payload, source_item, answers=None, item_id="", category_attributes=None, cross_account=False, destination_store_id=None, destination_stores=None):
+def create_item_with_clone_retries(
+    target_client,
+    create_payload,
+    source_item,
+    answers=None,
+    item_id="",
+    category_attributes=None,
+    cross_account=False,
+    destination_store_id=None,
+    destination_stores=None,
+    publication_model="",
+    publication_name="",
+):
     payload = json.loads(json.dumps(create_payload, ensure_ascii=False))
     sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [], source_item)
     payload = clone_payload_from_answers(payload, sanitize_clone_answers(answers or {}, category_attributes or []))
@@ -9062,6 +9863,8 @@ def create_item_with_clone_retries(target_client, create_payload, source_item, a
     max_rate_limit_attempts = max(0, int(os.getenv("MELI_CLONE_RATE_LIMIT_RETRIES", "3")))
     while validation_attempts < 5:
         try:
+            if publication_model and publication_name:
+                payload = apply_publication_name(payload, publication_name, publication_model)
             if cross_account:
                 removed_store = prepare_cross_account_official_store_payload(payload, destination_store_id)
                 if removed_store and not any(row.get("tipo") == "vinculo_loja_oficial_origem_substituido" for row in adjustments):
@@ -13109,13 +13912,52 @@ def generated_kit_weight(components):
     return f"{total_kg:g} kg" if total_kg > 0 else ""
 
 
-def detach_kit_from_source_product(create_payload, title, stock):
+def target_publication_model(target_client, target_account, source_item=None):
+    """Return the naming contract accepted by the destination seller."""
+    cached = str((target_account or {}).get("publication_model") or "").strip().lower()
+    if cached in {"user_product", "legacy"}:
+        return cached
+    seller_id = str((target_account or {}).get("seller_id") or "").strip()
+    try:
+        profile = run_interactive_meli_call(target_client.user, seller_id) if seller_id else {}
+        tags = {
+            str(tag or "").strip().lower()
+            for tag in (profile.get("tags") or [])
+            if str(tag or "").strip()
+        }
+        model = "user_product" if "user_product_seller" in tags else "legacy"
+    except Exception:
+        # A temporary profile failure must not block a manual publication. The
+        # source contract is the safest fallback and is revalidated by /items.
+        model = "user_product" if (
+            (source_item or {}).get("user_product_id")
+            or (source_item or {}).get("family_name")
+        ) else "legacy"
+    if isinstance(target_account, dict):
+        target_account["publication_model"] = model
+    return model
+
+
+def apply_publication_name(create_payload, title, publication_model):
+    """Send exactly one naming field, as required by the seller contract."""
+    clean_title = str(title or "").strip()[:60]
+    if not clean_title:
+        return create_payload
+    if publication_model == "user_product":
+        create_payload["family_name"] = normalize_family_name(clean_title)
+        create_payload.pop("title", None)
+    else:
+        create_payload["title"] = clean_title
+        create_payload.pop("family_name", None)
+    return create_payload
+
+
+def detach_kit_from_source_product(create_payload, title, stock, publication_model="legacy"):
     """Turn a clone payload into an independent kit publication."""
     create_payload = json.loads(json.dumps(create_payload or {}, ensure_ascii=False))
     for field in ("catalog_product_id", "catalog_listing", "user_product_id"):
         create_payload.pop(field, None)
-    create_payload["title"] = str(title or "").strip()[:60]
-    create_payload["family_name"] = normalize_family_name(create_payload["title"])
+    apply_publication_name(create_payload, title, publication_model)
     create_payload["condition"] = "new"
     create_payload.pop("variations", None)
     create_payload["available_quantity"] = max(0, int(float(stock or 0)))
@@ -13232,6 +14074,8 @@ def create_kit_listing(request, actor=None):
     if not target_account or not target_account.get("official"):
         raise RuntimeError("Selecione uma conta destino oficial.")
     first = components[0]["source_item"]
+    target_client = account_client(target_account)
+    publication_model = target_publication_model(target_client, target_account, first)
     fields = request.get("fields") or {}
     edits = {
         "title": str(fields.get("title") or "")[:60],
@@ -13246,6 +14090,7 @@ def create_kit_listing(request, actor=None):
         create_payload,
         edits["title"],
         edits["stock"],
+        publication_model,
     )
     pictures = request.get("pictures") or []
     if not pictures:
@@ -13305,7 +14150,6 @@ def create_kit_listing(request, actor=None):
         first,
         destination_stores,
     )
-    target_client = account_client(target_account)
     created = create_item_with_clone_retries(
         target_client,
         create_payload,
@@ -13316,6 +14160,8 @@ def create_kit_listing(request, actor=None):
         cross_account,
         destination_store_id,
         destination_stores,
+        publication_model,
+        edits["title"],
     )
     description = str(fields.get("description") or "").strip()
     if description and created.get("id"):
@@ -13866,7 +14712,7 @@ class App(BaseHTTPRequestHandler):
             "/api/reports/jobs/",
             "/api/spreadsheet/jobs/",
         )
-        fast_paths = {"/api/health", "/api/meta", "/api/dashboard", "/api/auth/me"}
+        fast_paths = {"/api/health", "/api/meta", "/api/dashboard", "/api/auth/me", "/api/returns"}
         semaphore = HTTP_FAST_REQUEST_SEMAPHORE if (
             parsed_path in fast_paths or parsed_path.startswith(fast_prefixes)
         ) else HTTP_REQUEST_SEMAPHORE
@@ -14051,6 +14897,16 @@ class App(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/accounts":
             self.send_json([public_account(account) for account in payload["accounts"]])
+            return
+        if parsed.path == "/api/returns":
+            actor = self.current_user(payload)
+            if not is_master(actor):
+                self.send_json({"error": "A Central de Devoluções está disponível apenas para o usuário master."}, status=403)
+                return
+            try:
+                self.send_json(query_returns(parse_qs(parsed.query)))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
             return
         if parsed.path == "/api/meli/config":
             user = self.current_user(payload)
@@ -14240,6 +15096,7 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/sale-fees/refresh",
             "/api/meli/identifiers/refresh",
             "/api/costs/save",
+            "/api/returns/sync",
             "/api/spreadsheet/template",
             "/api/spreadsheet/import",
             "/api/spreadsheet/apply",
@@ -14313,6 +15170,35 @@ class App(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/") and not parsed.path.startswith("/api/auth/"):
             if not self.require_auth(payload):
                 return
+
+        if parsed.path == "/api/returns/sync":
+            actor = self.current_user(payload)
+            if not is_master(actor):
+                self.send_json({"error": "A Central de Devoluções está disponível apenas para o usuário master."}, status=403)
+                return
+            account_ids = request.get("account_ids") or []
+            if isinstance(account_ids, str):
+                account_ids = [account_ids]
+            try:
+                days = max(1, min(731, int(request.get("days") or 90)))
+            except (TypeError, ValueError):
+                self.send_json({"error": "Período inválido para sincronizar devoluções."}, status=400)
+                return
+            date_from = str(request.get("date_from") or "")
+            date_to = str(request.get("date_to") or "")
+            try:
+                parse_return_sync_dates(date_from, date_to, days)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+                return
+            operation = start_async_operation(
+                "returns_sync",
+                lambda: sync_official_returns(account_ids, date_from, date_to, days),
+                message="Sincronização de devoluções adicionada à fila.",
+                priority="manual",
+            )
+            self.send_json({"ok": True, **operation}, status=202)
+            return
 
         if parsed.path == "/api/alerts/read":
             alert_id = request.get("id")
