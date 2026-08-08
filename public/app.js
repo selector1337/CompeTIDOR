@@ -119,6 +119,7 @@
   kitPictures: [],
   kitDragIndex: null,
   kitLoading: false,
+  kitPendingFields: [],
   returnsData: null,
   returnsLoading: false,
   returnsError: "",
@@ -345,7 +346,9 @@ async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 
     if (job.status === "error") {
       const message = job.message || "O processamento em segundo plano não foi concluído.";
       finishManualAction(actionId, "error", message);
-      throw new Error(message);
+      const error = new Error(message);
+      Object.assign(error, job);
+      throw error;
     }
   }
   finishManualAction(actionId, "error", "O acompanhamento excedeu o tempo desta tela.");
@@ -4327,6 +4330,73 @@ function clonePendingInputHtml(row, field) {
   `;
 }
 
+function kitPendingInputHtml(field) {
+  const common = `data-kit-answer-field="${escapeAttr(field.id)}"`;
+  const defaultValue = field.default_value || "";
+  if (field.options?.length) {
+    return `
+      <select ${common}>
+        <option value="">Selecione uma opção</option>
+        ${field.options.map((option) => {
+          const value = typeof option === "object" ? option.value : option;
+          const label = typeof option === "object" ? option.label : option;
+          return `<option value="${escapeAttr(value)}" ${String(value) === String(defaultValue) ? "selected" : ""}>${escapeText(label)}</option>`;
+        }).join("")}
+      </select>
+    `;
+  }
+  const input = `
+    <input ${common} type="text" ${field.kind === "number" ? 'inputmode="decimal"' : ""}
+      ${field.max_length ? `maxlength="${escapeAttr(field.max_length)}"` : ""}
+      value="${escapeAttr(defaultValue)}"
+      placeholder="${escapeAttr(field.message || "Informe o valor exigido pelo Mercado Livre")}" />
+  `;
+  if (!field.units?.length) return input;
+  return `
+    <span class="clone-value-with-unit">
+      ${input}
+      ${field.units.length === 1
+        ? `<span class="clone-fixed-unit" data-kit-answer-unit="${escapeAttr(field.units[0])}">${escapeText(field.units[0])}</span>`
+        : `<select data-kit-answer-unit>${field.units.map((unit) => `<option value="${escapeAttr(unit)}">${escapeText(unit)}</option>`).join("")}</select>`}
+    </span>
+  `;
+}
+
+function renderKitPendingFields() {
+  const root = document.querySelector("#kit-required-fields");
+  if (!root) return;
+  const fields = state.kitPendingFields || [];
+  root.hidden = !fields.length;
+  root.innerHTML = fields.length ? `
+    <div class="kit-required-heading">
+      <strong>Informações exigidas pelo Mercado Livre</strong>
+      <small>Preencha os campos abaixo e publique novamente. Os demais dados do kit foram preservados.</small>
+    </div>
+    <div class="clone-pending-grid">
+      ${fields.map((field) => `
+        <label>
+          ${escapeText(field.label || field.id)}
+          ${kitPendingInputHtml(field)}
+          ${field.message ? `<small>${escapeText(field.message)}</small>` : ""}
+        </label>
+      `).join("")}
+    </div>
+  ` : "";
+}
+
+function collectKitAnswers() {
+  const answers = {};
+  document.querySelectorAll("#kit-required-fields [data-kit-answer-field]").forEach((input) => {
+    let value = String(input.value || "").trim();
+    const unit = input.closest("label")?.querySelector("[data-kit-answer-unit]")?.value
+      || input.closest("label")?.querySelector("[data-kit-answer-unit]")?.dataset.kitAnswerUnit
+      || "";
+    if (value && unit && !value.toLowerCase().endsWith(String(unit).toLowerCase())) value = `${value} ${unit}`;
+    if (value) answers[input.dataset.kitAnswerField] = value;
+  });
+  return answers;
+}
+
 function cloneErrorsHtml(errors, validationVersion = 0) {
   if (!validationVersion && errors.some((row) => row.pending_fields?.length)) {
     return `
@@ -4439,9 +4509,11 @@ function setKitProgress(percent, message, title = "Preparando kit") {
 
 function applyKitPreview(preview) {
   state.kitPreview = preview;
+  state.kitPendingFields = [];
   state.kitPictures = (preview.pictures || []).map((picture) => ({ ...picture, preview: picture.source }));
   const form = document.querySelector("#kit-form");
   form.hidden = false;
+  renderKitPendingFields();
   for (const name of ["title", "sku", "gtin", "price", "stock", "listing_type_id"]) {
     if (form.elements[name]) form.elements[name].value = preview[name] ?? "";
   }
@@ -6635,12 +6707,15 @@ document.querySelector("#kit-form")?.addEventListener("submit", async (event) =>
         components: state.kitComponents,
         pictures: state.kitPictures.map(({ id, source }) => ({ id, source })),
         fields,
+        answers: collectKitAnswers(),
       }),
     });
     const result = await waitForAsyncOperation(queued, (message) => {
       setKitProgress(55, message || "Criando anúncio oficial.", "Publicando kit");
     });
     setKitProgress(100, `Anúncio ${result.item?.id || ""} criado com sucesso.`, "Kit publicado");
+    state.kitPendingFields = [];
+    renderKitPendingFields();
     if (result.item) state.data.catalog.push(result.item);
     const resultLink = document.querySelector("#kit-result-link");
     if (resultLink) {
@@ -6652,6 +6727,11 @@ document.querySelector("#kit-form")?.addEventListener("submit", async (event) =>
     }
     showToast(`Kit publicado com sucesso${result.item?.id ? `: ${result.item.id}` : ""}.`);
   } catch (error) {
+    state.kitPendingFields = Array.isArray(error.pending_fields) ? error.pending_fields : [];
+    renderKitPendingFields();
+    if (state.kitPendingFields.length) {
+      document.querySelector("#kit-required-fields")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
     setKitProgress(100, error.message || "Não foi possível publicar.", "Falha na publicação");
     showToast(error.message || "Não foi possível publicar o kit.", "error");
   } finally {

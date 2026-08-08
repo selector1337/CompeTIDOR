@@ -6933,16 +6933,21 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
                                 }
                             )
                 except Exception as exc:
+                    pending_fields = getattr(exc, "pending_fields", None)
+                    original_error = getattr(exc, "original_error", "")
                     with ASYNC_OPERATION_JOBS_LOCK:
                         current = ASYNC_OPERATION_JOBS.get(job_id)
                         if current:
-                            current.update(
-                                {
-                                    "status": "error",
-                                    "message": str(exc),
-                                    "updated_epoch": time.time(),
-                                }
-                            )
+                            error_update = {
+                                "status": "error",
+                                "message": str(exc),
+                                "updated_epoch": time.time(),
+                            }
+                            if pending_fields:
+                                error_update["pending_fields"] = pending_fields
+                            if original_error:
+                                error_update["original_error"] = str(original_error)
+                            current.update(error_update)
         finally:
             if interactive:
                 with ASYNC_OPERATION_JOBS_LOCK:
@@ -9024,11 +9029,31 @@ def official_store_retry_id(exc, source_item, current_store_id=None):
 
 
 def required_fields_from_error(exc):
-    text = str(exc)
-    match = re.search(r"properties \[([^\]]+)\]", text)
-    if not match:
-        return []
-    return [field.strip().strip("'\"") for field in match.group(1).split(",") if field.strip()]
+    text = meli_error_text(exc)
+    fields = []
+    for pattern in (
+        r"properties \[([^\]]+)\]",
+        r"attributes? \[([^\]]+)\] (?:are|is) required",
+        r"campos? \[([^\]]+)\].*obrigat",
+    ):
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            fields.extend(
+                field.strip().strip("'\"")
+                for field in match.group(1).split(",")
+                if field.strip()
+            )
+    detail = meli_error_detail(exc)
+    if isinstance(detail, dict):
+        for cause in detail.get("cause") or []:
+            code = str(cause.get("code") or "").lower()
+            message = str(cause.get("message") or "")
+            if "required" not in code and "required" not in message.lower() and "obrigat" not in message.lower():
+                continue
+            for reference in cause.get("references") or []:
+                field = str(reference or "").replace("body.", "").strip()
+                if field and field not in {"body", "item.attributes", "item.variations"}:
+                    fields.append(field)
+    return list(dict.fromkeys(fields))
 
 
 def meli_error_detail(exc):
@@ -9104,6 +9129,22 @@ def invalid_fields_from_error(exc):
         if match:
             fields.extend(field.strip().strip("'\"") for field in match.group(1).split(",") if field.strip())
     return list(dict.fromkeys(fields))
+
+
+def publication_model_required_by_error(exc, current_model=""):
+    """Return the naming contract explicitly requested by the API error."""
+    required = {str(field).strip().lower() for field in required_fields_from_error(exc)}
+    invalid = {str(field).strip().lower() for field in invalid_fields_from_error(exc)}
+    text = meli_error_text(exc).lower()
+    if "title" in required:
+        return "legacy"
+    if "family_name" in required:
+        return "user_product"
+    if "title" in invalid or ("fields [title]" in text and "invalid" in text):
+        return "user_product"
+    if "family_name" in invalid or ("fields [family_name]" in text and "invalid" in text):
+        return "legacy"
+    return current_model
 
 
 def attribute_ids_from_error_text(text):
@@ -9861,7 +9902,8 @@ def create_item_with_clone_retries(
     validation_attempts = 0
     rate_limit_attempts = 0
     max_rate_limit_attempts = max(0, int(os.getenv("MELI_CLONE_RATE_LIMIT_RETRIES", "3")))
-    while validation_attempts < 5:
+    max_validation_attempts = max(5, min(10, int(os.getenv("MELI_CLONE_VALIDATION_RETRIES", "8"))))
+    while validation_attempts < max_validation_attempts:
         try:
             if publication_model and publication_name:
                 payload = apply_publication_name(payload, publication_name, publication_model)
@@ -9918,6 +9960,18 @@ def create_item_with_clone_retries(
                     pending_fields.append(official_store_pending_field(item_id, destination_stores))
                     validation_attempts += 1
                     break
+            required_model = publication_model_required_by_error(exc, publication_model)
+            if publication_name and required_model and required_model != publication_model:
+                previous_model = publication_model
+                publication_model = required_model
+                payload = apply_publication_name(payload, publication_name, publication_model)
+                adjustments.append({
+                    "tipo": "modelo_de_publicacao_corrigido_pela_api",
+                    "de": previous_model,
+                    "para": publication_model,
+                })
+                validation_attempts += 1
+                continue
             validation_attempts += 1
             payload, changed, new_adjustments = clone_retry_adjustments_from_error(
                 exc,
@@ -9933,8 +9987,13 @@ def create_item_with_clone_retries(
             if not changed:
                 break
     if pending_fields:
-        error = RuntimeError("Revise campos obrigatórios antes de copiar este anúncio.")
-        error.pending_fields = dedupe_pending_fields(pending_fields)
+        deduped_fields = dedupe_pending_fields(pending_fields)
+        labels = ", ".join(str(field.get("label") or field.get("id") or "").strip() for field in deduped_fields)
+        message = "Revise campos obrigatórios antes de copiar este anúncio."
+        if labels:
+            message = f"O Mercado Livre exige o preenchimento de: {labels}."
+        error = RuntimeError(message)
+        error.pending_fields = deduped_fields
         error.original_error = str(last_error)
         raise error
     raise last_error
@@ -14154,7 +14213,7 @@ def create_kit_listing(request, actor=None):
         target_client,
         create_payload,
         first,
-        {},
+        request.get("answers") or {},
         components[0]["item_id"],
         category_attributes,
         cross_account,
