@@ -8583,7 +8583,7 @@ def hydrate_clone_package_attributes(create_payload, source_item):
 def restore_clone_attribute_from_source(create_payload, source_item, category_attributes, attr_id):
     canonical_id = canonical_clone_attribute_id(attr_id)
     if not canonical_id or clone_required_attribute_satisfied(create_payload, canonical_id):
-        return bool(canonical_id)
+        return False
     if canonical_id.startswith("SELLER_PACKAGE_"):
         hydrate_clone_package_attributes(create_payload, source_item)
         if clone_required_attribute_satisfied(create_payload, canonical_id):
@@ -9221,6 +9221,34 @@ def add_or_update_clone_attribute(create_payload, attr_id, value):
     return True
 
 
+def apply_kit_empty_gtin_reason(create_payload, category_attributes=None):
+    """Use the official no-GTIN reason when a unit identifier cannot identify a kit."""
+    remove_clone_attributes(create_payload, GTIN_IDENTIFIER_ATTRS)
+    for variation in create_payload.get("variations") or []:
+        variation["attributes"] = remove_clone_product_identifiers(variation.get("attributes") or [])
+
+    definition = category_attribute_definition(category_attributes or [], "EMPTY_GTIN_REASON")
+    kit_value = next(
+        (
+            value
+            for value in definition.get("values") or []
+            if normalized_attribute_label(value.get("name")) == "kit"
+        ),
+        {},
+    )
+    attribute = {
+        "id": "EMPTY_GTIN_REASON",
+        "value_name": clean_attribute_value(kit_value.get("name")) or "Kit",
+    }
+    # Official MLB value for EMPTY_GTIN_REASON=Kit. Prefer the live category
+    # definition, while keeping the documented value available when its cache
+    # is incomplete.
+    attribute["value_id"] = clean_attribute_value(kit_value.get("id")) or "17055159"
+    remove_clone_attributes(create_payload, ["EMPTY_GTIN_REASON"])
+    create_payload.setdefault("attributes", []).append(attribute)
+    return attribute
+
+
 ATTRIBUTE_LABELS_PT = {
     "ALPHANUMERIC_MODEL": "Modelo alfanumérico",
     "DETAILED_MODEL": "Modelo detalhado",
@@ -9656,7 +9684,15 @@ def clone_payload_from_answers(create_payload, answers):
     return create_payload
 
 
-def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending_fields, item_id="", category_attributes=None):
+def clone_retry_adjustments_from_error(
+    exc,
+    create_payload,
+    source_item,
+    pending_fields,
+    item_id="",
+    category_attributes=None,
+    kit_mode=False,
+):
     changed = False
     adjustments = []
     error_text = meli_error_text(exc)
@@ -9680,8 +9716,28 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
     if removed_dropped_attrs:
         changed = True
         adjustments.append({"tipo": "atributos_inexistentes_removidos", "campos": removed_dropped_attrs})
-    for field in required_clone_attributes_from_error(exc, source_item, category_attributes or []):
+    required_error_fields = required_clone_attributes_from_error(exc, source_item, category_attributes or [])
+    required_error_ids = {
+        canonical_clone_attribute_id(str(field.get("id") or "").replace("attribute:", ""))
+        for field in required_error_fields
+    }
+    kit_gtin_fallback_applied = bool(
+        kit_mode
+        and required_error_ids.intersection(GTIN_IDENTIFIER_ATTRS)
+        and clone_payload_has_attribute(create_payload, "GTIN")
+    )
+    if kit_gtin_fallback_applied:
+        apply_kit_empty_gtin_reason(create_payload, category_attributes or [])
+        changed = True
+        adjustments.append({
+            "tipo": "gtin_unitario_substituido_por_motivo_kit",
+            "campos": ["GTIN", "EMPTY_GTIN_REASON"],
+        })
+
+    for field in required_error_fields:
         attr_id = str(field.get("id") or "").replace("attribute:", "")
+        if kit_gtin_fallback_applied and canonical_clone_attribute_id(attr_id) in GTIN_IDENTIFIER_ATTRS:
+            continue
         if restore_clone_attribute_from_source(create_payload, source_item, category_attributes or [], attr_id):
             changed = True
             adjustments.append({"tipo": "atributo_recuperado_do_anuncio_original", "campos": [canonical_clone_attribute_id(attr_id)]})
@@ -9763,13 +9819,28 @@ def clone_retry_adjustments_from_error(exc, create_payload, source_item, pending
         if code == "item.attribute.invalid_product_identifier":
             source_identifiers = source_clone_identifiers(source_item)
             attrs_to_remove.extend(GTIN_IDENTIFIER_ATTRS)
-            gtin_definition = category_attribute_definition(category_attributes or [], "GTIN")
-            if gtin_definition and clone_attribute_is_required(gtin_definition):
+            if kit_mode:
+                apply_kit_empty_gtin_reason(create_payload, category_attributes or [])
+                pending_fields[:] = [
+                    field
+                    for field in pending_fields
+                    if canonical_clone_attribute_id(str(field.get("id") or "").replace("attribute:", ""))
+                    not in GTIN_IDENTIFIER_ATTRS
+                ]
+                changed = True
+                if not kit_gtin_fallback_applied:
+                    adjustments.append({
+                        "tipo": "gtin_unitario_substituido_por_motivo_kit",
+                        "campos": ["GTIN", "EMPTY_GTIN_REASON"],
+                    })
+            else:
+                gtin_definition = category_attribute_definition(category_attributes or [], "GTIN")
+                if not gtin_definition or not clone_attribute_is_required(gtin_definition):
+                    continue
                 pending = pending_clone_attribute("GTIN", source_item, category_attributes or [], item_id)
                 if pending:
-                    pending["message"] = "Informe um GTIN/EAN/UPC válido. Para variações, separe um código por vírgula para cada variação."
-                    if source_identifiers:
-                        pending["default_value"] = ", ".join(source_identifiers)
+                    pending["message"] = "Informe um novo GTIN/EAN/UPC que ainda não esteja vinculado a outro produto do Mercado Livre."
+                    pending["default_value"] = ""
                     pending_fields.append(pending)
                 if not source_identifiers:
                     empty_reason = pending_clone_attribute("EMPTY_GTIN_REASON", source_item, category_attributes or [], item_id)
@@ -9895,6 +9966,7 @@ def create_item_with_clone_retries(
     destination_stores=None,
     publication_model="",
     publication_name="",
+    kit_mode=False,
 ):
     payload = json.loads(json.dumps(create_payload, ensure_ascii=False))
     sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [], source_item)
@@ -9985,6 +10057,7 @@ def create_item_with_clone_retries(
                 pending_fields,
                 item_id,
                 category_attributes or [],
+                kit_mode,
             )
             adjustments.extend(new_adjustments)
             if pending_fields:
@@ -14226,6 +14299,7 @@ def create_kit_listing(request, actor=None):
         destination_stores,
         publication_model,
         edits["title"],
+        True,
     )
     description = str(fields.get("description") or "").strip()
     if description and created.get("id"):
