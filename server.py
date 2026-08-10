@@ -239,6 +239,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/claims/search(\?|$)"),
     re.compile(r"^/v1/claims/search(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/search(\?|$)"),
+    re.compile(r"^/post-purchase/v1/claims/reasons/[^/?]+(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/[^/]+(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/[^/]+/detail(\?|$)"),
     re.compile(r"^/post-purchase/v1/claims/[^/]+/charges/return-cost(\?|$)"),
@@ -1969,6 +1970,16 @@ class MercadoLivreClient:
 
     def claim_detail(self, claim_id):
         return self.get(f"/post-purchase/v1/claims/{claim_id}/detail")
+
+    def claim_reason(self, reason_id):
+        clean_reason_id = re.sub(r"[^A-Za-z0-9_-]", "", str(reason_id or ""))
+        if not clean_reason_id:
+            return {}
+        return self.get(
+            f"/post-purchase/v1/claims/reasons/{clean_reason_id}",
+            retries=2,
+            timeout=15,
+        )
 
     def claim_return(self, claim_id):
         return self.get(f"/post-purchase/v2/claims/{claim_id}/returns", retries=2, timeout=15)
@@ -5596,6 +5607,62 @@ RETURN_REASON_LABELS = {
     "PDD9949": "Fomos informados que o produto chegou avariado",
 }
 
+RETURN_REASON_TRIAGE = {
+    "repentant": ("arrependimento", "Arrependimento"),
+    "repentance": ("arrependimento", "Arrependimento"),
+    "defective": ("defeito", "Defeito ou falha"),
+    "not_working": ("defeito", "Não funciona"),
+    "damaged": ("avaria", "Avaria ou dano"),
+    "incomplete": ("incompleto", "Produto incompleto"),
+    "different": ("incorreto", "Produto diferente ou incorreto"),
+    "wrong_product": ("incorreto", "Produto diferente ou incorreto"),
+    "not_received": ("nao_recebido", "Produto não recebido"),
+}
+
+RETURN_REASON_FILTER_OPTIONS = (
+    {"id": "arrependimento", "name": "Arrependimento"},
+    {"id": "avaria", "name": "Avaria ou dano"},
+    {"id": "defeito", "name": "Defeito ou falha"},
+    {"id": "incompleto", "name": "Produto incompleto"},
+    {"id": "incorreto", "name": "Produto diferente ou incorreto"},
+    {"id": "nao_recebido", "name": "Produto não recebido"},
+    {"id": "logistica", "name": "Problema logístico"},
+    {"id": "outros", "name": "Outros motivos"},
+)
+
+RETURN_REASON_NAME_LABELS = {
+    "repentant_buyer": "O comprador se arrependeu da compra",
+    "damaged_item": "O produto chegou avariado",
+    "defective_item": "O produto apresentou defeito",
+    "item_not_working": "O produto não funciona",
+    "incomplete_item": "O produto chegou incompleto",
+    "different_item": "O produto recebido é diferente do anunciado",
+    "wrong_item": "O comprador recebeu o produto incorreto",
+}
+
+RETURN_REASON_CACHE = {}
+RETURN_REASON_CACHE_LOCK = threading.Lock()
+
+
+def normalized_return_text(value):
+    return unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode().lower().strip()
+
+
+def return_reason_is_workflow(value):
+    normalized = normalized_return_text(value).replace("-", "_").replace(" ", "_")
+    exact = {
+        "warehouse_decision", "preferred_to_keep_product", "prefered_to_keep_product",
+        "mediation_with_return", "return_enabled", "return_completed", "return_in_transit",
+    }
+    if normalized in exact:
+        return True
+    workflow_phrases = (
+        "devolucao_finalizada", "reembolso_para_o_comprador", "mediacao_com_devolucao",
+        "devolucao_habilitada", "devolucao_a_caminho", "sem_custo_de_envio",
+        "produto_sera_devolvido", "aguardando_devolucao", "retorno_em_transito",
+    )
+    return any(phrase in normalized for phrase in workflow_phrases)
+
 
 def return_reason_is_human(value):
     text = str(value or "").strip()
@@ -5607,6 +5674,8 @@ def return_reason_is_human(value):
         "opened", "closed", "resolved", "buyer", "seller", "respondent",
     }
     if normalized in generic:
+        return False
+    if return_reason_is_workflow(text):
         return False
     if re.fullmatch(r"[a-z]{2,12}[-_]?\d{2,}", normalized):
         return False
@@ -5643,20 +5712,52 @@ def return_reason_candidates(payload):
     return values
 
 
+def claim_reason_id(claim, review=None, returned=None):
+    return str(
+        first_present(
+            claim or {},
+            ("reason_id", "reason.id", "official_detail.reason_id", "official_detail.reason.id"),
+            "",
+        )
+        or first_present(returned or {}, ("reason_id", "reason.id"), "")
+        or (review or {}).get("reason_id")
+        or ""
+    ).strip()
+
+
+def official_claim_reason(claim):
+    payload = (claim or {}).get("official_reason") or {}
+    if isinstance(payload, list):
+        payload = next((row for row in payload if isinstance(row, dict)), {})
+    if not isinstance(payload, dict):
+        return {}
+    detail = str(payload.get("detail") or payload.get("description") or "").strip()
+    name = str(payload.get("name") or "").strip()
+    triage = first_present(payload, ("settings.rules_engine_triage", "rules_engine_triage"), []) or []
+    if isinstance(triage, str):
+        triage = [triage]
+    return {
+        "id": str(payload.get("id") or ""),
+        "detail": detail if return_reason_is_human(detail) else "",
+        "name": name,
+        "triage": [str(value or "").strip().lower() for value in triage if str(value or "").strip()],
+    }
+
+
 def return_reason_text(claim, review, returned=None):
-    for payload in (claim, returned or {}, review):
+    official = official_claim_reason(claim)
+    if official.get("detail"):
+        return official["detail"]
+    mapped_name = RETURN_REASON_NAME_LABELS.get(official.get("name", "").lower())
+    if mapped_name:
+        return mapped_name
+    for payload in (claim, review):
         candidates = return_reason_candidates(payload)
         if candidates:
             return candidates[0]
-    reason_ids = (
-        claim.get("reason_id"),
-        first_present(returned or {}, ("reason_id", "reason.id"), ""),
-        review.get("reason_id"),
-    )
-    for reason_id in reason_ids:
-        mapped = RETURN_REASON_LABELS.get(str(reason_id or "").strip().upper())
-        if mapped:
-            return mapped
+    mapped = RETURN_REASON_LABELS.get(claim_reason_id(claim, review, returned).upper())
+    if mapped:
+        return mapped
     condition = str(review.get("product_condition") or "").strip()
     condition_labels = {
         "damaged": "Produto devolvido com avaria",
@@ -5683,6 +5784,27 @@ def classify_return_reason(reason):
         if any(token in normalized for token in tokens):
             return key, label
     return "outros", "Outros motivos"
+
+
+def classify_official_return_reason(claim, reason):
+    official = official_claim_reason(claim)
+    for triage in official.get("triage") or []:
+        if triage in RETURN_REASON_TRIAGE:
+            return RETURN_REASON_TRIAGE[triage]
+    name = normalized_return_text(official.get("name")).replace(" ", "_")
+    for token, classification in (
+        ("repent", RETURN_REASON_TRIAGE["repentant"]),
+        ("damag", RETURN_REASON_TRIAGE["damaged"]),
+        ("defect", RETURN_REASON_TRIAGE["defective"]),
+        ("not_work", RETURN_REASON_TRIAGE["not_working"]),
+        ("incomplete", RETURN_REASON_TRIAGE["incomplete"]),
+        ("different", RETURN_REASON_TRIAGE["different"]),
+        ("wrong", RETURN_REASON_TRIAGE["wrong_product"]),
+        ("not_received", RETURN_REASON_TRIAGE["not_received"]),
+    ):
+        if token in name:
+            return classification
+    return classify_return_reason(reason)
 
 
 def return_workflow_status(claim, returned, review):
@@ -5818,7 +5940,8 @@ def enrich_return_order_items(client, order):
 def normalize_return_record(account, claim, returned, cost_payload, review_payload, order, errors=None):
     review = return_review_data(review_payload)
     reason = return_reason_text(claim, review, returned)
-    defect_key, defect_label = classify_return_reason(reason)
+    defect_key, defect_label = classify_official_return_reason(claim, reason)
+    official_reason = official_claim_reason(claim)
     workflow_status, workflow_label = return_workflow_status(claim, returned, review)
     shipment = return_shipment_data(returned)
     items = return_order_items(order, claim, returned)
@@ -5846,8 +5969,13 @@ def normalize_return_record(account, claim, returned, cost_payload, review_paylo
         "claim_status": str(claim.get("status") or ""),
         "claim_type": str(claim.get("type") or ""),
         "claim_stage": str(claim.get("stage") or ""),
-        "reason_id": str(claim.get("reason_id") or review.get("reason_id") or ""),
+        "reason_id": claim_reason_id(claim, review, returned),
         "reason": reason or "Motivo não detalhado pelo Mercado Livre",
+        "reason_detail": official_reason.get("detail") or reason,
+        "reason_name": official_reason.get("name") or "",
+        "reason_triage": official_reason.get("triage") or [],
+        "reason_source": "claims_reason_api" if official_reason else "claim_payload",
+        "resolution_reason": str(first_present(claim, ("resolution.reason", "resolution"), "") or ""),
         "problem": str(claim.get("problem") or claim.get("description") or ""),
         "fulfilled": bool(claim.get("fulfilled")),
         "claimed_quantity": int(return_number(claim.get("claimed_quantity"), total_quantity)),
@@ -5892,6 +6020,22 @@ def return_record_in_period(record, date_from, date_to):
     return True
 
 
+def cached_claim_reason(client, reason_id):
+    cache_key = str(reason_id or "").strip().upper()
+    if not cache_key:
+        return {}
+    with RETURN_REASON_CACHE_LOCK:
+        cached = RETURN_REASON_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    payload = client.claim_reason(cache_key) or {}
+    if isinstance(payload, dict):
+        with RETURN_REASON_CACHE_LOCK:
+            RETURN_REASON_CACHE[cache_key] = dict(payload)
+        return payload
+    return {}
+
+
 def collect_claim_return_records(account, client, claim):
     claim_id = claim.get("id") or claim.get("claim_id")
     if not claim_id:
@@ -5902,7 +6046,8 @@ def collect_claim_return_records(account, client, claim):
         detailed_claim = {**claim, **(client.claim(claim_id) or {})}
     except Exception as exc:
         errors.append(f"Detalhe da reclamação: {exc}")
-    if not return_reason_candidates(detailed_claim):
+    reason_id = claim_reason_id(detailed_claim)
+    if not reason_id or not return_reason_candidates(detailed_claim):
         try:
             claim_detail = client.claim_detail(claim_id) or {}
             if isinstance(claim_detail, dict) and claim_detail:
@@ -5910,6 +6055,15 @@ def collect_claim_return_records(account, client, claim):
         except Exception as exc:
             if "404" not in str(exc):
                 errors.append(f"Motivo da reclamação: {exc}")
+    reason_id = claim_reason_id(detailed_claim)
+    if reason_id:
+        try:
+            official_reason = cached_claim_reason(client, reason_id)
+            if official_reason:
+                detailed_claim["official_reason"] = official_reason
+        except Exception as exc:
+            if "404" not in str(exc):
+                errors.append(f"Catálogo oficial do motivo: {exc}")
     # Claims search/detail can omit return metadata even when the v2 returns
     # resource already exists. The returns endpoint is the source of truth.
     try:
@@ -6210,7 +6364,16 @@ def return_filter_options(records):
             key=lambda row: row["name"],
         ),
         "defects": sorted(
-            ({"id": row.get("defect_category") or "outros", "name": row.get("defect_label") or "Outros motivos"} for row in records),
+            (
+                *RETURN_REASON_FILTER_OPTIONS,
+                *(
+                    {
+                        "id": row.get("defect_category") or "outros",
+                        "name": row.get("defect_label") or "Outros motivos",
+                    }
+                    for row in records
+                ),
+            ),
             key=lambda row: row["name"],
         ),
     }

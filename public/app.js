@@ -2865,18 +2865,24 @@ const RETURN_REASON_LABELS = {
 
 function returnReasonLabel(record = {}) {
   const reasonId = String(record.reason_id || "").trim().toUpperCase();
-  const raw = String(record.reason || record.problem || "").trim();
+  const raw = String(record.reason_detail || record.reason || record.problem || "").trim();
   const embeddedCode = raw.match(/\b([A-Z]{2,12}\d{2,})\b/i)?.[1]?.toUpperCase() || "";
   const mapped = RETURN_REASON_LABELS[reasonId] || RETURN_REASON_LABELS[embeddedCode];
   if (mapped) return mapped;
+  const normalizedRaw = raw.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[\s-]+/g, "_");
+  const workflowOnly = [
+    "warehouse_decision", "preferred_to_keep_product", "prefered_to_keep_product",
+    "devolucao_finalizada", "reembolso_para_o_comprador", "mediacao_com_devolucao",
+    "devolucao_habilitada", "devolucao_a_caminho", "sem_custo_de_envio",
+  ].some((value) => normalizedRaw.includes(value));
   const structuralOnly = raw
     .split("·")
     .map((value) => value.trim())
     .filter(Boolean)
     .every((value) => /^(?:[A-Z]{2,12}\d{2,}|mediation|mediations|return|returns|claim|claims)$/i.test(value));
-  if (raw && !structuralOnly) return raw;
+  if (raw && !structuralOnly && !workflowOnly) return raw;
   if (record.defect_label && record.defect_label !== "Outros motivos") return record.defect_label;
-  return "Motivo não detalhado pelo Mercado Livre";
+  return "Motivo original ainda não detalhado pela API oficial";
 }
 
 function returnDetail(label, value, emphasis = false) {
