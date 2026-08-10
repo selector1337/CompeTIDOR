@@ -662,62 +662,22 @@ function renderSummary() {
   if (officialLabel) officialLabel.textContent = `${accounts.filter((account) => account.official).length} oficiais`;
 }
 
-function formatMonthPeriod(period) {
-  const match = String(period || "").match(/^(\d{4})-(\d{2})$/);
-  if (!match) return period || "mês anterior";
-  const label = new Intl.DateTimeFormat("pt-BR", { month: "short", year: "numeric" })
-    .format(new Date(Number(match[1]), Number(match[2]) - 1, 1))
-    .replace(" de ", "/");
-  return label.charAt(0).toUpperCase() + label.slice(1);
-}
-
-function comparisonBadge(value, noun) {
-  if (value === null || value === undefined || !Number.isFinite(Number(value))) {
-    return `<span class="revenue-delta neutral">Sem base anterior</span>`;
-  }
-  const numeric = Number(value);
-  const tone = numeric > 0 ? "positive" : numeric < 0 ? "negative" : "neutral";
-  const symbol = numeric > 0 ? "↑" : numeric < 0 ? "↓" : "→";
-  const formatted = Math.abs(numeric).toLocaleString("pt-BR", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-  return `<span class="revenue-delta ${tone}">${symbol} ${numeric > 0 ? "+" : numeric < 0 ? "-" : ""}${formatted}% ${noun}</span>`;
-}
-
-function reputationLevel(metric) {
-  const levels = {
-    "1_red": ["Vermelho", "red"],
-    "2_orange": ["Laranja", "orange"],
-    "3_yellow": ["Amarelo", "yellow"],
-    "4_light_green": ["Verde-claro", "light-green"],
-    "5_green": ["Verde", "green"],
-  };
-  return levels[String(metric.level_id || metric.real_level || "").toLowerCase()] || ["Sem nível informado", "neutral"];
-}
-
-function mercadoLeaderLabel(status) {
-  return ({ silver: "MercadoLíder", gold: "MercadoLíder Gold", platinum: "MercadoLíder Platinum" })[String(status || "").toLowerCase()] || "";
-}
-
 function renderDashboard() {
   const ops = state.data.operations || {};
   const stockRows = filterByStockPeriod(ops.attention_stock || []);
   renderDashboardAccountFilters();
-  const previousPeriod = formatMonthPeriod(ops.previous_revenue_period);
   document.querySelector("#dashboard-revenue").innerHTML = `
     <article class="revenue-total">
       <span>Faturamento real mensal</span>
       <strong>${money.format(ops.total_monthly_revenue || 0)}</strong>
-      <div class="revenue-comparison">${comparisonBadge(ops.total_revenue_delta_percentage, "em faturamento")}${comparisonBadge(ops.total_orders_delta_percentage, "em pedidos")}</div>
-      <small>${Number(ops.total_orders_count || 0).toLocaleString("pt-BR")} pedidos no mês atual</small>
-      <div class="revenue-previous"><span>${previousPeriod}</span><strong>${money.format(ops.total_previous_monthly_revenue || 0)}</strong><small>${Number(ops.total_previous_orders_count || 0).toLocaleString("pt-BR")} pedidos</small></div>
+      <small>Pedidos oficiais sincronizados no Mercado Livre</small>
     </article>
     ${(ops.revenue || []).map((item) => `
       <article class="revenue-account">
         <strong>${item.account}</strong>
         <span>${money.format(item.monthly_revenue || 0)}</span>
-        <div class="revenue-comparison">${comparisonBadge(item.revenue_delta_percentage, "faturamento")}${comparisonBadge(item.orders_delta_percentage, "pedidos")}</div>
-        <small>${Number(item.orders_count || 0).toLocaleString("pt-BR")} pedidos no mês atual</small>
-        <div class="revenue-previous"><span>${formatMonthPeriod(item.previous_period)}</span><strong>${money.format(item.previous_monthly_revenue || 0)}</strong><small>${Number(item.previous_orders_count || 0).toLocaleString("pt-BR")} pedidos</small></div>
-        <small class="revenue-sync">${item.updated_at ? `Atualizado em ${formatDateBR(item.updated_at)}` : item.sync_status || item.source || ""}</small>
+        <small>${Number(item.orders_count || 0)} pedidos · ${item.period || "-"} · ${item.updated_at ? formatDateBR(item.updated_at) : "Aguardando atualização"}</small>
+        <small>${item.sync_status || item.source || ""}</small>
       </article>
     `).join("")}
   `;
@@ -799,25 +759,20 @@ function renderDashboard() {
 
   document.querySelector("#dashboard-metrics").innerHTML = state.data.metrics
     .map(
-      (metric) => {
-        const [levelLabel, levelTone] = reputationLevel(metric);
-        const leader = mercadoLeaderLabel(metric.power_seller_status);
-        return `
+      (metric) => `
         <article class="metric-item">
           <div class="metric-header">
             <strong>${metric.account}</strong>
-            <div class="reputation-badges"><span class="reputation-badge ${levelTone}">${levelLabel}</span>${leader ? `<span class="leader-badge">${leader}</span>` : ""}</div>
+            <span>${metric.period}</span>
           </div>
           <div class="metric-bars">
             ${metricLine("Reclamações", metric.claims, 8, true)}
             ${metricLine("Envios em atraso", metric.late_shipments, 10, true)}
-            ${metricLine("Cancelamentos", metric.cancellations, 8, true)}
-            ${metricLine("Avaliações positivas", metric.ratings_positive, 100, false)}
+            ${metricLine("Agências ML", metric.agency_score, 100, false)}
+            ${metricLine("Flex", metric.flex_score, 100, false)}
           </div>
-          <div class="metric-footer"><span>${Number(metric.transactions_completed || 0).toLocaleString("pt-BR")} transações concluídas</span><span>${metric.updated_at ? `Atualizado em ${formatDateBR(metric.updated_at)}` : metric.period || ""}</span></div>
         </article>
-      `;
-      }
+      `
     )
     .join("");
 }
