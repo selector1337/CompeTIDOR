@@ -2239,10 +2239,11 @@ nav a {
 
 .sidebar:hover nav a {
   justify-content: flex-start;
-  width: auto;
+  width: calc(100% - 2px);
   min-width: 0;
   height: auto;
   padding: 12px 14px;
+  margin-right: 2px;
 }
 
 nav a span,
@@ -6069,7 +6070,14 @@ nav a,
 
 .sidebar:hover nav a,
 .sidebar:focus-within nav a {
-  width: 212px;
+  width: calc(100% - 3px);
+  max-width: calc(100% - 3px);
+  margin-right: 3px;
+}
+
+.sidebar nav a {
+  box-sizing: border-box;
+  max-width: 100%;
 }
 
 nav a strong,
@@ -7651,7 +7659,31 @@ textarea:focus {
 }
 
 .ad-stock-row {
-  grid-template-columns: repeat(3, minmax(150px, 1fr));
+  grid-template-columns: repeat(4, minmax(105px, 1fr));
+  align-items: start;
+}
+
+.ad-stock-row > label {
+  display: grid;
+  grid-template-rows: 18px 38px minmax(18px, auto);
+  align-content: start;
+  min-width: 0;
+}
+
+.ad-stock-row > label > span:first-child {
+  align-self: end;
+}
+
+.ad-stock-row > label > input,
+.ad-stock-row > label > .money-field,
+.ad-stock-row > label > .unit-field {
+  width: 100%;
+  min-width: 0;
+}
+
+.ad-stock-row > label > small {
+  padding-top: 4px;
+  line-height: 1.25;
 }
 
 .ad-package-row {

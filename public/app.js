@@ -18,6 +18,7 @@
   adsListingType: "all",
   adsCatalog: "all",
   adsFlex: "all",
+  adsPickup: "all",
   adsProfit: "all",
   adsSelectedIds: new Set(),
   stockPeriod: "today",
@@ -1667,6 +1668,7 @@ function renderAds() {
       && (state.adsListingType === "all" || item.listing_type_id === state.adsListingType)
       && (state.adsCatalog === "all" || (state.adsCatalog === "catalog" ? isCatalogItem(item) : !isCatalogItem(item)))
       && (state.adsFlex === "all" || (state.adsFlex === "active" ? item.shipping_logistic_type === "self_service" : item.shipping_logistic_type !== "self_service"))
+      && (state.adsPickup === "all" || (state.adsPickup === "active" ? item.local_pick_up === true : item.local_pick_up !== true))
       && (state.adsProfit === "all"
         || (state.adsProfit === "cost"
           ? itemCommercialValues(item).cost !== null
@@ -5172,6 +5174,7 @@ document.addEventListener("click", (event) => {
   ["#ads-listing-type-filter", "adsListingType"],
   ["#ads-catalog-filter", "adsCatalog"],
   ["#ads-flex-filter", "adsFlex"],
+  ["#ads-pickup-filter", "adsPickup"],
   ["#ads-profit-filter", "adsProfit"],
   ["#costs-search", "costsSearch"],
   ["#costs-status-filter", "costsStatus"],
@@ -5302,6 +5305,7 @@ document.querySelector("#clear-ads-filters")?.addEventListener("click", () => {
     adsListingType: "all",
     adsCatalog: "all",
     adsFlex: "all",
+    adsPickup: "all",
     adsProfit: "all",
     adsPage: 1,
   });
@@ -5315,6 +5319,7 @@ document.querySelector("#clear-ads-filters")?.addEventListener("click", () => {
     "#ads-listing-type-filter": "all",
     "#ads-catalog-filter": "all",
     "#ads-flex-filter": "all",
+    "#ads-pickup-filter": "all",
     "#ads-profit-filter": "all",
   };
   Object.entries(values).forEach(([selector, value]) => {

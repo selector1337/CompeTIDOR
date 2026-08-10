@@ -1948,9 +1948,10 @@ class MercadoLivreClient:
     def shipment_sla(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}/sla")
 
-    def seller_claims(self, seller_id, limit=50, offset=0, status="opened", role="respondent"):
+    def seller_claims(self, seller_id, limit=50, offset=0, status="opened", role="respondent", filters=None):
         params = {
             "players.user_id": seller_id,
+            "site_id": "MLB",
             "sort": "last_updated:desc",
             "limit": min(int(limit or 50), 100),
             "offset": max(int(offset or 0), 0),
@@ -1959,6 +1960,8 @@ class MercadoLivreClient:
             params["players.role"] = role
         if status:
             params["status"] = status
+        if isinstance(filters, dict):
+            params.update({key: value for key, value in filters.items() if value not in (None, "")})
         return self.get(f"/post-purchase/v1/claims/search?{urlencode(params)}")
 
     def claim(self, claim_id):
@@ -2315,6 +2318,76 @@ def first_present(payload, keys, default=None):
         if current not in (None, ""):
             return current
     return default
+
+
+def meli_boolean(value, default=False):
+    """Normalize boolean fields returned by different Mercado Livre contracts."""
+    if value in (None, ""):
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "sim", "active", "enabled"}:
+        return True
+    if normalized in {"false", "0", "no", "nao", "não", "inactive", "disabled"}:
+        return False
+    return bool(default)
+
+
+def item_local_pick_up(item):
+    """Return the listing's current local-pickup state across API variants."""
+    explicit = first_present(
+        item,
+        [
+            "local_pick_up",
+            "local_pickup",
+            "store_pick_up",
+            "store_pickup",
+            "shipping.local_pick_up",
+            "shipping.local_pickup",
+            "shipping.store_pick_up",
+            "shipping.store_pickup",
+            "shipping.pick_up",
+            "shipping.pickup",
+        ],
+        None,
+    )
+    if explicit not in (None, ""):
+        return meli_boolean(explicit)
+    tags = first_present(item, ["shipping.tags", "shipping_tags", "tags"], []) or []
+    if isinstance(tags, str):
+        tags = [tags]
+    normalized = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+    if normalized.intersection({"local_pick_up", "local_pickup", "store_pick_up", "store_pickup"}):
+        return True
+    if normalized.intersection({"local_pick_up_disabled", "local_pickup_disabled", "store_pick_up_disabled"}):
+        return False
+    return False
+
+
+def item_list_price(item, regular_amount=None):
+    """Read MSRP/list price without confusing the current promotional price."""
+    direct = optional_money(first_present(item, ["list_price", "msrp"], None))
+    if direct is not None:
+        return direct
+    wanted = {"LIST_PRICE", "MSRP", "MANUFACTURER_SUGGESTED_RETAIL_PRICE"}
+    for section in (item.get("sale_terms") or [], item.get("attributes") or []):
+        for term in section:
+            if not isinstance(term, dict) or str(term.get("id") or "").upper() not in wanted:
+                continue
+            value = optional_money(
+                first_present(term, ["value_struct.number", "value_name", "value_id"], None)
+            )
+            if value is not None:
+                return value
+    # `original_price` is also used by Mercado Livre for temporary promotions,
+    # so it is only a compatibility fallback after the explicit MSRP fields.
+    original = optional_money(item.get("original_price"))
+    if original is not None:
+        return original
+    return optional_money(regular_amount)
 
 
 def extract_meli_item_id(value):
@@ -3735,9 +3808,7 @@ def synced_catalog_item(account, item, competition=None):
     official_store = item.get("official_store") if isinstance(item.get("official_store"), dict) else {}
     pictures = item.get("pictures") if isinstance(item.get("pictures"), list) else None
     price_values = sale_price_values(item.get("sale_price"), item.get("price"))
-    list_price = optional_money(item.get("original_price"))
-    if list_price is None:
-        list_price = price_values.get("regular_amount")
+    list_price = item_list_price(item, price_values.get("regular_amount"))
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
@@ -3767,7 +3838,7 @@ def synced_catalog_item(account, item, competition=None):
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
         "free_shipping": bool(first_present(item, ["shipping.free_shipping"], False)),
-        "local_pick_up": bool(first_present(item, ["shipping.local_pick_up"], False)),
+        "local_pick_up": item_local_pick_up(item),
         "manufacturing_time": item_manufacturing_time(item),
         **package_values,
         "status": status,
@@ -4754,6 +4825,8 @@ def refresh_item_prices_operation(item_ids):
                         "sale_price_checked_at": now_label(),
                     }
                 )
+                if values["regular_amount"] is not None:
+                    refreshed["list_price"] = values["regular_amount"]
             else:
                 refreshed["price_source"] = "items_fallback"
                 refreshed["sale_price_checked_at"] = now_label()
@@ -4769,7 +4842,8 @@ def refresh_item_prices_operation(item_ids):
                     "item_data_checked_at", "updated_at", "sale_fee_amount", "sale_fee_status",
                     "sale_fee_basis", "sale_fee_updated_at",
                     "shipping_cost", "shipping_cost_status", "net_sale_amount", "net_stock_value",
-                    "regular_price", "price_source", "sale_price_checked_at",
+                    "regular_price", "price_source", "sale_price_checked_at", "list_price",
+                    "local_pick_up", "manufacturing_time",
                 )
             }
             detail["result_status"] = "updated"
@@ -5389,7 +5463,7 @@ def returns_rows(payload, *keys):
         return [row for row in payload if isinstance(row, dict)]
     if not isinstance(payload, dict):
         return []
-    for key in (*keys, "data", "results", "returns", "reviews"):
+    for key in (*keys, "data", "results", "return", "returns", "claims", "reviews"):
         value = payload.get(key)
         if isinstance(value, list):
             return [row for row in value if isinstance(row, dict)]
@@ -5397,7 +5471,7 @@ def returns_rows(payload, *keys):
             nested = returns_rows(value, *keys)
             if nested:
                 return nested
-    if payload.get("id") or payload.get("return_id"):
+    if payload.get("id") or payload.get("return_id") or payload.get("claim_id"):
         return [payload]
     return []
 
@@ -5740,13 +5814,23 @@ def collect_claim_return_records(account, client, claim):
     try:
         returned_payload = client.claim_return(claim_id) or {}
     except Exception as exc:
-        if "404" in str(exc) or "not_found" in str(exc).lower() or "resource not found" in str(exc).lower():
-            return []
+        returned_payload = {}
         errors.append(f"Devolução: {exc}")
-        return []
     returned_rows = returns_rows(returned_payload, "returns")
     if not returned_rows:
-        return []
+        claim_type = str(detailed_claim.get("type") or "").lower()
+        explicit_return = claim_explicitly_has_return(detailed_claim)
+        if claim_type != "return" and explicit_return is not True:
+            return []
+        # Some seller credentials expose the official return only through the
+        # claim resource. Keep that return visible instead of reporting zero.
+        returned_rows = [{
+            "id": f"claim-{claim_id}",
+            "type": "return",
+            "status": detailed_claim.get("status") or "opened",
+            "last_updated": detailed_claim.get("last_updated") or detailed_claim.get("date_created"),
+            "order_id": detailed_claim.get("resource_id") if str(detailed_claim.get("resource") or "").lower() == "order" else "",
+        }]
     try:
         cost_payload = client.claim_return_cost(claim_id) or {}
     except Exception as exc:
@@ -5805,16 +5889,36 @@ def list_account_return_claims(account, client, date_from, date_to):
     limit = 100
     maximum = max(100, min(10000, int(os.getenv("MELI_RETURNS_MAX_CLAIMS", "3000"))))
     maximum_pages = max(1, min(100, int(os.getenv("MELI_RETURNS_MAX_PAGES", "50"))))
-    def read_role(role):
+    def read_role(role, filters=None):
         role_rows = []
         offset = 0
+        dated_filters = dict(filters or {})
+        # Asking the API for the requested activity window avoids paging through
+        # years of claims before reaching the current returns. The local period
+        # check below remains authoritative for credentials that reject range.
+        dated_filters.setdefault(
+            "range",
+            (
+                f"last_updated:after:{date_from.isoformat()}T00:00:00.000-03:00,"
+                f"before:{date_to.isoformat()}T23:59:59.999-03:00"
+            ),
+        )
         for _page in range(maximum_pages):
             try:
                 response = client.seller_claims(
-                    account.get("seller_id"), limit, offset, status="", role=role
+                    account.get("seller_id"), limit, offset, status="", role=role, filters=dated_filters
                 ) or {}
             except TypeError:
-                response = client.seller_claims(account.get("seller_id"), limit, offset, status="") or {}
+                response = client.seller_claims(
+                    account.get("seller_id"), limit, offset, status="", role=role
+                ) or {}
+            except Exception:
+                # Older claim contracts may reject `range`; retry the same
+                # official feed without it instead of turning the account into
+                # a false zero-return result.
+                response = client.seller_claims(
+                    account.get("seller_id"), limit, offset, status="", role=role, filters=filters
+                ) or {}
             page_rows, total = claim_search_rows(response)
             if not page_rows:
                 break
@@ -5831,9 +5935,30 @@ def list_account_return_claims(account, client, date_from, date_to):
     # Buyer claims list the seller as respondent, while claims whose type is
     # `return` may list the seller as complainant. Both feeds are required: a
     # non-empty respondent feed does not imply that it contains the returns.
-    rows = read_role("respondent") + read_role("complainant")
-    if not rows:
-        rows = read_role(None)
+    rows = []
+    role_errors = []
+    for role in ("respondent", "complainant"):
+        try:
+            rows.extend(read_role(role))
+        except Exception as exc:
+            role_errors.append(exc)
+    # Type-filtered feeds can contain returns omitted from the generic feeds,
+    # even when another return already exists there. Always query both roles.
+    for role in ("respondent", "complainant"):
+        try:
+            rows.extend(read_role(role, {"type": "return"}))
+        except Exception:
+            pass
+    # Some credentials accept the documented user filter but reject or omit
+    # role-specific rows. The role-less forms close that discovery gap.
+    for filters in (None, {"type": "return"}):
+        try:
+            rows.extend(read_role(None, filters))
+        except Exception as exc:
+            if not rows:
+                role_errors.append(exc)
+    if not rows and role_errors:
+        raise role_errors[0]
     rows = list({str(row.get("id") or row.get("claim_id") or index): row for index, row in enumerate(rows)}.values())
     selected = []
     for claim in rows[:maximum]:
@@ -11097,7 +11222,23 @@ def flex_full_shipping_coverage(sale_amount):
     return amount is not None and 19.0 <= amount < 79.0
 
 
-def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False, sale_amount=None):
+def order_line_unit_amount(line):
+    """Resolve the actual unit value even when an order exposes only a line total."""
+    if not isinstance(line, dict):
+        return None
+    for key in ("unit_price", "full_unit_price", "sale_price"):
+        value = optional_money(line.get(key))
+        if value is not None and value > 0:
+            return value
+    quantity = max(1, int(return_number(line.get("quantity"), 1)))
+    for key in ("total_amount", "line_amount", "amount"):
+        total = optional_money(line.get(key))
+        if total is not None and total > 0:
+            return round(total / quantity, 2)
+    return None
+
+
+def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False, sale_amount=None, unit_amounts=None):
     """Return actual seller debit and reimbursement from shipment costs."""
     if not isinstance(cost_payload, dict):
         return None, 0.0
@@ -11119,8 +11260,11 @@ def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False, sale_amou
         valid_senders = [sender for sender in senders if isinstance(sender, dict)]
         if len(valid_senders) == 1 or seller_id in (None, ""):
             selected = valid_senders[0] if valid_senders else None
+    flex_covered = flex_full_shipping_coverage(sale_amount) or any(
+        flex_full_shipping_coverage(amount) for amount in (unit_amounts or [])
+    )
     if not selected:
-        if is_flex and flex_full_shipping_coverage(sale_amount) and gross_amount is not None and gross_amount > 0:
+        if is_flex and flex_covered and gross_amount is not None and gross_amount > 0:
             return 0.0, round(gross_amount, 2)
         return None, 0.0
     signed_cost = optional_money(selected.get("cost"))
@@ -11129,7 +11273,7 @@ def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False, sale_amou
         # exposing the official gross tariff. For Flex sales fully subsidized
         # by MLB, that gross tariff is the exact reimbursement and the seller
         # debit remains zero.
-        if is_flex and flex_full_shipping_coverage(sale_amount) and gross_amount is not None and gross_amount > 0:
+        if is_flex and flex_covered and gross_amount is not None and gross_amount > 0:
             return 0.0, round(gross_amount, 2)
         return None, 0.0
     compensation = optional_money(selected.get("compensation"))
@@ -11156,7 +11300,7 @@ def shipment_seller_costs(cost_payload, seller_id=None, is_flex=False, sale_amou
     if (
         is_flex
         and reimbursement == 0
-        and flex_full_shipping_coverage(sale_amount)
+        and flex_covered
         and gross_amount is not None
         and gross_amount > 0
     ):
@@ -11539,7 +11683,7 @@ def fetch_flex_billing_reimbursements(client, order_ids, order_periods=None):
     return amounts, warnings
 
 
-def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_cache, sale_amount=None):
+def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_cache, sale_amount=None, unit_amounts=None):
     shipment_id = shipment_id_from_order(order)
     if shipment_id in (None, "", 0, "0"):
         return 0.0, 0.0, "Sem cobrança de Mercado Envios"
@@ -11550,7 +11694,9 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
     now = time.monotonic()
     # Versioned because older cache entries used promoted_amount * rate and
     # could persist a value ten times smaller than the official reimbursement.
-    global_key = f"seller-compensation-v7:{key}"
+    # Versioned because the reconciliation rule now considers each order line,
+    # not only the order total (for example, 2 units below R$ 79).
+    global_key = f"seller-compensation-v9:{key}"
     with SHIPMENT_COST_CACHE_LOCK:
         cached = SHIPMENT_COST_CACHE.get(global_key)
     if cached and now - cached.get("time", 0) < ttl:
@@ -11564,6 +11710,7 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
             seller_id,
             is_flex=is_flex is True,
             sale_amount=sale_amount,
+            unit_amounts=unit_amounts,
         )
         if shipping is None:
             raise RuntimeError("A API não informou o custo do remetente.")
@@ -11714,6 +11861,11 @@ def query_sales_report(payload, request):
                 first_catalog_item,
                 shipment_cost_cache,
                 sale_amount=order_gross,
+                unit_amounts=[
+                    order_line_unit_amount(line)
+                    for line in order_lines
+                    if order_line_unit_amount(line) is not None
+                ],
             )
             billing_reimbursement = float(billing_reimbursements.get(order_id) or 0)
             if billing_reimbursement > order_reimbursement:
