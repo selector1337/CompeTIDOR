@@ -571,10 +571,7 @@ function tenantLabel(meta, data) {
 function setRoute() {
   const route = (location.hash.replace("#/", "") || "dashboard").split("?")[0];
   const requestedRoute = pageTitles[route] ? route : "dashboard";
-  state.route = requestedRoute === "devolucoes" && !canManageOAuth() ? "dashboard" : requestedRoute;
-  if (requestedRoute !== state.route && location.hash !== "#/dashboard") {
-    history.replaceState(null, "", "#/dashboard");
-  }
+  state.route = requestedRoute;
   document.querySelectorAll(".page").forEach((page) => page.classList.remove("active"));
   document.querySelector(`#page-${state.route}`).classList.add("active");
   document.querySelectorAll("nav a").forEach((link) => link.classList.toggle("active", link.dataset.route === state.route));
@@ -2698,7 +2695,7 @@ function returnsQueryString() {
 }
 
 async function loadReturns(force = false) {
-  if (!canManageOAuth() || state.returnsLoading) return;
+  if (state.returnsLoading) return;
   if (state.returnsData && !force) {
     renderReturns();
     return;
@@ -2862,6 +2859,26 @@ function returnItemHtml(item) {
   `;
 }
 
+const RETURN_REASON_LABELS = {
+  PDD9949: "Fomos informados que o produto chegou avariado",
+};
+
+function returnReasonLabel(record = {}) {
+  const reasonId = String(record.reason_id || "").trim().toUpperCase();
+  const raw = String(record.reason || record.problem || "").trim();
+  const embeddedCode = raw.match(/\b([A-Z]{2,12}\d{2,})\b/i)?.[1]?.toUpperCase() || "";
+  const mapped = RETURN_REASON_LABELS[reasonId] || RETURN_REASON_LABELS[embeddedCode];
+  if (mapped) return mapped;
+  const structuralOnly = raw
+    .split("·")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .every((value) => /^(?:[A-Z]{2,12}\d{2,}|mediation|mediations|return|returns|claim|claims)$/i.test(value));
+  if (raw && !structuralOnly) return raw;
+  if (record.defect_label && record.defect_label !== "Outros motivos") return record.defect_label;
+  return "Motivo não detalhado pelo Mercado Livre";
+}
+
 function returnDetail(label, value, emphasis = false) {
   return `<div class="return-detail ${emphasis ? "emphasis" : ""}"><small>${escapeText(label)}</small><strong>${escapeText(value || "-")}</strong></div>`;
 }
@@ -2897,7 +2914,7 @@ function renderReturnRecord(record) {
       <div class="return-operational-grid">
         <section>
           <header>Motivo e responsabilidade</header>
-          ${returnDetail("Motivo informado", record.reason || record.problem || "Não informado")}
+          ${returnDetail("Motivo informado", returnReasonLabel(record))}
           ${returnDetail("Classificação", record.defect_label || "Outros motivos")}
           ${returnDetail("Responsável pela ação", record.action_responsible || "Não informado")}
           ${returnDetail("Atendimento", record.fulfilled === true ? "Atendido" : record.fulfilled === false ? "Pendente" : "Não informado")}
@@ -2952,7 +2969,6 @@ function renderReturnsSync() {
 }
 
 function renderReturns() {
-  if (!canManageOAuth()) return;
   hydrateReturnsFilters();
   renderReturnsSync();
   const summary = document.querySelector("#returns-summary");
@@ -3002,7 +3018,7 @@ function renderReturns() {
 }
 
 async function syncReturns() {
-  if (!canManageOAuth() || state.returnsSyncProgress?.status === "running") return;
+  if (state.returnsSyncProgress?.status === "running") return;
   let range;
   try {
     range = returnsDateRange();

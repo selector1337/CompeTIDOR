@@ -5590,19 +5590,83 @@ def return_review_data(payload):
     }
 
 
-def return_reason_text(claim, review):
-    values = [
+RETURN_REASON_LABELS = {
+    # The Claims API can return only this reason code while the seller panel
+    # displays the human description below.
+    "PDD9949": "Fomos informados que o produto chegou avariado",
+}
+
+
+def return_reason_is_human(value):
+    text = str(value or "").strip()
+    if len(text) < 8:
+        return False
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    generic = {
+        "return", "returns", "mediation", "mediations", "claim", "claims",
+        "opened", "closed", "resolved", "buyer", "seller", "respondent",
+    }
+    if normalized in generic:
+        return False
+    if re.fullmatch(r"[a-z]{2,12}[-_]?\d{2,}", normalized):
+        return False
+    return " " in text or len(text) >= 18
+
+
+def return_reason_candidates(payload):
+    if not isinstance(payload, dict):
+        return []
+    preferred_keys = {
+        "description", "message", "title", "reason", "reason_detail", "reason_description",
+        "problem", "buyer_reason", "customer_reason", "seller_reason", "detail",
+    }
+    ignored_keys = {"error", "status", "type", "stage", "role", "resource", "action"}
+    values = []
+
+    def walk(node, parent_key=""):
+        if isinstance(node, dict):
+            for key, child in node.items():
+                key_name = str(key or "").lower()
+                if key_name in ignored_keys:
+                    continue
+                if isinstance(child, (dict, list)):
+                    walk(child, key_name)
+                elif key_name in preferred_keys or "reason" in key_name or "problem" in key_name:
+                    text = str(child or "").strip()
+                    if return_reason_is_human(text):
+                        values.append(text)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child, parent_key)
+
+    walk(payload)
+    return values
+
+
+def return_reason_text(claim, review, returned=None):
+    for payload in (claim, returned or {}, review):
+        candidates = return_reason_candidates(payload)
+        if candidates:
+            return candidates[0]
+    reason_ids = (
         claim.get("reason_id"),
-        claim.get("reason"),
-        claim.get("type"),
-        claim.get("title"),
-        claim.get("description"),
-        claim.get("problem"),
-        review.get("seller_reason"),
+        first_present(returned or {}, ("reason_id", "reason.id"), ""),
         review.get("reason_id"),
-        review.get("product_condition"),
-    ]
-    return " · ".join(str(value).strip() for value in values if str(value or "").strip())
+    )
+    for reason_id in reason_ids:
+        mapped = RETURN_REASON_LABELS.get(str(reason_id or "").strip().upper())
+        if mapped:
+            return mapped
+    condition = str(review.get("product_condition") or "").strip()
+    condition_labels = {
+        "damaged": "Produto devolvido com avaria",
+        "defective": "Produto devolvido com defeito",
+        "incomplete": "Produto devolvido incompleto",
+        "used": "Produto devolvido com sinais de uso",
+    }
+    if condition:
+        return condition_labels.get(condition.lower(), condition.replace("_", " ").capitalize())
+    return "Motivo não detalhado pelo Mercado Livre"
 
 
 def classify_return_reason(reason):
@@ -5722,9 +5786,38 @@ def return_order_items(order, claim, returned):
     ]
 
 
+def enrich_return_order_items(client, order):
+    if not isinstance(order, dict):
+        return order
+    enriched = dict(order)
+    enriched_lines = []
+    item_cache = {}
+    for original_line in order.get("order_items") or []:
+        if not isinstance(original_line, dict):
+            enriched_lines.append(original_line)
+            continue
+        line = dict(original_line)
+        item = dict(line.get("item") or {})
+        item_id = str(item.get("id") or "")
+        if item_id and not item_thumbnail(item):
+            if item_id not in item_cache:
+                try:
+                    item_cache[item_id] = client.item(item_id) or {}
+                except Exception:
+                    item_cache[item_id] = {}
+            official = item_cache[item_id]
+            for key in ("secure_thumbnail", "thumbnail", "pictures", "title", "seller_sku"):
+                if not item.get(key) and official.get(key):
+                    item[key] = official.get(key)
+        line["item"] = item
+        enriched_lines.append(line)
+    enriched["order_items"] = enriched_lines
+    return enriched
+
+
 def normalize_return_record(account, claim, returned, cost_payload, review_payload, order, errors=None):
     review = return_review_data(review_payload)
-    reason = return_reason_text(claim, review)
+    reason = return_reason_text(claim, review, returned)
     defect_key, defect_label = classify_return_reason(reason)
     workflow_status, workflow_label = return_workflow_status(claim, returned, review)
     shipment = return_shipment_data(returned)
@@ -5809,6 +5902,14 @@ def collect_claim_return_records(account, client, claim):
         detailed_claim = {**claim, **(client.claim(claim_id) or {})}
     except Exception as exc:
         errors.append(f"Detalhe da reclamação: {exc}")
+    if not return_reason_candidates(detailed_claim):
+        try:
+            claim_detail = client.claim_detail(claim_id) or {}
+            if isinstance(claim_detail, dict) and claim_detail:
+                detailed_claim["official_detail"] = claim_detail
+        except Exception as exc:
+            if "404" not in str(exc):
+                errors.append(f"Motivo da reclamação: {exc}")
     # Claims search/detail can omit return metadata even when the v2 returns
     # resource already exists. The returns endpoint is the source of truth.
     try:
@@ -5843,6 +5944,7 @@ def collect_claim_return_records(account, client, claim):
     except Exception as exc:
         order = {}
         errors.append(f"Pedido: {exc}")
+    order = enrich_return_order_items(client, order)
     records = []
     for index, returned in enumerate(returned_rows):
         return_id = returned.get("id") or returned.get("return_id")
@@ -15352,10 +15454,6 @@ class App(BaseHTTPRequestHandler):
             self.send_json([public_account(account) for account in payload["accounts"]])
             return
         if parsed.path == "/api/returns":
-            actor = self.current_user(payload)
-            if not is_master(actor):
-                self.send_json({"error": "A Central de Devoluções está disponível apenas para o usuário master."}, status=403)
-                return
             try:
                 self.send_json(query_returns(parse_qs(parsed.query)))
             except Exception as exc:
@@ -15631,10 +15729,6 @@ class App(BaseHTTPRequestHandler):
                 return
 
         if parsed.path == "/api/returns/sync":
-            actor = self.current_user(payload)
-            if not is_master(actor):
-                self.send_json({"error": "A Central de Devoluções está disponível apenas para o usuário master."}, status=403)
-                return
             account_ids = request.get("account_ids") or []
             if isinstance(account_ids, str):
                 account_ids = [account_ids]
