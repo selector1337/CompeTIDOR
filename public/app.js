@@ -1762,6 +1762,7 @@ function renderAds() {
           ${fact("Tipo", listingTypeLabel(item.listing_type_id))}
           ${fact("Modalidade", isCatalogItem(item) ? "Catálogo" : "Tradicional")}
           ${flexStatusBadge(item.shipping_logistic_type)}
+          ${fact("Retirada pessoal", item.local_pick_up ? "Ativa" : "Inativa")}
           ${fact("Status do anúncio", statusLabel(item.meli_status || item.status))}
         </div>
         <div class="ad-facts ad-commercial-facts" aria-label="Valores do anúncio">
@@ -1774,6 +1775,7 @@ function renderAds() {
         <div class="inline-edit">
           <div class="inline-edit-row ad-stock-row">
             <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
+            <label>Preço de lista <span class="money-field"><input type="number" min="0" step="0.01" value="${item.list_price || ""}" data-original-value="${item.list_price || ""}" data-list-price-input="${item.id}" placeholder="Opcional" /></span><small>Preço sugerido pelo fabricante (MSRP).</small></label>
             <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
             <label>Disponibilidade <span class="unit-field"><input type="number" min="0" max="45" step="1" value="${Number(item.manufacturing_time || 0)}" data-original-value="${Number(item.manufacturing_time || 0)}" data-manufacturing-time-input="${item.id}" /><span>dias</span></span><small>Use 0 para disponibilidade imediata.</small></label>
           </div>
@@ -1800,7 +1802,13 @@ function renderAds() {
               : item.official_source
                 ? `<button class="mini-button success-button" data-activate-flex="${item.id}">Ativar Flex</button>`
                 : ""}
+            ${item.official_source && item.local_pick_up
+              ? `<button class="mini-button warning-button" data-remove-pickup="${item.id}">Desativar retirada</button>`
+              : item.official_source
+                ? `<button class="mini-button success-button" data-activate-pickup="${item.id}">Ativar retirada</button>`
+                : ""}
             <button class="mini-button schedule-price-button" type="button" data-schedule-price="${item.id}">Agendar preço</button>
+            ${item.official_source ? `<button class="mini-button danger-button" type="button" data-delete-ad="${item.id}">Excluir anúncio</button>` : ""}
           </div>
         </div>
         ${priceScheduleHtml(item)}
@@ -2220,10 +2228,16 @@ function updateBulkPriceBar() {
   const button = root.querySelector("[data-apply-bulk-price]");
   const flexButton = root.querySelector("[data-bulk-remove-flex]");
   const activateFlexButton = root.querySelector("[data-bulk-activate-flex]");
+  const removePickupButton = root.querySelector("[data-bulk-remove-pickup]");
+  const activatePickupButton = root.querySelector("[data-bulk-activate-pickup]");
+  const deleteButton = root.querySelector("[data-bulk-delete-ads]");
   if (label) label.textContent = count;
   if (button) button.disabled = count === 0;
   if (flexButton) flexButton.disabled = count === 0;
   if (activateFlexButton) activateFlexButton.disabled = count === 0;
+  if (removePickupButton) removePickupButton.disabled = count === 0;
+  if (activatePickupButton) activatePickupButton.disabled = count === 0;
+  if (deleteButton) deleteButton.disabled = count === 0;
   renderBulkPriceProgress();
 }
 
@@ -5248,6 +5262,9 @@ async function persistSkuCost(sku, cost, remove = false) {
   });
   state.data.sku_costs = result.sku_costs || {};
   renderCosts();
+  if (state.route === "anuncios") renderAds();
+  else if (state.route === "catalogo") renderCatalog();
+  else if (state.route === "dashboard") renderDashboard();
   if (remove) showToast(`Custo do SKU ${sku} removido.`);
   else showToast(`Custo do SKU ${sku} salvo com sucesso.`);
 }
@@ -5494,6 +5511,67 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
     }
     return;
   }
+  const pickupActivateButton = event.target.closest("[data-bulk-activate-pickup]");
+  const pickupRemoveButton = event.target.closest("[data-bulk-remove-pickup]");
+  const deleteAdsButton = event.target.closest("[data-bulk-delete-ads]");
+  const bulkActionButton = pickupActivateButton || pickupRemoveButton || deleteAdsButton;
+  if (bulkActionButton) {
+    const deleting = Boolean(deleteAdsButton);
+    const activating = Boolean(pickupActivateButton);
+    const selected = [...state.adsSelectedIds];
+    if (deleting && !window.confirm(`Excluir definitivamente ${selected.length} anúncio(s) do Mercado Livre? Esta ação não pode ser desfeita.`)) return;
+    const endpoint = deleting
+      ? "/api/meli/items/bulk-delete"
+      : activating ? "/api/meli/items/bulk-activate-pickup" : "/api/meli/items/bulk-remove-pickup";
+    bulkActionButton.disabled = true;
+    state.bulkPriceProgress = {
+      status: "running",
+      message: deleting ? "Excluindo anúncios no Mercado Livre..." : `${activating ? "Ativando" : "Desativando"} retirada pessoal...`,
+      completed: 0,
+      total: selected.length,
+      percent: 0,
+      results: [],
+      operation: deleting ? "delete" : activating ? "pickup_activate" : "pickup_remove",
+    };
+    renderBulkPriceProgress();
+    try {
+      const queued = await api(endpoint, { method: "POST", body: JSON.stringify({ item_ids: selected }) });
+      const result = await waitForAsyncOperation(queued, (message, job) => {
+        state.bulkPriceProgress = {
+          ...state.bulkPriceProgress,
+          status: job?.status || "running",
+          message: message || state.bulkPriceProgress.message,
+          completed: Number(job?.completed || 0),
+          total: Number(job?.total || selected.length),
+          percent: Number(job?.percent || 0),
+        };
+        renderBulkPriceProgress();
+      });
+      const updatedIds = new Set((result.results || []).filter((row) => row.status === "updated").map((row) => row.item_id));
+      if (deleting) state.data.catalog = state.data.catalog.filter((item) => !updatedIds.has(item.id));
+      else state.data.catalog = state.data.catalog.map((item) => updatedIds.has(item.id) ? { ...item, local_pick_up: activating } : item);
+      updatedIds.forEach((itemId) => state.adsSelectedIds.delete(itemId));
+      state.bulkPriceProgress = {
+        status: "completed",
+        operation: state.bulkPriceProgress.operation,
+        message: result.failed ? "Alguns anúncios precisam de nova tentativa." : deleting ? "Anúncios excluídos definitivamente." : "Retirada pessoal atualizada.",
+        completed: (result.results || []).length,
+        total: (result.results || []).length,
+        percent: 100,
+        failed: Number(result.failed || 0),
+        results: result.results || [],
+      };
+      showToast(`${result.updated || 0} anúncio(s) ${deleting ? "excluídos" : "atualizados"}.`, result.failed ? "error" : "success");
+      renderAds();
+    } catch (error) {
+      state.bulkPriceProgress = { ...state.bulkPriceProgress, status: "error", message: error.message || "A operação não foi concluída." };
+      renderBulkPriceProgress();
+      showToast(error.message || "A operação não foi concluída.", "error");
+    } finally {
+      bulkActionButton.disabled = state.adsSelectedIds.size === 0;
+    }
+    return;
+  }
   const button = event.target.closest("[data-apply-bulk-price]");
   if (!button) return;
   const root = button.closest("#ads-bulk-price");
@@ -5734,10 +5812,45 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
 });
 
 document.querySelector("#ads-list").addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-save-ad], [data-pause-ad], [data-activate-ad], [data-remove-flex], [data-activate-flex]");
+  const button = event.target.closest("[data-save-ad], [data-pause-ad], [data-activate-ad], [data-remove-flex], [data-activate-flex], [data-remove-pickup], [data-activate-pickup], [data-delete-ad]");
   if (!button) return;
-  const id = button.dataset.saveAd || button.dataset.pauseAd || button.dataset.activateAd || button.dataset.removeFlex || button.dataset.activateFlex;
+  const id = button.dataset.saveAd || button.dataset.pauseAd || button.dataset.activateAd || button.dataset.removeFlex || button.dataset.activateFlex || button.dataset.removePickup || button.dataset.activatePickup || button.dataset.deleteAd;
   const item = state.data.catalog.find((row) => row.id === id);
+  if (button.dataset.deleteAd) {
+    if (!window.confirm(`Excluir definitivamente o anúncio ${id} do Mercado Livre? Esta ação não pode ser desfeita.`)) return;
+    try {
+      await runManualItemOperation(
+        "/api/meli/item/delete",
+        { item_id: id, account_id: item.account_id },
+        button,
+        "Excluindo...",
+      );
+      state.data.catalog = state.data.catalog.filter((row) => row.id !== id);
+      state.adsSelectedIds.delete(id);
+      showToast("Anúncio excluído definitivamente do Mercado Livre.", "success");
+      renderAds();
+    } catch (error) {
+      showToast(error.message || "Não foi possível excluir o anúncio.", "error");
+    }
+    return;
+  }
+  if (button.dataset.removePickup || button.dataset.activatePickup) {
+    const activate = Boolean(button.dataset.activatePickup);
+    try {
+      const result = await runManualItemOperation(
+        activate ? "/api/meli/item/activate_pickup" : "/api/meli/item/remove_pickup",
+        { item_id: id, account_id: item.account_id },
+        button,
+        activate ? "Ativando..." : "Desativando...",
+      );
+      mergeCatalogItem(result?.item);
+      showToast(`Retirada pessoal ${activate ? "ativada" : "desativada"} com sucesso.`, "success");
+      renderAds();
+    } catch (error) {
+      showToast(error.message || "Não foi possível alterar a retirada pessoal.", "error");
+    }
+    return;
+  }
   if (button.dataset.removeFlex) {
     try {
       const result = await runManualItemOperation(
@@ -5776,6 +5889,11 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   if (button.dataset.saveAd) {
     payload.price = Number(document.querySelector(`[data-price-input="${id}"]`).value);
     payload.available_quantity = Number(document.querySelector(`[data-stock-input="${id}"]`).value);
+    const listPriceInput = document.querySelector(`[data-list-price-input="${id}"]`);
+    if ((listPriceInput?.value || "").trim() !== (listPriceInput?.dataset.originalValue || "").trim()) {
+      if ((listPriceInput?.value || "").trim()) payload.list_price = Number(listPriceInput.value);
+      else payload.clear_list_price = true;
+    }
     const packageInputs = [
       ["package_weight", `[data-weight-input="${id}"]`, "kg"],
       ["package_height", `[data-height-input="${id}"]`, "cm"],

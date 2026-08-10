@@ -1948,14 +1948,15 @@ class MercadoLivreClient:
     def shipment_sla(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}/sla")
 
-    def seller_claims(self, seller_id, limit=50, offset=0, status="opened"):
+    def seller_claims(self, seller_id, limit=50, offset=0, status="opened", role="respondent"):
         params = {
             "players.user_id": seller_id,
-            "players.role": "respondent",
             "sort": "last_updated:desc",
             "limit": min(int(limit or 50), 100),
             "offset": max(int(offset or 0), 0),
         }
+        if role:
+            params["players.role"] = role
         if status:
             params["status"] = status
         return self.get(f"/post-purchase/v1/claims/search?{urlencode(params)}")
@@ -3733,6 +3734,10 @@ def synced_catalog_item(account, item, competition=None):
     identifier_values = source_clone_identifiers(item, {})
     official_store = item.get("official_store") if isinstance(item.get("official_store"), dict) else {}
     pictures = item.get("pictures") if isinstance(item.get("pictures"), list) else None
+    price_values = sale_price_values(item.get("sale_price"), item.get("price"))
+    list_price = optional_money(item.get("original_price"))
+    if list_price is None:
+        list_price = price_values.get("regular_amount")
     return {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
@@ -3762,11 +3767,13 @@ def synced_catalog_item(account, item, competition=None):
         "shipping_logistic_type": shipping_logistic_type,
         "shipping_mode": shipping_mode,
         "free_shipping": bool(first_present(item, ["shipping.free_shipping"], False)),
+        "local_pick_up": bool(first_present(item, ["shipping.local_pick_up"], False)),
         "manufacturing_time": item_manufacturing_time(item),
         **package_values,
         "status": status,
         "share": competition_share(competition.get("competition_status"), competition.get("visit_share")) if is_catalog else 100,
-        "price": sale_price_values(item.get("sale_price"), item.get("price"))["amount"],
+        "price": price_values["amount"],
+        "list_price": list_price,
         "stock": stock,
         "competitor": "A sincronizar",
         "action": action,
@@ -5424,6 +5431,24 @@ def return_date_value(*payloads):
     return ""
 
 
+def return_activity_date_value(*payloads):
+    keys = (
+        "last_updated",
+        "date_last_updated",
+        "date_closed",
+        "date_created",
+        "created_at",
+        "shipment.last_updated",
+        "shipment.date_created",
+    )
+    for payload in payloads:
+        if isinstance(payload, dict):
+            value = first_present(payload, keys, "")
+            if value:
+                return str(value)
+    return ""
+
+
 def return_relation_values(value):
     values = []
     if isinstance(value, dict):
@@ -5690,7 +5715,7 @@ def claim_search_rows(payload):
 
 
 def return_record_in_period(record, date_from, date_to):
-    parsed = parse_meli_datetime(record.get("created_at") or record.get("last_updated"))
+    parsed = parse_meli_datetime(record.get("last_updated") or record.get("created_at"))
     if not parsed:
         return True
     if date_from and parsed.date() < date_from:
@@ -5710,9 +5735,8 @@ def collect_claim_return_records(account, client, claim):
         detailed_claim = {**claim, **(client.claim(claim_id) or {})}
     except Exception as exc:
         errors.append(f"Detalhe da reclamação: {exc}")
-    has_return = claim_explicitly_has_return(detailed_claim)
-    if has_return is False:
-        return []
+    # Claims search/detail can omit return metadata even when the v2 returns
+    # resource already exists. The returns endpoint is the source of truth.
     try:
         returned_payload = client.claim_return(claim_id) or {}
     except Exception as exc:
@@ -5781,24 +5805,39 @@ def list_account_return_claims(account, client, date_from, date_to):
     limit = 100
     maximum = max(100, min(10000, int(os.getenv("MELI_RETURNS_MAX_CLAIMS", "3000"))))
     maximum_pages = max(1, min(100, int(os.getenv("MELI_RETURNS_MAX_PAGES", "50"))))
-    rows = []
-    offset = 0
-    for _page in range(maximum_pages):
-        response = client.seller_claims(account.get("seller_id"), limit, offset, status="") or {}
-        page_rows, total = claim_search_rows(response)
-        if not page_rows:
-            break
-        rows.extend(page_rows)
-        dated = [parse_meli_datetime(return_date_value(item)) for item in page_rows]
-        dated = [value for value in dated if value]
-        if dated and max(value.date() for value in dated) < date_from:
-            break
-        offset += len(page_rows)
-        if offset >= total or len(page_rows) < limit or len(rows) >= maximum:
-            break
+    def read_role(role):
+        role_rows = []
+        offset = 0
+        for _page in range(maximum_pages):
+            try:
+                response = client.seller_claims(
+                    account.get("seller_id"), limit, offset, status="", role=role
+                ) or {}
+            except TypeError:
+                response = client.seller_claims(account.get("seller_id"), limit, offset, status="") or {}
+            page_rows, total = claim_search_rows(response)
+            if not page_rows:
+                break
+            role_rows.extend(page_rows)
+            dated = [parse_meli_datetime(return_activity_date_value(item)) for item in page_rows]
+            dated = [value for value in dated if value]
+            if dated and max(value.date() for value in dated) < date_from:
+                break
+            offset += len(page_rows)
+            if offset >= total or len(page_rows) < limit or len(role_rows) >= maximum:
+                break
+        return role_rows
+
+    # Buyer claims list the seller as respondent, while claims whose type is
+    # `return` may list the seller as complainant. Both feeds are required: a
+    # non-empty respondent feed does not imply that it contains the returns.
+    rows = read_role("respondent") + read_role("complainant")
+    if not rows:
+        rows = read_role(None)
+    rows = list({str(row.get("id") or row.get("claim_id") or index): row for index, row in enumerate(rows)}.values())
     selected = []
     for claim in rows[:maximum]:
-        parsed = parse_meli_datetime(return_date_value(claim))
+        parsed = parse_meli_datetime(return_activity_date_value(claim))
         if parsed and not (date_from <= parsed.date() <= date_to):
             continue
         selected.append(claim)
@@ -5812,7 +5851,7 @@ def merge_return_records(store, account, records, sync_meta):
     maximum = max(1000, min(100000, int(os.getenv("MELI_RETURNS_MAX_RECORDS", "30000"))))
     merged = sorted(
         existing.values(),
-        key=lambda item: parse_meli_datetime(item.get("created_at") or item.get("last_updated"))
+        key=lambda item: parse_meli_datetime(item.get("last_updated") or item.get("created_at"))
         or datetime.min.replace(tzinfo=APP_TZ),
         reverse=True,
     )[:maximum]
@@ -6066,7 +6105,7 @@ def query_returns(params):
         records.sort(key=lambda row: str((row.get("items") or [{}])[0].get("sku") or ""))
     else:
         records.sort(
-            key=lambda row: parse_meli_datetime(row.get("created_at") or row.get("last_updated"))
+            key=lambda row: parse_meli_datetime(row.get("last_updated") or row.get("created_at"))
             or datetime.min.replace(tzinfo=APP_TZ),
             reverse=True,
         )
@@ -7212,6 +7251,13 @@ def update_item_operation(request, actor=None):
     for key in ("price", "available_quantity", "title"):
         if key in request and request[key] not in ("", None):
             update[key] = request[key]
+    if request.get("clear_list_price") is True:
+        update["original_price"] = None
+    elif request.get("list_price") not in (None, ""):
+        list_price = optional_money(request.get("list_price"))
+        if list_price is None or list_price < 0:
+            raise RuntimeError("Informe um preço de lista válido.")
+        update["original_price"] = round(list_price, 2)
     if request.get("status_action") == "pause":
         update["status"] = "paused"
     if request.get("status_action") == "activate":
@@ -7292,6 +7338,9 @@ def update_item_operation(request, actor=None):
         if "title" in update:
             changes["title"] = {"from": item.get("title"), "to": update["title"]}
             item["title"] = update["title"]
+        if "original_price" in update:
+            changes["list_price"] = {"from": item.get("list_price"), "to": update["original_price"]}
+            item["list_price"] = update["original_price"]
         if manufacturing_time_requested:
             changes["manufacturing_time"] = {"from": item.get("manufacturing_time") or 0, "to": manufacturing_time}
             item["manufacturing_time"] = manufacturing_time
@@ -7824,6 +7873,75 @@ def flex_item_operation(request, actor=None, activate=False):
     return {"ok": True, "official": official, "item": item}
 
 
+def local_pickup_item_operation(request, actor=None, activate=False):
+    payload = read_payload()
+    item_id = str(request.get("item_id") or "")
+    account_id = str(request.get("account_id") or "")
+    item = next((row for row in payload.get("catalog", []) if str(row.get("id") or "") == item_id), None)
+    if not item:
+        raise RuntimeError("Anúncio não encontrado.")
+    account = next(
+        (row for row in payload.get("accounts", []) if row.get("official") and (
+            str(row.get("id") or "") == account_id or str(row.get("id") or "") == str(item.get("account_id") or "")
+        )),
+        None,
+    )
+    if not account:
+        raise RuntimeError("Conta oficial não encontrada para alterar a retirada pessoal.")
+    target = bool(activate)
+    official = run_interactive_meli_call(
+        account_client(account).update_item,
+        item_id,
+        {"shipping": {"local_pick_up": target}},
+    )
+    previous = bool(item.get("local_pick_up"))
+    item["local_pick_up"] = target
+    item["item_data_checked_at"] = now_label()
+    item["updated_at"] = now_label()
+    append_item_log(
+        payload, item, actor or {},
+        "Ativação da retirada pessoal" if target else "Desativação da retirada pessoal",
+        {"local_pick_up": {"from": previous, "to": target}},
+    )
+    write_payload(payload)
+    return {"ok": True, "official": official, "item": item}
+
+
+def delete_item_operation(request, actor=None):
+    payload = read_payload()
+    item_id = str(request.get("item_id") or "")
+    account_id = str(request.get("account_id") or "")
+    item = next((row for row in payload.get("catalog", []) if str(row.get("id") or "") == item_id), None)
+    if not item:
+        raise RuntimeError("Anúncio não encontrado.")
+    account = next(
+        (row for row in payload.get("accounts", []) if row.get("official") and (
+            str(row.get("id") or "") == account_id or str(row.get("id") or "") == str(item.get("account_id") or "")
+        )),
+        None,
+    )
+    if not account:
+        raise RuntimeError("Conta oficial não encontrada para excluir o anúncio.")
+    client = account_client(account)
+    if str(item.get("meli_status") or "").lower() != "closed":
+        run_interactive_meli_call(client.update_item, item_id, {"status": "closed"})
+    official = run_interactive_meli_call(client.update_item, item_id, {"deleted": True})
+    payload["catalog"] = [row for row in payload.get("catalog", []) if str(row.get("id") or "") != item_id]
+    deleted_items = payload.setdefault("deleted_items", [])
+    deleted_items.insert(0, {
+        "item_id": item_id,
+        "account_id": item.get("account_id"),
+        "account": item.get("account"),
+        "sku": item.get("sku"),
+        "title": item.get("title"),
+        "deleted_at": datetime.now(APP_TZ).isoformat(),
+        "actor": (actor or {}).get("email") or (actor or {}).get("name") or "Usuário",
+    })
+    del deleted_items[5000:]
+    write_payload(payload)
+    return {"ok": True, "official": official, "item_id": item_id, "deleted": True}
+
+
 def bulk_price_operation(request, actor=None):
     item_ids = list(dict.fromkeys(str(value or "").strip() for value in request.get("item_ids") or [] if value))
     maximum = max(1, int(os.getenv("MELI_BULK_PRICE_MAX_ITEMS", "500")))
@@ -7963,6 +8081,44 @@ def bulk_remove_flex_operation(request, actor=None):
 
 def bulk_activate_flex_operation(request, actor=None):
     return bulk_flex_operation(request, actor, activate=True)
+
+
+def bulk_item_action_operation(request, actor=None, action=""):
+    item_ids = list(dict.fromkeys(str(value or "").strip() for value in request.get("item_ids") or [] if value))
+    maximum = max(1, int(os.getenv("MELI_BULK_ITEM_ACTION_MAX_ITEMS", "500")))
+    if not item_ids:
+        raise RuntimeError("Selecione ao menos um anúncio.")
+    if len(item_ids) > maximum:
+        raise RuntimeError(f"Processe no máximo {maximum} anúncios por operação.")
+    results = []
+    total = len(item_ids)
+    labels = {
+        "pickup_activate": "Ativando retirada pessoal",
+        "pickup_remove": "Desativando retirada pessoal",
+        "delete": "Excluindo anúncios",
+    }
+    update_async_operation_progress(labels.get(action, "Processando anúncios"), 0, total)
+    for index, item_id in enumerate(item_ids, 1):
+        try:
+            current_payload = read_payload(include_catalog=True)
+            item = next((row for row in current_payload.get("catalog", []) if str(row.get("id") or "") == item_id), None)
+            if not item:
+                raise RuntimeError("Anúncio não encontrado.")
+            operation_request = {"item_id": item_id, "account_id": item.get("account_id")}
+            if action == "delete":
+                response = delete_item_operation(operation_request, actor)
+            else:
+                response = local_pickup_item_operation(operation_request, actor, activate=action == "pickup_activate")
+            result = {"item_id": item_id, "status": "updated", **response}
+        except Exception as exc:
+            result = {"item_id": item_id, "status": "error", "error": str(exc)}
+        results.append(result)
+        update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, result)
+    return {
+        "updated": sum(row.get("status") == "updated" for row in results),
+        "failed": sum(row.get("status") == "error" for row in results),
+        "results": results,
+    }
 
 
 def official_account_by_name(payload, name):
@@ -9790,6 +9946,8 @@ def clone_retry_adjustments_from_error(
             canonical_id = canonical_clone_attribute_id(field)
             if not canonical_id:
                 continue
+            if kit_gtin_fallback_applied and canonical_id in GTIN_IDENTIFIER_ATTRS:
+                continue
             if restore_clone_attribute_from_source(create_payload, source_item, category_attributes or [], canonical_id):
                 changed = True
                 adjustments.append({"tipo": "atributo_recuperado_do_anuncio_original", "campos": [canonical_id]})
@@ -11503,7 +11661,12 @@ def query_sales_report(payload, request):
             )
             sold_at = parse_meli_datetime(order.get("date_created") or order.get("last_updated"))
             if sold_at and order_id:
-                billing_period_by_order[order_id] = f"{sold_at.year:04d}-{sold_at.month:02d}-01"
+                sale_month = sold_at.date().replace(day=1)
+                next_month = (sale_month + timedelta(days=32)).replace(day=1)
+                current_month = datetime.now(APP_TZ).date().replace(day=1)
+                billing_period_by_order[order_id] = list(dict.fromkeys(
+                    value.isoformat() for value in (sale_month, next_month, current_month)
+                ))
         billing_reimbursements, billing_warnings = fetch_flex_billing_reimbursements(
             client,
             [order_id for order_id, flex in flex_by_order.items() if flex is True],
@@ -14299,7 +14462,7 @@ def create_kit_listing(request, actor=None):
         destination_stores,
         publication_model,
         edits["title"],
-        True,
+        kit_mode=True,
     )
     description = str(fields.get("description") or "").strip()
     if description and created.get("id"):
@@ -15220,6 +15383,9 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/item/win_catalog",
             "/api/meli/item/remove_flex",
             "/api/meli/item/activate_flex",
+            "/api/meli/item/remove_pickup",
+            "/api/meli/item/activate_pickup",
+            "/api/meli/item/delete",
             "/api/clone/preview",
             "/api/clone/execute",
             "/api/clone/execute-batch",
@@ -15229,6 +15395,9 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/items/bulk-price",
             "/api/meli/items/bulk-remove-flex",
             "/api/meli/items/bulk-activate-flex",
+            "/api/meli/items/bulk-remove-pickup",
+            "/api/meli/items/bulk-activate-pickup",
+            "/api/meli/items/bulk-delete",
             "/api/meli/prices/refresh",
             "/api/meli/shipping-costs/refresh",
             "/api/meli/sale-fees/refresh",
@@ -15867,6 +16036,27 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=400)
             return
 
+        bulk_item_actions = {
+            "/api/meli/items/bulk-remove-pickup": ("bulk_remove_pickup", "pickup_remove", "Desativação da retirada pessoal adicionada à fila."),
+            "/api/meli/items/bulk-activate-pickup": ("bulk_activate_pickup", "pickup_activate", "Ativação da retirada pessoal adicionada à fila."),
+            "/api/meli/items/bulk-delete": ("bulk_delete_items", "delete", "Exclusão dos anúncios adicionada à fila."),
+        }
+        if parsed.path in bulk_item_actions:
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                kind, action, message = bulk_item_actions[parsed.path]
+                operation = start_async_operation(
+                    kind,
+                    lambda: bulk_item_action_operation(request_copy, actor, action),
+                    message,
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
         manual_item_operations = {
             "/api/meli/item/update": (
                 "item_update",
@@ -15887,6 +16077,21 @@ class App(BaseHTTPRequestHandler):
                 "activate_flex",
                 lambda request_copy, actor: flex_item_operation(request_copy, actor, activate=True),
                 "Ativação do Mercado Envios Flex adicionada à fila prioritária.",
+            ),
+            "/api/meli/item/remove_pickup": (
+                "remove_pickup",
+                lambda request_copy, actor: local_pickup_item_operation(request_copy, actor, activate=False),
+                "Desativação da retirada pessoal adicionada à fila prioritária.",
+            ),
+            "/api/meli/item/activate_pickup": (
+                "activate_pickup",
+                lambda request_copy, actor: local_pickup_item_operation(request_copy, actor, activate=True),
+                "Ativação da retirada pessoal adicionada à fila prioritária.",
+            ),
+            "/api/meli/item/delete": (
+                "delete_item",
+                lambda request_copy, actor: delete_item_operation(request_copy, actor),
+                "Exclusão definitiva do anúncio adicionada à fila prioritária.",
             ),
         }
         if parsed.path in manual_item_operations:

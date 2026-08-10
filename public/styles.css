@@ -6126,22 +6126,30 @@ nav a.active .nav-icon {
 
 /* Keep the theme control visible while the expanded desktop menu scrolls independently. */
 @media (min-width: 781px) {
+  .sidebar,
+  .sidebar:hover,
+  .sidebar:focus-within,
+  .sidebar nav {
+    scrollbar-width: none !important;
+    -ms-overflow-style: none !important;
+    scrollbar-color: transparent transparent;
+  }
+
   .sidebar nav {
     flex: 1 1 auto;
     min-height: 0;
     overflow-x: hidden;
     overflow-y: auto;
-    scrollbar-width: thin;
-    scrollbar-color: #394552 transparent;
   }
 
+  .sidebar::-webkit-scrollbar,
+  .sidebar:hover::-webkit-scrollbar,
+  .sidebar:focus-within::-webkit-scrollbar,
   .sidebar nav::-webkit-scrollbar {
-    width: 5px;
-  }
-
-  .sidebar nav::-webkit-scrollbar-thumb {
-    border-radius: 999px;
-    background: #394552;
+    display: none !important;
+    width: 0 !important;
+    height: 0 !important;
+    background: transparent !important;
   }
 }
 
