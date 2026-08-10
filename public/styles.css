@@ -15,11 +15,15 @@
   --nav: #070b10;
   --nav-2: #111827;
   --green: #0f9f6e;
+  --good: #0f9f6e;
   --green-soft: #e1f7ee;
   --red: #dc2626;
+  --danger: #dc2626;
   --red-soft: #fee2e2;
   --amber: #d97706;
+  --warning: #d97706;
   --amber-soft: #fff3c4;
+  --yellow: #ffe600;
   --blue: #2563eb;
   --blue-soft: #dbeafe;
   --shadow: 0 20px 60px rgba(15, 23, 42, 0.09);
@@ -2359,6 +2363,77 @@ main {
   font-size: 1.25rem;
   font-weight: 950;
 }
+
+.revenue-comparison {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.revenue-delta {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 24px;
+  padding: 3px 7px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: .7rem;
+  font-weight: 900;
+}
+
+.revenue-delta.positive { color: var(--good); background: color-mix(in srgb, var(--good) 10%, transparent); }
+.revenue-delta.negative { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.revenue-delta.neutral { color: var(--muted); background: color-mix(in srgb, var(--muted) 8%, transparent); }
+
+.revenue-previous {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.revenue-previous > span {
+  grid-row: 1 / span 2;
+  font-size: .68rem;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.revenue-previous > strong { font-size: .9rem; }
+.revenue-previous > small { color: var(--muted); }
+.revenue-sync { color: var(--muted); }
+
+.reputation-badges,
+.metric-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.reputation-badge,
+.leader-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: .7rem;
+  font-weight: 900;
+}
+
+.reputation-badge.green,
+.reputation-badge.light-green { color: var(--good); border-color: color-mix(in srgb, var(--good) 55%, transparent); }
+.reputation-badge.yellow { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 55%, transparent); }
+.reputation-badge.orange { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 55%, transparent); }
+.reputation-badge.red { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 55%, transparent); }
+.reputation-badge.neutral { color: var(--muted); }
+.leader-badge { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 55%, transparent); }
+.metric-footer { justify-content: space-between; color: var(--muted); font-size: .72rem; }
 
 .ops-list,
 .ads-list {
@@ -7065,6 +7140,14 @@ textarea:focus {
     justify-content: center;
   }
 
+  .sidebar.force-collapsed nav a.active,
+  .sidebar.force-collapsed:hover nav a.active,
+  .sidebar.force-collapsed:focus-within nav a.active {
+    width: 50px;
+    min-width: 50px;
+    margin-inline: 1px;
+  }
+
   .sidebar.force-collapsed nav a strong,
   .sidebar.force-collapsed:hover nav a strong,
   .sidebar.force-collapsed:focus-within nav a strong {
@@ -7945,6 +8028,12 @@ textarea:focus {
   line-height: 1;
   vertical-align: text-bottom;
   cursor: help;
+}
+
+.field-label-inline {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
 }
 
 .return-thumb,

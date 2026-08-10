@@ -1161,44 +1161,80 @@ def current_month_period():
     return f"{now.year:04d}-{now.month:02d}"
 
 
-def current_month_window():
+def month_window(month_offset=0):
     now = datetime.now(APP_TZ)
-    start = datetime(now.year, now.month, 1, tzinfo=APP_TZ)
-    if now.month == 12:
-        end = datetime(now.year + 1, 1, 1, tzinfo=APP_TZ)
+    month_index = (now.year * 12 + now.month - 1) + int(month_offset or 0)
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    start = datetime(year, month, 1, tzinfo=APP_TZ)
+    if month == 12:
+        end = datetime(year + 1, 1, 1, tzinfo=APP_TZ)
     else:
-        end = datetime(now.year, now.month + 1, 1, tzinfo=APP_TZ)
+        end = datetime(year, month + 1, 1, tzinfo=APP_TZ)
     return (
-        current_month_period(),
-        start.strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
-        end.strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
+        f"{year:04d}-{month:02d}",
+        start.isoformat(timespec="milliseconds"),
+        end.isoformat(timespec="milliseconds"),
     )
+
+
+def current_month_window():
+    return month_window(0)
+
+
+def previous_month_window():
+    return month_window(-1)
+
+
+def percentage_change(current, previous):
+    current_value = float(current or 0)
+    previous_value = float(previous or 0)
+    if previous_value == 0:
+        return None
+    return round(((current_value - previous_value) / previous_value) * 100, 2)
 
 
 def build_operations(payload):
     accounts = payload.get("accounts", [])
     catalog = payload.get("catalog", [])
     monthly = payload.get("monthly_revenue") or {}
-    revenue_accounts = monthly.get("accounts") or {}
+    history = monthly.get("history") or {}
     period = monthly.get("period") or current_month_period()
+    current_period, _, _ = current_month_window()
+    previous_period, _, _ = previous_month_window()
+    revenue_accounts = (history.get(current_period) or {}).get("accounts") or monthly.get("accounts") or {}
+    previous_accounts = (history.get(previous_period) or {}).get("accounts") or {}
     revenue = []
     revenue_source_accounts = [account for account in accounts if account.get("official")]
     for account in revenue_source_accounts:
         key = account.get("id") or account.get("nickname")
         record = revenue_accounts.get(key) or revenue_accounts.get(account.get("nickname")) or {}
+        previous_record = previous_accounts.get(key) or previous_accounts.get(account.get("nickname")) or {}
+        current_amount = round(float(record.get("amount") or 0), 2)
+        previous_amount = round(float(previous_record.get("amount") or 0), 2)
+        current_orders = int(record.get("orders_count") or 0)
+        previous_orders = int(previous_record.get("orders_count") or 0)
         revenue.append(
             {
                 "account": account.get("nickname"),
-                "monthly_revenue": round(float(record.get("amount") or 0), 2),
+                "monthly_revenue": current_amount,
+                "previous_monthly_revenue": previous_amount,
                 "currency": "BRL",
                 "source": record.get("source") or "Pedidos oficiais Mercado Livre",
-                "orders_count": int(record.get("orders_count") or 0),
-                "period": period,
+                "orders_count": current_orders,
+                "previous_orders_count": previous_orders,
+                "revenue_delta_percentage": percentage_change(current_amount, previous_amount),
+                "orders_delta_percentage": percentage_change(current_orders, previous_orders),
+                "period": current_period if period != current_period else period,
+                "previous_period": previous_period,
                 "updated_at": record.get("updated_at") or "",
                 "sync_status": record.get("sync_status") or account.get("sales_sync_status") or "Aguardando sincronização real",
             }
         )
     total_revenue = round(sum(item["monthly_revenue"] for item in revenue), 2)
+    total_previous_revenue = round(sum(item["previous_monthly_revenue"] for item in revenue), 2)
+    total_orders = sum(item["orders_count"] for item in revenue)
+    total_previous_orders = sum(item["previous_orders_count"] for item in revenue)
 
     stock = []
     catalog_attention = []
@@ -1312,6 +1348,13 @@ def build_operations(payload):
     return {
         "revenue": revenue,
         "total_monthly_revenue": total_revenue,
+        "total_previous_monthly_revenue": total_previous_revenue,
+        "total_orders_count": total_orders,
+        "total_previous_orders_count": total_previous_orders,
+        "total_revenue_delta_percentage": percentage_change(total_revenue, total_previous_revenue),
+        "total_orders_delta_percentage": percentage_change(total_orders, total_previous_orders),
+        "revenue_period": current_period,
+        "previous_revenue_period": previous_period,
         "attention_stock": stock[:200],
         "attention_catalog": catalog_attention[:200],
         "claims": claims,
@@ -1532,7 +1575,7 @@ def empty_payload():
         "claim_details": [],
         "pending_shipments": [],
         "price_schedules": [],
-        "monthly_revenue": {"period": current_month_period(), "accounts": {}},
+        "monthly_revenue": {"period": current_month_period(), "accounts": {}, "history": {}},
         "user_notifications": {},
         "notifications_migrated_to_users": True,
     }
@@ -3141,7 +3184,9 @@ def auto_official_sync_loop():
                     )
                     if account.get("operations_refresh_requested") or run_count % operations_every == 0:
                         sync_recent_sales(payload, account, client)
+                        sync_previous_month_revenue(payload, account, client)
                         sync_claims(payload, account, client)
+                        upsert_metric(payload, account, client.user(account.get("seller_id")))
                         account["operations_refresh_requested"] = False
                     account["auto_sync_error"] = ""
                     account["last_auto_sync_at"] = now_label()
@@ -4993,18 +5038,27 @@ def append_item_log(payload, item, user, action, changes=None, sale_id=None):
 def upsert_metric(payload, account, user_profile):
     reputation = user_profile.get("seller_reputation", {}) or {}
     metrics = reputation.get("metrics", {}) or {}
+    transactions = reputation.get("transactions", {}) or {}
+    ratings = transactions.get("ratings", {}) or {}
     claims = percent_rate((metrics.get("claims") or {}).get("rate"))
     cancellations = percent_rate((metrics.get("cancellations") or {}).get("rate"))
     late = percent_rate((metrics.get("delayed_handling_time") or {}).get("rate"))
     metric = {
         "account": account.get("nickname"),
         "claims": claims,
-        "mediations": percent_rate((metrics.get("sales") or {}).get("completed")),
         "cancellations": cancellations,
         "late_shipments": late,
-        "agency_score": max(0, round(100 - late, 2)),
-        "flex_score": max(0, round(100 - late, 2)),
+        "level_id": reputation.get("level_id") or "",
+        "real_level": reputation.get("real_level") or "",
+        "power_seller_status": reputation.get("power_seller_status") or "",
+        "transactions_total": int(transactions.get("total") or 0),
+        "transactions_completed": int(transactions.get("completed") or 0),
+        "transactions_canceled": int(transactions.get("canceled") or 0),
+        "ratings_positive": percent_rate(ratings.get("positive")),
+        "ratings_neutral": percent_rate(ratings.get("neutral")),
+        "ratings_negative": percent_rate(ratings.get("negative")),
         "period": "Período informado pela API oficial",
+        "updated_at": now_label(),
     }
     existing = payload.get("metrics", [])
     for index, current in enumerate(existing):
@@ -5299,18 +5353,7 @@ def reconcile_order_sku_alias(payload, item_id, official_sku):
 def sync_recent_sales(payload, account, client):
     period, date_from, date_to = current_month_window()
     try:
-        orders = []
-        offset = 0
-        page_size = 50
-        max_orders = int(os.getenv("MELI_MONTHLY_ORDERS_LIMIT", "500"))
-        while len(orders) < max_orders:
-            data = client.seller_orders(account.get("seller_id"), limit=page_size, offset=offset, date_from=date_from, date_to=date_to)
-            batch = data.get("results", []) or []
-            orders.extend(batch)
-            total = (data.get("paging") or {}).get("total") or len(orders)
-            if not batch or len(orders) >= total:
-                break
-            offset += page_size
+        orders = fetch_seller_orders_window(client, account.get("seller_id"), date_from, date_to)
     except Exception as exc:
         account["sales_sync_status"] = policy_error_message(exc, "a leitura das vendas reais do mês")
         mark_monthly_revenue_error(payload, account, period, account["sales_sync_status"])
@@ -5389,6 +5432,58 @@ def sync_recent_sales(payload, account, client):
     upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"])
     sync_pending_shipments_from_orders(payload, account, orders)
     return rows
+
+
+def fetch_seller_orders_window(client, seller_id, date_from, date_to, max_orders=None):
+    orders = []
+    offset = 0
+    page_size = 50
+    # Dashboard totals must not inherit the old recent-sales cap. The dedicated
+    # limit remains configurable as an emergency guard for exceptionally large accounts.
+    limit = int(max_orders or os.getenv("MELI_DASHBOARD_MONTHLY_ORDERS_LIMIT", "50000"))
+    while len(orders) < limit:
+        data = client.seller_orders(seller_id, limit=page_size, offset=offset, date_from=date_from, date_to=date_to)
+        batch = data.get("results", []) or []
+        orders.extend(batch)
+        total = int((data.get("paging") or {}).get("total") or len(orders))
+        if not batch or len(orders) >= total:
+            break
+        offset += len(batch)
+    return orders[:limit]
+
+
+def summarize_monthly_orders(orders):
+    ignored_statuses = {"cancelled", "canceled", "invalid"}
+    amount = 0.0
+    count = 0
+    for order in orders or []:
+        status = str(order.get("status") or "").lower()
+        total = float(order.get("total_amount") or order.get("paid_amount") or 0)
+        if total > 0 and status not in ignored_statuses:
+            amount += total
+            count += 1
+    return round(amount, 2), count
+
+
+def sync_previous_month_revenue(payload, account, client):
+    period, date_from, date_to = previous_month_window()
+    monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}, "history": {}})
+    history_accounts = ((monthly.get("history") or {}).get(period) or {}).get("accounts") or {}
+    key = account.get("id") or account.get("nickname")
+    existing = history_accounts.get(key) or history_accounts.get(account.get("nickname")) or {}
+    refreshed_at = parse_meli_datetime(existing.get("updated_at"))
+    source_is_official = existing.get("source") == "Pedidos oficiais Mercado Livre"
+    sync_succeeded = "pedidos reais sincronizados" in str(existing.get("sync_status") or "").lower()
+    if refreshed_at and refreshed_at.date() == datetime.now(APP_TZ).date() and source_is_official and sync_succeeded:
+        return existing
+    try:
+        orders = fetch_seller_orders_window(client, account.get("seller_id"), date_from, date_to)
+        amount, count = summarize_monthly_orders(orders)
+        status = f"{count} pedidos reais sincronizados no mês anterior"
+        return upsert_monthly_revenue(payload, account, amount, count, period, status)
+    except Exception as exc:
+        status = policy_error_message(exc, "a leitura das vendas reais do mês anterior")
+        return mark_monthly_revenue_error(payload, account, period, status)
 
 
 def sync_claims(payload, account, client):
@@ -6652,11 +6747,13 @@ def competition_snapshot(item):
 
 
 def upsert_monthly_revenue(payload, account, amount, orders_count, period, status):
-    monthly = payload.setdefault("monthly_revenue", {"period": period, "accounts": {}})
+    monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}, "history": {}})
+    history = monthly.setdefault("history", {})
     if monthly.get("period") != period:
-        monthly["period"] = period
-        monthly["accounts"] = {}
-    monthly.setdefault("accounts", {})[account.get("id") or account.get("nickname")] = {
+        old_period = monthly.get("period")
+        if old_period and monthly.get("accounts"):
+            history.setdefault(old_period, {})["accounts"] = dict(monthly.get("accounts") or {})
+    record = {
         "account": account.get("nickname"),
         "amount": round(float(amount or 0), 2),
         "orders_count": int(orders_count or 0),
@@ -6664,14 +6761,17 @@ def upsert_monthly_revenue(payload, account, amount, orders_count, period, statu
         "sync_status": status,
         "updated_at": now_label(),
     }
+    history.setdefault(period, {}).setdefault("accounts", {})[account.get("id") or account.get("nickname")] = record
+    if period == current_month_period():
+        monthly["period"] = period
+        monthly.setdefault("accounts", {})[account.get("id") or account.get("nickname")] = record
+    return record
 
 
 def mark_monthly_revenue_error(payload, account, period, status):
-    monthly = payload.setdefault("monthly_revenue", {"period": period, "accounts": {}})
-    if monthly.get("period") != period:
-        monthly["period"] = period
-        monthly["accounts"] = {}
-    accounts = monthly.setdefault("accounts", {})
+    monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}, "history": {}})
+    history = monthly.setdefault("history", {})
+    accounts = history.setdefault(period, {}).setdefault("accounts", {})
     record = accounts.setdefault(
         account.get("id") or account.get("nickname"),
         {
@@ -6683,6 +6783,10 @@ def mark_monthly_revenue_error(payload, account, period, status):
     )
     record["sync_status"] = status
     record["updated_at"] = now_label()
+    if period == current_month_period():
+        monthly["period"] = period
+        monthly.setdefault("accounts", {})[account.get("id") or account.get("nickname")] = record
+    return record
 
 
 def sync_official_account(payload, account_id, limit=None, progress=None):
