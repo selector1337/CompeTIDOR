@@ -752,10 +752,10 @@ function renderDashboard() {
     `).join("")}
   `;
 
-  const stockPage = paginate(stockRows, state.dashboardStockPage, 10);
+  const stockPage = paginate(stockRows, state.dashboardStockPage, 5);
   state.dashboardStockPage = stockPage.current;
   document.querySelector("#dashboard-stock").innerHTML = opsRows(stockPage.items, "Sem produtos sem estoque neste período.", "danger") + paginationHtml("dashboardStockPage", stockPage);
-  const catalogPage = paginate(ops.attention_catalog || [], state.dashboardCatalogPage, 10);
+  const catalogPage = paginate(ops.attention_catalog || [], state.dashboardCatalogPage, 5);
   state.dashboardCatalogPage = catalogPage.current;
   document.querySelector("#dashboard-catalog-loss").innerHTML = opsRows(catalogPage.items, "Sem perdas de catálogo detectadas.", "danger") + paginationHtml("dashboardCatalogPage", catalogPage);
   document.querySelector("#dashboard-claims").innerHTML = (ops.claims || []).map((item) => `
@@ -777,7 +777,7 @@ function renderDashboard() {
     </details>
   `).join("") || `<div class="notice">Nenhuma reclamação ativa sincronizada.</div>`;
   const shipmentRows = (ops.pending_shipments || []).filter((item) => state.dashboardShipmentAccount === "all" || item.account === state.dashboardShipmentAccount);
-  const shipmentPage = paginate(shipmentRows, state.dashboardShipmentPage, 10);
+  const shipmentPage = paginate(shipmentRows, state.dashboardShipmentPage, 5);
   state.dashboardShipmentPage = shipmentPage.current;
   document.querySelector("#dashboard-shipments").innerHTML = shipmentPage.items.map((item) => `
     <article class="ops-item">
@@ -789,7 +789,7 @@ function renderDashboard() {
   `).join("") + paginationHtml("dashboardShipmentPage", shipmentPage) || `<div class="notice">Nenhum envio pendente sincronizado.</div>`;
 
   const salesRows = (state.data.recent_sales || []).filter((sale) => state.dashboardSalesAccount === "all" || sale.account === state.dashboardSalesAccount);
-  const salesPage = paginate(salesRows, state.dashboardSalesPage, 10);
+  const salesPage = paginate(salesRows, state.dashboardSalesPage, 5);
   state.dashboardSalesPage = salesPage.current;
   document.querySelector("#dashboard-sales").innerHTML = salesPage.items.map((sale) => `
     <article class="sale-item">
@@ -813,7 +813,7 @@ function renderDashboard() {
     </article>
   `).join("") + paginationHtml("dashboardSalesPage", salesPage) || `<div class="notice">Nenhuma venda recente sincronizada. Sincronize uma conta oficial com permissão de vendas/pedidos para preencher este bloco.</div>`;
 
-  const topSkuPage = paginate(ops.top_skus_today || [], state.dashboardTopSkuPage, 10);
+  const topSkuPage = paginate(ops.top_skus_today || [], state.dashboardTopSkuPage, 5);
   state.dashboardTopSkuPage = topSkuPage.current;
   document.querySelector("#dashboard-top-skus").innerHTML = topSkuPage.items.map((item, index) => `
     <article class="sale-item top-sku-item">

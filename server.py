@@ -1228,13 +1228,22 @@ def build_operations(payload):
     metrics_by_account = {
         str(metric.get("account") or ""): metric
         for metric in payload.get("metrics") or []
+        if metric.get("account")
+    }
+    metrics_by_account_id = {
+        str(metric.get("account_id") or metric.get("seller_id") or ""): metric
+        for metric in payload.get("metrics") or []
+        if metric.get("account_id") or metric.get("seller_id")
     }
     revenue = []
     revenue_source_accounts = [account for account in accounts if account.get("official")]
     for account in revenue_source_accounts:
         record = account_record(revenue_accounts, account)
         previous_record = account_record(previous_accounts, account)
-        metric = metrics_by_account.get(str(account.get("nickname") or ""), {})
+        metric = (
+            metrics_by_account_id.get(str(account.get("id") or account.get("seller_id") or ""))
+            or metrics_by_account.get(str(account.get("nickname") or ""), {})
+        )
         current_amount = round(float(record.get("amount") or 0), 2)
         current_orders = int(record.get("orders_count") or 0)
         previous_amount = round(float(previous_record.get("amount") or 0), 2)
@@ -3216,7 +3225,7 @@ def auto_official_sync_loop():
                     )
                     metric_updated = parse_meli_datetime(metric.get("updated_at"))
                     metric_stale = (
-                        not metric.get("reputation_level")
+                        not (metric.get("reputation_level") or metric.get("power_seller_status"))
                         or not metric_updated
                         or (datetime.now(APP_TZ) - metric_updated).total_seconds() >= 3600
                     )
@@ -5196,13 +5205,47 @@ def append_item_log(payload, item, user, action, changes=None, sale_id=None):
 def upsert_metric(payload, account, user_profile):
     reputation = user_profile.get("seller_reputation", {}) or {}
     metrics = reputation.get("metrics", {}) or {}
-    claims = percent_rate((metrics.get("claims") or {}).get("rate"))
-    cancellations = percent_rate((metrics.get("cancellations") or {}).get("rate"))
-    late = percent_rate((metrics.get("delayed_handling_time") or {}).get("rate"))
+    existing = payload.get("metrics", [])
+    stable_account_id = str(account.get("id") or account.get("seller_id") or "")
+    current_metric = next(
+        (
+            current
+            for current in existing
+            if (
+                stable_account_id
+                and str(current.get("account_id") or current.get("seller_id") or "") == stable_account_id
+            )
+            or current.get("account") == account.get("nickname")
+        ),
+        {},
+    )
+    incoming_level = reputation.get("level_id") or ""
+    incoming_power = reputation.get("power_seller_status") or ""
+
+    def metric_rate(source_key, target_key):
+        source = metrics.get(source_key)
+        if isinstance(source, dict) and source.get("rate") is not None:
+            return percent_rate(source.get("rate"))
+        return current_metric.get(target_key, 0)
+
+    claims = metric_rate("claims", "claims")
+    cancellations = metric_rate("cancellations", "cancellations")
+    late = metric_rate("delayed_handling_time", "late_shipments")
+
+    # O endpoint de usuário pode responder temporariamente sem seller_reputation.
+    # Nunca substitua uma reputação confirmada por esse snapshot incompleto.
+    has_incoming_metric = any(
+        isinstance(metrics.get(key), dict) and metrics.get(key, {}).get("rate") is not None
+        for key in ("claims", "cancellations", "delayed_handling_time")
+    )
+    if current_metric and not (incoming_level or incoming_power or has_incoming_metric):
+        return
+
     metric = {
         "account": account.get("nickname"),
-        "reputation_level": reputation.get("level_id") or "",
-        "power_seller_status": reputation.get("power_seller_status") or "",
+        "account_id": stable_account_id,
+        "reputation_level": incoming_level or current_metric.get("reputation_level") or "",
+        "power_seller_status": incoming_power or current_metric.get("power_seller_status") or "",
         "claims": claims,
         "cancellations": cancellations,
         "late_shipments": late,
@@ -5211,9 +5254,11 @@ def upsert_metric(payload, account, user_profile):
         "period": "Período relevante Mercado Livre",
         "updated_at": now_label(),
     }
-    existing = payload.get("metrics", [])
     for index, current in enumerate(existing):
-        if current.get("account") == account.get("nickname"):
+        if current is current_metric or (
+            stable_account_id
+            and str(current.get("account_id") or current.get("seller_id") or "") == stable_account_id
+        ) or current.get("account") == account.get("nickname"):
             existing[index] = metric
             break
     else:

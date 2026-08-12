@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260812-dashboard-reports-v1" />
+  <link rel="stylesheet" href="/styles.css?v=20260812-dashboard-reports-v2" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -756,16 +756,18 @@
           <div id="ads-bulk-price" class="bulk-price-bar" aria-live="polite">
             <div class="bulk-price-heading">
               <div><small>Alteração em lote</small><strong>Atualizar preços selecionados</strong></div>
-              <span class="bulk-price-count"><b data-bulk-selected-count>0</b> selecionado(s)</span>
             </div>
-            <div class="bulk-price-selection">
-              <button class="mini-button" type="button" data-select-visible-ads>Selecionar página</button>
-              <button class="mini-button" type="button" data-clear-selected-ads>Limpar seleção</button>
-              <button class="mini-button success-button" type="button" data-bulk-activate-flex disabled>Ativar Flex nos selecionados</button>
-              <button class="mini-button warning-button" type="button" data-bulk-remove-flex disabled>Remover Flex dos selecionados</button>
-              <button class="mini-button success-button" type="button" data-bulk-activate-pickup disabled>Ativar retirada nos selecionados</button>
-              <button class="mini-button warning-button" type="button" data-bulk-remove-pickup disabled>Desativar retirada nos selecionados</button>
-              <button class="mini-button danger-button" type="button" data-bulk-delete-ads disabled>Excluir selecionados</button>
+            <div class="bulk-price-actions">
+              <div class="bulk-price-selection">
+                <button class="mini-button" type="button" data-select-visible-ads>Selecionar página</button>
+                <button class="mini-button" type="button" data-clear-selected-ads>Limpar seleção</button>
+                <button class="mini-button success-button" type="button" data-bulk-activate-flex disabled>Ativar Flex nos selecionados</button>
+                <button class="mini-button warning-button" type="button" data-bulk-remove-flex disabled>Remover Flex dos selecionados</button>
+                <button class="mini-button success-button" type="button" data-bulk-activate-pickup disabled>Ativar retirada nos selecionados</button>
+                <button class="mini-button warning-button" type="button" data-bulk-remove-pickup disabled>Desativar retirada nos selecionados</button>
+                <button class="mini-button danger-button" type="button" data-bulk-delete-ads disabled>Excluir selecionados</button>
+              </div>
+              <span class="bulk-price-count"><b data-bulk-selected-count>0</b> selecionado(s)</span>
             </div>
             <div class="bulk-price-fields">
               <label>Tipo de alteração
@@ -1202,6 +1204,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260812-dashboard-reports-v1"></script>
+  <script src="/app.js?v=20260812-dashboard-reports-v2"></script>
   </body>
 </html>

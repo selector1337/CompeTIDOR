@@ -4469,8 +4469,8 @@ body {
 
 .bulk-price-bar {
   display: grid;
-  grid-template-columns: minmax(260px, .8fr) minmax(220px, 1.2fr);
-  align-items: center;
+  grid-template-columns: minmax(210px, .35fr) minmax(0, 1.65fr);
+  align-items: start;
   gap: 14px 20px;
   margin: 0 0 12px;
   padding: 16px 18px;
@@ -4489,7 +4489,9 @@ body {
 .bulk-price-heading strong { font-size: 1rem; overflow-wrap: anywhere; }
 .bulk-price-count { flex: 0 0 auto; padding: 7px 10px; border: 1px solid color-mix(in srgb, var(--brand) 42%, var(--line)); border-radius: 999px; color: var(--muted); font-size: .75rem; font-weight: 800; background: var(--panel); }
 .bulk-price-count b { color: var(--brand); font-size: .88rem; }
-.bulk-price-selection { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.bulk-price-actions { display: grid; gap: 8px; min-width: 0; }
+.bulk-price-actions .bulk-price-count { justify-self: end; }
+.bulk-price-selection { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: nowrap; overflow-x: auto; padding-bottom: 2px; }
 .bulk-price-fields { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(220px, 1fr) minmax(150px, .45fr) minmax(160px, auto); align-items: end; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
 .bulk-price-apply { min-height: 40px; padding-inline: 22px; }
 
@@ -4559,7 +4561,8 @@ body {
   .report-filter-bar { grid-template-columns: 1fr 1fr; }
   .ad-description-actions { align-items: stretch; flex-direction: column; }
   .bulk-price-bar { grid-template-columns: 1fr; }
-  .bulk-price-selection { justify-content: flex-start; }
+  .bulk-price-selection { justify-content: flex-start; flex-wrap: wrap; overflow: visible; }
+  .bulk-price-actions .bulk-price-count { justify-self: start; }
   .bulk-price-fields { grid-template-columns: 1fr 1fr; }
   .bulk-price-apply { grid-column: 1 / -1; }
 }
@@ -8263,6 +8266,40 @@ textarea:focus {
   width: 13px;
   height: 13px;
   opacity: .8;
+}
+
+/* Relatorios: tipografia e controles seguem a escala compacta das estatisticas. */
+#page-relatorios .panel-heading h2,
+#page-relatorios .statistics-panel .panel-heading h2,
+#page-relatorios .reports-hub h2 {
+  font-size: 1rem;
+  line-height: 1.25;
+}
+
+#page-relatorios .eyebrow {
+  font-size: .68rem;
+}
+
+#page-relatorios :is(.statistics-filters, .report-filter-bar, .brand-report-filter-bar, .reports-hub) label {
+  font-size: .72rem;
+  line-height: 1.2;
+}
+
+#page-relatorios :is(.statistics-filters, .report-filter-bar, .brand-report-filter-bar, .reports-hub) :is(input, select, button) {
+  min-height: 40px;
+  font-size: .78rem;
+}
+
+/* Campos editaveis usam a mesma superficie escura em toda a aplicacao. */
+:root[data-theme="dark"] .page :is(input, select, textarea):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]):not([type="color"]) {
+  border-color: var(--line) !important;
+  background: var(--surface) !important;
+  color: var(--ink) !important;
+}
+
+:root[data-theme="dark"] .page :is(input, textarea)::placeholder {
+  color: var(--muted) !important;
+  opacity: .78;
 }
 
 @media (max-width: 1100px) {
