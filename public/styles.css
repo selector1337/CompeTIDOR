@@ -65,7 +65,7 @@ body {
   min-height: 100vh;
   background: linear-gradient(135deg, var(--bg), var(--surface));
   color: var(--ink);
-  font-family: Inter, Manrope, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: Manrope, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 15px;
   font-weight: 600;
 }
@@ -2359,7 +2359,7 @@ main {
   gap: 6px;
 }
 
-.revenue-account span {
+.revenue-account > span {
   font-size: 1.25rem;
   font-weight: 950;
 }
@@ -3350,12 +3350,12 @@ body {
 
 /* Dashboard: comparativos mensais e reputacao em uma leitura mais compacta. */
 #page-dashboard .dashboard-revenue-panel {
-  margin-bottom: 10px;
-  padding: 14px;
+  margin-bottom: 8px;
+  padding: 11px 12px;
 }
 
 #page-dashboard .dashboard-revenue-panel .panel-heading {
-  margin-bottom: 10px;
+  margin-bottom: 7px;
 }
 
 #page-dashboard .revenue-grid {
@@ -3366,17 +3366,28 @@ body {
 #page-dashboard .revenue-total,
 #page-dashboard .revenue-account {
   min-height: 0;
-  padding: 11px 12px;
-  gap: 4px;
+  padding: 9px 10px;
+  gap: 3px;
 }
 
 #page-dashboard .revenue-total strong {
   margin: 2px 0;
-  font-size: 1.75rem;
+  font-size: 1.55rem;
 }
 
 #page-dashboard .revenue-account > span {
-  font-size: 1.08rem;
+  font-size: 1rem;
+}
+
+#page-dashboard .revenue-total > span,
+#page-dashboard .revenue-account-heading > strong {
+  font-size: .76rem;
+}
+
+#page-dashboard .revenue-total > small,
+#page-dashboard .revenue-account > small {
+  font-size: .64rem;
+  line-height: 1.2;
 }
 
 .revenue-account-heading {
@@ -3399,11 +3410,11 @@ body {
   align-items: center;
   flex: 0 0 auto;
   gap: 5px;
-  padding: 3px 6px;
+  padding: 2px 5px;
   border: 1px solid currentColor;
   border-radius: 999px;
   color: var(--muted);
-  font-size: .65rem;
+  font-size: .6rem;
   font-weight: 850;
   line-height: 1;
   white-space: nowrap;
@@ -3428,13 +3439,13 @@ body {
 
 .revenue-history {
   display: grid;
-  gap: 3px;
-  margin-top: 3px;
-  padding-top: 5px;
+  gap: 2px;
+  margin-top: 2px;
+  padding-top: 4px;
   border-top: 1px solid var(--line);
   color: var(--muted);
-  font-size: .69rem;
-  line-height: 1.3;
+  font-size: .62rem;
+  line-height: 1.2;
 }
 
 .revenue-history > span:last-child {
@@ -3447,9 +3458,9 @@ body {
   display: inline-flex;
   align-items: center;
   width: fit-content;
-  padding: 2px 5px;
+  padding: 1px 4px;
   border-radius: 999px;
-  font-size: .64rem;
+  font-size: .58rem;
   font-weight: 850;
 }
 
@@ -3468,36 +3479,106 @@ body {
   background: color-mix(in srgb, var(--muted) 10%, transparent);
 }
 
-#page-dashboard .summary-grid {
-  gap: 8px;
-  margin-bottom: 10px;
-}
-
-#page-dashboard .summary-card {
-  min-height: 84px;
-  padding: 10px 12px;
+.revenue-history.pending > span {
+  display: inline-flex;
+  align-items: center;
   gap: 5px;
 }
 
+.sync-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--yellow);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--yellow) 60%, transparent);
+}
+
+.field-label-inline {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 4px;
+  min-width: 0;
+}
+
+.field-label-inline .field-help {
+  margin-left: 0;
+}
+
+#page-dashboard .summary-grid {
+  gap: 7px;
+  margin-bottom: 8px;
+}
+
+#page-dashboard .summary-card {
+  min-height: 68px;
+  padding: 8px 10px;
+  gap: 3px;
+}
+
 #page-dashboard .summary-card strong {
-  font-size: 1.55rem;
+  font-size: 1.35rem;
 }
 
 #page-dashboard .summary-card small {
-  font-size: .7rem;
+  font-size: .63rem;
 }
 
 #page-dashboard .dashboard-sections {
-  gap: 10px;
-  margin-bottom: 10px;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 #page-dashboard .dashboard-sections > .panel {
-  padding: 13px;
+  padding: 10px;
 }
 
 #page-dashboard .dashboard-sections .panel-heading {
-  margin-bottom: 9px;
+  margin-bottom: 6px;
+}
+
+#page-dashboard .panel-heading h2 {
+  font-size: .88rem;
+}
+
+#page-dashboard .eyebrow {
+  font-size: .6rem;
+}
+
+#page-dashboard .ops-list,
+#page-dashboard .ads-list,
+#page-dashboard .sales-list,
+#page-dashboard .metrics-list {
+  gap: 5px;
+}
+
+#page-dashboard .ops-item,
+#page-dashboard .sale-item,
+#page-dashboard .metric-item {
+  padding: 7px 8px;
+}
+
+#page-dashboard .ops-item,
+#page-dashboard .sale-item,
+#page-dashboard .metric-item,
+#page-dashboard .claim-detail {
+  font-size: .72rem;
+}
+
+#page-dashboard .sale-thumb {
+  width: 46px;
+  height: 46px;
+}
+
+#page-dashboard .chip {
+  min-height: 24px;
+  padding: 3px 7px;
+  font-size: .64rem;
+}
+
+#page-dashboard .metric-bars {
+  gap: 5px;
 }
 
 @media (max-width: 1450px) {
@@ -6089,7 +6170,7 @@ html {
 
 body {
   background: var(--bg);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: Manrope, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 14px;
   font-weight: 600;
   line-height: 1.45;
@@ -6099,6 +6180,8 @@ button,
 input,
 select,
 textarea {
+  font-family: inherit;
+  letter-spacing: 0;
   font: inherit;
 }
 

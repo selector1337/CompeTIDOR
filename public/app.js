@@ -700,6 +700,24 @@ function dashboardReputation(item) {
   return `<span class="account-reputation ${escapeAttr(tone)}"><i aria-hidden="true"></i>${escapeText(label)}</span>`;
 }
 
+function dashboardPreviousMonth({ available, revenue, orders, revenueChange, ordersChange, pendingAccounts = 0 }) {
+  if (!available) {
+    const pending = Number(pendingAccounts || 0);
+    const suffix = pending > 0 ? ` · ${pending} conta${pending === 1 ? "" : "s"}` : "";
+    return `
+      <div class="revenue-history pending">
+        <span><i class="sync-dot" aria-hidden="true"></i>Mês passado: sincronizando em segundo plano${suffix}</span>
+      </div>
+    `;
+  }
+  return `
+    <div class="revenue-history">
+      <span>Mês passado: <b>${money.format(revenue || 0)}</b> · ${Number(orders || 0).toLocaleString("pt-BR")} pedidos</span>
+      <span>${dashboardComparison(revenueChange, "faturamento")}${dashboardComparison(ordersChange, "pedidos")}</span>
+    </div>
+  `;
+}
+
 function renderDashboard() {
   const ops = state.data.operations || {};
   const stockRows = filterByStockPeriod(ops.attention_stock || []);
@@ -709,20 +727,27 @@ function renderDashboard() {
       <span>Faturamento real mensal</span>
       <strong>${money.format(ops.total_monthly_revenue || 0)}</strong>
       <small>${Number(ops.total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos oficiais no mês atual</small>
-      <div class="revenue-history">
-        <span>Mês passado: <b>${money.format(ops.previous_total_monthly_revenue || 0)}</b> · ${Number(ops.previous_total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos</span>
-        <span>${dashboardComparison(ops.total_revenue_change_percent, "em faturamento")}${dashboardComparison(ops.total_orders_change_percent, "em pedidos")}</span>
-      </div>
+      ${dashboardPreviousMonth({
+        available: ops.previous_month_complete !== false,
+        revenue: ops.previous_total_monthly_revenue,
+        orders: ops.previous_total_monthly_orders,
+        revenueChange: ops.total_revenue_change_percent,
+        ordersChange: ops.total_orders_change_percent,
+        pendingAccounts: ops.previous_month_pending_accounts,
+      })}
     </article>
     ${(ops.revenue || []).map((item) => `
       <article class="revenue-account">
         <div class="revenue-account-heading"><strong>${escapeText(item.account)}</strong>${dashboardReputation(item)}</div>
         <span>${money.format(item.monthly_revenue || 0)}</span>
         <small>${Number(item.orders_count || 0).toLocaleString("pt-BR")} pedidos no mês atual</small>
-        <div class="revenue-history">
-          <span>Mês passado: <b>${money.format(item.previous_month_revenue || 0)}</b> · ${Number(item.previous_orders_count || 0).toLocaleString("pt-BR")} pedidos</span>
-          <span>${dashboardComparison(item.revenue_change_percent, "faturamento")}${dashboardComparison(item.orders_change_percent, "pedidos")}</span>
-        </div>
+        ${dashboardPreviousMonth({
+          available: item.previous_month_available !== false,
+          revenue: item.previous_month_revenue,
+          orders: item.previous_orders_count,
+          revenueChange: item.revenue_change_percent,
+          ordersChange: item.orders_change_percent,
+        })}
       </article>
     `).join("")}
   `;
