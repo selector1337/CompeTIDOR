@@ -8292,14 +8292,52 @@ textarea:focus {
 
 /* Campos editaveis usam a mesma superficie escura em toda a aplicacao. */
 :root[data-theme="dark"] .page :is(input, select, textarea):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]):not([type="color"]) {
-  border-color: var(--line) !important;
-  background: var(--surface) !important;
+  box-sizing: border-box;
+  border: 1px solid var(--line) !important;
+  border-radius: 7px !important;
+  background-color: var(--surface) !important;
   color: var(--ink) !important;
+  box-shadow: none !important;
 }
 
 :root[data-theme="dark"] .page :is(input, textarea)::placeholder {
   color: var(--muted) !important;
   opacity: .78;
+}
+
+/* Acabamento final dos controles: evita campos quadrados ou com apenas uma linha
+   quando componentes antigos sobrescrevem parte da borda. */
+.page :is(input, select, textarea):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]):not([type="color"]) {
+  box-sizing: border-box;
+  border-style: solid;
+  border-width: 1px;
+  border-radius: 7px !important;
+  box-shadow: none;
+}
+
+/* As acoes em lote permanecem em uma unica linha no desktop sem aumentar o painel. */
+.bulk-price-selection .mini-button {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-inline: 8px;
+  white-space: nowrap;
+  font-size: .68rem;
+  line-height: 1;
+}
+
+/* O realce ativo precisa de respiro para nao tocar o recorte da barra recolhida. */
+@media (min-width: 781px) {
+  .sidebar:not(:hover):not(:focus-within) nav a,
+  .sidebar.force-collapsed nav a,
+  .sidebar.force-collapsed:hover nav a,
+  .sidebar.force-collapsed:focus-within nav a {
+    width: 50px;
+    min-width: 50px;
+    max-width: 50px;
+    margin-inline: 1px;
+    padding-inline: 6px;
+    justify-content: center;
+  }
 }
 
 @media (max-width: 1100px) {
@@ -8421,5 +8459,467 @@ textarea:focus {
 
   .ad-picture-list {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Mobile application shell. Kept at the end so desktop behavior remains unchanged. */
+@media (max-width: 780px) {
+  :root {
+    --mobile-dock-height: 72px;
+  }
+
+  html {
+    scroll-padding-top: 72px;
+  }
+
+  body {
+    min-width: 0;
+    padding-bottom: env(safe-area-inset-bottom);
+    overscroll-behavior-y: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .sidebar,
+  .sidebar:hover,
+  .sidebar:focus-within,
+  .sidebar.force-collapsed {
+    position: fixed;
+    inset: auto 0 0 0;
+    z-index: 100;
+    width: 100%;
+    height: calc(var(--mobile-dock-height) + env(safe-area-inset-bottom));
+    min-height: calc(var(--mobile-dock-height) + env(safe-area-inset-bottom));
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    overflow: hidden;
+    border: 0;
+    border-top: 1px solid color-mix(in srgb, var(--brand) 24%, var(--line));
+    background: color-mix(in srgb, var(--panel) 94%, transparent);
+    box-shadow: 0 -10px 28px rgb(0 0 0 / 24%);
+    backdrop-filter: blur(18px) saturate(135%);
+  }
+
+  .sidebar .brand {
+    display: none;
+  }
+
+  .sidebar nav {
+    display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x proximity;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+
+  .sidebar nav::-webkit-scrollbar,
+  .summary-grid::-webkit-scrollbar,
+  .revenue-grid::-webkit-scrollbar,
+  .mini-filter-bar::-webkit-scrollbar,
+  .segmented::-webkit-scrollbar,
+  .panel-actions::-webkit-scrollbar {
+    display: none;
+  }
+
+  .sidebar nav a,
+  .sidebar:hover nav a,
+  .sidebar:focus-within nav a,
+  .sidebar.force-collapsed nav a {
+    flex: 0 0 58px;
+    width: 58px;
+    min-width: 58px;
+    height: 58px;
+    min-height: 58px;
+    padding: 5px 3px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    overflow: hidden;
+    border-radius: 8px;
+    scroll-snap-align: center;
+  }
+
+  .sidebar nav a .nav-icon {
+    width: 25px;
+    min-width: 25px;
+    height: 25px;
+  }
+
+  .sidebar nav a strong,
+  .sidebar:hover nav a strong,
+  .sidebar:focus-within nav a strong,
+  .sidebar.force-collapsed nav a strong {
+    display: block;
+    width: 100%;
+    overflow: hidden;
+    color: var(--muted);
+    font-size: .57rem;
+    line-height: 1.05;
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sidebar nav a.active {
+    border-color: color-mix(in srgb, var(--brand) 70%, transparent);
+    background: color-mix(in srgb, var(--brand) 13%, var(--panel-2));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--brand) 12%, transparent), 0 0 16px color-mix(in srgb, var(--brand) 13%, transparent);
+  }
+
+  .sidebar nav a.active strong {
+    color: var(--brand);
+  }
+
+  .theme-button {
+    flex: 0 0 48px;
+    width: 48px;
+    height: 52px;
+    min-height: 52px;
+    margin: 0 0 0 3px;
+    align-self: center;
+    border-radius: 8px;
+  }
+
+  main {
+    width: 100%;
+    margin-left: 0;
+    padding: 0 10px calc(var(--mobile-dock-height) + 18px + env(safe-area-inset-bottom));
+  }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 60;
+    min-height: 62px;
+    margin: 0 -10px 10px;
+    padding: 9px 12px;
+    gap: 8px;
+    border-width: 0 0 1px;
+    border-radius: 0 0 8px 8px;
+    background: color-mix(in srgb, var(--panel) 94%, transparent);
+    box-shadow: 0 8px 22px rgb(0 0 0 / 16%);
+    backdrop-filter: blur(18px) saturate(135%);
+  }
+
+  .topbar h1 {
+    font-size: 1.25rem;
+    line-height: 1.12;
+  }
+
+  .topbar .eyebrow {
+    margin-bottom: 2px;
+    font-size: .57rem;
+  }
+
+  .topbar-actions {
+    flex: 0 0 auto;
+    gap: 5px;
+    flex-wrap: nowrap;
+  }
+
+  #api-pill,
+  #tenant-pill {
+    display: none;
+  }
+
+  .user-menu {
+    position: relative;
+    width: 42px;
+    min-width: 42px;
+    min-height: 42px;
+    padding: 3px;
+    justify-content: center;
+    cursor: pointer;
+  }
+
+  .user-menu strong {
+    display: none;
+  }
+
+  .user-menu > span {
+    width: 34px;
+    min-width: 34px;
+    height: 34px;
+  }
+
+  .user-menu .logout-link {
+    top: calc(100% + 8px);
+    right: 0;
+    z-index: 120;
+    min-width: 108px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .user-menu.mobile-open .logout-link {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  .page,
+  .page.active,
+  .panel,
+  .catalog-item,
+  .ad-item,
+  .copy-item {
+    min-width: 0;
+  }
+
+  .panel {
+    margin-bottom: 10px;
+    padding: 12px;
+    border-radius: 8px;
+  }
+
+  .panel-heading {
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .panel-heading h2 {
+    font-size: 1rem;
+    line-height: 1.2;
+  }
+
+  .panel-heading .eyebrow {
+    font-size: .58rem;
+  }
+
+  .summary-grid,
+  .revenue-grid {
+    display: flex;
+    grid-template-columns: none;
+    gap: 8px;
+    padding-bottom: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x mandatory;
+    scrollbar-width: none;
+  }
+
+  .summary-grid > *,
+  .revenue-grid > * {
+    scroll-snap-align: start;
+  }
+
+  .summary-grid > * {
+    flex: 0 0 min(72vw, 245px);
+  }
+
+  .revenue-grid > * {
+    flex: 0 0 min(86vw, 310px);
+  }
+
+  .summary-card {
+    min-height: 108px;
+    padding: 12px;
+  }
+
+  .summary-card strong {
+    font-size: 1.55rem;
+  }
+
+  .dashboard-sections {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .mini-filter-bar,
+  .segmented,
+  .panel-actions {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 6px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .mini-filter-bar > *,
+  .segmented > *,
+  .panel-actions > * {
+    flex: 0 0 auto;
+  }
+
+  :is(.filters, .copy-filter-grid, .clone-edit-grid, .statistics-filters, .report-filter-bar, .brand-report-filter-bar, .purchase-filters, .returns-filters, .catalog-filters) {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .page :is(input:not([type="checkbox"]):not([type="radio"]), select, textarea),
+  .page button,
+  .page .button {
+    min-height: 44px;
+  }
+
+  .page button,
+  .page .button,
+  .sidebar button,
+  .sidebar a {
+    touch-action: manipulation;
+  }
+
+  .catalog-item {
+    grid-template-columns: 72px minmax(0, 1fr);
+    gap: 10px;
+    padding: 11px;
+  }
+
+  .catalog-item .product-media,
+  .catalog-item .catalog-media,
+  .catalog-item > img {
+    width: 70px;
+    height: 70px;
+    aspect-ratio: 1;
+  }
+
+  .ad-commercial-facts,
+  .ad-stock-row,
+  .ad-package-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  .inventory-summary,
+  #sales-report-summary.inventory-summary {
+    display: flex;
+    grid-template-columns: none;
+    gap: 8px;
+    padding-bottom: 4px;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    scrollbar-width: none;
+  }
+
+  .inventory-summary > *,
+  #sales-report-summary .sales-summary-row > div {
+    flex: 0 0 min(72vw, 235px);
+    scroll-snap-align: start;
+  }
+
+  #sales-report-summary .sales-summary-row {
+    display: contents;
+  }
+
+  .bulk-price-bar,
+  .bulk-price-fields {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .bulk-price-selection {
+    justify-content: flex-start;
+    overflow-x: auto;
+  }
+
+  .bulk-price-selection button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .pagination {
+    gap: 8px;
+  }
+
+  .pagination > div {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .table-wrap,
+  .report-table-wrap {
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+
+  dialog {
+    width: calc(100vw - 20px);
+    max-width: none;
+    max-height: calc(100dvh - 28px);
+    margin: auto;
+    border-radius: 8px;
+  }
+
+  .manual-action-center {
+    right: 8px;
+    bottom: calc(var(--mobile-dock-height) + 8px + env(safe-area-inset-bottom));
+    left: 8px;
+    width: auto;
+    max-width: none;
+  }
+
+  .toast-stack {
+    right: 10px;
+    bottom: calc(var(--mobile-dock-height) + 10px + env(safe-area-inset-bottom));
+    left: 10px;
+    width: auto;
+  }
+
+  .login-screen {
+    min-height: 100dvh;
+    padding: max(18px, env(safe-area-inset-top)) 14px max(18px, env(safe-area-inset-bottom));
+  }
+
+  .login-card,
+  .first-access-card {
+    width: 100%;
+    max-width: 440px;
+  }
+}
+
+@media (max-width: 430px) {
+  main {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  .topbar {
+    margin-right: -8px;
+    margin-left: -8px;
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+
+  .topbar h1 {
+    max-width: 230px;
+    font-size: 1.12rem;
+  }
+
+  .summary-grid > * {
+    flex-basis: 82vw;
+  }
+
+  .revenue-grid > * {
+    flex-basis: 88vw;
+  }
+
+  .catalog-item {
+    grid-template-columns: 64px minmax(0, 1fr);
+    padding: 10px;
+  }
+
+  .catalog-item .product-media,
+  .catalog-item .catalog-media,
+  .catalog-item > img {
+    width: 62px;
+    height: 62px;
+  }
+
+  .copy-item {
+    grid-template-columns: 18px 54px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .ad-commercial-facts,
+  .ad-stock-row,
+  .ad-package-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
   }
 }

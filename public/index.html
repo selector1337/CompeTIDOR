@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260812-dashboard-reports-v2" />
+  <link rel="stylesheet" href="/styles.css?v=20260812-mobile-app-v1" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -59,7 +59,7 @@
         <div class="topbar-actions">
           <span class="api-pill" id="api-pill">OAuth verificando</span>
           <span class="tenant-pill" id="tenant-pill">0 contas</span>
-          <div class="user-menu" id="current-user">
+          <div class="user-menu" id="current-user" tabindex="0" aria-label="Menu do usuário" aria-expanded="false">
             <span id="current-user-avatar">A</span>
             <strong id="current-user-name">Administrador</strong>
             <a id="logout" class="logout-link" href="/api/auth/logout">Sair</a>
@@ -1204,6 +1204,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260812-dashboard-reports-v2"></script>
+  <script src="/app.js?v=20260812-ui-controls-v3"></script>
   </body>
 </html>

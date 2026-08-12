@@ -579,6 +579,16 @@ function setRoute() {
   document.querySelectorAll("nav a").forEach((link) => link.classList.toggle("active", link.dataset.route === state.route));
   document.querySelector("#page-eyebrow").textContent = pageTitles[state.route][0];
   document.querySelector("#page-title").textContent = pageTitles[state.route][1];
+  window.requestAnimationFrame(() => centerMobileNavigation(false));
+}
+
+function centerMobileNavigation(smooth = true) {
+  if (!window.matchMedia("(max-width: 780px)").matches) return;
+  const nav = document.querySelector(".sidebar nav");
+  const active = nav?.querySelector("a.active");
+  if (!nav || !active) return;
+  const left = Math.max(0, active.offsetLeft - ((nav.clientWidth - active.offsetWidth) / 2));
+  nav.scrollTo({ left, behavior: smooth ? "smooth" : "auto" });
 }
 
 function routeParams() {
@@ -7039,7 +7049,38 @@ document.querySelector("#theme-toggle").addEventListener("click", () => {
   applyTheme();
 });
 window.addEventListener("hashchange", () => {
+  document.querySelector("#current-user")?.classList.remove("mobile-open");
   if (state.data) render();
+});
+
+const currentUserMenu = document.querySelector("#current-user");
+function toggleMobileUserMenu(force) {
+  if (!currentUserMenu || !window.matchMedia("(max-width: 780px)").matches) return;
+  const open = typeof force === "boolean" ? force : !currentUserMenu.classList.contains("mobile-open");
+  currentUserMenu.classList.toggle("mobile-open", open);
+  currentUserMenu.setAttribute("aria-expanded", String(open));
+}
+currentUserMenu?.addEventListener("click", (event) => {
+  if (event.target.closest("#logout")) return;
+  event.stopPropagation();
+  toggleMobileUserMenu();
+});
+currentUserMenu?.addEventListener("keydown", (event) => {
+  if (!['Enter', ' '].includes(event.key)) return;
+  event.preventDefault();
+  toggleMobileUserMenu();
+});
+document.addEventListener("click", (event) => {
+  if (!currentUserMenu || currentUserMenu.contains(event.target)) return;
+  toggleMobileUserMenu(false);
+});
+window.addEventListener("resize", () => {
+  if (!window.matchMedia("(max-width: 780px)").matches) {
+    currentUserMenu?.classList.remove("mobile-open");
+    currentUserMenu?.setAttribute("aria-expanded", "false");
+    return;
+  }
+  centerMobileNavigation(false);
 });
 
 window.setInterval(async () => {
