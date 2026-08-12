@@ -3348,6 +3348,178 @@ body {
   }
 }
 
+/* Dashboard: comparativos mensais e reputacao em uma leitura mais compacta. */
+#page-dashboard .dashboard-revenue-panel {
+  margin-bottom: 10px;
+  padding: 14px;
+}
+
+#page-dashboard .dashboard-revenue-panel .panel-heading {
+  margin-bottom: 10px;
+}
+
+#page-dashboard .revenue-grid {
+  grid-template-columns: minmax(250px, 1.25fr) repeat(4, minmax(160px, 1fr));
+  gap: 8px;
+}
+
+#page-dashboard .revenue-total,
+#page-dashboard .revenue-account {
+  min-height: 0;
+  padding: 11px 12px;
+  gap: 4px;
+}
+
+#page-dashboard .revenue-total strong {
+  margin: 2px 0;
+  font-size: 1.75rem;
+}
+
+#page-dashboard .revenue-account > span {
+  font-size: 1.08rem;
+}
+
+.revenue-account-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 8px;
+}
+
+.revenue-account-heading > strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-reputation {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 5px;
+  padding: 3px 6px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: .65rem;
+  font-weight: 850;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.account-reputation i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 7px currentColor;
+}
+
+.account-reputation.green,
+.account-reputation.leader-platinum { color: var(--green); }
+.account-reputation.light-green,
+.account-reputation.leader-gold { color: #74d96c; }
+.account-reputation.yellow,
+.account-reputation.leader-silver { color: var(--yellow); }
+.account-reputation.orange { color: var(--amber); }
+.account-reputation.red { color: var(--red); }
+
+.revenue-history {
+  display: grid;
+  gap: 3px;
+  margin-top: 3px;
+  padding-top: 5px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: .69rem;
+  line-height: 1.3;
+}
+
+.revenue-history > span:last-child {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.dashboard-comparison {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 2px 5px;
+  border-radius: 999px;
+  font-size: .64rem;
+  font-weight: 850;
+}
+
+.dashboard-comparison.positive {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+}
+
+.dashboard-comparison.negative {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+
+.dashboard-comparison.neutral {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 10%, transparent);
+}
+
+#page-dashboard .summary-grid {
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+#page-dashboard .summary-card {
+  min-height: 84px;
+  padding: 10px 12px;
+  gap: 5px;
+}
+
+#page-dashboard .summary-card strong {
+  font-size: 1.55rem;
+}
+
+#page-dashboard .summary-card small {
+  font-size: .7rem;
+}
+
+#page-dashboard .dashboard-sections {
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+#page-dashboard .dashboard-sections > .panel {
+  padding: 13px;
+}
+
+#page-dashboard .dashboard-sections .panel-heading {
+  margin-bottom: 9px;
+}
+
+@media (max-width: 1450px) {
+  #page-dashboard .revenue-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  #page-dashboard .revenue-total {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 760px) {
+  #page-dashboard .revenue-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #page-dashboard .revenue-total {
+    grid-column: auto;
+  }
+}
+
 /* Central de Devoluções */
 .returns-page {
   min-width: 0;

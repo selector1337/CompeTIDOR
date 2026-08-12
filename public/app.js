@@ -570,7 +570,9 @@ function tenantLabel(meta, data) {
 
 function setRoute() {
   const route = (location.hash.replace("#/", "") || "dashboard").split("?")[0];
-  const requestedRoute = pageTitles[route] ? route : "dashboard";
+  const legacyStatistics = route === "estatisticas";
+  const requestedRoute = legacyStatistics ? "relatorios" : (pageTitles[route] ? route : "dashboard");
+  if (legacyStatistics) state.reportsSection = "statistics";
   state.route = requestedRoute;
   document.querySelectorAll(".page").forEach((page) => page.classList.remove("active"));
   document.querySelector(`#page-${state.route}`).classList.add("active");
@@ -629,6 +631,12 @@ function renderReportsHub() {
   document.querySelectorAll("[data-report-section]").forEach((section) => {
     section.hidden = section.dataset.reportSection !== state.reportsSection;
   });
+  if (state.reportsSection === "statistics") {
+    const host = document.querySelector("#reports-statistics-host");
+    const panel = document.querySelector("#page-estatisticas .statistics-panel");
+    if (host && panel && panel.parentElement !== host) host.appendChild(panel);
+    renderStatistics();
+  }
   if (state.reportsSection === "sales") renderSalesReport();
   if (state.reportsSection === "brand") {
     if (!state.catalogLoaded) loadCatalogInBackground();
@@ -662,6 +670,36 @@ function renderSummary() {
   if (officialLabel) officialLabel.textContent = `${accounts.filter((account) => account.official).length} oficiais`;
 }
 
+function dashboardComparison(value, label) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+    return `<span class="dashboard-comparison neutral">Sem base anterior</span>`;
+  }
+  const number = Number(value);
+  const direction = number > 0 ? "positive" : number < 0 ? "negative" : "neutral";
+  const sign = number > 0 ? "+" : "";
+  return `<span class="dashboard-comparison ${direction}">${sign}${number.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% ${escapeText(label)}</span>`;
+}
+
+function dashboardReputation(item) {
+  const power = String(item.power_seller_status || "").toLowerCase();
+  const level = String(item.reputation_level || "").toLowerCase();
+  const powerLabels = {
+    platinum: "MercadoLíder Platinum",
+    gold: "MercadoLíder Gold",
+    silver: "MercadoLíder",
+  };
+  const levelLabels = {
+    "5_green": "Verde",
+    "4_light_green": "Verde claro",
+    "3_yellow": "Amarelo",
+    "2_orange": "Laranja",
+    "1_red": "Vermelho",
+  };
+  const label = powerLabels[power] || levelLabels[level] || "Reputação a sincronizar";
+  const tone = power ? `leader-${power}` : (level.replace(/^\d+_/, "").replaceAll("_", "-") || "pending");
+  return `<span class="account-reputation ${escapeAttr(tone)}"><i aria-hidden="true"></i>${escapeText(label)}</span>`;
+}
+
 function renderDashboard() {
   const ops = state.data.operations || {};
   const stockRows = filterByStockPeriod(ops.attention_stock || []);
@@ -670,14 +708,21 @@ function renderDashboard() {
     <article class="revenue-total">
       <span>Faturamento real mensal</span>
       <strong>${money.format(ops.total_monthly_revenue || 0)}</strong>
-      <small>Pedidos oficiais sincronizados no Mercado Livre</small>
+      <small>${Number(ops.total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos oficiais no mês atual</small>
+      <div class="revenue-history">
+        <span>Mês passado: <b>${money.format(ops.previous_total_monthly_revenue || 0)}</b> · ${Number(ops.previous_total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos</span>
+        <span>${dashboardComparison(ops.total_revenue_change_percent, "em faturamento")}${dashboardComparison(ops.total_orders_change_percent, "em pedidos")}</span>
+      </div>
     </article>
     ${(ops.revenue || []).map((item) => `
       <article class="revenue-account">
-        <strong>${item.account}</strong>
+        <div class="revenue-account-heading"><strong>${escapeText(item.account)}</strong>${dashboardReputation(item)}</div>
         <span>${money.format(item.monthly_revenue || 0)}</span>
-        <small>${Number(item.orders_count || 0)} pedidos · ${item.period || "-"} · ${item.updated_at ? formatDateBR(item.updated_at) : "Aguardando atualização"}</small>
-        <small>${item.sync_status || item.source || ""}</small>
+        <small>${Number(item.orders_count || 0).toLocaleString("pt-BR")} pedidos no mês atual</small>
+        <div class="revenue-history">
+          <span>Mês passado: <b>${money.format(item.previous_month_revenue || 0)}</b> · ${Number(item.previous_orders_count || 0).toLocaleString("pt-BR")} pedidos</span>
+          <span>${dashboardComparison(item.revenue_change_percent, "faturamento")}${dashboardComparison(item.orders_change_percent, "pedidos")}</span>
+        </div>
       </article>
     `).join("")}
   `;
@@ -1933,15 +1978,19 @@ function renderEqualizationReports() {
   setOptions("#equalization-account-filter", ["all", ...accounts], state.equalizationAccount, "Todas as contas");
   const clipsAction = document.querySelector("#refresh-clips-report");
   const photosAction = document.querySelector("#refresh-photos-report");
+  const descriptionsAction = document.querySelector("#refresh-descriptions-report");
   const mediaHelp = document.querySelector("#equalization-media-help");
   const isClipsReport = state.equalizationType === "missing_clips";
   const isPhotosReport = state.equalizationType === "photo_coverage";
-  if (mediaActions) mediaActions.hidden = !isClipsReport && !isPhotosReport;
+  const isDescriptionsReport = state.equalizationType === "missing_description";
+  if (mediaActions) mediaActions.hidden = !isClipsReport && !isPhotosReport && !isDescriptionsReport;
   if (clipsAction) clipsAction.hidden = !isClipsReport;
   if (photosAction) photosAction.hidden = !isPhotosReport;
+  if (descriptionsAction) descriptionsAction.hidden = !isDescriptionsReport;
   if (mediaHelp) mediaHelp.textContent = isClipsReport
     ? "Confere as pendências de Clips diretamente na qualidade de cada anúncio."
-    : isPhotosReport ? "Preenche em segundo plano a contagem oficial dos anúncios ainda não conferidos." : "";
+    : isPhotosReport ? "Preenche em segundo plano a contagem oficial dos anúncios ainda não conferidos."
+      : isDescriptionsReport ? "Confere sob demanda a descrição oficial de cada anúncio filtrado." : "";
   const sourceItems = (state.data.catalog || []).filter((item) => {
     const account = item.account || "";
     const sku = String(item.sku || "").trim().toUpperCase();
@@ -1950,7 +1999,7 @@ function renderEqualizationReports() {
       && (state.equalizationAccount === "all" || account === state.equalizationAccount)
       && (state.equalizationStatus === "all" || status === state.equalizationStatus);
   });
-  const mediaModes = new Set(["package_discrepancy", "gtin_discrepancy", "missing_clips", "photo_coverage"]);
+  const mediaModes = new Set(["package_discrepancy", "gtin_discrepancy", "missing_clips", "photo_coverage", "missing_description"]);
   if (mediaModes.has(state.equalizationType)) {
     const bySku = new Map();
     sourceItems.forEach((item) => {
@@ -1969,6 +2018,8 @@ function renderEqualizationReports() {
       });
     } else if (state.equalizationType === "photo_coverage") {
       rows = sourceItems.filter((item) => Number.isFinite(Number(item.picture_count)) && Number(item.picture_count) < 12);
+    } else if (state.equalizationType === "missing_description") {
+      rows = sourceItems.filter((item) => item.description_status === "missing");
     } else {
       rows = sourceItems.filter((item) => item.clips_status === "missing");
     }
@@ -1994,10 +2045,16 @@ function renderEqualizationReports() {
     const accessClipFailures = ["auth", "permission", "account"]
       .reduce((total, kind) => total + (clipFailures[kind] || 0), 0);
     const unknownPhotos = sourceItems.filter((item) => item.picture_count === null || item.picture_count === undefined).length;
+    const missingDescriptions = sourceItems.filter((item) => item.description_status === "missing").length;
+    const presentDescriptions = sourceItems.filter((item) => item.description_status === "present").length;
+    const unavailableDescriptions = sourceItems.filter((item) => item.description_status === "unavailable").length;
+    const checkedDescriptions = missingDescriptions + presentDescriptions;
+    const unknownDescriptions = Math.max(0, sourceItems.length - checkedDescriptions - unavailableDescriptions);
     const summary = document.querySelector("#equalization-summary");
     const objective = state.equalizationType === "package_discrepancy" ? "Padronizar medidas e peso"
       : state.equalizationType === "gtin_discrepancy" ? "Padronizar códigos universais"
         : state.equalizationType === "missing_clips" ? "Completar Clips confirmados como pendentes"
+          : state.equalizationType === "missing_description" ? "Preencher descrições ausentes"
           : "Completar 12 fotos por anúncio";
     if (summary) summary.innerHTML = `
       <div><span>Ocorrências encontradas</span><strong>${rows.length.toLocaleString("pt-BR")}</strong></div>
@@ -2008,7 +2065,10 @@ function renderEqualizationReports() {
       ${state.equalizationType === "missing_clips" && failedClips ? `<div><span>Consultas não concluídas</span><strong>${failedClips.toLocaleString("pt-BR")}</strong></div>` : ""}
       ${state.equalizationType === "missing_clips" && transientClipFailures ? `<div><span>Limite ou instabilidade</span><strong>${transientClipFailures.toLocaleString("pt-BR")}</strong></div>` : ""}
       ${state.equalizationType === "missing_clips" && accessClipFailures ? `<div><span>OAuth ou permissão</span><strong>${accessClipFailures.toLocaleString("pt-BR")}</strong></div>` : ""}
-      ${state.equalizationType === "photo_coverage" && unknownPhotos ? `<div><span>Aguardando sincronização de fotos</span><strong>${unknownPhotos.toLocaleString("pt-BR")}</strong></div>` : ""}`;
+      ${state.equalizationType === "photo_coverage" && unknownPhotos ? `<div><span>Aguardando sincronização de fotos</span><strong>${unknownPhotos.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "missing_description" ? `<div><span>Descrições conferidas</span><strong>${checkedDescriptions.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "missing_description" && unavailableDescriptions ? `<div><span>Consultas não concluídas</span><strong>${unavailableDescriptions.toLocaleString("pt-BR")}</strong></div>` : ""}
+      ${state.equalizationType === "missing_description" && unknownDescriptions ? `<div><span>Aguardando conferência</span><strong>${unknownDescriptions.toLocaleString("pt-BR")}</strong></div>` : ""}`;
     if (!rows.length) {
       let text = "Nenhuma ocorrência encontrada com estes filtros.";
       let noticeClass = "success-notice";
@@ -2022,6 +2082,11 @@ function renderEqualizationReports() {
         const otherFailures = Math.max(0, failedClips - transientClipFailures - accessClipFailures);
         if (otherFailures) parts.push(`${otherFailures.toLocaleString("pt-BR")} com outra falha`);
         text = `Cobertura ainda não conclusiva: ${parts.join("; ")}. O botão repete as consultas recuperáveis; ausência de diagnóstico oficial não é tratada como Clip existente nem como Clip ausente.`;
+        noticeClass = "warning-notice";
+      } else if (state.equalizationType === "missing_description" && !checkedDescriptions && !unavailableDescriptions) {
+        text = "Clique em Conferir descrições na API oficial para iniciar a verificação dos anúncios filtrados.";
+      } else if (state.equalizationType === "missing_description" && (unknownDescriptions || unavailableDescriptions)) {
+        text = `A conferência ainda não foi conclusiva para ${(unknownDescriptions + unavailableDescriptions).toLocaleString("pt-BR")} anúncio(s). Execute novamente para concluir consultas temporariamente indisponíveis.`;
         noticeClass = "warning-notice";
       }
       container.innerHTML = `<div class="notice ${noticeClass}">${text}</div>`;
@@ -2038,6 +2103,9 @@ function renderEqualizationReports() {
     } else if (state.equalizationType === "photo_coverage") {
       headings = "<th>SKU</th><th>Produto</th><th>Conta</th><th>Anúncio ML</th><th>Fotos atuais</th><th>Faltam para 12</th>";
       cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td>${Number(row.picture_count)}</td><td><span class="report-missing">${12 - Number(row.picture_count)}</span></td>`;
+    } else if (state.equalizationType === "missing_description") {
+      headings = "<th>SKU</th><th>Produto</th><th>Conta</th><th>Anúncio ML</th><th>Situação</th><th>Conferido em</th>";
+      cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td><span class="report-missing">Sem descrição</span></td><td>${escapeText(formatDateBR(row.description_checked_at) || "-")}</td>`;
     } else {
       headings = "<th>SKU</th><th>Produto</th><th>Conta</th><th>Anúncio ML</th><th>Situação</th><th>Conferido em</th>";
       cells = (row) => `<td><strong>${escapeText(row.sku)}</strong></td><td>${escapeText(row.title || "-")}</td><td>${escapeText(row.account || "-")}</td><td>${escapeText(row.id || "-")}</td><td><span class="report-missing">Clip pendente confirmado</span></td><td>${escapeText(formatDateBR(row.clips_checked_at) || "-")}</td>`;
@@ -4055,7 +4123,8 @@ async function downloadReport(button) {
 async function refreshMediaReport(button, kind) {
   const progress = document.querySelector("#media-report-progress");
   const isPhotos = kind === "photos";
-  const title = isPhotos ? "Sincronizando fotos" : "Conferindo Clips";
+  const isDescriptions = kind === "descriptions";
+  const title = isPhotos ? "Sincronizando fotos" : isDescriptions ? "Conferindo descrições" : "Conferindo Clips";
   button.disabled = true;
   if (progress) {
     progress.hidden = false;
@@ -4078,9 +4147,10 @@ async function refreshMediaReport(button, kind) {
     renderEqualizationReports();
     showToast(isPhotos
       ? `${Number(result.below_twelve || 0).toLocaleString("pt-BR")} anúncio(s) possuem menos de 12 fotos.`
+      : isDescriptions ? `${Number(result.missing || 0).toLocaleString("pt-BR")} anúncio(s) sem descrição confirmado(s).`
       : `${Number(result.missing || 0).toLocaleString("pt-BR")} anúncio(s) com Clip pendente confirmado(s).`);
   } catch (error) {
-    showToast(error.message || (isPhotos ? "Não foi possível sincronizar as fotos." : "Não foi possível conferir os Clips."), "error");
+    showToast(error.message || (isPhotos ? "Não foi possível sincronizar as fotos." : isDescriptions ? "Não foi possível conferir as descrições." : "Não foi possível conferir os Clips."), "error");
   } finally {
     button.disabled = false;
     if (progress) progress.hidden = true;
@@ -5179,6 +5249,8 @@ document.addEventListener("click", (event) => {
   if (clipsButton) refreshMediaReport(clipsButton, "clips");
   const photosButton = event.target.closest("#refresh-photos-report");
   if (photosButton) refreshMediaReport(photosButton, "photos");
+  const descriptionsButton = event.target.closest("#refresh-descriptions-report");
+  if (descriptionsButton) refreshMediaReport(descriptionsButton, "descriptions");
 });
 
 [

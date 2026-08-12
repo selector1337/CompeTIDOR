@@ -1161,18 +1161,33 @@ def current_month_period():
     return f"{now.year:04d}-{now.month:02d}"
 
 
-def current_month_window():
+def month_window(offset=0):
     now = datetime.now(APP_TZ)
-    start = datetime(now.year, now.month, 1, tzinfo=APP_TZ)
-    if now.month == 12:
-        end = datetime(now.year + 1, 1, 1, tzinfo=APP_TZ)
+    month_index = (now.year * 12 + now.month - 1) + int(offset)
+    year, zero_month = divmod(month_index, 12)
+    month = zero_month + 1
+    start = datetime(year, month, 1, tzinfo=APP_TZ)
+    if month == 12:
+        end = datetime(year + 1, 1, 1, tzinfo=APP_TZ)
     else:
-        end = datetime(now.year, now.month + 1, 1, tzinfo=APP_TZ)
+        end = datetime(year, month + 1, 1, tzinfo=APP_TZ)
     return (
-        f"{now.year:04d}-{now.month:02d}",
+        f"{year:04d}-{month:02d}",
         start.isoformat(timespec="milliseconds"),
         end.isoformat(timespec="milliseconds"),
     )
+
+
+def current_month_window():
+    return month_window(0)
+
+
+def percentage_change(current, previous):
+    current = float(current or 0)
+    previous = float(previous or 0)
+    if previous <= 0:
+        return None
+    return round(((current - previous) / previous) * 100, 2)
 
 
 def build_operations(payload):
@@ -1181,24 +1196,46 @@ def build_operations(payload):
     monthly = payload.get("monthly_revenue") or {}
     period = monthly.get("period") or current_month_period()
     revenue_accounts = monthly.get("accounts") or {}
+    previous_period = month_window(-1)[0]
+    previous_accounts = (((monthly.get("history") or {}).get(previous_period) or {}).get("accounts") or {})
+    metrics_by_account = {
+        str(metric.get("account") or ""): metric
+        for metric in payload.get("metrics") or []
+    }
     revenue = []
     revenue_source_accounts = [account for account in accounts if account.get("official")]
     for account in revenue_source_accounts:
         key = account.get("id") or account.get("nickname")
         record = revenue_accounts.get(key) or revenue_accounts.get(account.get("nickname")) or {}
+        previous_record = previous_accounts.get(key) or previous_accounts.get(account.get("nickname")) or {}
+        metric = metrics_by_account.get(str(account.get("nickname") or ""), {})
+        current_amount = round(float(record.get("amount") or 0), 2)
+        current_orders = int(record.get("orders_count") or 0)
+        previous_amount = round(float(previous_record.get("amount") or 0), 2)
+        previous_orders = int(previous_record.get("orders_count") or 0)
         revenue.append(
             {
                 "account": account.get("nickname"),
-                "monthly_revenue": round(float(record.get("amount") or 0), 2),
+                "monthly_revenue": current_amount,
                 "currency": "BRL",
                 "source": record.get("source") or "Pedidos oficiais Mercado Livre",
-                "orders_count": int(record.get("orders_count") or 0),
+                "orders_count": current_orders,
                 "period": period,
+                "previous_period": previous_period,
+                "previous_month_revenue": previous_amount,
+                "previous_orders_count": previous_orders,
+                "revenue_change_percent": percentage_change(current_amount, previous_amount),
+                "orders_change_percent": percentage_change(current_orders, previous_orders),
+                "reputation_level": metric.get("reputation_level") or "",
+                "power_seller_status": metric.get("power_seller_status") or "",
                 "updated_at": record.get("updated_at") or "",
                 "sync_status": record.get("sync_status") or account.get("sales_sync_status") or "Aguardando sincronização real",
             }
         )
     total_revenue = round(sum(item["monthly_revenue"] for item in revenue), 2)
+    total_orders = sum(item["orders_count"] for item in revenue)
+    previous_total_revenue = round(sum(item["previous_month_revenue"] for item in revenue), 2)
+    previous_total_orders = sum(item["previous_orders_count"] for item in revenue)
 
     stock = []
     catalog_attention = []
@@ -1312,6 +1349,12 @@ def build_operations(payload):
     return {
         "revenue": revenue,
         "total_monthly_revenue": total_revenue,
+        "total_monthly_orders": total_orders,
+        "previous_period": previous_period,
+        "previous_total_monthly_revenue": previous_total_revenue,
+        "previous_total_monthly_orders": previous_total_orders,
+        "total_revenue_change_percent": percentage_change(total_revenue, previous_total_revenue),
+        "total_orders_change_percent": percentage_change(total_orders, previous_total_orders),
         "attention_stock": stock[:200],
         "attention_catalog": catalog_attention[:200],
         "claims": claims,
@@ -4400,6 +4443,14 @@ def preserve_clips_snapshot(target, previous):
     return target
 
 
+def preserve_description_snapshot(target, previous):
+    """Keep the last official description diagnosis across full item synchronization."""
+    for key in ("description_status", "description_checked_at", "description_error"):
+        if previous.get(key) not in (None, ""):
+            target[key] = previous.get(key)
+    return target
+
+
 def refresh_identifiers_for_items(payload, item_ids):
     maximum = max(1, int(os.getenv("MELI_GTIN_ON_DEMAND_LIMIT", "15")))
     requested = list(dict.fromkeys(str(item_id) for item_id in (item_ids or []) if item_id))[:maximum]
@@ -4765,6 +4816,78 @@ def refresh_photos_report_operation(request):
     }
 
 
+def refresh_descriptions_report_operation(request):
+    payload = read_payload(include_catalog=True)
+    rows = equalization_source_items(payload, request or {})
+    search = normalized_attribute_label((request or {}).get("search") or "")
+    if search:
+        rows = [
+            item for item in rows
+            if search in normalized_attribute_label(
+                f"{item.get('sku', '')} {item.get('title', '')} {item.get('id', '')}"
+            )
+        ]
+    ttl_seconds = max(3600, int(os.getenv("MELI_DESCRIPTION_CACHE_SECONDS", "604800")))
+    now = datetime.now(APP_TZ)
+    pending = []
+    for item in rows:
+        checked = parse_meli_datetime(item.get("description_checked_at"))
+        retry_ttl = max(60, int(os.getenv("MELI_DESCRIPTION_ERROR_CACHE_SECONDS", "900")))
+        effective_ttl = retry_ttl if item.get("description_status") == "unavailable" else ttl_seconds
+        if checked and (now - checked).total_seconds() < effective_ttl:
+            continue
+        pending.append(item)
+    total = len(pending)
+    update_async_operation_progress("Preparando conferência oficial de descrições.", 0, total)
+    accounts = {
+        str(account.get("id") or ""): account
+        for account in payload.get("accounts") or []
+        if account.get("official") and account.get("access_token")
+    }
+
+    def check(item):
+        account = accounts.get(str(item.get("account_id") or ""))
+        if not account:
+            return item.get("id"), "unavailable", "Conta OAuth não encontrada."
+        try:
+            description = account_client(account).item_description(item.get("id")) or {}
+            text = str(description.get("plain_text") or description.get("text") or "").strip()
+            return item.get("id"), ("present" if text else "missing"), ""
+        except Exception as exc:
+            error = str(exc)
+            if "HTTP 404" in error:
+                return item.get("id"), "missing", ""
+            return item.get("id"), "unavailable", error[:240]
+
+    by_id = {str(item.get("id") or ""): item for item in payload.get("catalog") or []}
+    workers = max(1, min(8, int(os.getenv("MELI_DESCRIPTION_REPORT_WORKERS", "4"))))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meli-descriptions") as executor:
+        futures = [executor.submit(run_meli_work, "background", check, item) for item in pending]
+        for future in as_completed(futures):
+            item_id, status, error = future.result()
+            item = by_id.get(str(item_id or ""))
+            if item is not None:
+                item["description_status"] = status
+                item["description_checked_at"] = now_label()
+                item["description_error"] = error
+            completed += 1
+            if completed == total or completed % 20 == 0:
+                update_async_operation_progress(
+                    f"Conferindo descrições: {completed} de {total} anúncios.", completed, total,
+                )
+    if pending:
+        write_payload(payload)
+    considered = [item for item in rows if item.get("description_status")]
+    return {
+        "checked": completed,
+        "cached": len(rows) - total,
+        "missing": sum(1 for item in considered if item.get("description_status") == "missing"),
+        "present": sum(1 for item in considered if item.get("description_status") == "present"),
+        "unavailable": sum(1 for item in considered if item.get("description_status") == "unavailable"),
+    }
+
+
 def refresh_item_prices_operation(item_ids):
     maximum = max(1, int(os.getenv("MELI_PRICE_ON_DEMAND_LIMIT", "200")))
     requested = list(dict.fromkeys(str(item_id or "").strip() for item_id in item_ids or [] if item_id))[:maximum]
@@ -4999,6 +5122,8 @@ def upsert_metric(payload, account, user_profile):
     late = percent_rate((metrics.get("delayed_handling_time") or {}).get("rate"))
     metric = {
         "account": account.get("nickname"),
+        "reputation_level": reputation.get("level_id") or "",
+        "power_seller_status": reputation.get("power_seller_status") or "",
         "claims": claims,
         "cancellations": cancellations,
         "late_shipments": late,
@@ -5377,6 +5502,7 @@ def sync_recent_sales(payload, account, client):
     payload["daily_sku_sales"] = daily
     account["sales_sync_status"] = f"{revenue_orders} pedidos reais sincronizados no mês"
     upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"])
+    sync_previous_month_revenue(payload, account, client)
     sync_pending_shipments_from_orders(payload, account, orders)
     return rows
 
@@ -6673,7 +6799,7 @@ def competition_snapshot(item):
 
 
 def upsert_monthly_revenue(payload, account, amount, orders_count, period, status):
-    monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}})
+    monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}, "history": {}})
     record = {
         "account": account.get("nickname"),
         "amount": round(float(amount or 0), 2),
@@ -6682,13 +6808,44 @@ def upsert_monthly_revenue(payload, account, amount, orders_count, period, statu
         "sync_status": status,
         "updated_at": now_label(),
     }
-    monthly["period"] = period
-    monthly.setdefault("accounts", {})[account.get("id") or account.get("nickname")] = record
+    key = account.get("id") or account.get("nickname")
+    monthly.setdefault("history", {}).setdefault(period, {"accounts": {}}).setdefault("accounts", {})[key] = record
+    if period == current_month_period():
+        monthly["period"] = period
+        monthly.setdefault("accounts", {})[key] = record
     return record
 
 
+def sync_previous_month_revenue(payload, account, client):
+    period, date_from, date_to = month_window(-1)
+    monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}, "history": {}})
+    key = account.get("id") or account.get("nickname")
+    period_accounts = monthly.setdefault("history", {}).setdefault(period, {"accounts": {}}).setdefault("accounts", {})
+    if key in period_accounts and period_accounts[key].get("source") == "Pedidos oficiais Mercado Livre":
+        return period_accounts[key]
+    try:
+        orders = fetch_seller_orders_window(client, account.get("seller_id"), date_from, date_to)
+        amount, count = summarize_monthly_orders(orders)
+        return upsert_monthly_revenue(
+            payload, account, amount, count, period,
+            f"{count} pedidos reais sincronizados no mês anterior",
+        )
+    except Exception as exc:
+        status = policy_error_message(exc, "a leitura das vendas reais do mês anterior")
+        record = {
+            "account": account.get("nickname"),
+            "amount": 0,
+            "orders_count": 0,
+            "source": "Erro temporário",
+            "sync_status": status,
+            "updated_at": now_label(),
+        }
+        period_accounts[key] = record
+        return record
+
+
 def mark_monthly_revenue_error(payload, account, period, status):
-    monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}})
+    monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}, "history": {}})
     monthly["period"] = period
     accounts = monthly.setdefault("accounts", {})
     record = accounts.setdefault(
@@ -6799,6 +6956,7 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
                 preserve_sale_fee_snapshot(row, previous)
                 preserve_identifier_snapshot(row, previous)
                 preserve_clips_snapshot(row, previous)
+                preserve_description_snapshot(row, previous)
                 row["first_seen_at"] = previous.get("first_seen_at") or now_label()
                 imported.append(row)
             fetched_count += planned_count
@@ -13527,6 +13685,18 @@ def media_consistency_report_rows(payload, filters, report_mode):
                 "clips_status_label": "Clip pendente confirmado pela API",
                 "clips_checked_at": item.get("clips_checked_at") or "",
             })
+    elif report_mode == "missing_description":
+        for item in items:
+            if item.get("description_status") != "missing":
+                continue
+            rows.append({
+                "sku": str(item.get("sku") or "").strip().upper(),
+                "product": item.get("title") or "",
+                "account": item.get("account") or "",
+                "item_id": item.get("id") or "",
+                "description_status_label": "Sem descrição",
+                "description_checked_at": item.get("description_checked_at") or "",
+            })
     search = normalized_attribute_label(filters.get("search") or "")
     if search:
         rows = [row for row in rows if search in normalized_attribute_label(" ".join(str(value) for value in row.values()))]
@@ -13734,7 +13904,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
         ml_status_filter = str(filters.get("ml_status") or "all").lower()
         report_mode = str(filters.get("report_mode") or "listing_type_gap")
         account_filter = str(filters.get("account") or "all")
-        if report_mode in {"package_discrepancy", "gtin_discrepancy", "missing_clips", "photo_coverage"}:
+        if report_mode in {"package_discrepancy", "gtin_discrepancy", "missing_clips", "photo_coverage", "missing_description"}:
             output = media_consistency_report_rows(payload, filters, report_mode)
             if report_mode == "package_discrepancy":
                 title = "Divergências de medidas e peso por SKU"
@@ -13759,6 +13929,14 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
                     ("sku", "SKU", "text"), ("product", "Produto", "text"),
                     ("account", "Conta", "text"), ("item_id", "Anúncio ML", "text"),
                     ("clips_status_label", "Situação", "text"), ("clips_checked_at", "Conferido em", "text"),
+                ]
+            elif report_mode == "missing_description":
+                title = "Anúncios sem descrição"
+                columns = [
+                    ("sku", "SKU", "text"), ("product", "Produto", "text"),
+                    ("account", "Conta", "text"), ("item_id", "Anúncio ML", "text"),
+                    ("description_status_label", "Situação", "text"),
+                    ("description_checked_at", "Conferido em", "text"),
                 ]
             else:
                 title = "Anúncios com menos de 12 fotos"
@@ -16278,6 +16456,20 @@ class App(BaseHTTPRequestHandler):
                     "photos_report",
                     lambda: refresh_photos_report_operation(request_copy),
                     "Sincronização da contagem de fotos adicionada à fila de segundo plano.",
+                    priority="background",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/reports/descriptions/refresh":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "descriptions_report",
+                    lambda: refresh_descriptions_report_operation(request_copy),
+                    "Conferência de descrições adicionada à fila de segundo plano.",
                     priority="background",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
