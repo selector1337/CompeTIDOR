@@ -11651,6 +11651,34 @@ def optional_money(value):
         return None
 
 
+def allocate_money_by_weights(total, weights):
+    """Rateia um valor monetario sem duplicar nem perder centavos."""
+    values = list(weights or [])
+    if total is None:
+        return [None] * len(values)
+    if not values:
+        return []
+    total_cents = int(round(float(total) * 100))
+    sign = -1 if total_cents < 0 else 1
+    absolute_cents = abs(total_cents)
+    normalized = [max(0.0, float(value or 0)) for value in values]
+    weight_total = sum(normalized)
+    if weight_total <= 0:
+        normalized = [1.0] * len(values)
+        weight_total = float(len(values))
+    raw_cents = [absolute_cents * value / weight_total for value in normalized]
+    allocated_cents = [int(math.floor(value)) for value in raw_cents]
+    remainder = absolute_cents - sum(allocated_cents)
+    remainder_order = sorted(
+        range(len(raw_cents)),
+        key=lambda index: (raw_cents[index] - allocated_cents[index], -index),
+        reverse=True,
+    )
+    for index in remainder_order[:remainder]:
+        allocated_cents[index] += 1
+    return [round(sign * value / 100, 2) for value in allocated_cents]
+
+
 def order_item_fee_amount(order_item, catalog_item, line_total, quantity=1):
     # The Orders API exposes sale_fee per sold unit. Keeping the multiplication
     # here avoids understating fees when one order line contains several units.
@@ -12466,7 +12494,22 @@ def query_sales_report(payload, request):
                     else:
                         reimbursement_status = "not_identified"
                         shipping_source = "Estorno não retornado pelas fontes oficiais consultadas"
-            for order_item in order.get("order_items") or []:
+            line_totals = [
+                round(
+                    float(line.get("unit_price") or line.get("full_unit_price") or 0)
+                    * max(1, int(line.get("quantity") or 1)),
+                    2,
+                )
+                for line in order_lines
+            ]
+            shipping_allocations = allocate_money_by_weights(order_shipping, line_totals)
+            reimbursement_allocations = allocate_money_by_weights(order_reimbursement, line_totals)
+            sale_is_flex = is_flex is True or (is_flex is None and order_reimbursement > 0)
+            carrier_allocations = allocate_money_by_weights(
+                flex_carrier_cost if sale_is_flex and flex_carrier_cost is not None else 0.0,
+                line_totals,
+            )
+            for line_index, order_item in enumerate(order_lines):
                 source = order_item.get("item") or {}
                 item_id = str(source.get("id") or "")
                 catalog_item = (
@@ -12483,19 +12526,14 @@ def query_sales_report(payload, request):
                     cache=sale_fee_split_cache,
                 )
                 percentage_fee = round(fee - fixed_fee, 2) if fee is not None and fixed_fee is not None else None
-                allocation = line_total / order_gross if order_gross > 0 else 1.0 / max(1, len(order_lines))
-                shipping = round(order_shipping * allocation, 2) if order_shipping is not None else None
-                reimbursement = round(order_reimbursement * allocation, 2)
-                sale_is_flex = is_flex is True or (is_flex is None and order_reimbursement > 0)
+                shipping = shipping_allocations[line_index]
+                reimbursement = reimbursement_allocations[line_index]
                 sale_is_confirmed_non_flex = is_flex is False
                 if shipping_method_filter == "flex" and not sale_is_flex:
                     continue
                 if shipping_method_filter == "non_flex" and not sale_is_confirmed_non_flex:
                     continue
-                external_flex_carrier = (
-                    round(flex_carrier_cost * allocation, 2)
-                    if sale_is_flex and flex_carrier_cost is not None else 0.0
-                )
+                external_flex_carrier = carrier_allocations[line_index]
                 sku = order_item_sku(order_item, catalog_item) or "-"
                 if sku_filter and normalized_sku_key(sku) != sku_filter:
                     continue
