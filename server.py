@@ -524,7 +524,7 @@ CATALOG_ITEM_FIELDS = {
     "title", "thumbnail", "sku", "brand", "gtin", "variation_count", "catalog_product_id",
     "catalog_listing", "listing_type_id", "shipping_logistic_type", "shipping_mode", "free_shipping",
     "package_weight", "package_height", "package_width", "package_length", "package_mode",
-    "manufacturing_time", "price", "stock",
+    "manufacturing_time", "price", "stock", "sold_quantity", "family_name",
     "meli_status", "permalink", "picture_count", "picture_count_status", "item_data_checked_at",
 }
 CATALOG_SHIPPING_FIELDS = {
@@ -3988,6 +3988,8 @@ def synced_catalog_item(account, item, competition=None):
         "share": competition_share(competition.get("competition_status"), competition.get("visit_share")) if is_catalog else 100,
         "price": price_values["amount"],
         "list_price": list_price,
+        "sold_quantity": max(0, int(item.get("sold_quantity") or 0)),
+        "family_name": clean_attribute_value(item.get("family_name")),
         "stock": stock,
         "competitor": "A sincronizar",
         "action": action,
@@ -6411,50 +6413,59 @@ def parse_return_sync_dates(date_from="", date_to="", days=90):
     return start, end
 
 
+def return_sync_date_windows(date_from, date_to, maximum_days=90):
+    """Split long claim searches because the official feed caps broad ranges."""
+    window_days = max(1, int(maximum_days or 90))
+    cursor_end = date_to
+    windows = []
+    while cursor_end >= date_from:
+        cursor_start = max(date_from, cursor_end - timedelta(days=window_days - 1))
+        windows.append((cursor_start, cursor_end))
+        cursor_end = cursor_start - timedelta(days=1)
+    return windows
+
+
 def list_account_return_claims(account, client, date_from, date_to):
     limit = 100
     maximum = max(100, min(10000, int(os.getenv("MELI_RETURNS_MAX_CLAIMS", "3000"))))
     maximum_pages = max(1, min(100, int(os.getenv("MELI_RETURNS_MAX_PAGES", "50"))))
     def read_role(role, filters=None):
         role_rows = []
-        offset = 0
-        dated_filters = dict(filters or {})
-        # Asking the API for the requested activity window avoids paging through
-        # years of claims before reaching the current returns. The local period
-        # check below remains authoritative for credentials that reject range.
-        dated_filters.setdefault(
-            "range",
-            (
-                f"last_updated:after:{date_from.isoformat()}T00:00:00.000-03:00,"
-                f"before:{date_to.isoformat()}T23:59:59.999-03:00"
-            ),
-        )
-        for _page in range(maximum_pages):
-            try:
-                response = client.seller_claims(
-                    account.get("seller_id"), limit, offset, status="", role=role, filters=dated_filters
-                ) or {}
-            except TypeError:
-                response = client.seller_claims(
-                    account.get("seller_id"), limit, offset, status="", role=role
-                ) or {}
-            except Exception:
-                # Older claim contracts may reject `range`; retry the same
-                # official feed without it instead of turning the account into
-                # a false zero-return result.
-                response = client.seller_claims(
-                    account.get("seller_id"), limit, offset, status="", role=role, filters=filters
-                ) or {}
-            page_rows, total = claim_search_rows(response)
-            if not page_rows:
-                break
-            role_rows.extend(page_rows)
-            dated = [parse_meli_datetime(return_activity_date_value(item)) for item in page_rows]
-            dated = [value for value in dated if value]
-            if dated and max(value.date() for value in dated) < date_from:
-                break
-            offset += len(page_rows)
-            if offset >= total or len(page_rows) < limit or len(role_rows) >= maximum:
+        for window_start, window_end in return_sync_date_windows(date_from, date_to):
+            offset = 0
+            dated_filters = dict(filters or {})
+            # The claims service may silently constrain broad ranges to roughly
+            # 90 days. Adjacent windows ensure a 12-month synchronization visits
+            # the entire requested period.
+            dated_filters["range"] = (
+                f"last_updated:after:{window_start.isoformat()}T00:00:00.000-03:00,"
+                f"before:{window_end.isoformat()}T23:59:59.999-03:00"
+            )
+            for _page in range(maximum_pages):
+                try:
+                    response = client.seller_claims(
+                        account.get("seller_id"), limit, offset, status="", role=role, filters=dated_filters
+                    ) or {}
+                except TypeError:
+                    response = client.seller_claims(
+                        account.get("seller_id"), limit, offset, status="", role=role
+                    ) or {}
+                except Exception:
+                    response = client.seller_claims(
+                        account.get("seller_id"), limit, offset, status="", role=role, filters=filters
+                    ) or {}
+                page_rows, total = claim_search_rows(response)
+                if not page_rows:
+                    break
+                role_rows.extend(page_rows)
+                dated = [parse_meli_datetime(return_activity_date_value(item)) for item in page_rows]
+                dated = [value for value in dated if value]
+                if dated and max(value.date() for value in dated) < window_start:
+                    break
+                offset += len(page_rows)
+                if offset >= total or len(page_rows) < limit or len(role_rows) >= maximum:
+                    break
+            if len(role_rows) >= maximum:
                 break
         return role_rows
 
@@ -7948,16 +7959,33 @@ def update_item_operation(request, actor=None):
         raise RuntimeError("Conta oficial não encontrada para atualizar o anúncio.")
     client = account_client(account)
     update = {}
-    for key in ("price", "available_quantity", "title"):
+    for key in ("price", "available_quantity"):
         if key in request and request[key] not in ("", None):
             update[key] = request[key]
-    if request.get("clear_list_price") is True:
-        update["original_price"] = None
-    elif request.get("list_price") not in (None, ""):
+    if request.get("title") not in (None, ""):
+        requested_title = str(request.get("title") or "").strip()
+        if not requested_title:
+            raise RuntimeError("Informe o novo título do anúncio.")
+        if len(requested_title) > 200:
+            raise RuntimeError("O título informado é muito longo.")
+        official_item = run_interactive_meli_call(client.item, item_id) or {}
+        if is_catalog_listing(official_item):
+            raise RuntimeError("Anúncios de catálogo têm o título definido pelo Mercado Livre e não podem ser alterados.")
+        if clean_attribute_value(official_item.get("family_name")):
+            raise RuntimeError("Este anúncio usa o novo modelo de produto; o título é calculado pelo Mercado Livre.")
+        if int(official_item.get("sold_quantity") or 0) > 0:
+            raise RuntimeError("O Mercado Livre não permite alterar o título de anúncios que já tiveram vendas.")
+        if normalized_meli_status(official_item.get("status")) != "active":
+            raise RuntimeError("Ative o anúncio no Mercado Livre antes de alterar o título.")
+        update["title"] = requested_title
+
+    list_price_requested = request.get("clear_list_price") is True or request.get("list_price") not in (None, "")
+    list_price = None
+    if request.get("list_price") not in (None, ""):
         list_price = optional_money(request.get("list_price"))
         if list_price is None or list_price < 0:
             raise RuntimeError("Informe um preço de lista válido.")
-        update["original_price"] = round(list_price, 2)
+        list_price = round(list_price, 2)
     if request.get("status_action") == "pause":
         update["status"] = "paused"
     if request.get("status_action") == "activate":
@@ -8003,7 +8031,7 @@ def update_item_operation(request, actor=None):
     package_mode = str(request.get("package_mode") or "").strip().lower()
     if package_mode and package_mode not in {"factory", "additional"}:
         raise RuntimeError("Tipo de embalagem inválido.")
-    if not update and not package_mode:
+    if not update and not package_mode and not list_price_requested:
         raise RuntimeError("Nenhum campo informado para atualizar.")
 
     official = run_interactive_meli_call(client.update_item, item_id, update) if update else {"local_only": True}
@@ -8038,9 +8066,13 @@ def update_item_operation(request, actor=None):
         if "title" in update:
             changes["title"] = {"from": item.get("title"), "to": update["title"]}
             item["title"] = update["title"]
-        if "original_price" in update:
-            changes["list_price"] = {"from": item.get("list_price"), "to": update["original_price"]}
-            item["list_price"] = update["original_price"]
+        if list_price_requested:
+            changes["list_price"] = {"from": item.get("msrp", item.get("list_price")), "to": list_price}
+            # original_price is derived from Mercado Livre promotions and is
+            # not editable. MSRP is an internal commercial reference instead.
+            item["msrp"] = list_price
+            item["list_price"] = list_price
+            item["msrp_updated_at"] = now_label()
         if manufacturing_time_requested:
             changes["manufacturing_time"] = {"from": item.get("manufacturing_time") or 0, "to": manufacturing_time}
             item["manufacturing_time"] = manufacturing_time
@@ -13700,6 +13732,7 @@ def report_filtered_catalog(payload, report_type, filters):
     stock_filter = str(filters.get("stock") or "all")
     catalog_filter = str(filters.get("catalog") or "all")
     flex_filter = str(filters.get("flex") or "all")
+    availability_filter = str(filters.get("availability") or "all")
     profit_filter = str(filters.get("profit") or "all")
     sales_filter = str(filters.get("sales") or "all")
     no_sale_days = filters.get("no_sale_days") or 30
@@ -13733,6 +13766,11 @@ def report_filtered_catalog(payload, report_type, filters):
         if flex_filter == "active" and not is_flex:
             continue
         if flex_filter == "inactive" and is_flex:
+            continue
+        manufacturing_days = int(float(item.get("manufacturing_time") or 0))
+        if availability_filter == "delayed" and manufacturing_days <= 0:
+            continue
+        if availability_filter == "immediate" and manufacturing_days > 0:
             continue
         if report_type == "catalog" and not catalog_item_matches_sales_filter(
             item,
@@ -13783,6 +13821,7 @@ def normalized_package_signature(item):
 def equalization_source_items(payload, filters):
     account_filter = str(filters.get("account") or "all")
     ml_status_filter = str(filters.get("ml_status") or "all").lower()
+    modality_filter = str(filters.get("modality") or filters.get("catalog") or "all").lower()
     accounts = {
         str(account.get("nickname") or "")
         for account in payload.get("accounts") or []
@@ -13797,6 +13836,10 @@ def equalization_source_items(payload, filters):
         if account_filter != "all" and account_filter not in {account_name, str(item.get("account_id") or "")}:
             continue
         if ml_status_filter != "all" and normalized_meli_status(item.get("meli_status")) != ml_status_filter:
+            continue
+        if modality_filter == "catalog" and not is_catalog_listing(item):
+            continue
+        if modality_filter == "traditional" and is_catalog_listing(item):
             continue
         rows.append(item)
     return rows

@@ -19,6 +19,7 @@
   adsCatalog: "all",
   adsFlex: "all",
   adsPickup: "all",
+  adsAvailability: "all",
   adsProfit: "all",
   adsSelectedIds: new Set(),
   stockPeriod: "today",
@@ -102,6 +103,7 @@
   equalizationReady: false,
   equalizationAccount: "all",
   equalizationStatus: "all",
+  equalizationModality: "all",
   equalizationSearch: "",
   equalizationPage: 1,
   equalizationPageSize: 20,
@@ -214,6 +216,10 @@ function calculatorIcon() {
     <rect x="7" y="5.5" width="10" height="3.5" rx="0.5"></rect>
     <path d="M8 13h.01M12 13h.01M16 13h.01M8 17h.01M12 17h.01M16 17h.01"></path>
   </svg>`;
+}
+
+function pencilIcon() {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4Zm12.5-16.5 4 4 1-1a1.4 1.4 0 0 0 0-2l-2-2a1.4 1.4 0 0 0-2 0l-1 1Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" /></svg>`;
 }
 
 function copyIcon() {
@@ -728,6 +734,30 @@ function dashboardPreviousMonth({ available, revenue, orders, revenueChange, ord
   `;
 }
 
+function dashboardRevenueProjection(currentRevenue, previousRevenue, previousAvailable = true) {
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  const elapsedFraction = Math.min(1, Math.max(1 / 31, (now.getTime() - monthStart.getTime()) / (nextMonth.getTime() - monthStart.getTime())));
+  const projected = Number(currentRevenue || 0) / elapsedFraction;
+  const previous = Number(previousRevenue || 0);
+  const change = previousAvailable && previous > 0 ? ((projected - previous) / previous) * 100 : null;
+  const tone = change === null ? "neutral" : (change >= 0 ? "positive" : "negative");
+  const comparison = change === null
+    ? ""
+    : ` · <b>${change >= 0 ? "+" : ""}${change.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</b> vs. mês passado`;
+  return `<div class="revenue-projection ${tone}">Projeção no fechamento: <b>${money.format(projected)}</b>${comparison}</div>`;
+}
+
+function adTitleEditState(item) {
+  if (!item?.official_source) return { allowed: false, reason: "Disponível apenas para anúncios de contas oficiais." };
+  if (isCatalogItem(item)) return { allowed: false, reason: "O título de anúncios de catálogo é definido pelo Mercado Livre." };
+  if (item.family_name) return { allowed: false, reason: "No novo modelo de produto, o título é calculado pelo Mercado Livre." };
+  if (Number(item.sold_quantity || 0) > 0) return { allowed: false, reason: "O Mercado Livre bloqueia a alteração após a primeira venda." };
+  if (normalizedMlStatus(item.meli_status) !== "active") return { allowed: false, reason: "Ative o anúncio antes de alterar o título." };
+  return { allowed: true, reason: "Alterar o título oficial no Mercado Livre." };
+}
+
 function renderDashboard() {
   const ops = state.data.operations || {};
   const stockRows = filterByStockPeriod(ops.attention_stock || []);
@@ -745,6 +775,7 @@ function renderDashboard() {
         ordersChange: ops.total_orders_change_percent,
         pendingAccounts: ops.previous_month_pending_accounts,
       })}
+      ${dashboardRevenueProjection(ops.total_monthly_revenue, ops.previous_total_monthly_revenue, ops.previous_month_complete !== false)}
     </article>
     ${(ops.revenue || []).map((item) => `
       <article class="revenue-account">
@@ -758,6 +789,7 @@ function renderDashboard() {
           revenueChange: item.revenue_change_percent,
           ordersChange: item.orders_change_percent,
         })}
+        ${dashboardRevenueProjection(item.monthly_revenue, item.previous_month_revenue, item.previous_month_available !== false)}
       </article>
     `).join("")}
   `;
@@ -1746,6 +1778,7 @@ function renderAds() {
       && (state.adsCatalog === "all" || (state.adsCatalog === "catalog" ? isCatalogItem(item) : !isCatalogItem(item)))
       && (state.adsFlex === "all" || (state.adsFlex === "active" ? item.shipping_logistic_type === "self_service" : item.shipping_logistic_type !== "self_service"))
       && (state.adsPickup === "all" || (state.adsPickup === "active" ? item.local_pick_up === true : item.local_pick_up !== true))
+      && (state.adsAvailability === "all" || (state.adsAvailability === "delayed" ? Number(item.manufacturing_time || 0) > 0 : Number(item.manufacturing_time || 0) <= 0))
       && (state.adsProfit === "all"
         || (state.adsProfit === "cost"
           ? itemCommercialValues(item).cost !== null
@@ -1827,7 +1860,13 @@ function renderAds() {
       </a>
       <div class="ad-main">
         <div class="ad-title-row">
-          <strong>${item.title}</strong>
+          <div class="ad-title-copy">
+            <strong>${escapeText(item.title || item.id)}</strong>
+            ${(() => {
+              const edit = adTitleEditState(item);
+              return `<button class="icon-button ad-title-edit-button" type="button" data-edit-ad-title="${escapeAttr(item.id)}" title="${escapeAttr(edit.reason)}" aria-label="${escapeAttr(edit.reason)}" ${edit.allowed ? "" : "disabled"}>${pencilIcon()}</button>`;
+            })()}
+          </div>
           <div class="ad-title-actions">
             <button class="icon-button ad-profit-calculator-button" type="button" data-profit-calculator="${item.id}" title="Calcular lucro, prejuízo e margem" aria-label="Abrir calculadora de rentabilidade de ${escapeAttr(item.title || item.id)}">${calculatorIcon()}</button>
             <span class="badge ${normalizedMlStatus(item.meli_status) === "paused" ? "paused" : "winning"}">${statusLabel(item.meli_status || item.status)}</span>
@@ -1853,9 +1892,9 @@ function renderAds() {
         </div>
         <div class="inline-edit">
           <div class="inline-edit-row ad-stock-row">
-            <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
-            <label>Preço de lista <span class="money-field"><input type="number" min="0" step="0.01" value="${item.list_price || ""}" data-original-value="${item.list_price || ""}" data-list-price-input="${item.id}" placeholder="Opcional" /></span><small>Preço sugerido pelo fabricante (MSRP).</small></label>
-            <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
+            <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-original-value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
+            <label>Preço de lista <span class="money-field"><input type="number" min="0" step="0.01" value="${item.msrp ?? item.list_price ?? ""}" data-original-value="${item.msrp ?? item.list_price ?? ""}" data-list-price-input="${item.id}" placeholder="Opcional" /></span><small>MSRP interno; não altera promoções do Mercado Livre.</small></label>
+            <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-original-value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
             <label>Disponibilidade <span class="unit-field"><input type="number" min="0" max="45" step="1" value="${Number(item.manufacturing_time || 0)}" data-original-value="${Number(item.manufacturing_time || 0)}" data-manufacturing-time-input="${item.id}" /><span>dias</span></span><small>Use 0 para disponibilidade imediata.</small></label>
           </div>
           <div class="inline-edit-row ad-package-row">
@@ -2032,7 +2071,8 @@ function renderEqualizationReports() {
     const status = String(item.meli_status || "").toLowerCase() === "inactive" ? "paused" : String(item.meli_status || "").toLowerCase();
     return accounts.includes(account) && sku && sku !== "-"
       && (state.equalizationAccount === "all" || account === state.equalizationAccount)
-      && (state.equalizationStatus === "all" || status === state.equalizationStatus);
+      && (state.equalizationStatus === "all" || status === state.equalizationStatus)
+      && (state.equalizationModality === "all" || (state.equalizationModality === "catalog" ? isCatalogItem(item) : !isCatalogItem(item)));
   });
   const mediaModes = new Set(["package_discrepancy", "gtin_discrepancy", "missing_clips", "photo_coverage", "missing_description"]);
   if (mediaModes.has(state.equalizationType)) {
@@ -4056,6 +4096,7 @@ function currentReportFilters(reportType) {
       report_mode: state.equalizationType,
       account: state.equalizationAccount,
       ml_status: state.equalizationStatus,
+      modality: state.equalizationModality,
       search: state.equalizationSearch,
     };
   }
@@ -4069,6 +4110,7 @@ function currentReportFilters(reportType) {
     listing_type: state.adsListingType,
     catalog: state.adsCatalog,
     flex: state.adsFlex,
+    availability: state.adsAvailability,
     profit: state.adsProfit,
   };
 }
@@ -5305,6 +5347,7 @@ document.addEventListener("click", (event) => {
   ["#ads-catalog-filter", "adsCatalog"],
   ["#ads-flex-filter", "adsFlex"],
   ["#ads-pickup-filter", "adsPickup"],
+  ["#ads-availability-filter", "adsAvailability"],
   ["#ads-profit-filter", "adsProfit"],
   ["#costs-search", "costsSearch"],
   ["#costs-status-filter", "costsStatus"],
@@ -5317,6 +5360,7 @@ document.addEventListener("click", (event) => {
   ["#equalization-report-type", "equalizationType"],
   ["#equalization-account-filter", "equalizationAccount"],
   ["#equalization-status-filter", "equalizationStatus"],
+  ["#equalization-modality-filter", "equalizationModality"],
   ["#equalization-search", "equalizationSearch"],
   ["#equalization-page-size", "equalizationPageSize"],
 ].forEach(([selector, key]) => {
@@ -5342,7 +5386,7 @@ document.addEventListener("click", (event) => {
     }
     if (key.startsWith("equalization")) {
       state.equalizationPage = 1;
-      if (["equalizationType", "equalizationAccount", "equalizationStatus"].includes(key)) {
+      if (["equalizationType", "equalizationAccount", "equalizationStatus", "equalizationModality"].includes(key)) {
         state.equalizationReady = false;
       }
       scheduleRender("equalization", renderEqualizationReports);
@@ -5370,7 +5414,7 @@ document.addEventListener("click", (event) => {
     }
     if (key.startsWith("equalization")) {
       state.equalizationPage = 1;
-      if (["equalizationType", "equalizationAccount", "equalizationStatus"].includes(key)) {
+      if (["equalizationType", "equalizationAccount", "equalizationStatus", "equalizationModality"].includes(key)) {
         state.equalizationReady = false;
       }
       renderEqualizationReports();
@@ -5436,6 +5480,7 @@ document.querySelector("#clear-ads-filters")?.addEventListener("click", () => {
     adsCatalog: "all",
     adsFlex: "all",
     adsPickup: "all",
+    adsAvailability: "all",
     adsProfit: "all",
     adsPage: 1,
   });
@@ -5947,10 +5992,37 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
 });
 
 document.querySelector("#ads-list").addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-save-ad], [data-pause-ad], [data-activate-ad], [data-remove-flex], [data-activate-flex], [data-remove-pickup], [data-activate-pickup], [data-delete-ad]");
+  const button = event.target.closest("[data-edit-ad-title], [data-save-ad], [data-pause-ad], [data-activate-ad], [data-remove-flex], [data-activate-flex], [data-remove-pickup], [data-activate-pickup], [data-delete-ad]");
   if (!button) return;
-  const id = button.dataset.saveAd || button.dataset.pauseAd || button.dataset.activateAd || button.dataset.removeFlex || button.dataset.activateFlex || button.dataset.removePickup || button.dataset.activatePickup || button.dataset.deleteAd;
+  const id = button.dataset.editAdTitle || button.dataset.saveAd || button.dataset.pauseAd || button.dataset.activateAd || button.dataset.removeFlex || button.dataset.activateFlex || button.dataset.removePickup || button.dataset.activatePickup || button.dataset.deleteAd;
   const item = state.data.catalog.find((row) => row.id === id);
+  if (button.dataset.editAdTitle) {
+    const edit = adTitleEditState(item);
+    if (!edit.allowed) {
+      showToast(edit.reason, "error");
+      return;
+    }
+    const title = window.prompt("Novo título oficial do anúncio:", item.title || "");
+    if (title === null || title.trim() === (item.title || "").trim()) return;
+    if (!title.trim()) {
+      showToast("Informe um título para o anúncio.", "error");
+      return;
+    }
+    try {
+      const result = await runManualItemOperation(
+        "/api/meli/item/update",
+        { item_id: id, account_id: item.account_id, title: title.trim() },
+        button,
+        "Alterando título...",
+      );
+      mergeCatalogItem(result?.item);
+      showToast("Título oficial atualizado no Mercado Livre.", "success");
+      renderAds();
+    } catch (error) {
+      showToast(error.message || "Não foi possível alterar o título.", "error");
+    }
+    return;
+  }
   if (button.dataset.deleteAd) {
     if (!window.confirm(`Excluir definitivamente o anúncio ${id} do Mercado Livre? Esta ação não pode ser desfeita.`)) return;
     try {
@@ -6022,8 +6094,14 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
   }
   const payload = { item_id: id, account_id: item.account_id };
   if (button.dataset.saveAd) {
-    payload.price = Number(document.querySelector(`[data-price-input="${id}"]`).value);
-    payload.available_quantity = Number(document.querySelector(`[data-stock-input="${id}"]`).value);
+    const priceInput = document.querySelector(`[data-price-input="${id}"]`);
+    if (Number(priceInput?.value || 0) !== Number(priceInput?.dataset.originalValue || 0)) {
+      payload.price = Number(priceInput.value);
+    }
+    const stockInput = document.querySelector(`[data-stock-input="${id}"]`);
+    if (Number(stockInput?.value || 0) !== Number(stockInput?.dataset.originalValue || 0)) {
+      payload.available_quantity = Number(stockInput.value);
+    }
     const listPriceInput = document.querySelector(`[data-list-price-input="${id}"]`);
     if ((listPriceInput?.value || "").trim() !== (listPriceInput?.dataset.originalValue || "").trim()) {
       if ((listPriceInput?.value || "").trim()) payload.list_price = Number(listPriceInput.value);

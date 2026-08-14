@@ -2636,6 +2636,32 @@ main {
   overflow-wrap: anywhere;
 }
 
+.ad-title-copy {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ad-title-edit-button {
+  width: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  height: 24px;
+  padding: 4px;
+  border-radius: 6px;
+}
+
+.ad-title-edit-button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.ad-title-edit-button:disabled {
+  cursor: not-allowed;
+  opacity: .3;
+}
+
 .ad-facts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -3478,6 +3504,17 @@ body {
   color: var(--muted);
   background: color-mix(in srgb, var(--muted) 10%, transparent);
 }
+
+.revenue-projection {
+  margin-top: 3px;
+  font-size: .59rem;
+  line-height: 1.2;
+  color: var(--muted);
+}
+
+.revenue-projection.positive { color: var(--green); }
+.revenue-projection.negative { color: var(--red); }
+.revenue-projection.neutral { color: var(--muted); }
 
 .revenue-history.pending > span {
   display: inline-flex;
