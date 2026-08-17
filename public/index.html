@@ -769,7 +769,7 @@
           </div>
           <div id="ads-bulk-price" class="bulk-price-bar" aria-live="polite">
             <div class="bulk-price-heading">
-              <div><small>Alteração em lote</small><strong>Atualizar preços selecionados</strong></div>
+              <div><small>Alteração em lote</small><strong>Atualizar anúncios selecionados</strong></div>
             </div>
             <div class="bulk-price-actions">
               <div class="bulk-price-selection">
@@ -795,6 +795,16 @@
               </label>
               <label>Valor <input data-bulk-price-value type="number" min="0.01" step="0.01" placeholder="0,00" /></label>
               <button class="mini-button success-button bulk-price-apply" type="button" data-apply-bulk-price disabled>Aplicar preços</button>
+            </div>
+            <div class="bulk-availability-fields">
+              <div class="bulk-availability-copy">
+                <strong>Disponibilidade</strong>
+                <small>Defina o prazo dos selecionados. Use 0 para disponibilidade imediata.</small>
+              </div>
+              <label>Prazo
+                <span class="bulk-days-field"><input data-bulk-availability-value type="number" min="0" max="45" step="1" value="0" /><b>dias</b></span>
+              </label>
+              <button class="mini-button success-button bulk-price-apply" type="button" data-apply-bulk-availability disabled>Aplicar prazo</button>
             </div>
             <div class="bulk-price-progress" data-bulk-price-progress hidden>
               <div><strong data-bulk-progress-title>Processando alterações</strong><span data-bulk-progress-count></span></div>

@@ -4530,6 +4530,13 @@ body {
 .bulk-price-actions .bulk-price-count { justify-self: end; }
 .bulk-price-selection { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: nowrap; overflow-x: auto; padding-bottom: 2px; }
 .bulk-price-fields { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(220px, 1fr) minmax(150px, .45fr) minmax(160px, auto); align-items: end; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
+.bulk-availability-fields { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(260px, 1fr) minmax(150px, .35fr) minmax(160px, auto); align-items: end; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
+.bulk-availability-copy { display: grid; gap: 3px; align-self: center; min-width: 0; }
+.bulk-availability-copy strong { color: var(--text); font-size: .78rem; text-transform: uppercase; }
+.bulk-availability-copy small { color: var(--muted); font-size: .72rem; line-height: 1.35; }
+.bulk-days-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; }
+.bulk-days-field input { border-radius: 6px 0 0 6px; }
+.bulk-days-field b { display: grid; place-items: center; min-width: 48px; padding: 0 10px; border: 1px solid var(--line); border-left: 0; border-radius: 0 6px 6px 0; color: var(--brand); background: color-mix(in srgb, var(--brand) 12%, var(--panel)); font-size: .75rem; text-transform: lowercase; }
 .bulk-price-apply { min-height: 40px; padding-inline: 22px; }
 
 .ad-item { grid-template-columns: 28px 120px minmax(0, 1fr); }
@@ -4601,6 +4608,8 @@ body {
   .bulk-price-selection { justify-content: flex-start; flex-wrap: wrap; overflow: visible; }
   .bulk-price-actions .bulk-price-count { justify-self: start; }
   .bulk-price-fields { grid-template-columns: 1fr 1fr; }
+  .bulk-availability-fields { grid-template-columns: 1fr 1fr; }
+  .bulk-availability-copy { grid-column: 1 / -1; }
   .bulk-price-apply { grid-column: 1 / -1; }
 }
 
@@ -4608,7 +4617,8 @@ body {
   .report-filter-bar { grid-template-columns: 1fr; }
   .bulk-price-bar { grid-template-columns: 1fr; }
   .bulk-price-heading { align-items: flex-start; flex-direction: column; }
-  .bulk-price-fields { grid-template-columns: 1fr; }
+  .bulk-price-fields, .bulk-availability-fields { grid-template-columns: 1fr; }
+  .bulk-availability-copy { grid-column: auto; }
   .bulk-price-apply { grid-column: auto; }
   .ad-item { grid-template-columns: 24px minmax(0, 1fr); }
   .ad-item > .product-media { grid-column: 2; }
@@ -8846,7 +8856,8 @@ textarea:focus {
   }
 
   .bulk-price-bar,
-  .bulk-price-fields {
+  .bulk-price-fields,
+  .bulk-availability-fields {
     grid-template-columns: minmax(0, 1fr) !important;
   }
 

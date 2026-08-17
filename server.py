@@ -524,7 +524,7 @@ CATALOG_ITEM_FIELDS = {
     "title", "thumbnail", "sku", "brand", "gtin", "variation_count", "catalog_product_id",
     "catalog_listing", "listing_type_id", "shipping_logistic_type", "shipping_mode", "free_shipping",
     "package_weight", "package_height", "package_width", "package_length", "package_mode",
-    "manufacturing_time", "price", "stock", "sold_quantity", "family_name",
+    "manufacturing_time", "price", "list_price", "stock", "sold_quantity", "family_name",
     "meli_status", "permalink", "picture_count", "picture_count_status", "item_data_checked_at",
 }
 CATALOG_SHIPPING_FIELDS = {
@@ -2463,8 +2463,8 @@ def item_local_pick_up(item):
     return False
 
 
-def item_list_price(item, regular_amount=None):
-    """Read MSRP/list price without confusing the current promotional price."""
+def explicit_item_list_price(item):
+    """Read a seller-provided list price, excluding promotion-derived values."""
     direct = optional_money(first_present(item, ["list_price", "msrp"], None))
     if direct is not None:
         return direct
@@ -2478,6 +2478,14 @@ def item_list_price(item, regular_amount=None):
             )
             if value is not None:
                 return value
+    return None
+
+
+def item_list_price(item, regular_amount=None):
+    """Read MSRP/list price without confusing the current promotional price."""
+    explicit = explicit_item_list_price(item)
+    if explicit is not None:
+        return explicit
     # `original_price` is also used by Mercado Livre for temporary promotions,
     # so it is only a compatibility fallback after the explicit MSRP fields.
     original = optional_money(item.get("original_price"))
@@ -7986,6 +7994,8 @@ def update_item_operation(request, actor=None):
         if list_price is None or list_price < 0:
             raise RuntimeError("Informe um preço de lista válido.")
         list_price = round(list_price, 2)
+    if list_price_requested:
+        update["list_price"] = list_price
     if request.get("status_action") == "pause":
         update["status"] = "paused"
     if request.get("status_action") == "activate":
@@ -8035,6 +8045,14 @@ def update_item_operation(request, actor=None):
         raise RuntimeError("Nenhum campo informado para atualizar.")
 
     official = run_interactive_meli_call(client.update_item, item_id, update) if update else {"local_only": True}
+    if list_price_requested:
+        verified_list_item = run_interactive_meli_call(client.item, item_id) or {}
+        verified_list_price = explicit_item_list_price(verified_list_item)
+        if list_price is None:
+            if verified_list_price is not None:
+                raise RuntimeError("O Mercado Livre não removeu o preço de lista. Tente novamente em alguns instantes.")
+        elif verified_list_price is None or abs(verified_list_price - list_price) > 0.009:
+            raise RuntimeError("O Mercado Livre não confirmou o preço de lista informado.")
     verified_item = run_interactive_meli_call(
         verify_package_update, client, item_id, expected_package_values
     ) if expected_package_values else {}
@@ -8068,11 +8086,9 @@ def update_item_operation(request, actor=None):
             item["title"] = update["title"]
         if list_price_requested:
             changes["list_price"] = {"from": item.get("msrp", item.get("list_price")), "to": list_price}
-            # original_price is derived from Mercado Livre promotions and is
-            # not editable. MSRP is an internal commercial reference instead.
-            item["msrp"] = list_price
             item["list_price"] = list_price
-            item["msrp_updated_at"] = now_label()
+            item.pop("msrp", None)
+            item.pop("msrp_updated_at", None)
         if manufacturing_time_requested:
             changes["manufacturing_time"] = {"from": item.get("manufacturing_time") or 0, "to": manufacturing_time}
             item["manufacturing_time"] = manufacturing_time
@@ -8739,6 +8755,69 @@ def bulk_price_operation(request, actor=None):
         except Exception as exc:
             results.append({"item_id": item_id, "status": "error", "error": str(exc)})
         update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, results[-1])
+    write_payload(payload)
+    return {
+        "updated": sum(row.get("status") == "updated" for row in results),
+        "failed": sum(row.get("status") == "error" for row in results),
+        "results": results,
+    }
+
+
+def bulk_availability_operation(request, actor=None):
+    item_ids = list(dict.fromkeys(str(value or "").strip() for value in request.get("item_ids") or [] if value))
+    maximum = max(1, int(os.getenv("MELI_BULK_AVAILABILITY_MAX_ITEMS", "500")))
+    if not item_ids:
+        raise RuntimeError("Selecione ao menos um anúncio.")
+    if len(item_ids) > maximum:
+        raise RuntimeError(f"Altere a disponibilidade de no máximo {maximum} anúncios por operação.")
+    raw_days = request.get("manufacturing_time")
+    try:
+        days_number = float(raw_days)
+        if not days_number.is_integer():
+            raise ValueError
+        days = int(days_number)
+    except (TypeError, ValueError):
+        raise RuntimeError("Informe um prazo inteiro entre 0 e 45 dias.")
+    if days < 0 or days > 45:
+        raise RuntimeError("Informe um prazo inteiro entre 0 e 45 dias.")
+
+    payload = read_payload(include_catalog=True)
+    catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
+    accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
+    results = []
+    total = len(item_ids)
+    update_async_operation_progress("Preparando alterações de disponibilidade.", 0, total)
+    for index, item_id in enumerate(item_ids, 1):
+        item = catalog.get(item_id)
+        account = accounts.get(str((item or {}).get("account_id") or ""))
+        if not item or not account:
+            result = {"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."}
+        else:
+            previous = int(item.get("manufacturing_time") or 0)
+            try:
+                client = account_client(account)
+                run_interactive_meli_call(client.update_item, item_id, {
+                    "sale_terms": [{
+                        "id": "MANUFACTURING_TIME",
+                        "value_name": f"{days} dias" if days else None,
+                    }],
+                })
+                verified = run_interactive_meli_call(client.item, item_id) or {}
+                confirmed_days = item_manufacturing_time(verified)
+                if confirmed_days != days:
+                    raise RuntimeError("O Mercado Livre não confirmou o prazo informado.")
+                checked_at = now_label()
+                item["manufacturing_time"] = days
+                item["item_data_checked_at"] = checked_at
+                item["updated_at"] = checked_at
+                append_item_log(payload, item, actor or {}, "Alteração de disponibilidade em massa", {
+                    "manufacturing_time": {"from": previous, "to": days},
+                })
+                result = {"item_id": item_id, "status": "updated", "manufacturing_time": days, "checked_at": checked_at}
+            except Exception as exc:
+                result = {"item_id": item_id, "status": "error", "error": str(exc)}
+        results.append(result)
+        update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, result)
     write_payload(payload)
     return {
         "updated": sum(row.get("status") == "updated" for row in results),
@@ -16217,6 +16296,7 @@ class App(BaseHTTPRequestHandler):
             "/api/kits/picture",
             "/api/kits/create",
             "/api/meli/items/bulk-price",
+            "/api/meli/items/bulk-availability",
             "/api/meli/items/bulk-remove-flex",
             "/api/meli/items/bulk-activate-flex",
             "/api/meli/items/bulk-remove-pickup",
@@ -16833,6 +16913,21 @@ class App(BaseHTTPRequestHandler):
                     "bulk_price",
                     lambda: bulk_price_operation(request_copy, actor),
                     "Alteração de preços adicionada à fila.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/meli/items/bulk-availability":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                operation = start_async_operation(
+                    "bulk_availability",
+                    lambda: bulk_availability_operation(request_copy, actor),
+                    "Alteração de disponibilidade adicionada à fila.",
                     priority="manual",
                 )
                 self.send_json({"ok": True, **operation}, status=202)

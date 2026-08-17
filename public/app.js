@@ -234,6 +234,7 @@ function manualActionLabel(path) {
     "/api/clone/execute": "Copiando anúncio",
     "/api/clone/execute-batch": "Copiando anúncios",
     "/api/meli/items/bulk-price": "Atualizando preços em lote",
+    "/api/meli/items/bulk-availability": "Atualizando disponibilidade em lote",
     "/api/meli/item/update": "Atualizando anúncio",
     "/api/spreadsheet/template": "Gerando planilha",
     "/api/spreadsheet/import": "Validando planilha",
@@ -1893,7 +1894,7 @@ function renderAds() {
         <div class="inline-edit">
           <div class="inline-edit-row ad-stock-row">
             <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-original-value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
-            <label>Preço de lista <span class="money-field"><input type="number" min="0" step="0.01" value="${item.msrp ?? item.list_price ?? ""}" data-original-value="${item.msrp ?? item.list_price ?? ""}" data-list-price-input="${item.id}" placeholder="Opcional" /></span><small>MSRP interno; não altera promoções do Mercado Livre.</small></label>
+            <label>Preço de lista <span class="money-field"><input type="number" min="0" step="0.01" value="${item.list_price ?? ""}" data-original-value="${item.list_price ?? ""}" data-list-price-input="${item.id}" placeholder="Opcional" /></span><small>Enviado ao campo Preço do anúncio no Mercado Livre.</small></label>
             <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-original-value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
             <label>Disponibilidade <span class="unit-field"><input type="number" min="0" max="45" step="1" value="${Number(item.manufacturing_time || 0)}" data-original-value="${Number(item.manufacturing_time || 0)}" data-manufacturing-time-input="${item.id}" /><span>dias</span></span><small>Use 0 para disponibilidade imediata.</small></label>
           </div>
@@ -2368,6 +2369,7 @@ function updateBulkPriceBar() {
   const count = state.adsSelectedIds.size;
   const label = root.querySelector("[data-bulk-selected-count]");
   const button = root.querySelector("[data-apply-bulk-price]");
+  const availabilityButton = root.querySelector("[data-apply-bulk-availability]");
   const flexButton = root.querySelector("[data-bulk-remove-flex]");
   const activateFlexButton = root.querySelector("[data-bulk-activate-flex]");
   const removePickupButton = root.querySelector("[data-bulk-remove-pickup]");
@@ -2375,6 +2377,7 @@ function updateBulkPriceBar() {
   const deleteButton = root.querySelector("[data-bulk-delete-ads]");
   if (label) label.textContent = count;
   if (button) button.disabled = count === 0;
+  if (availabilityButton) availabilityButton.disabled = count === 0;
   if (flexButton) flexButton.disabled = count === 0;
   if (activateFlexButton) activateFlexButton.disabled = count === 0;
   if (removePickupButton) removePickupButton.disabled = count === 0;
@@ -2408,7 +2411,8 @@ function renderBulkPriceProgress() {
   if (title) title.textContent = progress.status === "completed"
     ? progress.failed ? "Alteração concluída com pendências" : "Alteração concluída com sucesso"
     : progress.status === "error" ? "Alteração interrompida"
-      : progress.operation === "flex_activate" ? "Ativando Mercado Envios Flex"
+          : progress.operation === "availability" ? "Atualizando disponibilidade"
+            : progress.operation === "flex_activate" ? "Ativando Mercado Envios Flex"
         : ["flex", "flex_remove"].includes(progress.operation) ? "Removendo Mercado Envios Flex"
           : "Atualizando preços";
   if (count) count.textContent = total ? `${completed} de ${total} · ${percent.toLocaleString("pt-BR")}%` : "";
@@ -2419,7 +2423,8 @@ function renderBulkPriceProgress() {
       <span class="${item.status === "updated" ? "bulk-result-ok" : "bulk-result-error"}">
         <b>${item.status === "updated" ? "✓" : "!"}</b>
         ${escapeText(item.item_id || "Anúncio")}${item.status === "updated"
-          ? progress.operation === "flex_activate" ? " · Flex ativado"
+          ? progress.operation === "availability" ? ` · ${Number(item.manufacturing_time || 0) ? `${Number(item.manufacturing_time)} dias` : "Disponibilidade imediata"}`
+            : progress.operation === "flex_activate" ? " · Flex ativado"
             : ["flex", "flex_remove"].includes(progress.operation) ? " · Flex removido"
               : ` · ${money.format(item.price)}`
           : item.status === "ignored" ? ` · ${escapeText(item.message || "Sem alteração")}` : ` · ${escapeText(item.error || "Falhou")}`}
@@ -5749,6 +5754,62 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
       showToast(error.message || "A operação não foi concluída.", "error");
     } finally {
       bulkActionButton.disabled = state.adsSelectedIds.size === 0;
+    }
+    return;
+  }
+  const availabilityButton = event.target.closest("[data-apply-bulk-availability]");
+  if (availabilityButton) {
+    const root = availabilityButton.closest("#ads-bulk-price");
+    const input = root.querySelector("[data-bulk-availability-value]");
+    const rawValue = String(input?.value ?? "").trim();
+    const days = Number(rawValue);
+    if (rawValue === "" || !Number.isInteger(days) || days < 0 || days > 45) {
+      showToast("Informe um prazo inteiro entre 0 e 45 dias.", "error");
+      return;
+    }
+    availabilityButton.disabled = true;
+    const original = availabilityButton.textContent;
+    state.bulkPriceProgress = {
+      status: "running", operation: "availability",
+      message: "Adicionando alterações de disponibilidade à fila prioritária...",
+      completed: 0, total: state.adsSelectedIds.size, percent: 0, results: [],
+    };
+    renderBulkPriceProgress();
+    try {
+      const queued = await api("/api/meli/items/bulk-availability", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: [...state.adsSelectedIds], manufacturing_time: days }),
+      });
+      const result = await waitForAsyncOperation(queued, (message, job) => {
+        availabilityButton.textContent = message || "Atualizando prazo...";
+        state.bulkPriceProgress = {
+          ...state.bulkPriceProgress, status: job?.status || "running",
+          message: message || "Atualizando disponibilidade...",
+          completed: Number(job?.completed || 0), total: Number(job?.total || state.adsSelectedIds.size),
+          percent: Number(job?.percent || 0),
+        };
+        renderBulkPriceProgress();
+      });
+      const updates = new Map((result.results || []).filter((row) => row.status === "updated").map((row) => [row.item_id, Number(row.manufacturing_time || 0)]));
+      state.data.catalog = state.data.catalog.map((item) => updates.has(item.id)
+        ? { ...item, manufacturing_time: updates.get(item.id), item_data_checked_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+        : item);
+      updates.forEach((_, itemId) => state.adsSelectedIds.delete(itemId));
+      state.bulkPriceProgress = {
+        status: "completed", operation: "availability",
+        message: result.failed ? "Confira os anúncios que precisam de nova tentativa." : "Disponibilidade confirmada pelo Mercado Livre.",
+        completed: (result.results || []).length, total: (result.results || []).length, percent: 100,
+        updated: Number(result.updated || 0), failed: Number(result.failed || 0), results: result.results || [],
+      };
+      showToast(`${result.updated || 0} anúncio(s) atualizado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`, result.failed ? "error" : "success");
+      renderAds();
+    } catch (error) {
+      state.bulkPriceProgress = { ...state.bulkPriceProgress, status: "error", message: error.message || "Não foi possível atualizar a disponibilidade." };
+      renderBulkPriceProgress();
+      showToast(error.message || "Não foi possível atualizar a disponibilidade em lote.", "error");
+    } finally {
+      availabilityButton.disabled = state.adsSelectedIds.size === 0;
+      availabilityButton.textContent = original;
     }
     return;
   }
