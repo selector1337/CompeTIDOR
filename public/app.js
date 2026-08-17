@@ -1894,7 +1894,7 @@ function renderAds() {
         <div class="inline-edit">
           <div class="inline-edit-row ad-stock-row">
             <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-original-value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
-            <label>Preço de lista <span class="money-field"><input type="number" min="0" step="0.01" value="${item.list_price ?? ""}" data-original-value="${item.list_price ?? ""}" data-list-price-input="${item.id}" placeholder="Opcional" /></span><small>Enviado ao campo Preço do anúncio no Mercado Livre.</small></label>
+            <label>Preço de lista <span class="money-field"><input type="number" min="0" step="0.01" value="${item.list_price ?? ""}" data-original-value="${item.list_price ?? ""}" data-list-price-input="${item.id}" placeholder="Opcional" ${Number(item.sold_quantity || 0) > 0 ? "disabled" : ""} /></span><small>${Number(item.sold_quantity || 0) > 0 ? "Bloqueado pelo Mercado Livre após a primeira venda." : "Enviado ao campo Preço do anúncio no Mercado Livre."}</small></label>
             <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-original-value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
             <label>Disponibilidade <span class="unit-field"><input type="number" min="0" max="45" step="1" value="${Number(item.manufacturing_time || 0)}" data-original-value="${Number(item.manufacturing_time || 0)}" data-manufacturing-time-input="${item.id}" /><span>dias</span></span><small>Use 0 para disponibilidade imediata.</small></label>
           </div>

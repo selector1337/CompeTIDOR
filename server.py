@@ -7966,6 +7966,7 @@ def update_item_operation(request, actor=None):
     if not account or not account.get("official"):
         raise RuntimeError("Conta oficial não encontrada para atualizar o anúncio.")
     client = account_client(account)
+    official_item = None
     update = {}
     for key in ("price", "available_quantity"):
         if key in request and request[key] not in ("", None):
@@ -7995,6 +7996,13 @@ def update_item_operation(request, actor=None):
             raise RuntimeError("Informe um preço de lista válido.")
         list_price = round(list_price, 2)
     if list_price_requested:
+        if official_item is None:
+            official_item = run_interactive_meli_call(client.item, item_id) or {}
+        if int(official_item.get("sold_quantity") or 0) > 0 or official_item.get("has_bids") is True:
+            raise RuntimeError(
+                "O Mercado Livre não permite definir ou alterar o preço de lista depois que o anúncio já teve vendas. "
+                "Esse campo só pode ser configurado em anúncios sem vendas."
+            )
         update["list_price"] = list_price
     if request.get("status_action") == "pause":
         update["status"] = "paused"
@@ -8044,7 +8052,16 @@ def update_item_operation(request, actor=None):
     if not update and not package_mode and not list_price_requested:
         raise RuntimeError("Nenhum campo informado para atualizar.")
 
-    official = run_interactive_meli_call(client.update_item, item_id, update) if update else {"local_only": True}
+    try:
+        official = run_interactive_meli_call(client.update_item, item_id, update) if update else {"local_only": True}
+    except RuntimeError as exc:
+        detail = str(exc).lower()
+        if list_price_requested and "field_not_updatable" in detail and "list_price" in detail:
+            raise RuntimeError(
+                "O Mercado Livre recusou o preço de lista porque esse anúncio já teve vendas. "
+                "O campo só pode ser configurado em anúncios sem vendas."
+            ) from exc
+        raise
     if list_price_requested:
         verified_list_item = run_interactive_meli_call(client.item, item_id) or {}
         verified_list_price = explicit_item_list_price(verified_list_item)
