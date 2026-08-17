@@ -2001,7 +2001,14 @@ class MercadoLivreClient:
         )
 
     def ml_billing_period_shipping_bonuses(self, period_key, order_ids, document_type):
-        """Read shipping bonuses from the official monthly billing report."""
+        """Read order billing details used to reconcile shipping bonuses.
+
+        On MLB a Flex reimbursement is not consistently returned with
+        ``detail_type=bonus``.  Some billing documents expose it as a SHIPPING
+        charge whose ``discount_info`` contains the bonified amount.  Asking
+        the API to pre-filter only bonuses therefore drops valid Flex refunds
+        before the response reaches our parser.
+        """
         clean_period = str(period_key or "").strip()
         try:
             period_date = date.fromisoformat(clean_period)
@@ -2018,8 +2025,6 @@ class MercadoLivreClient:
         params = {
             "document_type": clean_document_type,
             "order_ids": ",".join(clean_ids),
-            "detail_type": "bonus",
-            "marketplace_type": "SHIPPING",
             "limit": 1000,
             "from_id": 0,
             "sort_by": "ID",
@@ -12084,9 +12089,20 @@ def billing_detail_order_id(detail, fallback=""):
     if direct not in (None, ""):
         return str(direct)
     shipping_info = detail.get("shipping_info") or {}
+    if shipping_info.get("order_id") not in (None, ""):
+        return str(shipping_info.get("order_id"))
     shipping_order = shipping_info.get("order") or {}
-    if shipping_order.get("order_id") not in (None, ""):
+    if isinstance(shipping_order, dict) and shipping_order.get("order_id") not in (None, ""):
         return str(shipping_order.get("order_id"))
+    shipping_orders = shipping_info.get("orders") or []
+    if isinstance(shipping_orders, dict):
+        shipping_orders = [shipping_orders]
+    for shipping_order in shipping_orders:
+        if isinstance(shipping_order, dict) and shipping_order.get("order_id") not in (None, ""):
+            return str(shipping_order.get("order_id"))
+    direct_order = detail.get("order") or {}
+    if isinstance(direct_order, dict) and direct_order.get("order_id") not in (None, ""):
+        return str(direct_order.get("order_id"))
     sales_info = detail.get("sales_info") or []
     if isinstance(sales_info, dict):
         sales_info = [sales_info]
