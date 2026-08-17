@@ -7996,13 +7996,6 @@ def update_item_operation(request, actor=None):
             raise RuntimeError("Informe um preço de lista válido.")
         list_price = round(list_price, 2)
     if list_price_requested:
-        if official_item is None:
-            official_item = run_interactive_meli_call(client.item, item_id) or {}
-        if int(official_item.get("sold_quantity") or 0) > 0 or official_item.get("has_bids") is True:
-            raise RuntimeError(
-                "O Mercado Livre não permite definir ou alterar o preço de lista depois que o anúncio já teve vendas. "
-                "Esse campo só pode ser configurado em anúncios sem vendas."
-            )
         update["list_price"] = list_price
     if request.get("status_action") == "pause":
         update["status"] = "paused"
@@ -8058,8 +8051,8 @@ def update_item_operation(request, actor=None):
         detail = str(exc).lower()
         if list_price_requested and "field_not_updatable" in detail and "list_price" in detail:
             raise RuntimeError(
-                "O Mercado Livre recusou o preço de lista porque esse anúncio já teve vendas. "
-                "O campo só pode ser configurado em anúncios sem vendas."
+                "O Mercado Livre recusou o preço de lista pela API pública de integrações. "
+                "O editor oficial usa um fluxo interno diferente para este anúncio; nenhuma alteração foi salva localmente."
             ) from exc
         raise
     if list_price_requested:
