@@ -60,6 +60,18 @@
   statisticsRequestToken: 0,
   statisticsPage: 1,
   statisticsPageSize: 50,
+  analytics: null,
+  analyticsLoading: false,
+  analyticsError: "",
+  analyticsProgress: "",
+  analyticsJobId: "",
+  analyticsRequestToken: 0,
+  customers: null,
+  customersLoading: false,
+  customersError: "",
+  customersSyncing: false,
+  customersSyncProgress: "",
+  customersPage: 1,
   salesReport: null,
   salesReportLoading: false,
   salesReportError: "",
@@ -160,6 +172,8 @@ document.addEventListener("error", (event) => {
 
 const pageTitles = {
   dashboard: ["Painel unificado", "Dashboard"],
+  analitico: ["Inteligência comercial", "Analítico"],
+  clientes: ["Histórico transacional", "Clientes"],
   estatisticas: ["Vendas oficiais", "Estatísticas por SKU"],
   custos: ["Rentabilidade", "Custos por SKU"],
   compras: ["Inteligência de abastecimento", "Compras"],
@@ -559,6 +573,9 @@ function renderPermissionUi() {
   document.querySelectorAll("[data-users-admin-only]").forEach((node) => {
     node.hidden = !canManageUsers();
   });
+  document.querySelectorAll("[data-customers-admin-only]").forEach((node) => {
+    node.hidden = !canManageUsers();
+  });
   document.querySelectorAll('#users-form select[name="role"] option[value="master"]').forEach((node) => {
     node.hidden = !canManageOAuth();
     node.disabled = !canManageOAuth();
@@ -578,7 +595,8 @@ function tenantLabel(meta, data) {
 function setRoute() {
   const route = (location.hash.replace("#/", "") || "dashboard").split("?")[0];
   const legacyStatistics = route === "estatisticas";
-  const requestedRoute = legacyStatistics ? "relatorios" : (pageTitles[route] ? route : "dashboard");
+  const requestedRoute = route === "clientes" && !canManageUsers()
+    ? "dashboard" : legacyStatistics ? "relatorios" : (pageTitles[route] ? route : "dashboard");
   if (legacyStatistics) state.reportsSection = "statistics";
   state.route = requestedRoute;
   document.querySelectorAll(".page").forEach((page) => page.classList.remove("active"));
@@ -617,6 +635,8 @@ function renderRoute() {
   }
   const routeRenderers = {
     dashboard: renderDashboard,
+    analitico: renderAnalytics,
+    clientes: renderCustomers,
     estatisticas: renderStatistics,
     custos: renderCosts,
     compras: renderPurchases,
@@ -674,6 +694,326 @@ function connectedAccounts() {
   return state.data.accounts.filter(
     (account) => account.official && account.status === "connected" && account.id
   );
+}
+
+const analyticsPalette = ["#00c896", "#3b82f6", "#f59e0b", "#a855f7", "#ef4444", "#14b8a6", "#ec4899", "#84cc16"];
+
+function analyticsDateLabel(value) {
+  const [year, month, day] = String(value || "").split("-");
+  return year && month && day ? `${day}/${month}/${year}` : "—";
+}
+
+function analyticsCompactNumber(value, currency = false) {
+  const number = Number(value || 0);
+  const absolute = Math.abs(number);
+  const compact = absolute >= 1000000
+    ? `${(number / 1000000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mi`
+    : absolute >= 1000
+      ? `${(number / 1000).toLocaleString("pt-BR", { maximumFractionDigits: 0 })} mil`
+      : number.toLocaleString("pt-BR", { maximumFractionDigits: 0 });
+  return currency ? `R$ ${compact}` : compact;
+}
+
+function analyticsDelta(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+    return `<span class="analytics-delta neutral">Sem base anterior</span>`;
+  }
+  const number = Number(value);
+  const tone = number > 0 ? "positive" : number < 0 ? "negative" : "neutral";
+  const arrow = number > 0 ? "↑" : number < 0 ? "↓" : "→";
+  return `<span class="analytics-delta ${tone}">${arrow} ${Math.abs(number).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</span>`;
+}
+
+function analyticsSeriesChart(current, comparison, field, currency = false) {
+  const currentRows = current?.daily || [];
+  const comparisonRows = comparison?.daily || [];
+  const count = Math.max(currentRows.length, comparisonRows.length, 2);
+  const values = [...currentRows, ...comparisonRows].map((row) => Number(row[field] || 0));
+  const maximum = Math.max(1, ...values);
+  const width = 1000;
+  const height = 300;
+  const left = 76;
+  const right = 20;
+  const top = 20;
+  const bottom = 42;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+  const x = (index) => left + ((Number(index || 1) - 1) / Math.max(1, count - 1)) * plotWidth;
+  const y = (value) => top + plotHeight - (Number(value || 0) / maximum) * plotHeight;
+  const pathFor = (rows) => rows.map((row, index) => `${index ? "L" : "M"}${x(row.index).toFixed(1)},${y(row[field]).toFixed(1)}`).join(" ");
+  const areaFor = (rows) => rows.length
+    ? `${pathFor(rows)} L${x(rows.at(-1).index).toFixed(1)},${top + plotHeight} L${x(rows[0].index).toFixed(1)},${top + plotHeight} Z`
+    : "";
+  const ticks = Array.from({ length: 5 }, (_, index) => {
+    const ratio = index / 4;
+    const value = maximum * (1 - ratio);
+    const tickY = top + plotHeight * ratio;
+    return `<g><line x1="${left}" y1="${tickY}" x2="${width - right}" y2="${tickY}" class="analytics-grid-line"/><text x="${left - 10}" y="${tickY + 4}" text-anchor="end" class="analytics-axis-label">${escapeText(analyticsCompactNumber(value, currency))}</text></g>`;
+  }).join("");
+  const tickIndexes = [...new Set([1, Math.ceil(count * .25), Math.ceil(count * .5), Math.ceil(count * .75), count])];
+  const xTicks = tickIndexes.map((index) => `<text x="${x(index)}" y="${height - 12}" text-anchor="middle" class="analytics-axis-label">${index}</text>`).join("");
+  const gradientId = field === "revenue" ? "analytics-current-revenue" : "analytics-current-orders";
+  const comparisonGradientId = `${gradientId}-comparison`;
+  return `<div class="analytics-chart-scroll"><svg class="analytics-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Comparativo de ${field === "revenue" ? "faturamento" : "pedidos"}">
+    <defs>
+      <linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3b82f6" stop-opacity=".42"/><stop offset="1" stop-color="#3b82f6" stop-opacity=".03"/></linearGradient>
+      <linearGradient id="${comparisonGradientId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a855f7" stop-opacity=".34"/><stop offset="1" stop-color="#a855f7" stop-opacity=".02"/></linearGradient>
+    </defs>
+    ${ticks}${xTicks}
+    ${areaFor(comparisonRows) ? `<path d="${areaFor(comparisonRows)}" fill="url(#${comparisonGradientId})"/>` : ""}
+    ${areaFor(currentRows) ? `<path d="${areaFor(currentRows)}" fill="url(#${gradientId})"/>` : ""}
+    ${pathFor(comparisonRows) ? `<path d="${pathFor(comparisonRows)}" class="analytics-line comparison"/>` : ""}
+    ${pathFor(currentRows) ? `<path d="${pathFor(currentRows)}" class="analytics-line current"/>` : ""}
+  </svg></div>`;
+}
+
+function analyticsDonut(channels, valueField, shareField, total, currency = false) {
+  const rows = (channels || []).filter((row) => Number(row[valueField] || 0) > 0);
+  let cursor = 0;
+  const stops = rows.map((row, index) => {
+    const start = cursor;
+    cursor += Number(row[shareField] || 0);
+    return `${analyticsPalette[index % analyticsPalette.length]} ${start}% ${Math.min(100, cursor)}%`;
+  });
+  const background = stops.length ? `conic-gradient(${stops.join(",")})` : "conic-gradient(var(--panel-2) 0 100%)";
+  return `<div class="analytics-donut-layout">
+    <div class="analytics-donut" style="background:${background}"><div><small>Total</small><strong>${currency ? money.format(total || 0) : Number(total || 0).toLocaleString("pt-BR")}</strong></div></div>
+    <div class="analytics-channel-legend">${rows.length ? rows.map((row, index) => `<div><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><span><strong>${escapeText(row.label)}</strong><small>${Number(row[shareField] || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${currency ? money.format(row[valueField] || 0) : Number(row[valueField] || 0).toLocaleString("pt-BR")}</small></span></div>`).join("") : `<p class="muted">Sem vendas no período.</p>`}</div>
+  </div>`;
+}
+
+function updateAnalyticsPeriodFields() {
+  const form = document.querySelector("#analytics-form");
+  if (!form) return;
+  const custom = form.elements.period.value === "custom";
+  form.querySelectorAll("[data-analytics-custom]").forEach((node) => { node.hidden = !custom; });
+}
+
+function renderAnalytics() {
+  const form = document.querySelector("#analytics-form");
+  const feedback = document.querySelector("#analytics-feedback");
+  const content = document.querySelector("#analytics-content");
+  if (!form || !feedback || !content) return;
+  const selected = form.elements.account.value || "all";
+  form.elements.account.innerHTML = `<option value="all">Todas as contas</option>${connectedAccounts().map((account) => `<option value="${escapeAttr(account.id || account.seller_id)}">${escapeText(account.nickname || account.seller_id)}</option>`).join("")}`;
+  if ([...form.elements.account.options].some((option) => option.value === selected)) form.elements.account.value = selected;
+  const today = new Date();
+  const customEnd = localDateValue(today);
+  const customStartDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 29);
+  if (!form.elements.date_from.value) form.elements.date_from.value = localDateValue(customStartDate);
+  if (!form.elements.date_to.value) form.elements.date_to.value = customEnd;
+  updateAnalyticsPeriodFields();
+  feedback.innerHTML = state.analyticsLoading
+    ? `<div class="statistics-loading"><span></span><strong>${escapeText(state.analyticsProgress || "Consultando vendas oficiais...")}</strong></div>`
+    : state.analyticsError ? `<div class="notice danger-notice">${escapeText(state.analyticsError)}</div>` : "";
+  if (!state.analytics) {
+    content.innerHTML = `<div class="analytics-empty"><span class="analytics-empty-icon">↗</span><strong>Escolha uma comparação para começar</strong><p>O processamento consulta as vendas oficiais somente quando você clicar em “Analisar período”.</p></div>`;
+    return;
+  }
+  const report = state.analytics;
+  const current = report.current || {};
+  const comparison = report.comparison || {};
+  const changes = report.changes || {};
+  const channels = report.channels || [];
+  const cache = report.cache || {};
+  const cacheNote = Number(cache.requested_days || 0) > 0
+    ? `<div class="analytics-cache-note"><span>⚡</span><strong>Consulta otimizada:</strong> ${Number(cache.cached_days || 0).toLocaleString("pt-BR")} dia(s)-conta reaproveitados do cache · ${Number(cache.refreshed_days || 0).toLocaleString("pt-BR")} atualizado(s) agora</div>`
+    : "";
+  const warning = report.warnings?.length ? `<div class="notice analytics-warning"><strong>Atenção:</strong> ${escapeText(report.warnings.join(" "))}</div>` : "";
+  const truncated = report.truncated ? `<div class="notice analytics-warning">A API atingiu o limite de paginação em pelo menos uma conta; os totais podem estar parciais.</div>` : "";
+  const bestDay = current.best_day;
+  content.innerHTML = `
+    <div class="analytics-period-banner"><div><span>Período analisado</span><strong>${escapeText(current.label || "Período atual")}</strong><small>${analyticsDateLabel(current.date_from)} a ${analyticsDateLabel(current.date_to)}</small></div><span class="analytics-versus">×</span><div><span>Base comparativa</span><strong>${escapeText(comparison.label || "Período anterior")}</strong><small>${analyticsDateLabel(comparison.date_from)} a ${analyticsDateLabel(comparison.date_to)}</small></div></div>
+    ${cacheNote}
+    ${warning}${truncated}
+    <div class="analytics-kpi-grid">
+      <article class="analytics-kpi featured"><span>Faturamento</span><strong>${money.format(current.revenue || 0)}</strong>${analyticsDelta(changes.revenue)}<small>Anterior: ${money.format(comparison.revenue || 0)}</small></article>
+      <article class="analytics-kpi"><span>Pedidos</span><strong>${Number(current.orders || 0).toLocaleString("pt-BR")}</strong>${analyticsDelta(changes.orders)}<small>Anterior: ${Number(comparison.orders || 0).toLocaleString("pt-BR")}</small></article>
+      <article class="analytics-kpi"><span>Unidades vendidas</span><strong>${Number(current.units || 0).toLocaleString("pt-BR")}</strong>${analyticsDelta(changes.units)}<small>Anterior: ${Number(comparison.units || 0).toLocaleString("pt-BR")}</small></article>
+      <article class="analytics-kpi"><span>Ticket médio</span><strong>${money.format(current.ticket || 0)}</strong>${analyticsDelta(changes.ticket)}<small>Anterior: ${money.format(comparison.ticket || 0)}</small></article>
+      <article class="analytics-kpi"><span>Média diária</span><strong>${money.format(current.daily_average || 0)}</strong><small>${Number(current.days || 0).toLocaleString("pt-BR")} dia(s) analisados</small></article>
+      <article class="analytics-kpi"><span>Melhor dia</span><strong>${bestDay ? money.format(bestDay.revenue || 0) : "—"}</strong><small>${bestDay ? `${analyticsDateLabel(bestDay.date)} · ${Number(bestDay.orders || 0).toLocaleString("pt-BR")} pedido(s)` : "Sem vendas no período"}</small></article>
+    </div>
+    <div class="analytics-chart-grid">
+      <article class="panel analytics-chart-card"><div class="analytics-card-heading"><div><span>Comparativo diário</span><h3>Faturamento</h3></div><div class="analytics-chart-legend"><span class="current">${escapeText(current.label || "Atual")}</span><span class="comparison">${escapeText(comparison.label || "Anterior")}</span></div></div>${analyticsSeriesChart(current, comparison, "revenue", true)}</article>
+      <article class="panel analytics-chart-card"><div class="analytics-card-heading"><div><span>Comparativo diário</span><h3>Quantidade de pedidos</h3></div><div class="analytics-chart-legend"><span class="current">${escapeText(current.label || "Atual")}</span><span class="comparison">${escapeText(comparison.label || "Anterior")}</span></div></div>${analyticsSeriesChart(current, comparison, "orders")}</article>
+    </div>
+    <div class="analytics-share-grid">
+      <article class="panel analytics-share-card"><div class="analytics-card-heading"><div><span>Participação por canal</span><h3>Faturamento</h3></div></div>${analyticsDonut(channels, "revenue", "revenue_share", current.revenue, true)}</article>
+      <article class="panel analytics-share-card"><div class="analytics-card-heading"><div><span>Participação por canal</span><h3>Pedidos</h3></div></div>${analyticsDonut(channels, "orders", "orders_share", current.orders)}</article>
+    </div>
+    <article class="panel analytics-table-card"><div class="analytics-card-heading"><div><span>Detalhamento</span><h3>Desempenho por conta / canal</h3></div></div><div class="analytics-table-wrap"><table class="analytics-table"><thead><tr><th>Canal</th><th>Faturamento</th><th>Participação</th><th>Variação</th><th>Pedidos</th><th>Participação</th><th>Variação</th><th>Unidades</th><th>Ticket médio</th></tr></thead><tbody>${channels.map((row, index) => `<tr><td><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><strong>${escapeText(row.label)}</strong></td><td>${money.format(row.revenue || 0)}</td><td>${Number(row.revenue_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</td><td>${analyticsDelta(row.revenue_change)}</td><td>${Number(row.orders || 0).toLocaleString("pt-BR")}</td><td>${Number(row.orders_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</td><td>${analyticsDelta(row.orders_change)}</td><td>${Number(row.units || 0).toLocaleString("pt-BR")}</td><td>${money.format(row.ticket || 0)}</td></tr>`).join("") || `<tr><td colspan="9">Sem dados no período.</td></tr>`}</tbody></table></div></article>`;
+}
+
+async function loadAnalytics() {
+  const form = document.querySelector("#analytics-form");
+  if (!form || !connectedAccounts().length) {
+    state.analyticsError = "Conecte ao menos uma conta oficial do Mercado Livre para usar o Analítico.";
+    renderAnalytics();
+    return;
+  }
+  const requestToken = ++state.analyticsRequestToken;
+  state.analyticsLoading = true;
+  state.analyticsError = "";
+  state.analyticsProgress = "Preparando a análise comparativa...";
+  const actionId = beginManualAction("Gerando análise comercial", state.analyticsProgress);
+  renderAnalytics();
+  try {
+    const body = {
+      period: form.elements.period.value,
+      account: form.elements.account.value,
+      date_from: form.elements.date_from.value,
+      date_to: form.elements.date_to.value,
+      comparison_date_from: form.elements.comparison_date_from.value,
+      comparison_date_to: form.elements.comparison_date_to.value,
+    };
+    let job = await api("/api/analytics/query", { method: "POST", manualProgress: false, body: JSON.stringify(body) });
+    state.analyticsJobId = job.id || "";
+    while (["queued", "processing"].includes(job.status)) {
+      if (requestToken !== state.analyticsRequestToken) return;
+      state.analyticsProgress = job.message || "Consultando as vendas oficiais...";
+      updateManualAction(actionId, { message: state.analyticsProgress, progress: Number.isFinite(Number(job.progress)) ? Number(job.progress) : null });
+      renderAnalytics();
+      await new Promise((resolve) => window.setTimeout(resolve, 1800));
+      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+    }
+    if (job.status !== "completed" || !job.result) throw new Error(job.message || "A análise não foi concluída.");
+    if (requestToken !== state.analyticsRequestToken) return;
+    state.analytics = job.result;
+    finishManualAction(actionId, "success", "Análise comercial concluída.");
+  } catch (error) {
+    finishManualAction(actionId, "error", error.message || "Não foi possível gerar a análise.");
+    state.analytics = null;
+    state.analyticsError = error.message || "Não foi possível gerar a análise.";
+    showToast(state.analyticsError, "error");
+  } finally {
+    if (requestToken === state.analyticsRequestToken) {
+      state.analyticsLoading = false;
+      state.analyticsProgress = "";
+      renderAnalytics();
+    }
+  }
+}
+
+function customerQueryParams() {
+  const form = document.querySelector("#customers-filters");
+  const params = new URLSearchParams({ page: String(state.customersPage || 1) });
+  if (!form) return params;
+  ["q", "name", "cpf", "address", "cep", "product", "sku", "account", "date_from", "date_to", "status", "recurring", "document", "min_orders", "min_spent", "sort", "per_page"].forEach((name) => {
+    const value = form.elements[name]?.value || "";
+    if (value) params.set(name, value);
+  });
+  return params;
+}
+
+async function loadCustomers() {
+  if (!canManageUsers() || state.customersLoading) return;
+  state.customersLoading = true;
+  state.customersError = "";
+  renderCustomers();
+  try {
+    state.customers = await api(`/api/customers?${customerQueryParams()}`);
+  } catch (error) {
+    state.customersError = error.message || "Não foi possível consultar os clientes.";
+  } finally {
+    state.customersLoading = false;
+    renderCustomers();
+  }
+}
+
+function updateCustomerSyncFields() {
+  const form = document.querySelector("#customers-sync-form");
+  if (!form) return;
+  form.querySelectorAll("[data-customers-sync-custom]").forEach((node) => {
+    node.hidden = form.elements.period.value !== "custom";
+  });
+}
+
+function renderCustomers() {
+  const summary = document.querySelector("#customers-summary");
+  const list = document.querySelector("#customers-list");
+  const feedback = document.querySelector("#customers-feedback");
+  const syncProgress = document.querySelector("#customers-sync-progress");
+  const syncForm = document.querySelector("#customers-sync-form");
+  const filters = document.querySelector("#customers-filters");
+  if (!summary || !list || !feedback || !syncProgress || !syncForm || !filters) return;
+  const accountOptions = connectedAccounts().map((account) => `<option value="${escapeAttr(account.id || account.seller_id)}">${escapeText(account.nickname)}</option>`).join("");
+  const selectedSync = syncForm.elements.account.value || "all";
+  syncForm.elements.account.innerHTML = `<option value="all">Todas as contas</option>${accountOptions}`;
+  if ([...syncForm.elements.account.options].some((row) => row.value === selectedSync)) syncForm.elements.account.value = selectedSync;
+  updateCustomerSyncFields();
+  syncProgress.innerHTML = state.customersSyncing ? `<div class="statistics-loading"><span></span><strong>${escapeText(state.customersSyncProgress || "Importando clientes e compras...")}</strong></div>` : "";
+  feedback.innerHTML = state.customersLoading ? `<div class="statistics-loading"><span></span><strong>Consultando banco de clientes...</strong></div>` : state.customersError ? `<div class="notice danger-notice">${escapeText(state.customersError)}</div>` : "";
+  if (!state.customers && !state.customersLoading) {
+    summary.innerHTML = "";
+    list.innerHTML = `<div class="customers-empty"><strong>Banco de clientes ainda não carregado</strong><span>Clique em “Importar clientes” para preservar o histórico disponível no Mercado Livre.</span></div>`;
+    window.setTimeout(() => { if (state.route === "clientes" && !state.customers) loadCustomers(); }, 0);
+    return;
+  }
+  const data = state.customers;
+  if (!data) return;
+  const selectedAccount = filters.elements.account.value || "";
+  filters.elements.account.innerHTML = `<option value="">Todas as contas</option>${(data.options?.accounts || []).map((name) => `<option value="${escapeAttr(name)}">${escapeText(name)}</option>`).join("")}`;
+  filters.elements.account.value = selectedAccount;
+  const totals = data.summary || {};
+  const recurrence = Number(totals.customers || 0) ? Number(totals.recurring || 0) / Number(totals.customers) * 100 : 0;
+  summary.innerHTML = `
+    <article><span>Clientes armazenados</span><strong>${Number(totals.customers || 0).toLocaleString("pt-BR")}</strong><small>Persistentes na aplicação</small></article>
+    <article class="success"><span>Clientes recorrentes</span><strong>${Number(totals.recurring || 0).toLocaleString("pt-BR")}</strong><small>${recurrence.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% compraram mais de uma vez</small></article>
+    <article><span>Compras identificadas</span><strong>${Number(totals.purchases || 0).toLocaleString("pt-BR")}</strong><small>Pedidos válidos consolidados</small></article>
+    <article><span>Valor histórico</span><strong>${money.format(totals.revenue || 0)}</strong><small>Soma dos itens não cancelados</small></article>
+    <article><span>Com documento</span><strong>${Number(totals.with_document || 0).toLocaleString("pt-BR")}</strong><small>CPF/CNPJ retornado pelo ML</small></article>`;
+  const lastSync = document.querySelector("#customers-last-sync");
+  if (lastSync) lastSync.textContent = data.sync?.last_sync_at ? `Última importação: ${data.sync.last_sync_at}` : "Ainda não importado";
+  const pageInfo = { total: Number(data.total || 0), current: Number(data.page || 1), pages: Number(data.pages || 1), pageSize: Number(data.per_page || 25) };
+  list.innerHTML = data.customers?.length ? `${paginationHtml("customersPage", pageInfo)}<div class="customers-grid">${data.customers.map((customer) => `
+    <article class="customer-card">
+      <div class="customer-card-head"><div class="customer-avatar">${escapeText(String(customer.name || "C").slice(0, 1).toUpperCase())}</div><div><strong>${escapeText(customer.name || "Cliente Mercado Livre")}</strong><span>${escapeText(customer.document_masked || "Documento não disponível")}</span></div><button class="mini-button" type="button" data-customer-detail="${escapeAttr(customer.id)}">Ver cadastro</button></div>
+      <div class="customer-card-metrics"><div><span>Compras</span><strong>${Number(customer.purchase_count || 0).toLocaleString("pt-BR")}</strong></div><div><span>Total gasto</span><strong>${money.format(customer.total_spent || 0)}</strong></div><div><span>Itens</span><strong>${Number(customer.items_count || 0).toLocaleString("pt-BR")}</strong></div></div>
+      <div class="customer-card-details"><span><b>Última compra:</b> ${customer.last_purchase ? formatDateBR(customer.last_purchase) : "—"}</span><span><b>Contas:</b> ${escapeText((customer.accounts || []).join(", ") || "—")}</span><span><b>SKU mais comprado:</b> ${escapeText(customer.top_sku || "—")}</span><span><b>Localização:</b> ${escapeText([customer.city, customer.state, customer.zip_code].filter(Boolean).join(" · ") || "Não disponível")}</span></div>
+    </article>`).join("")}</div>${paginationHtml("customersPage", pageInfo)}` : `<div class="customers-empty"><strong>Nenhum cliente encontrado</strong><span>Ajuste os filtros ou importe um período maior.</span></div>`;
+}
+
+async function openCustomerDetail(customerId) {
+  const dialog = document.querySelector("#customer-detail-dialog");
+  const content = document.querySelector("#customer-detail-content");
+  if (!dialog || !content) return;
+  content.innerHTML = `<div class="statistics-loading"><span></span><strong>Carregando ficha completa...</strong></div>`;
+  dialog.showModal();
+  try {
+    const result = await api(`/api/customers?customer_id=${encodeURIComponent(customerId)}`);
+    const customer = result.customer || {};
+    const addressBlock = (title, address) => `<div class="customer-address"><span>${title}</span><strong>${escapeText(address?.formatted || "Não disponibilizado pelo Mercado Livre")}</strong>${address?.comment ? `<small>Complemento: ${escapeText(address.comment)}</small>` : ""}</div>`;
+    content.innerHTML = `<div class="customer-detail-head"><div><p class="eyebrow">Ficha transacional</p><h2>${escapeText(customer.name || "Cliente Mercado Livre")}</h2><span>${escapeText(customer.document_type || "Documento")} ${escapeText(customer.document || "não disponibilizado")}</span></div><button class="dialog-close" type="button" data-close-customer-detail aria-label="Fechar">×</button></div>
+      <div class="customer-detail-kpis"><div><span>Compras</span><strong>${Number(customer.purchase_count || 0).toLocaleString("pt-BR")}</strong></div><div><span>Total gasto</span><strong>${money.format(customer.total_spent || 0)}</strong></div><div><span>Itens</span><strong>${Number(customer.items_count || 0).toLocaleString("pt-BR")}</strong></div><div><span>Primeira compra</span><strong>${customer.first_purchase ? formatDateBR(customer.first_purchase) : "—"}</strong></div></div>
+      <div class="customer-address-grid">${addressBlock("Endereço de entrega mais recente", customer.delivery_address)}${addressBlock("Endereço fiscal", customer.billing_address)}</div>
+      <div class="customer-purchases"><h3>Histórico completo de compras</h3><div class="customer-purchase-table"><table><thead><tr><th>Data</th><th>Pedido</th><th>Conta</th><th>Produto</th><th>SKU</th><th>Qtd.</th><th>Unitário</th><th>Total item</th><th>Pago no pedido</th><th>Status</th></tr></thead><tbody>${(customer.purchases || []).map((row) => `<tr class="${row.cancelled ? "cancelled" : ""}"><td>${formatDateBR(row.date)}</td><td>${escapeText(row.order_id)}</td><td>${escapeText(row.account)}</td><td>${escapeText(row.product)}</td><td>${escapeText(row.sku)}</td><td>${Number(row.quantity || 0).toLocaleString("pt-BR")}</td><td>${money.format(row.unit_price || 0)}</td><td>${money.format(row.line_total || 0)}</td><td>${money.format(row.order_total || 0)}</td><td>${escapeText(row.status || "—")}</td></tr>`).join("")}</tbody></table></div></div>`;
+  } catch (error) {
+    content.innerHTML = `<div class="notice danger-notice">${escapeText(error.message || "Não foi possível carregar o cliente.")}</div><button class="ghost" type="button" data-close-customer-detail>Fechar</button>`;
+  }
+}
+
+async function syncCustomers() {
+  const form = document.querySelector("#customers-sync-form");
+  if (!form || state.customersSyncing) return;
+  state.customersSyncing = true;
+  state.customersSyncProgress = "Preparando importação histórica...";
+  renderCustomers();
+  try {
+    const period = form.elements.period.value;
+    const queued = await api("/api/customers/sync", { method: "POST", body: JSON.stringify({ account_ids: form.elements.account.value, days: period === "custom" ? 90 : Number(period), date_from: period === "custom" ? form.elements.date_from.value : "", date_to: period === "custom" ? form.elements.date_to.value : "" }) });
+    const result = await waitForAsyncOperation(queued, (message) => { state.customersSyncProgress = message; renderCustomers(); }, 60 * 60 * 1000);
+    showToast(`${Number(result.imported || 0).toLocaleString("pt-BR")} novo(s) pedido(s) incorporado(s) ao cadastro.`, result.warnings?.length ? "error" : "success");
+    state.customersPage = 1;
+    state.customers = null;
+    await loadCustomers();
+  } catch (error) {
+    showToast(error.message || "Não foi possível importar os clientes.", "error");
+  } finally {
+    state.customersSyncing = false;
+    state.customersSyncProgress = "";
+    renderCustomers();
+  }
 }
 
 function renderSummary() {
@@ -5078,7 +5418,36 @@ document.addEventListener("click", (event) => {
   if (key === "costsPage") renderCosts();
   if (key === "purchasePage") renderPurchases();
   if (key === "returnsPage") loadReturns(true);
+  if (key === "customersPage") loadCustomers();
   if (["dashboardStockPage", "dashboardCatalogPage", "dashboardShipmentPage", "dashboardSalesPage", "dashboardTopSkuPage"].includes(key)) renderDashboard();
+});
+
+document.querySelector("#customers-sync-form")?.addEventListener("change", (event) => {
+  if (event.target.name === "period") updateCustomerSyncFields();
+});
+
+document.querySelector("#customers-sync")?.addEventListener("click", syncCustomers);
+
+document.querySelector("#customers-filters")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  state.customersPage = 1;
+  await loadCustomers();
+});
+
+document.querySelector("#customers-clear-filters")?.addEventListener("click", async () => {
+  const form = document.querySelector("#customers-filters");
+  form?.reset();
+  state.customersPage = 1;
+  await loadCustomers();
+});
+
+document.querySelector("#customers-list")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-customer-detail]");
+  if (button) openCustomerDetail(button.dataset.customerDetail);
+});
+
+document.querySelector("#customer-detail-dialog")?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-close-customer-detail]")) event.currentTarget.close();
 });
 
 document.querySelector("#dashboard-shipment-account")?.addEventListener("change", (event) => {
@@ -5138,6 +5507,19 @@ document.querySelector("#statistics-form")?.addEventListener("submit", async (ev
   event.preventDefault();
   state.statisticsPage = 1;
   await loadStatistics();
+});
+
+document.querySelector("#analytics-form")?.addEventListener("change", (event) => {
+  if (event.target.name === "period") updateAnalyticsPeriodFields();
+  state.analytics = null;
+  state.analyticsError = "";
+  state.analyticsJobId = "";
+  renderAnalytics();
+});
+
+document.querySelector("#analytics-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadAnalytics();
 });
 
 document.querySelector("#sales-report-form")?.addEventListener("change", (event) => {

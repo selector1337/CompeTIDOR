@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260812-mobile-app-v2" />
+  <link rel="stylesheet" href="/styles.css?v=20260826-customers-v1" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -34,6 +34,8 @@
       </div>
       <nav aria-label="Menu principal">
         <a class="active" href="#/dashboard" data-route="dashboard" aria-label="Dashboard" title="Dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/></svg></span><strong>Dashboard</strong></a>
+        <a href="#/analitico" data-route="analitico" aria-label="Analítico" title="Analítico"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 20V10h3v10H4Zm6 0V4h3v16h-3Zm6 0v-7h3v7h-3ZM3 22h18v-2H3v2Z"/></svg></span><strong>Analítico</strong></a>
+        <a href="#/clientes" data-route="clientes" aria-label="Clientes" title="Clientes" data-customers-admin-only><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm7.5 1a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7ZM2 21v-2.3A5.7 5.7 0 0 1 7.7 13h2.6a5.7 5.7 0 0 1 5.7 5.7V21H2Zm15.8 0v-2.3c0-1.5-.4-2.9-1.2-4.1h1a4.4 4.4 0 0 1 4.4 4.4v2h-4.2Z"/></svg></span><strong>Clientes</strong></a>
         <a href="#/custos" data-route="custos" aria-label="Custos" title="Custos"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2v2.1c-3.4.4-5 2.3-5 4.7 0 2.9 2.5 4 5 4.7 2.2.6 3 1.1 3 2.2 0 1.2-1.1 2.1-3 2.1-2.2 0-3.8-.8-5.2-1.8l-1.5 2.3c1.6 1.2 3.8 2 6.7 2.2V22h2v-1.7c3.5-.5 5.2-2.5 5.2-5 0-3-2.4-4.1-5.2-4.9-2.1-.6-3-1.1-3-2.1 0-1 .9-1.8 2.8-1.8 1.8 0 3.2.6 4.4 1.4l1.4-2.3A10.7 10.7 0 0 0 14 4.1V2h-2Z"/></svg></span><strong>Custos</strong></a>
         <a href="#/compras" data-route="compras" aria-label="Compras" title="Compras"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M7 4V2h2v2h6V2h2v2h3v18H4V4h3Zm11 6H6v10h12V10Zm-9 2h6v2H9v-2Zm0 4h6v2H9v-2Z"/></svg></span><strong>Compras</strong></a>
         <a href="#/relatorios" data-route="relatorios" aria-label="Relatórios" title="Relatórios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 3h10l4 4v14H5V3Zm9 1.8V8h3.2L14 4.8ZM8 12h8v-2H8v2Zm0 4h8v-2H8v2Zm0 3h6v-2H8v2Z"/></svg></span><strong>Relatórios</strong></a>
@@ -178,6 +180,95 @@
             <div id="dashboard-metrics" class="metrics-list"></div>
           </div>
         </section>
+      </section>
+
+      <section class="page" id="page-analitico">
+        <div class="panel analytics-control-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Inteligência comercial</p>
+              <h2>Visão comparativa das vendas</h2>
+              <p class="analytics-intro">Compare faturamento, pedidos e participação de cada conta em períodos equivalentes.</p>
+            </div>
+            <span class="analytics-data-source">Dados oficiais Mercado Livre</span>
+          </div>
+          <form id="analytics-form" class="analytics-filters">
+            <label>Conta / canal
+              <select name="account"><option value="all">Todas as contas</option></select>
+            </label>
+            <label class="analytics-period-field">Comparação
+              <select name="period">
+                <option value="current_month">Mês atual × mês anterior</option>
+                <option value="current_month_accumulated" selected>Mês atual × anterior acumulado</option>
+                <option value="last_30">Últimos 30 dias × período anterior</option>
+                <option value="last_90">Últimos 90 dias × período anterior</option>
+                <option value="last_180">Últimos 180 dias × período anterior</option>
+                <option value="last_365">Últimos 365 dias × período anterior</option>
+                <option value="current_year">Ano atual × ano anterior acumulado</option>
+                <option value="custom">Período personalizado</option>
+              </select>
+            </label>
+            <label data-analytics-custom hidden>Período atual — início
+              <input name="date_from" type="date" />
+            </label>
+            <label data-analytics-custom hidden>Período atual — fim
+              <input name="date_to" type="date" />
+            </label>
+            <label data-analytics-custom hidden>Comparação — início
+              <input name="comparison_date_from" type="date" />
+            </label>
+            <label data-analytics-custom hidden>Comparação — fim
+              <input name="comparison_date_to" type="date" />
+            </label>
+            <button class="primary analytics-submit" type="submit">Analisar período</button>
+          </form>
+          <p class="analytics-custom-hint" data-analytics-custom hidden>Se as datas de comparação ficarem vazias, será usado automaticamente o período imediatamente anterior com a mesma duração.</p>
+          <div id="analytics-feedback"></div>
+        </div>
+
+        <div id="analytics-content" class="analytics-content">
+          <div class="analytics-empty">
+            <span class="analytics-empty-icon">↗</span>
+            <strong>Escolha uma comparação para começar</strong>
+            <p>O processamento consulta as vendas oficiais somente quando você clicar em “Analisar período”.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="page customers-page" id="page-clientes" data-customers-admin-only>
+        <div class="panel customers-command-panel">
+          <div class="panel-heading customers-heading">
+            <div><p class="eyebrow">Histórico transacional persistente</p><h2>Clientes das contas conectadas</h2><p class="customers-heading-copy">Cadastro consolidado por CPF, com compras, SKUs, contas e valores preservados na aplicação.</p></div>
+            <div class="customers-heading-actions"><span id="customers-last-sync" class="customers-freshness">Ainda não importado</span><button id="customers-sync" class="primary" type="button">Importar clientes</button></div>
+          </div>
+          <div class="notice customers-privacy-notice"><strong>Uso restrito:</strong> estes dados pessoais são disponibilizados para gestão da transação, suporte, prevenção de fraude e obrigações legais. O Mercado Livre não autoriza sua reutilização para spam ou prospecção sem consentimento próprio e válido do cliente.</div>
+          <form id="customers-sync-form" class="customers-sync-form">
+            <label>Conta<select name="account"><option value="all">Todas as contas</option></select></label>
+            <label>Período para importação<select name="period"><option value="30">Últimos 30 dias</option><option value="90" selected>Últimos 90 dias</option><option value="180">Últimos 180 dias</option><option value="365">Últimos 12 meses</option><option value="custom">Personalizado</option></select></label>
+            <label data-customers-sync-custom hidden>Data inicial<input name="date_from" type="date" /></label>
+            <label data-customers-sync-custom hidden>Data final<input name="date_to" type="date" /></label>
+          </form>
+          <div id="customers-sync-progress"></div>
+        </div>
+        <div id="customers-summary" class="customers-summary"></div>
+        <div class="panel customers-results-panel">
+          <form id="customers-filters" class="customers-filter-grid">
+            <label class="customers-filter-wide">Busca geral<input name="q" type="search" placeholder="Nome, CPF, endereço, produto, SKU ou conta..." /></label>
+            <label>Nome<input name="name" type="search" placeholder="Nome do cliente" /></label><label>CPF/CNPJ<input name="cpf" type="search" inputmode="numeric" placeholder="Somente números ou formatado" /></label>
+            <label>Endereço<input name="address" type="search" placeholder="Rua, bairro, cidade ou UF" /></label><label>CEP<input name="cep" type="search" inputmode="numeric" placeholder="00000-000" /></label>
+            <label>Produto<input name="product" type="search" placeholder="Produto comprado" /></label><label>SKU<input name="sku" type="search" placeholder="SKU comprado" /></label>
+            <label>Conta<select name="account"><option value="">Todas as contas</option></select></label><label>Compra desde<input name="date_from" type="date" /></label><label>Compra até<input name="date_to" type="date" /></label>
+            <label>Status do pedido<select name="status"><option value="">Todos</option><option value="paid">Pago</option><option value="confirmed">Confirmado</option><option value="cancelled">Cancelado</option></select></label>
+            <label>Recorrência<select name="recurring"><option value="">Todos</option><option value="yes">Comprou mais de uma vez</option><option value="no">Compra única</option></select></label>
+            <label>Documento<select name="document"><option value="">Com e sem documento</option><option value="with">Com CPF/CNPJ</option><option value="missing">Sem documento retornado</option></select></label>
+            <label>Mínimo de compras<input name="min_orders" type="number" min="0" value="0" /></label><label>Gasto mínimo<input name="min_spent" type="number" min="0" step="0.01" value="0" /></label>
+            <label>Ordenar<select name="sort"><option value="last_desc">Compra mais recente</option><option value="spent_desc">Maior valor gasto</option><option value="orders_desc">Mais compras</option><option value="name_asc">Nome A–Z</option></select></label>
+            <label>Por página<select name="per_page"><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label>
+            <div class="customers-filter-actions"><button class="primary" type="submit">Aplicar filtros</button><button class="ghost" id="customers-clear-filters" type="button">Limpar</button></div>
+          </form>
+          <div id="customers-feedback"></div><div id="customers-list" class="customers-list"></div>
+        </div>
+        <dialog id="customer-detail-dialog" class="customer-detail-dialog"><div id="customer-detail-content"></div></dialog>
       </section>
 
       <section class="page" id="page-estatisticas">
@@ -1228,6 +1319,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260812-ui-controls-v3"></script>
+  <script src="/app.js?v=20260826-customers-v1"></script>
   </body>
 </html>

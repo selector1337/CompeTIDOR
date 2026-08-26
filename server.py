@@ -112,6 +112,8 @@ SKU_COSTS_FILE = "sku_costs.json"
 SKU_LAST_SALES_FILE = "sku_last_sales.json"
 SYNC_PROGRESS_FILE = "sync_progress.json"
 RETURNS_DATA_FILE = "returns.json"
+ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
+CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
 RETURNS_DATA_LOCK = threading.RLock()
@@ -138,6 +140,9 @@ CATALOG_OFFERS_CACHE_LOCK = threading.RLock()
 CATALOG_OFFERS_CACHE = {}
 STATISTICS_CACHE_LOCK = threading.RLock()
 STATISTICS_CACHE = {}
+ANALYTICS_DAILY_CACHE_LOCK = threading.RLock()
+CUSTOMERS_DATA_LOCK = threading.RLock()
+CUSTOMERS_SYNC_LOCK = threading.RLock()
 STATISTICS_JOBS_LOCK = threading.RLock()
 STATISTICS_JOBS = {}
 REPORT_JOBS_LOCK = threading.RLock()
@@ -215,6 +220,7 @@ SENSITIVE_MELI_PATH_TERMS = (
 SAFE_ML_BILLING_ORDER_DETAILS_PATH = re.compile(
     r"^/billing/integration/group/ML/order/details\?order_ids=[0-9,%]+(?:&(?:sort_by|order_by)=[A-Za-z]+)*$"
 )
+SAFE_ORDER_BILLING_INFO_PATH = re.compile(r"^/orders/billing-info/[A-Z]{3}/[^/?]+$")
 ALLOWED_MELI_PATHS = (
     re.compile(r"^/users/me$"),
     re.compile(r"^/users/[^/]+$"),
@@ -233,6 +239,8 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/user-products/[^/]+(\?|$)"),
     re.compile(r"^/orders/search(\?|$)"),
     re.compile(r"^/orders/[0-9]+$"),
+    re.compile(r"^/orders/[0-9]+/shipments\?list_all=true$"),
+    SAFE_ORDER_BILLING_INFO_PATH,
     re.compile(r"^/shipments/[^/]+(\?|$)"),
     re.compile(r"^/shipments/[^/]+/costs(\?|$)"),
     re.compile(r"^/shipments/[^/]+/sla(\?|$)"),
@@ -326,7 +334,7 @@ def write_json(name, payload):
     with DATA_LOCK:
         path = DATA / name
         temporary = DATA / f".{name}.{uuid.uuid4().hex}.tmp"
-        compact = name in {CATALOG_DATA_FILE, RETURNS_DATA_FILE}
+        compact = name in {CATALOG_DATA_FILE, RETURNS_DATA_FILE, ANALYTICS_DAILY_CACHE_FILE, CUSTOMERS_DATA_FILE}
         with temporary.open("w", encoding="utf-8") as stream:
             json.dump(
                 payload,
@@ -1582,7 +1590,10 @@ def run_interactive_meli_call(work, *args, **kwargs):
 
 def validate_meli_path(path):
     lowered = (path or "").lower()
-    safe_ml_billing = bool(SAFE_ML_BILLING_ORDER_DETAILS_PATH.match(path or ""))
+    safe_ml_billing = bool(
+        SAFE_ML_BILLING_ORDER_DETAILS_PATH.match(path or "")
+        or SAFE_ORDER_BILLING_INFO_PATH.match(path or "")
+    )
     if any(term in lowered for term in SENSITIVE_MELI_PATH_TERMS) and not safe_ml_billing:
         raise RuntimeError("Endpoint bloqueado por segurança: Mercado Pago, pagamentos e dados financeiros sensíveis não são permitidos.")
     if not any(pattern.match(path or "") for pattern in ALLOWED_MELI_PATHS):
@@ -1936,6 +1947,24 @@ class MercadoLivreClient:
             raise RuntimeError("Pedido inválido para conciliação.")
         return self.get(f"/orders/{clean_id}", retries=2, timeout=15)
 
+    def order_billing_info(self, site_id, billing_info_id):
+        clean_site = re.sub(r"[^A-Z]", "", str(site_id or "MLB").upper())[:3] or "MLB"
+        clean_id = re.sub(r"[^A-Za-z0-9_-]", "", str(billing_info_id or ""))
+        if not clean_id:
+            return {}
+        return self.get(f"/orders/billing-info/{clean_site}/{clean_id}", retries=2, timeout=15)
+
+    def order_shipments(self, order_id):
+        clean_id = str(order_id or "").strip()
+        if not clean_id.isdigit():
+            return {}
+        return self.get(
+            f"/orders/{clean_id}/shipments?list_all=true",
+            extra_headers={"X-New-Domain": "true", "X-Api-Version": "2"},
+            retries=2,
+            timeout=15,
+        )
+
     def seller_order(self, seller_id, order_id):
         clean_seller_id = str(seller_id or "").strip()
         clean_order_id = str(order_id or "").strip()
@@ -1955,6 +1984,17 @@ class MercadoLivreClient:
 
     def shipment(self, shipment_id):
         return self.get(f"/shipments/{shipment_id}", extra_headers={"x-format-new": "true"})
+
+    def shipment_destination(self, shipment_id):
+        clean_id = re.sub(r"[^A-Za-z0-9_-]", "", str(shipment_id or ""))
+        if not clean_id:
+            return {}
+        return self.get(
+            f"/shipments/{clean_id}?views=destination",
+            extra_headers={"x-format-new": "true", "X-Api-Version": "2"},
+            retries=2,
+            timeout=15,
+        )
 
     def shipment_costs(self, shipment_id):
         return self.get(
@@ -5642,6 +5682,25 @@ def sync_recent_sales(payload, account, client):
     account["sales_sync_status"] = f"{revenue_orders} pedidos reais sincronizados no mês"
     upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"])
     sync_pending_shipments_from_orders(payload, account, orders)
+    try:
+        with CUSTOMERS_SYNC_LOCK:
+            automatic_limit = max(1, int(os.getenv("MELI_CUSTOMERS_AUTOSYNC_ORDER_LIMIT", "50")))
+            customer_store = read_customers_store()
+            known_customer_orders = {
+                str(purchase.get("order_id") or "")
+                for customer in customer_store.get("customers", {}).values()
+                for purchase in customer.get("purchases") or []
+            }
+            sorted_orders = sorted(orders, key=lambda row: str(row.get("date_created") or ""), reverse=True)
+            new_orders = [row for row in sorted_orders if str(row.get("id") or "") not in known_customer_orders][:automatic_limit]
+            status_updates = [row for row in sorted_orders if str(row.get("id") or "") in known_customer_orders][:20]
+            selected_orders = list({str(row.get("id") or index): row for index, row in enumerate([*new_orders, *status_updates])}.values())
+            _, customer_result = sync_customers_from_orders(account, client, selected_orders, store=customer_store)
+        account["customers_sync_status"] = (
+            f"{customer_result['imported']} novo(s) cliente(s)/pedido(s) armazenado(s)"
+        )
+    except Exception as exc:
+        account["customers_sync_status"] = policy_error_message(exc, "o cadastro histórico de clientes")
     return rows
 
 
@@ -5661,6 +5720,425 @@ def fetch_seller_orders_window(client, seller_id, date_from, date_to, max_orders
             break
         offset += len(batch)
     return orders[:limit]
+
+
+def empty_customers_store():
+    return {
+        "version": 1,
+        "customers": {},
+        "sync": {"last_sync_at": "", "accounts": {}, "purpose": "transaction_support"},
+    }
+
+
+def read_customers_store():
+    with CUSTOMERS_DATA_LOCK:
+        store = read_json(CUSTOMERS_DATA_FILE, empty_customers_store())
+    if not isinstance(store, dict) or int(store.get("version") or 0) != 1:
+        return empty_customers_store()
+    store.setdefault("customers", {})
+    store.setdefault("sync", {"last_sync_at": "", "accounts": {}, "purpose": "transaction_support"})
+    return store
+
+
+def write_customers_store(store):
+    store["version"] = 1
+    store.setdefault("sync", {})["purpose"] = "transaction_support"
+    with CUSTOMERS_DATA_LOCK:
+        write_json(CUSTOMERS_DATA_FILE, store)
+
+
+def customer_digits(value):
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def customer_address(source):
+    source = source if isinstance(source, dict) else {}
+    state = source.get("state") if isinstance(source.get("state"), dict) else {}
+    city = source.get("city") if isinstance(source.get("city"), dict) else {}
+    country = source.get("country") if isinstance(source.get("country"), dict) else {}
+    row = {
+        "street_name": source.get("street_name") or source.get("address_line") or "",
+        "street_number": source.get("street_number") or "",
+        "comment": source.get("comment") or source.get("address_line_2") or "",
+        "neighborhood": source.get("neighborhood") or "",
+        "city": source.get("city_name") or city.get("name") or "",
+        "state": state.get("name") or source.get("state_name") or "",
+        "state_code": state.get("id") or state.get("code") or source.get("state_id") or "",
+        "zip_code": customer_digits(source.get("zip_code") or source.get("postal_code")),
+        "country": source.get("country_id") or country.get("id") or "BR",
+    }
+    row["formatted"] = ", ".join(filter(None, [
+        " ".join(filter(None, [str(row["street_name"]), str(row["street_number"])])),
+        row["neighborhood"], row["city"], row["state"], row["zip_code"],
+    ]))
+    return row
+
+
+def customer_order_identity(order, billing):
+    buyer = (order or {}).get("buyer") or {}
+    billing_buyer = (billing or {}).get("buyer") or {}
+    billing_info = billing_buyer.get("billing_info") or {}
+    identification = billing_info.get("identification") or {}
+    document_type = str(identification.get("type") or "").upper()
+    document = customer_digits(identification.get("number"))
+    buyer_id = str(buyer.get("id") or billing_buyer.get("cust_id") or "")
+    name = " ".join(filter(None, [
+        billing_info.get("name") or buyer.get("first_name"),
+        billing_info.get("last_name") or buyer.get("last_name"),
+    ])).strip() or buyer.get("nickname") or "Cliente Mercado Livre"
+    key = f"{document_type or 'DOC'}:{document}" if document else f"BUYER:{buyer_id}"
+    return key, {
+        "name": name,
+        "document_type": document_type,
+        "document": document,
+        "buyer_id": buyer_id,
+        "billing_address": customer_address(billing_info.get("address") or {}),
+    }
+
+
+def customer_purchase_rows(order, account):
+    status = str((order or {}).get("status") or "")
+    cancelled = status.lower() in {"cancelled", "canceled", "invalid"}
+    order_total = float((order or {}).get("total_amount") or (order or {}).get("paid_amount") or 0)
+    rows = []
+    for index, line in enumerate((order or {}).get("order_items") or [{}]):
+        item = line.get("item") or {}
+        quantity = max(1, int(line.get("quantity") or 1))
+        unit_price = float(line.get("unit_price") or line.get("full_unit_price") or 0)
+        rows.append({
+            "id": f"{order.get('id')}-{item.get('id') or index}-{index}",
+            "order_id": str(order.get("id") or ""),
+            "date": order.get("date_created") or order.get("last_updated") or "",
+            "last_updated": order.get("last_updated") or "",
+            "status": status,
+            "cancelled": cancelled,
+            "account_id": account.get("id") or "",
+            "account": account.get("nickname") or "",
+            "item_id": item.get("id") or "",
+            "product": item.get("title") or "Produto Mercado Livre",
+            "sku": item.get("seller_sku") or item.get("seller_custom_field") or "-",
+            "variation_id": item.get("variation_id") or line.get("variation_id") or "",
+            "quantity": quantity,
+            "unit_price": round(unit_price, 2),
+            "line_total": round(unit_price * quantity, 2),
+            "order_total": round(order_total, 2),
+            "currency": order.get("currency_id") or "BRL",
+            "channel": ((order.get("context") or {}).get("channel") or "Mercado Livre"),
+            "shipping_id": str(shipment_id_from_order(order) or ""),
+        })
+    return rows
+
+
+def recalculate_customer(customer):
+    purchases = customer.get("purchases") or []
+    valid = [row for row in purchases if not row.get("cancelled")]
+    order_ids = {row.get("order_id") for row in valid if row.get("order_id")}
+    customer["purchase_count"] = len(order_ids)
+    customer["items_count"] = sum(int(row.get("quantity") or 0) for row in valid)
+    grouped_orders = {}
+    for row in valid:
+        order_key = str(row.get("order_id") or row.get("id") or "")
+        bucket = grouped_orders.setdefault(order_key, {"order_total": 0.0, "lines": 0.0})
+        bucket["order_total"] = max(bucket["order_total"], float(row.get("order_total") or 0))
+        bucket["lines"] += float(row.get("line_total") or 0)
+    customer["total_spent"] = round(sum(
+        row["order_total"] if row["order_total"] > 0 else row["lines"]
+        for row in grouped_orders.values()
+    ), 2)
+    dates = [str(row.get("date") or "") for row in valid if row.get("date")]
+    customer["first_purchase"] = min(dates) if dates else ""
+    customer["last_purchase"] = max(dates) if dates else ""
+    customer["accounts"] = sorted({row.get("account") for row in valid if row.get("account")})
+    skus = {}
+    for row in valid:
+        sku = str(row.get("sku") or "-")
+        skus[sku] = skus.get(sku, 0) + int(row.get("quantity") or 0)
+    customer["top_sku"] = max(skus, key=skus.get) if skus else "-"
+    customer["updated_at"] = now_label()
+    return customer
+
+
+def upsert_customer_order(store, order, account, billing=None, shipment=None):
+    key, identity = customer_order_identity(order, billing or {})
+    if key == "BUYER:":
+        key = f"ORDER:{order.get('id')}"
+    customers = store.setdefault("customers", {})
+    existing_key = next((
+        current_key for current_key, row in customers.items()
+        if identity.get("document") and customer_digits(row.get("document")) == identity["document"]
+        or identity.get("buyer_id") and identity["buyer_id"] in (row.get("buyer_ids") or [])
+    ), "")
+    if existing_key and existing_key != key:
+        customer = customers.pop(existing_key)
+    else:
+        customer = customers.get(key) or {
+            "id": f"customer-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}",
+            "created_at": now_label(), "buyer_ids": [], "purchases": [],
+        }
+    customer["name"] = identity.get("name") or customer.get("name") or "Cliente Mercado Livre"
+    if identity.get("document"):
+        customer["document_type"] = identity.get("document_type")
+        customer["document"] = identity.get("document")
+    if identity.get("buyer_id") and identity["buyer_id"] not in customer.setdefault("buyer_ids", []):
+        customer["buyer_ids"].append(identity["buyer_id"])
+    if identity.get("billing_address", {}).get("formatted"):
+        customer["billing_address"] = identity["billing_address"]
+    shipment = shipment or {}
+    delivery_source = shipment.get("receiver_address") or shipment.get("shipping_address") or {}
+    delivery = customer_address(delivery_source)
+    if delivery.get("formatted"):
+        customer["delivery_address"] = delivery
+    purchases = {row.get("id"): row for row in customer.get("purchases") or []}
+    for purchase in customer_purchase_rows(order, account):
+        purchases[purchase["id"]] = {**(purchases.get(purchase["id"]) or {}), **purchase}
+    customer["purchases"] = sorted(purchases.values(), key=lambda row: str(row.get("date") or ""), reverse=True)
+    customers[key] = recalculate_customer(customer)
+    return customer
+
+
+def customer_order_enrichment(client, account, order):
+    detailed = order or {}
+    try:
+        if order.get("id"):
+            detailed = client.order(order.get("id")) or order
+    except Exception:
+        detailed = order
+    buyer = detailed.get("buyer") or {}
+    billing_id = ((buyer.get("billing_info") or {}).get("id") or "")
+    billing = {}
+    if billing_id:
+        try:
+            billing = client.order_billing_info(account.get("site_id") or "MLB", billing_id) or {}
+        except Exception:
+            billing = {}
+    shipment = {}
+    shipment_id = shipment_id_from_order(detailed)
+    if not shipment_id and detailed.get("id"):
+        try:
+            shipment_bundle = client.order_shipments(detailed.get("id")) or {}
+            shipment_rows = shipment_bundle if isinstance(shipment_bundle, list) else shipment_bundle.get("shipments") or shipment_bundle.get("results") or []
+            shipment = next((row for row in shipment_rows if str(row.get("type") or "forward").lower() != "return"), shipment_rows[0] if shipment_rows else {})
+            shipment_id = shipment.get("id") or ""
+        except Exception:
+            shipment = {}
+    if shipment_id:
+        try:
+            shipment = client.shipment_destination(shipment_id) or {}
+        except Exception:
+            shipment = {}
+    return detailed, billing, shipment
+
+
+def sync_customers_from_orders(account, client, orders, store=None, persist=True):
+    store = store or read_customers_store()
+    known_orders = {
+        str(purchase.get("order_id") or ""): customer
+        for customer in store.get("customers", {}).values()
+        for purchase in customer.get("purchases") or []
+        if purchase.get("order_id")
+    }
+    imported = updated = missing_document = 0
+    total = len(orders or [])
+    for index, order in enumerate(orders or [], 1):
+        order_id = str(order.get("id") or "")
+        known_customer = known_orders.get(order_id)
+        incomplete_identity = known_customer and (
+            not known_customer.get("document")
+            or not (known_customer.get("delivery_address") or {}).get("formatted")
+        )
+        if known_customer and not incomplete_identity:
+            # Status can change after the first import; update without repeating PII calls.
+            for customer in store.get("customers", {}).values():
+                changed = False
+                for purchase in customer.get("purchases") or []:
+                    if str(purchase.get("order_id") or "") == order_id:
+                        purchase["status"] = order.get("status") or purchase.get("status")
+                        purchase["cancelled"] = str(purchase["status"]).lower() in {"cancelled", "canceled", "invalid"}
+                        changed = True
+                if changed:
+                    recalculate_customer(customer)
+                    updated += 1
+            continue
+        detailed, billing, shipment = customer_order_enrichment(client, account, order)
+        customer = upsert_customer_order(store, detailed, account, billing, shipment)
+        if not customer.get("document"):
+            missing_document += 1
+        imported += 0 if known_customer else 1
+        updated += 1 if known_customer else 0
+        update_async_operation_progress(
+            f"Importando clientes da conta {account.get('nickname')}: {index} de {total} pedidos.",
+            index, total,
+        )
+        if persist and imported % 25 == 0:
+            write_customers_store(store)
+    sync = store.setdefault("sync", {})
+    sync["last_sync_at"] = now_label()
+    sync.setdefault("accounts", {})[str(account.get("id") or account.get("seller_id"))] = {
+        "account": account.get("nickname"), "updated_at": now_label(), "orders_seen": total,
+    }
+    if persist:
+        write_customers_store(store)
+    return store, {"imported": imported, "updated": updated, "missing_document": missing_document, "orders_seen": total}
+
+
+def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90):
+    payload = read_payload(include_catalog=False)
+    today = datetime.now(APP_TZ).date()
+    if date_from or date_to:
+        try:
+            start = date.fromisoformat(str(date_from)[:10])
+            end = date.fromisoformat(str(date_to)[:10])
+        except ValueError as exc:
+            raise RuntimeError("Informe um período válido para importar clientes.") from exc
+    else:
+        days = max(1, min(366, int(days or 90)))
+        start, end = today - timedelta(days=days - 1), today
+    if end < start or (end - start).days + 1 > 366:
+        raise RuntimeError("A importação de clientes aceita períodos de até 366 dias por execução.")
+    selected = {str(value) for value in (account_ids or []) if value}
+    accounts = [
+        row for row in payload.get("accounts") or []
+        if row.get("official") and row.get("access_token") and row.get("status") == "connected"
+        and (not selected or str(row.get("id")) in selected or str(row.get("seller_id")) in selected)
+    ]
+    if not accounts:
+        raise RuntimeError("Nenhuma conta oficial conectada corresponde ao filtro selecionado.")
+    totals = {"imported": 0, "updated": 0, "missing_document": 0, "orders_seen": 0}
+    warnings = []
+    with CUSTOMERS_SYNC_LOCK:
+        store = read_customers_store()
+        for account in accounts:
+            try:
+                client = account_client(account)
+                orders, truncated = fetch_statistics_orders(client, account.get("seller_id"), start, end)
+                store, result = sync_customers_from_orders(account, client, orders, store=store, persist=True)
+                for field in totals:
+                    totals[field] += int(result.get(field) or 0)
+                if truncated:
+                    warnings.append(f"{account.get('nickname')}: o limite de pedidos da consulta foi atingido.")
+            except Exception as exc:
+                warnings.append(f"{account.get('nickname')}: {policy_error_message(exc, 'a importação de clientes')}")
+        write_customers_store(store)
+    return {"ok": True, **totals, "customers": len(store.get("customers") or {}), "warnings": warnings, "date_from": start.isoformat(), "date_to": end.isoformat()}
+
+
+def masked_customer_document(value):
+    digits = customer_digits(value)
+    if len(digits) == 11:
+        return f"***.{digits[3:6]}.{digits[6:9]}-**"
+    if len(digits) == 14:
+        return f"**.{digits[2:5]}.{digits[5:8]}/****-{digits[-2:]}"
+    return "Documento não disponível" if not digits else f"***{digits[-4:]}"
+
+
+def query_customers(query, include_sensitive=False):
+    store = read_customers_store()
+    query = query or {}
+    term = str((query.get("q") or [""])[0]).strip().lower()
+    filters = {key: str((query.get(key) or [""])[0]).strip().lower() for key in ("name", "cpf", "address", "cep", "product", "sku", "account")}
+    status_filter = str((query.get("status") or [""])[0]).strip().lower()
+    recurring_filter = str((query.get("recurring") or [""])[0]).strip().lower()
+    document_filter = str((query.get("document") or [""])[0]).strip().lower()
+    date_from = str((query.get("date_from") or [""])[0])
+    date_to = str((query.get("date_to") or [""])[0])
+    try:
+        min_orders = max(0, int((query.get("min_orders") or ["0"])[0] or 0))
+        min_spent = max(0.0, float(str((query.get("min_spent") or ["0"])[0] or 0).replace(",", ".")))
+        page = max(1, int((query.get("page") or ["1"])[0] or 1))
+        per_page = max(10, min(100, int((query.get("per_page") or ["25"])[0] or 25)))
+    except (TypeError, ValueError):
+        raise RuntimeError("Filtro numérico inválido.")
+    rows = []
+    for customer in (store.get("customers") or {}).values():
+        purchases = customer.get("purchases") or []
+        matching_purchases = [row for row in purchases if (
+            (not filters["product"] or filters["product"] in str(row.get("product") or "").lower())
+            and (not filters["sku"] or filters["sku"] in str(row.get("sku") or "").lower())
+            and (not filters["account"] or filters["account"] in str(row.get("account") or "").lower())
+            and (not date_from or str(row.get("date") or "")[:10] >= date_from)
+            and (not date_to or str(row.get("date") or "")[:10] <= date_to)
+            and (not status_filter or str(row.get("status") or "").lower() == status_filter)
+        )]
+        address_text = " ".join([
+            str((customer.get("delivery_address") or {}).get("formatted") or ""),
+            str((customer.get("billing_address") or {}).get("formatted") or ""),
+        ]).lower()
+        haystack = " ".join([
+            str(customer.get("name") or ""), str(customer.get("document") or ""), address_text,
+            " ".join(str(row.get("product") or "") for row in purchases),
+            " ".join(str(row.get("sku") or "") for row in purchases),
+            " ".join(str(row.get("account") or "") for row in purchases),
+        ]).lower()
+        if term and term not in haystack:
+            continue
+        if filters["name"] and filters["name"] not in str(customer.get("name") or "").lower():
+            continue
+        if filters["cpf"] and customer_digits(filters["cpf"]) not in customer_digits(customer.get("document")):
+            continue
+        if filters["address"] and filters["address"] not in address_text:
+            continue
+        if filters["cep"] and customer_digits(filters["cep"]) not in customer_digits(address_text):
+            continue
+        if any([filters["product"], filters["sku"], filters["account"], date_from, date_to, status_filter]) and not matching_purchases:
+            continue
+        if recurring_filter == "yes" and int(customer.get("purchase_count") or 0) <= 1:
+            continue
+        if recurring_filter == "no" and int(customer.get("purchase_count") or 0) > 1:
+            continue
+        if document_filter == "with" and not customer.get("document"):
+            continue
+        if document_filter == "missing" and customer.get("document"):
+            continue
+        if int(customer.get("purchase_count") or 0) < min_orders or float(customer.get("total_spent") or 0) < min_spent:
+            continue
+        delivery = customer.get("delivery_address") or customer.get("billing_address") or {}
+        row = {
+            "id": customer.get("id"), "name": customer.get("name"),
+            "document_type": customer.get("document_type") or "",
+            "document_masked": masked_customer_document(customer.get("document")),
+            "document_available": bool(customer.get("document")),
+            "city": delivery.get("city") or "", "state": delivery.get("state") or "",
+            "zip_code": delivery.get("zip_code") or "", "address": delivery.get("formatted") or "",
+            "purchase_count": customer.get("purchase_count") or 0,
+            "items_count": customer.get("items_count") or 0,
+            "total_spent": customer.get("total_spent") or 0,
+            "first_purchase": customer.get("first_purchase") or "",
+            "last_purchase": customer.get("last_purchase") or "",
+            "accounts": customer.get("accounts") or [], "top_sku": customer.get("top_sku") or "-",
+        }
+        if include_sensitive:
+            row.update({"document": customer.get("document") or "", "buyer_ids": customer.get("buyer_ids") or [], "billing_address": customer.get("billing_address") or {}, "delivery_address": customer.get("delivery_address") or {}, "purchases": purchases})
+        rows.append(row)
+    sort = str((query.get("sort") or ["last_desc"])[0])
+    if sort == "spent_desc": rows.sort(key=lambda row: (-float(row["total_spent"]), str(row["name"])))
+    elif sort == "orders_desc": rows.sort(key=lambda row: (-int(row["purchase_count"]), str(row["name"])))
+    elif sort == "name_asc": rows.sort(key=lambda row: str(row["name"] or "").lower())
+    else: rows.sort(key=lambda row: str(row.get("last_purchase") or ""), reverse=True)
+    total = len(rows)
+    offset = (page - 1) * per_page
+    all_customers = list((store.get("customers") or {}).values())
+    return {
+        "ok": True, "customers": rows[offset:offset + per_page], "total": total,
+        "page": page, "per_page": per_page, "pages": max(1, math.ceil(total / per_page)),
+        "summary": {
+            "customers": len(all_customers),
+            "recurring": sum(1 for row in all_customers if int(row.get("purchase_count") or 0) > 1),
+            "purchases": sum(int(row.get("purchase_count") or 0) for row in all_customers),
+            "revenue": round(sum(float(row.get("total_spent") or 0) for row in all_customers), 2),
+            "with_document": sum(1 for row in all_customers if row.get("document")),
+        },
+        "sync": store.get("sync") or {},
+        "options": {"accounts": sorted({account for row in all_customers for account in row.get("accounts") or []})},
+        "privacy": {"purpose": "transaction_support", "marketing_allowed": False},
+    }
+
+
+def customer_detail(customer_id):
+    store = read_customers_store()
+    customer = next((row for row in (store.get("customers") or {}).values() if row.get("id") == customer_id), None)
+    if not customer:
+        raise RuntimeError("Cliente não encontrado.")
+    return customer
 
 
 def summarize_monthly_orders(orders):
@@ -13512,6 +13990,392 @@ def query_purchase_intelligence(payload, request):
     }
 
 
+ANALYTICS_MONTH_NAMES = (
+    "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+)
+
+
+def analytics_period_label(start, end):
+    if start.day == 1 and start.year == end.year and start.month == end.month:
+        return f"{ANALYTICS_MONTH_NAMES[start.month - 1].capitalize()} de {start.year}"
+    return f"{start.strftime('%d/%m/%Y')} a {end.strftime('%d/%m/%Y')}"
+
+
+def analytics_date_ranges(request, today=None):
+    """Resolve the main and comparison windows, limited to one year each."""
+    today = today or datetime.now(APP_TZ).date()
+    mode = str((request or {}).get("period") or "current_month").strip().lower()
+
+    if mode in {"current_month", "current_month_accumulated"}:
+        current_start = today.replace(day=1)
+        current_end = today
+        previous_month_end = current_start - timedelta(days=1)
+        previous_start = previous_month_end.replace(day=1)
+        if mode == "current_month_accumulated":
+            previous_end = previous_start + timedelta(days=min(today.day, previous_month_end.day) - 1)
+        else:
+            previous_end = previous_month_end
+    elif mode in {"last_30", "last_90", "last_180", "last_365"}:
+        days = int(mode.split("_")[1])
+        current_end = today
+        current_start = today - timedelta(days=days - 1)
+        previous_end = current_start - timedelta(days=1)
+        previous_start = previous_end - timedelta(days=days - 1)
+    elif mode == "current_year":
+        current_start = today.replace(month=1, day=1)
+        current_end = today
+        previous_start = current_start.replace(year=current_start.year - 1)
+        elapsed_days = (current_end - current_start).days
+        previous_year_end = previous_start.replace(year=previous_start.year + 1) - timedelta(days=1)
+        previous_end = min(previous_start + timedelta(days=elapsed_days), previous_year_end)
+    elif mode == "custom":
+        try:
+            current_start = date.fromisoformat(str((request or {}).get("date_from") or "")[:10])
+            current_end = date.fromisoformat(str((request or {}).get("date_to") or "")[:10])
+        except ValueError as exc:
+            raise RuntimeError("Informe as datas inicial e final do período analítico.") from exc
+        custom_compare_from = str((request or {}).get("comparison_date_from") or "").strip()
+        custom_compare_to = str((request or {}).get("comparison_date_to") or "").strip()
+        if custom_compare_from or custom_compare_to:
+            try:
+                previous_start = date.fromisoformat(custom_compare_from[:10])
+                previous_end = date.fromisoformat(custom_compare_to[:10])
+            except ValueError as exc:
+                raise RuntimeError("Informe as duas datas do período de comparação.") from exc
+        else:
+            period_days = (current_end - current_start).days + 1
+            previous_end = current_start - timedelta(days=1)
+            previous_start = previous_end - timedelta(days=period_days - 1)
+    else:
+        raise RuntimeError("Período analítico inválido.")
+
+    for start, end in ((current_start, current_end), (previous_start, previous_end)):
+        if end < start:
+            raise RuntimeError("A data final precisa ser igual ou posterior à data inicial.")
+        if (end - start).days + 1 > 366:
+            raise RuntimeError("Cada período analítico pode ter no máximo 1 ano.")
+    return current_start, current_end, previous_start, previous_end
+
+
+def analytics_order_amount(order):
+    amount = optional_money((order or {}).get("total_amount"))
+    if amount is None:
+        amount = optional_money((order or {}).get("paid_amount"))
+    if amount is not None:
+        return round(max(0.0, amount), 2)
+    return round(sum(
+        max(0.0, float(line.get("unit_price") or line.get("full_unit_price") or 0))
+        * max(1, int(line.get("quantity") or 1))
+        for line in ((order or {}).get("order_items") or [])
+    ), 2)
+
+
+def empty_analytics_snapshot(start, end):
+    days = (end - start).days + 1
+    return {
+        "date_from": start.isoformat(),
+        "date_to": end.isoformat(),
+        "label": analytics_period_label(start, end),
+        "days": days,
+        "revenue": 0.0,
+        "orders": 0,
+        "units": 0,
+        "ticket": 0.0,
+        "daily_average": 0.0,
+        "best_day": None,
+        "daily": [
+            {
+                "index": index + 1,
+                "date": (start + timedelta(days=index)).isoformat(),
+                "label": (start + timedelta(days=index)).strftime("%d/%m"),
+                "revenue": 0.0,
+                "orders": 0,
+                "units": 0,
+            }
+            for index in range(days)
+        ],
+    }
+
+
+def add_orders_to_analytics_snapshot(snapshot, orders):
+    ignored_statuses = {"cancelled", "canceled", "invalid"}
+    daily_by_date = {row["date"]: row for row in snapshot["daily"]}
+    seen = set()
+    for order in orders or []:
+        if str(order.get("status") or "").lower() in ignored_statuses:
+            continue
+        order_id = str(order.get("id") or "")
+        signature = order_id or json.dumps(order, sort_keys=True, ensure_ascii=False)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        sold_at = parse_meli_datetime(order.get("date_created") or order.get("last_updated"))
+        if not sold_at:
+            continue
+        day_key = sold_at.astimezone(APP_TZ).date().isoformat()
+        day = daily_by_date.get(day_key)
+        if not day:
+            continue
+        amount = analytics_order_amount(order)
+        units = sum(max(1, int(line.get("quantity") or 1)) for line in (order.get("order_items") or []))
+        snapshot["revenue"] += amount
+        snapshot["orders"] += 1
+        snapshot["units"] += units
+        day["revenue"] += amount
+        day["orders"] += 1
+        day["units"] += units
+    return finalize_analytics_snapshot(snapshot)
+
+
+def finalize_analytics_snapshot(snapshot):
+    snapshot["revenue"] = round(snapshot["revenue"], 2)
+    snapshot["ticket"] = round(snapshot["revenue"] / snapshot["orders"], 2) if snapshot["orders"] else 0.0
+    snapshot["daily_average"] = round(snapshot["revenue"] / snapshot["days"], 2) if snapshot["days"] else 0.0
+    for day in snapshot["daily"]:
+        day["revenue"] = round(day["revenue"], 2)
+    snapshot["best_day"] = max(snapshot["daily"], key=lambda row: (row["revenue"], row["orders"])) if snapshot["orders"] else None
+    return snapshot
+
+
+def merge_analytics_snapshot(target, source):
+    target_days = {row["date"]: row for row in target.get("daily") or []}
+    for source_day in source.get("daily") or []:
+        target_day = target_days.get(source_day.get("date"))
+        if not target_day:
+            continue
+        for field in ("revenue", "orders", "units"):
+            target_day[field] += source_day.get(field) or 0
+            target[field] += source_day.get(field) or 0
+    return finalize_analytics_snapshot(target)
+
+
+def analytics_cache_fresh(entry, day, today, now_epoch):
+    if not isinstance(entry, dict) or int(entry.get("version") or 0) != 1:
+        return False
+    updated_at = float(entry.get("updated_at") or 0)
+    if day >= today:
+        ttl = max(60, int(os.getenv("MELI_ANALYTICS_TODAY_CACHE_SECONDS", "300")))
+        return now_epoch - updated_at < ttl
+    revalidate_days = max(0, int(os.getenv("MELI_ANALYTICS_REVALIDATE_DAYS", "3")))
+    if day >= today - timedelta(days=revalidate_days):
+        ttl = max(300, int(os.getenv("MELI_ANALYTICS_RECENT_CACHE_SECONDS", "21600")))
+        return now_epoch - updated_at < ttl
+    # Older completed days are immutable for the analytical workload. Changing
+    # the entry version intentionally invalidates them if the formula evolves.
+    return True
+
+
+def analytics_contiguous_windows(days):
+    maximum = max(1, min(31, int(os.getenv("MELI_STATISTICS_WINDOW_DAYS", "31"))))
+    ordered = sorted(set(days))
+    if not ordered:
+        return []
+    windows = []
+    start = previous = ordered[0]
+    for day in ordered[1:]:
+        contiguous = day == previous + timedelta(days=1)
+        within_limit = (day - start).days + 1 <= maximum
+        if not contiguous or not within_limit:
+            windows.append((start, previous))
+            start = day
+        previous = day
+    windows.append((start, previous))
+    return windows
+
+
+def analytics_cache_day(day, updated_at, daily):
+    return {
+        "version": 1,
+        "date": day.isoformat(),
+        "revenue": round(float(daily.get("revenue") or 0), 2),
+        "orders": int(daily.get("orders") or 0),
+        "units": int(daily.get("units") or 0),
+        "updated_at": float(updated_at),
+    }
+
+
+def fetch_analytics_account_snapshot(client, seller_id, account_id, start, end, today=None, now_epoch=None):
+    """Return daily analytics while only refreshing missing or volatile days."""
+    today = today or datetime.now(APP_TZ).date()
+    now_epoch = float(now_epoch if now_epoch is not None else time.time())
+    account_key = str(account_id or seller_id or "").strip()
+    requested_days = [start + timedelta(days=index) for index in range((end - start).days + 1)]
+    with ANALYTICS_DAILY_CACHE_LOCK:
+        store = read_json(ANALYTICS_DAILY_CACHE_FILE, {"version": 1, "accounts": {}})
+        if int(store.get("version") or 0) != 1:
+            store = {"version": 1, "accounts": {}}
+        cached_days = dict((((store.get("accounts") or {}).get(account_key) or {}).get("days") or {}))
+
+    refresh_days = [
+        day for day in requested_days
+        if not analytics_cache_fresh(cached_days.get(day.isoformat()), day, today, now_epoch)
+    ]
+    refreshed_entries = {}
+    fetched_snapshots = []
+    truncated = False
+    api_windows = 0
+    for window_start, window_end in analytics_contiguous_windows(refresh_days):
+        orders, window_truncated = fetch_statistics_orders(client, seller_id, window_start, window_end)
+        api_windows += 1
+        truncated = truncated or window_truncated
+        window_snapshot = add_orders_to_analytics_snapshot(
+            empty_analytics_snapshot(window_start, window_end), orders
+        )
+        fetched_snapshots.append(window_snapshot)
+        if not window_truncated:
+            for daily in window_snapshot["daily"]:
+                refreshed_entries[daily["date"]] = analytics_cache_day(
+                    date.fromisoformat(daily["date"]), now_epoch, daily
+                )
+
+    if refreshed_entries:
+        with ANALYTICS_DAILY_CACHE_LOCK:
+            latest = read_json(ANALYTICS_DAILY_CACHE_FILE, {"version": 1, "accounts": {}})
+            if int(latest.get("version") or 0) != 1:
+                latest = {"version": 1, "accounts": {}}
+            accounts_cache = latest.setdefault("accounts", {})
+            account_cache = accounts_cache.setdefault(account_key, {"days": {}})
+            account_cache.setdefault("days", {}).update(refreshed_entries)
+            account_cache["seller_id"] = str(seller_id or "")
+            account_cache["updated_at"] = now_epoch
+            maximum_days = max(730, int(os.getenv("MELI_ANALYTICS_CACHE_MAX_DAYS_PER_ACCOUNT", "1100")))
+            if len(account_cache["days"]) > maximum_days:
+                keep = sorted(account_cache["days"], reverse=True)[:maximum_days]
+                account_cache["days"] = {key: account_cache["days"][key] for key in keep}
+            write_json(ANALYTICS_DAILY_CACHE_FILE, latest)
+
+    result = empty_analytics_snapshot(start, end)
+    refresh_keys = {day.isoformat() for day in refresh_days}
+    result_days = {row["date"]: row for row in result["daily"]}
+    for day in requested_days:
+        key = day.isoformat()
+        if key in refresh_keys:
+            continue
+        entry = cached_days.get(key) or {}
+        target = result_days[key]
+        for field in ("revenue", "orders", "units"):
+            target[field] = entry.get(field) or 0
+            result[field] += entry.get(field) or 0
+    for snapshot in fetched_snapshots:
+        merge_analytics_snapshot(result, snapshot)
+    finalize_analytics_snapshot(result)
+    return result, truncated, {
+        "requested_days": len(requested_days),
+        "cached_days": len(requested_days) - len(refresh_days),
+        "refreshed_days": len(refresh_days),
+        "api_windows": api_windows,
+    }
+
+
+def analytics_change(current, previous):
+    current = float(current or 0)
+    previous = float(previous or 0)
+    if previous == 0:
+        return None
+    return round((current - previous) / previous * 100, 2)
+
+
+def query_analytics_report(payload, request):
+    current_start, current_end, previous_start, previous_end = analytics_date_ranges(request)
+    account_filter = str((request or {}).get("account") or "all")
+    accounts = [
+        account for account in payload.get("accounts") or []
+        if account.get("official") and account.get("access_token") and account.get("status") == "connected"
+    ]
+    if account_filter != "all":
+        accounts = [
+            account for account in accounts
+            if account.get("id") == account_filter
+            or str(account.get("seller_id") or "") == account_filter
+            or account.get("nickname") == account_filter
+        ]
+    if not accounts:
+        raise RuntimeError("Nenhuma conta oficial conectada corresponde ao filtro selecionado.")
+
+    current = empty_analytics_snapshot(current_start, current_end)
+    comparison = empty_analytics_snapshot(previous_start, previous_end)
+    channels = {}
+    warnings = []
+    truncated = False
+    successful_accounts = 0
+    cache_summary = {"requested_days": 0, "cached_days": 0, "refreshed_days": 0, "api_windows": 0}
+    for account in accounts:
+        account_id = str(account.get("id") or account.get("seller_id") or account.get("nickname") or "")
+        channel = {
+            "id": account_id,
+            "label": account.get("nickname") or str(account.get("seller_id") or "Conta Mercado Livre"),
+            "revenue": 0.0,
+            "orders": 0,
+            "units": 0,
+            "comparison_revenue": 0.0,
+            "comparison_orders": 0,
+        }
+        client = account_client(account)
+        account_ok = False
+        for target, start, end, prefix in (
+            (current, current_start, current_end, ""),
+            (comparison, previous_start, previous_end, "comparison_"),
+        ):
+            try:
+                account_snapshot, account_truncated, account_cache = fetch_analytics_account_snapshot(
+                    client, account.get("seller_id"), account_id, start, end
+                )
+                truncated = truncated or account_truncated
+                account_ok = True
+            except Exception as exc:
+                warnings.append(
+                    f"{channel['label']} ({analytics_period_label(start, end)}): "
+                    f"{policy_error_message(exc, 'a leitura analítica das vendas')}"
+                )
+                continue
+            merge_analytics_snapshot(target, account_snapshot)
+            for field in cache_summary:
+                cache_summary[field] += int(account_cache.get(field) or 0)
+            channel[f"{prefix}revenue"] = account_snapshot["revenue"]
+            channel[f"{prefix}orders"] = account_snapshot["orders"]
+            if not prefix:
+                channel["units"] = account_snapshot["units"]
+        if account_ok:
+            successful_accounts += 1
+        channels[account_id] = channel
+
+    if not successful_accounts and warnings:
+        raise RuntimeError(" ".join(warnings))
+
+    channel_rows = []
+    for channel in channels.values():
+        channel_rows.append({
+            **channel,
+            "ticket": round(channel["revenue"] / channel["orders"], 2) if channel["orders"] else 0.0,
+            "revenue_share": round(channel["revenue"] / current["revenue"] * 100, 2) if current["revenue"] else 0.0,
+            "orders_share": round(channel["orders"] / current["orders"] * 100, 2) if current["orders"] else 0.0,
+            "revenue_change": analytics_change(channel["revenue"], channel["comparison_revenue"]),
+            "orders_change": analytics_change(channel["orders"], channel["comparison_orders"]),
+        })
+    channel_rows.sort(key=lambda row: (-float(row.get("revenue") or 0), row.get("label") or ""))
+
+    return {
+        "ok": True,
+        "kind": "analytics",
+        "period": str((request or {}).get("period") or "current_month"),
+        "account": account_filter,
+        "current": current,
+        "comparison": comparison,
+        "changes": {
+            "revenue": analytics_change(current["revenue"], comparison["revenue"]),
+            "orders": analytics_change(current["orders"], comparison["orders"]),
+            "units": analytics_change(current["units"], comparison["units"]),
+            "ticket": analytics_change(current["ticket"], comparison["ticket"]),
+        },
+        "channels": channel_rows,
+        "warnings": warnings,
+        "truncated": truncated,
+        "cache": cache_summary,
+        "generated_at": now_label(),
+    }
+
+
 def query_sku_history(payload, request):
     sku = normalized_sku_key((request or {}).get("sku"))
     if not sku or sku == "-":
@@ -13594,7 +14458,8 @@ def statistics_job_signature(request):
     keys = (
         "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
         "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
-        "date_from", "date_to", "flex_carrier_cost", "shipping_method",
+        "date_from", "date_to", "comparison_date_from", "comparison_date_to", "period",
+        "flex_carrier_cost", "shipping_method",
     )
     normalized = {key: str((request or {}).get(key) or "") for key in keys}
     return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
@@ -13620,7 +14485,8 @@ def start_statistics_job(request):
         for key in (
             "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
             "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
-            "date_from", "date_to", "flex_carrier_cost", "shipping_method",
+            "date_from", "date_to", "comparison_date_from", "comparison_date_to", "period",
+            "flex_carrier_cost", "shipping_method",
         )
     }
     signature = statistics_job_signature(safe_request)
@@ -13656,6 +14522,8 @@ def start_statistics_job(request):
             source_payload = read_payload()
             if safe_request.get("kind") == "sales":
                 result = query_sales_report(source_payload, safe_request)
+            elif safe_request.get("kind") == "analytics":
+                result = query_analytics_report(source_payload, safe_request)
             elif safe_request.get("kind") == "brand_sales":
                 result = query_brand_sales_report(source_payload, safe_request)
             elif safe_request.get("kind") == "purchase_intelligence":
@@ -15946,7 +16814,7 @@ class App(BaseHTTPRequestHandler):
             "/api/reports/jobs/",
             "/api/spreadsheet/jobs/",
         )
-        fast_paths = {"/api/health", "/api/meta", "/api/dashboard", "/api/auth/me", "/api/returns"}
+        fast_paths = {"/api/health", "/api/meta", "/api/dashboard", "/api/auth/me", "/api/returns", "/api/customers"}
         semaphore = HTTP_FAST_REQUEST_SEMAPHORE if (
             parsed_path in fast_paths or parsed_path.startswith(fast_prefixes)
         ) else HTTP_REQUEST_SEMAPHORE
@@ -16135,6 +17003,21 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/returns":
             try:
                 self.send_json(query_returns(parse_qs(parsed.query)))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+        if parsed.path == "/api/customers":
+            actor = self.current_user(payload)
+            if not can_manage_users(actor):
+                self.send_json({"error": "Somente master e administradores podem acessar dados pessoais de clientes."}, status=403)
+                return
+            query = parse_qs(parsed.query)
+            customer_id = str((query.get("customer_id") or [""])[0])
+            try:
+                if customer_id:
+                    self.send_json({"ok": True, "customer": customer_detail(customer_id)}, headers={"Cache-Control": "private, no-store"})
+                else:
+                    self.send_json(query_customers(query), headers={"Cache-Control": "private, no-store"})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
@@ -16334,6 +17217,7 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/identifiers/refresh",
             "/api/costs/save",
             "/api/returns/sync",
+            "/api/customers/sync",
             "/api/spreadsheet/template",
             "/api/spreadsheet/import",
             "/api/spreadsheet/apply",
@@ -16429,6 +17313,28 @@ class App(BaseHTTPRequestHandler):
                 lambda: sync_official_returns(account_ids, date_from, date_to, days),
                 message="Sincronização de devoluções adicionada à fila.",
                 priority="manual",
+            )
+            self.send_json({"ok": True, **operation}, status=202)
+            return
+
+        if parsed.path == "/api/customers/sync":
+            actor = self.current_user(payload)
+            if not can_manage_users(actor):
+                self.send_json({"error": "Somente master e administradores podem importar dados de clientes."}, status=403)
+                return
+            account_ids = request.get("account_ids") or []
+            if isinstance(account_ids, str):
+                account_ids = [] if account_ids == "all" else [account_ids]
+            try:
+                days = max(1, min(366, int(request.get("days") or 90)))
+            except (TypeError, ValueError):
+                self.send_json({"error": "Período inválido para importar clientes."}, status=400)
+                return
+            operation = start_async_operation(
+                "customers_sync",
+                lambda: sync_customers_operation(account_ids, request.get("date_from") or "", request.get("date_to") or "", days),
+                message="Importação histórica de clientes adicionada à fila.",
+                heavy=True,
             )
             self.send_json({"ok": True, **operation}, status=202)
             return
@@ -16725,6 +17631,14 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/sales-report/query":
             try:
                 job = start_statistics_job({**request, "kind": "sales"})
+                self.send_json({"ok": True, **job}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/analytics/query":
+            try:
+                job = start_statistics_job({**request, "kind": "analytics"})
                 self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
