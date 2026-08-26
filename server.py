@@ -2019,7 +2019,6 @@ class MercadoLivreClient:
             return {}
         return self.get(
             f"/shipments/{clean_id}/billing_info",
-            extra_headers={"x-format-new": "true"},
             retries=2,
             timeout=15,
         )
@@ -5878,12 +5877,60 @@ def customer_delivery_source(payload):
     return next((row for row in candidates if isinstance(row, dict) and row), {})
 
 
+def customer_document_from_payload(payload):
+    if isinstance(payload, (list, tuple)):
+        for row in payload:
+            document_type, document_number = customer_document_from_payload(row)
+            if document_number:
+                return document_type, document_number
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+
+    for key in ("document", "identification"):
+        document = payload.get(key)
+        if isinstance(document, dict):
+            document_type = customer_text_value(document.get("id") or document.get("type")).upper()
+            document_number = customer_digits(customer_text_value(
+                document.get("value") or document.get("number") or document.get("doc_number")
+            ))
+            if document_number:
+                return document_type, document_number
+
+    direct_type = customer_text_value(
+        payload.get("doc_type") or payload.get("document_type") or payload.get("documentType")
+    ).upper()
+    direct_number = customer_digits(customer_text_value(
+        payload.get("doc_number") or payload.get("document_number") or payload.get("documentNumber")
+        or payload.get("cpf") or payload.get("cnpj")
+    ))
+    if direct_number:
+        return direct_type or ("CPF" if len(direct_number) == 11 else "CNPJ" if len(direct_number) == 14 else "DOC"), direct_number
+
+    additional = payload.get("additional_info") or []
+    if isinstance(additional, list):
+        fields = {
+            customer_text_value(row.get("type")).upper(): row.get("value")
+            for row in additional if isinstance(row, dict)
+        }
+        additional_number = customer_digits(customer_text_value(
+            fields.get("DOC_NUMBER") or fields.get("DOCUMENT_NUMBER")
+        ))
+        if additional_number:
+            return customer_text_value(fields.get("DOC_TYPE") or fields.get("DOCUMENT_TYPE")).upper(), additional_number
+
+    # Only traverse buyer/receiver-oriented branches. Never use sender or carrier documents.
+    for key in ("receiver", "buyer", "billing_info", "fiscal_data", "invoice_data", "data", "result", "results"):
+        document_type, document_number = customer_document_from_payload(payload.get(key))
+        if document_number:
+            return document_type, document_number
+    return "", ""
+
+
 def customer_shipment_billing_payload(payload, order=None, shipment=None):
-    payload = payload if isinstance(payload, dict) else {}
-    receiver = payload.get("receiver") if isinstance(payload.get("receiver"), dict) else {}
-    document = receiver.get("document") if isinstance(receiver.get("document"), dict) else {}
-    document_type = customer_text_value(document.get("id") or document.get("type")).upper()
-    document_number = customer_digits(customer_text_value(document.get("value") or document.get("number")))
+    payload = payload if isinstance(payload, (dict, list, tuple)) else {}
+    receiver = payload.get("receiver") if isinstance(payload, dict) and isinstance(payload.get("receiver"), dict) else {}
+    document_type, document_number = customer_document_from_payload(receiver or payload)
     if not document_number:
         return {}
     delivery_source = customer_delivery_source(shipment or {})
@@ -5928,7 +5975,7 @@ def customer_order_identity(order, billing):
     buyer = (order or {}).get("buyer") or {}
     buyer = buyer if isinstance(buyer, dict) else {}
     billing_buyer, billing_info = customer_billing_parts(billing)
-    identification = billing_info.get("identification") or {}
+    identification = billing_info.get("identification") or buyer.get("identification") or {}
     document_type = customer_text_value(identification.get("type") or identification.get("id")).upper()
     document = customer_digits(customer_text_value(identification.get("number") or identification.get("value")))
     buyer_id = str(buyer.get("id") or billing_buyer.get("cust_id") or "")
@@ -6151,6 +6198,30 @@ def customer_order_enrichment(client, account, order, diagnostics=None, context=
                 diagnostics["shipment_billing"] = "resposta_sem_documento"
         except Exception as exc:
             diagnostics["shipment_billing"] = customer_enrichment_error(exc)
+    _, final_billing_info = customer_billing_parts(billing)
+    final_identification = final_billing_info.get("identification") or {}
+    buyer = detailed.get("buyer") if isinstance(detailed.get("buyer"), dict) else {}
+    buyer_id = customer_digits(customer_text_value(buyer.get("id")))
+    if (
+        not customer_digits(customer_text_value(final_identification.get("number") or final_identification.get("value")))
+        and buyer_id
+    ):
+        try:
+            buyer_profile = client.user(buyer_id) or {}
+            document_type, document_number = customer_document_from_payload(buyer_profile)
+            if document_number:
+                billing = customer_shipment_billing_payload({
+                    "receiver": {
+                        "id": buyer_id,
+                        "document": {"id": document_type, "value": document_number},
+                    }
+                }, detailed, shipment)
+                diagnostics["billing"] = "ok_buyer_profile"
+                diagnostics["buyer_profile"] = "ok"
+            else:
+                diagnostics["buyer_profile"] = "resposta_sem_documento"
+        except Exception as exc:
+            diagnostics["buyer_profile"] = customer_enrichment_error(exc)
     return detailed, billing, shipment
 
 
@@ -6164,6 +6235,7 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
     }
     imported = updated = missing_document = missing_location = 0
     already_existing = reprocessed = pii_updated = status_only = 0
+    document_updated = billing_address_updated = delivery_address_updated = 0
     enrichment_issues = {}
     enrichment_context = {}
     total = len(orders or [])
@@ -6209,11 +6281,17 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
             or (after_delivery_address and not before_delivery_address)
         ):
             pii_updated += 1
+        if after_document and not before_document:
+            document_updated += 1
+        if after_billing_address and not before_billing_address:
+            billing_address_updated += 1
+        if after_delivery_address and not before_delivery_address:
+            delivery_address_updated += 1
         if not customer.get("document"):
             missing_document += 1
         if not after_billing_address or (bool(shipment_id_from_order(detailed)) and not after_delivery_address):
             missing_location += 1
-        for source in ("order_detail", "billing", "shipment_lookup", "delivery", "shipment_billing"):
+        for source in ("order_detail", "billing", "shipment_lookup", "delivery", "shipment_billing", "buyer_profile"):
             outcome = diagnostics.get(source)
             if isinstance(outcome, dict):
                 key = f"{source}:{outcome.get('reason') or 'falha_api'}"
@@ -6237,6 +6315,9 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
         "missing_document": missing_document, "missing_location": missing_location,
         "new_orders": imported, "already_existing": already_existing,
         "reprocessed": reprocessed, "pii_updated": pii_updated, "status_only": status_only,
+        "document_updated": document_updated,
+        "billing_address_updated": billing_address_updated,
+        "delivery_address_updated": delivery_address_updated,
         "issues": enrichment_issues,
     }
     if persist:
@@ -6245,7 +6326,11 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
         "imported": imported, "updated": updated, "missing_document": missing_document,
         "missing_location": missing_location, "orders_seen": total,
         "already_existing": already_existing, "reprocessed": reprocessed,
-        "pii_updated": pii_updated, "status_only": status_only, "issues": enrichment_issues,
+        "pii_updated": pii_updated, "status_only": status_only,
+        "document_updated": document_updated,
+        "billing_address_updated": billing_address_updated,
+        "delivery_address_updated": delivery_address_updated,
+        "issues": enrichment_issues,
     }
 
 
@@ -6277,7 +6362,8 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
     totals = {
         "imported": 0, "updated": 0, "missing_document": 0, "missing_location": 0,
         "orders_seen": 0, "already_existing": 0, "reprocessed": 0,
-        "pii_updated": 0, "status_only": 0,
+        "pii_updated": 0, "status_only": 0, "document_updated": 0,
+        "billing_address_updated": 0, "delivery_address_updated": 0,
     }
     warnings = []
     account_results = []
@@ -6301,9 +6387,23 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
                 if result.get("missing_document"):
                     issues = result.get("issues") or {}
                     summary = ", ".join(f"{key} ({value})" for key, value in sorted(issues.items())[:4])
+                    fiscal_access_denied = any(
+                        key in issues for key in (
+                            "billing:acesso_negado",
+                            "shipment_billing:acesso_negado",
+                            "buyer_profile:acesso_negado",
+                            "billing:credencial_sem_autorizacao",
+                            "shipment_billing:credencial_sem_autorizacao",
+                        )
+                    )
                     warnings.append(
                         f"{account.get('nickname')}: {result['missing_document']} pedido(s) sem documento"
-                        + (f" — {summary}" if summary else " — a API não devolveu identificação fiscal.")
+                        + (
+                            " — a credencial desta aplicação foi recusada nas fontes fiscais. "
+                            "Habilite o acesso a vendas/faturamento no aplicativo do Mercado Livre e reconecte esta conta."
+                            if fiscal_access_denied
+                            else (f" — {summary}" if summary else " — a API não devolveu identificação fiscal.")
+                        )
                     )
                 if truncated:
                     warnings.append(f"{account.get('nickname')}: o limite de pedidos da consulta foi atingido.")
