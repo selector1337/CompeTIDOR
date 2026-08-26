@@ -5711,7 +5711,8 @@ def sync_recent_sales(payload, account, client):
             selected_orders = list({str(row.get("id") or index): row for index, row in enumerate([*new_orders, *status_updates])}.values())
             _, customer_result = sync_customers_from_orders(account, client, selected_orders, store=customer_store)
         account["customers_sync_status"] = (
-            f"{customer_result['imported']} novo(s) cliente(s)/pedido(s) armazenado(s)"
+            f"{customer_result['orders_seen']} pedido(s) conciliado(s): "
+            f"{customer_result['imported']} novo(s), {customer_result['pii_updated']} cadastro(s) completado(s)"
         )
     except Exception as exc:
         account["customers_sync_status"] = policy_error_message(exc, "o cadastro histórico de clientes")
@@ -5951,6 +5952,14 @@ def recalculate_customer(customer):
     return customer
 
 
+def customer_distinct_purchase_count(customer):
+    return len({
+        str(row.get("order_id") or "")
+        for row in (customer or {}).get("purchases") or []
+        if row.get("order_id") and not row.get("cancelled")
+    })
+
+
 def upsert_customer_order(store, order, account, billing=None, shipment=None, enrichment=None):
     key, identity = customer_order_identity(order, billing or {})
     if key == "BUYER:":
@@ -6014,16 +6023,29 @@ def customer_order_enrichment(client, account, order, diagnostics=None):
         diagnostics["billing"] = "sem_billing_info_id"
     _, normalized_billing = customer_billing_parts(billing)
     identification = normalized_billing.get("identification") or {}
-    if not customer_digits(identification.get("number") or identification.get("value")) and detailed.get("id"):
+    normalized_address = customer_address(normalized_billing.get("address") or {})
+    needs_compatible_billing = (
+        not customer_digits(identification.get("number") or identification.get("value"))
+        or not normalized_address.get("formatted")
+    )
+    if needs_compatible_billing and detailed.get("id"):
         try:
             legacy_billing = client.legacy_order_billing_info(detailed.get("id")) or {}
             _, legacy_info = customer_billing_parts(legacy_billing)
             legacy_identification = legacy_info.get("identification") or {}
-            if customer_digits(legacy_identification.get("number") or legacy_identification.get("value")):
+            legacy_address = customer_address(legacy_info.get("address") or {})
+            if (
+                customer_digits(legacy_identification.get("number") or legacy_identification.get("value"))
+                and legacy_address.get("formatted")
+            ):
                 billing = legacy_billing
                 diagnostics["billing"] = "ok_compatibilidade"
             elif diagnostics.get("billing") == "ok":
-                diagnostics["billing"] = "resposta_sem_documento"
+                diagnostics["billing"] = (
+                    "resposta_sem_documento"
+                    if not customer_digits(identification.get("number") or identification.get("value"))
+                    else "resposta_sem_endereco_fiscal"
+                )
         except Exception as exc:
             if not billing:
                 diagnostics["billing"] = customer_enrichment_error(exc)
@@ -6060,16 +6082,20 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
         if purchase.get("order_id")
     }
     imported = updated = missing_document = missing_location = 0
+    already_existing = reprocessed = pii_updated = status_only = 0
     enrichment_issues = {}
     total = len(orders or [])
     for index, order in enumerate(orders or [], 1):
         order_id = str(order.get("id") or "")
         known_customer = known_orders.get(order_id)
+        requires_delivery = bool(shipment_id_from_order(order))
         incomplete_identity = known_customer and (
             not known_customer.get("document")
-            or not (known_customer.get("delivery_address") or {}).get("formatted")
+            or not (known_customer.get("billing_address") or {}).get("formatted")
+            or (requires_delivery and not (known_customer.get("delivery_address") or {}).get("formatted"))
         )
         if known_customer and not incomplete_identity:
+            already_existing += 1
             # Status can change after the first import; update without repeating PII calls.
             for customer in store.get("customers", {}).values():
                 changed = False
@@ -6080,14 +6106,28 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
                         changed = True
                 if changed:
                     recalculate_customer(customer)
-                    updated += 1
+                    status_only += 1
             continue
+        before_document = bool((known_customer or {}).get("document"))
+        before_billing_address = bool(((known_customer or {}).get("billing_address") or {}).get("formatted"))
+        before_delivery_address = bool(((known_customer or {}).get("delivery_address") or {}).get("formatted"))
         diagnostics = {}
         detailed, billing, shipment = customer_order_enrichment(client, account, order, diagnostics)
         customer = upsert_customer_order(store, detailed, account, billing, shipment, diagnostics)
+        if known_customer:
+            reprocessed += 1
+        after_document = bool(customer.get("document"))
+        after_billing_address = bool((customer.get("billing_address") or {}).get("formatted"))
+        after_delivery_address = bool((customer.get("delivery_address") or {}).get("formatted"))
+        if (
+            (after_document and not before_document)
+            or (after_billing_address and not before_billing_address)
+            or (after_delivery_address and not before_delivery_address)
+        ):
+            pii_updated += 1
         if not customer.get("document"):
             missing_document += 1
-        if not (customer.get("delivery_address") or customer.get("billing_address") or {}).get("formatted"):
+        if not after_billing_address or (bool(shipment_id_from_order(detailed)) and not after_delivery_address):
             missing_location += 1
         for source in ("order_detail", "billing", "shipment_lookup", "delivery"):
             outcome = diagnostics.get(source)
@@ -6111,13 +6151,17 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
     sync.setdefault("accounts", {})[str(account.get("id") or account.get("seller_id"))] = {
         "account": account.get("nickname"), "updated_at": now_label(), "orders_seen": total,
         "missing_document": missing_document, "missing_location": missing_location,
+        "new_orders": imported, "already_existing": already_existing,
+        "reprocessed": reprocessed, "pii_updated": pii_updated, "status_only": status_only,
         "issues": enrichment_issues,
     }
     if persist:
         write_customers_store(store)
     return store, {
         "imported": imported, "updated": updated, "missing_document": missing_document,
-        "missing_location": missing_location, "orders_seen": total, "issues": enrichment_issues,
+        "missing_location": missing_location, "orders_seen": total,
+        "already_existing": already_existing, "reprocessed": reprocessed,
+        "pii_updated": pii_updated, "status_only": status_only, "issues": enrichment_issues,
     }
 
 
@@ -6135,7 +6179,10 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
         start, end = today - timedelta(days=days - 1), today
     if end < start or (end - start).days + 1 > 366:
         raise RuntimeError("A importação de clientes aceita períodos de até 366 dias por execução.")
-    selected = {str(value) for value in (account_ids or []) if value}
+    selected = {
+        str(value) for value in (account_ids or [])
+        if value and str(value).strip().lower() != "all"
+    }
     accounts = [
         row for row in payload.get("accounts") or []
         if row.get("official") and row.get("access_token") and row.get("status") == "connected"
@@ -6143,10 +6190,17 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
     ]
     if not accounts:
         raise RuntimeError("Nenhuma conta oficial conectada corresponde ao filtro selecionado.")
-    totals = {"imported": 0, "updated": 0, "missing_document": 0, "missing_location": 0, "orders_seen": 0}
+    totals = {
+        "imported": 0, "updated": 0, "missing_document": 0, "missing_location": 0,
+        "orders_seen": 0, "already_existing": 0, "reprocessed": 0,
+        "pii_updated": 0, "status_only": 0,
+    }
     warnings = []
+    account_results = []
     with CUSTOMERS_SYNC_LOCK:
         store = read_customers_store()
+        for customer in store.get("customers", {}).values():
+            recalculate_customer(customer)
         for account in accounts:
             try:
                 client = account_client(account)
@@ -6154,6 +6208,10 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
                 store, result = sync_customers_from_orders(account, client, orders, store=store, persist=True)
                 for field in totals:
                     totals[field] += int(result.get(field) or 0)
+                account_results.append({
+                    "account": account.get("nickname") or "Conta Mercado Livre",
+                    **{field: int(result.get(field) or 0) for field in totals},
+                })
                 if result.get("missing_document"):
                     issues = result.get("issues") or {}
                     summary = ", ".join(f"{key} ({value})" for key, value in sorted(issues.items())[:4])
@@ -6166,7 +6224,11 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
             except Exception as exc:
                 warnings.append(f"{account.get('nickname')}: {policy_error_message(exc, 'a importação de clientes')}")
         write_customers_store(store)
-    return {"ok": True, **totals, "customers": len(store.get("customers") or {}), "warnings": warnings, "date_from": start.isoformat(), "date_to": end.isoformat()}
+    return {
+        "ok": True, **totals, "customers": len(store.get("customers") or {}),
+        "account_results": account_results, "warnings": warnings,
+        "date_from": start.isoformat(), "date_to": end.isoformat(),
+    }
 
 
 def masked_customer_document(value):
@@ -6197,6 +6259,9 @@ def query_customers(query, include_sensitive=False):
         raise RuntimeError("Filtro numérico inválido.")
     rows = []
     for customer in (store.get("customers") or {}).values():
+        # Rebuild derived counters from distinct order IDs. This also migrates
+        # stores created by versions that could confuse item quantity with recurrence.
+        recalculate_customer(customer)
         purchases = customer.get("purchases") or []
         matching_purchases = [row for row in purchases if (
             (not filters["product"] or filters["product"] in str(row.get("product") or "").lower())
@@ -6228,15 +6293,16 @@ def query_customers(query, include_sensitive=False):
             continue
         if any([filters["product"], filters["sku"], filters["account"], date_from, date_to, status_filter]) and not matching_purchases:
             continue
-        if recurring_filter == "yes" and int(customer.get("purchase_count") or 0) <= 1:
+        distinct_purchases = customer_distinct_purchase_count(customer)
+        if recurring_filter == "yes" and distinct_purchases <= 1:
             continue
-        if recurring_filter == "no" and int(customer.get("purchase_count") or 0) > 1:
+        if recurring_filter == "no" and distinct_purchases > 1:
             continue
         if document_filter == "with" and not customer.get("document"):
             continue
         if document_filter == "missing" and customer.get("document"):
             continue
-        if int(customer.get("purchase_count") or 0) < min_orders or float(customer.get("total_spent") or 0) < min_spent:
+        if distinct_purchases < min_orders or float(customer.get("total_spent") or 0) < min_spent:
             continue
         delivery = customer.get("delivery_address") or customer.get("billing_address") or {}
         row = {
@@ -6246,7 +6312,7 @@ def query_customers(query, include_sensitive=False):
             "document_available": bool(customer.get("document")),
             "city": delivery.get("city") or "", "state": delivery.get("state") or "",
             "zip_code": delivery.get("zip_code") or "", "address": delivery.get("formatted") or "",
-            "purchase_count": customer.get("purchase_count") or 0,
+            "purchase_count": distinct_purchases,
             "items_count": customer.get("items_count") or 0,
             "total_spent": customer.get("total_spent") or 0,
             "first_purchase": customer.get("first_purchase") or "",
@@ -6269,12 +6335,15 @@ def query_customers(query, include_sensitive=False):
         "page": page, "per_page": per_page, "pages": max(1, math.ceil(total / per_page)),
         "summary": {
             "customers": len(all_customers),
-            "recurring": sum(1 for row in all_customers if int(row.get("purchase_count") or 0) > 1),
-            "purchases": sum(int(row.get("purchase_count") or 0) for row in all_customers),
+            "recurring": sum(1 for row in all_customers if customer_distinct_purchase_count(row) > 1),
+            "purchases": sum(customer_distinct_purchase_count(row) for row in all_customers),
             "revenue": round(sum(float(row.get("total_spent") or 0) for row in all_customers), 2),
             "with_document": sum(1 for row in all_customers if row.get("document")),
             "with_location": sum(1 for row in all_customers if (
                 (row.get("delivery_address") or row.get("billing_address") or {}).get("formatted")
+            )),
+            "invoice_ready": sum(1 for row in all_customers if (
+                row.get("document") and (row.get("billing_address") or {}).get("formatted")
             )),
         },
         "sync": store.get("sync") or {},

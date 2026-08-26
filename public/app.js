@@ -955,10 +955,12 @@ function renderCustomers() {
   const syncAccounts = Object.values(data.sync?.accounts || {});
   const missingDocuments = syncAccounts.reduce((sum, row) => sum + Number(row.missing_document || 0), 0);
   const missingLocations = syncAccounts.reduce((sum, row) => sum + Number(row.missing_location || 0), 0);
+  const reconciliation = syncAccounts.map((row) => `${escapeText(row.account || "Conta")}: ${Number(row.orders_seen || 0).toLocaleString("pt-BR")} encontrado(s), ${Number(row.new_orders || 0).toLocaleString("pt-BR")} novo(s), ${Number(row.reprocessed || 0).toLocaleString("pt-BR")} reprocessado(s), ${Number(row.pii_updated || 0).toLocaleString("pt-BR")} cadastro(s) completado(s)`).join("<br>");
   if (!state.customersLoading && !state.customersError && (missingDocuments || missingLocations)) {
     const issueNames = {
       "billing:sem_billing_info_id": "pedido sem identificador fiscal",
       "billing:resposta_sem_documento": "resposta fiscal sem CPF/CNPJ",
+      "billing:resposta_sem_endereco_fiscal": "resposta fiscal sem endereço",
       "billing:acesso_negado": "acesso fiscal negado pela credencial",
       "billing:credencial_sem_autorizacao": "credencial fiscal sem autorização",
       "billing:nao_encontrado": "dados fiscais não encontrados",
@@ -969,7 +971,9 @@ function renderCustomers() {
     const issueTotals = {};
     syncAccounts.forEach((row) => Object.entries(row.issues || {}).forEach(([key, value]) => { issueTotals[key] = (issueTotals[key] || 0) + Number(value || 0); }));
     const reasons = Object.entries(issueTotals).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([key, value]) => `${issueNames[key] || key.replaceAll("_", " ")} (${value})`).join("; ");
-    feedback.innerHTML = `<div class="notice danger-notice"><strong>Importação parcial:</strong> ${missingDocuments.toLocaleString("pt-BR")} pedido(s) sem documento e ${missingLocations.toLocaleString("pt-BR")} sem localização.${reasons ? ` Motivos identificados: ${escapeText(reasons)}.` : ""} Execute novamente a importação; falhas temporárias serão reconsultadas.</div>`;
+    feedback.innerHTML = `<div class="notice danger-notice"><strong>Importação parcial:</strong> ${missingDocuments.toLocaleString("pt-BR")} pedido(s) sem documento e ${missingLocations.toLocaleString("pt-BR")} sem endereço fiscal/de entrega completo.${reasons ? ` Motivos identificados: ${escapeText(reasons)}.` : ""} Execute novamente a importação; falhas temporárias serão reconsultadas.${reconciliation ? `<br><small>${reconciliation}</small>` : ""}</div>`;
+  } else if (!state.customersLoading && !state.customersError && reconciliation) {
+    feedback.innerHTML = `<div class="notice"><strong>Última conciliação com o Mercado Livre</strong><br><small>${reconciliation}</small></div>`;
   }
   const selectedAccount = filters.elements.account.value || "";
   filters.elements.account.innerHTML = `<option value="">Todas as contas</option>${(data.options?.accounts || []).map((name) => `<option value="${escapeAttr(name)}">${escapeText(name)}</option>`).join("")}`;
@@ -982,7 +986,7 @@ function renderCustomers() {
     <article><span>Compras identificadas</span><strong>${Number(totals.purchases || 0).toLocaleString("pt-BR")}</strong><small>Pedidos válidos consolidados</small></article>
     <article><span>Valor histórico</span><strong>${money.format(totals.revenue || 0)}</strong><small>Soma dos itens não cancelados</small></article>
     <article><span>Com documento</span><strong>${Number(totals.with_document || 0).toLocaleString("pt-BR")}</strong><small>CPF/CNPJ retornado pelo ML</small></article>
-    <article><span>Com localização</span><strong>${Number(totals.with_location || 0).toLocaleString("pt-BR")}</strong><small>Endereço fiscal ou de entrega</small></article>`;
+    <article><span>Prontos para NF</span><strong>${Number(totals.invoice_ready || 0).toLocaleString("pt-BR")}</strong><small>Com CPF/CNPJ e endereço fiscal</small></article>`;
   const lastSync = document.querySelector("#customers-last-sync");
   if (lastSync) lastSync.textContent = data.sync?.last_sync_at ? `Última importação: ${data.sync.last_sync_at}` : "Ainda não importado";
   const pageInfo = { total: Number(data.total || 0), current: Number(data.page || 1), pages: Number(data.pages || 1), pageSize: Number(data.per_page || 25) };
@@ -1023,13 +1027,16 @@ async function syncCustomers() {
     const period = form.elements.period.value;
     const queued = await api("/api/customers/sync", { method: "POST", body: JSON.stringify({ account_ids: form.elements.account.value, days: period === "custom" ? 90 : Number(period), date_from: period === "custom" ? form.elements.date_from.value : "", date_to: period === "custom" ? form.elements.date_to.value : "" }) });
     const result = await waitForAsyncOperation(queued, (message) => { state.customersSyncProgress = message; renderCustomers(); }, 60 * 60 * 1000);
+    const found = Number(result.orders_seen || 0);
+    const imported = Number(result.imported || 0);
+    const existing = Number(result.already_existing || 0);
+    const reprocessed = Number(result.reprocessed || 0);
+    const piiUpdated = Number(result.pii_updated || 0);
     const missing = Number(result.missing_document || 0) + Number(result.missing_location || 0);
-    showToast(
-      missing
-        ? `${Number(result.imported || 0).toLocaleString("pt-BR")} novo(s) pedido(s) incorporado(s); ${Number(result.missing_document || 0).toLocaleString("pt-BR")} sem documento e ${Number(result.missing_location || 0).toLocaleString("pt-BR")} sem localização. Consulte o diagnóstico no painel.`
-        : `${Number(result.imported || 0).toLocaleString("pt-BR")} novo(s) pedido(s) incorporado(s), com dados pessoais consultados.`,
-      result.warnings?.length ? "error" : "success",
-    );
+    const message = found === 0
+      ? `O Mercado Livre não retornou pedidos para a conta e o período selecionados (${result.date_from || "—"} a ${result.date_to || "—"}).`
+      : `${found.toLocaleString("pt-BR")} pedido(s) encontrado(s): ${imported.toLocaleString("pt-BR")} novo(s), ${existing.toLocaleString("pt-BR")} já completo(s), ${reprocessed.toLocaleString("pt-BR")} reprocessado(s) e ${piiUpdated.toLocaleString("pt-BR")} cadastro(s) com CPF/endereço completado(s).`;
+    showToast(message, found === 0 || missing || result.warnings?.length ? "error" : "success");
     state.customersPage = 1;
     state.customers = null;
     await loadCustomers();

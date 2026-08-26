@@ -1942,13 +1942,6 @@ h2 {
   white-space: nowrap;
 }
 
-.customers-privacy-notice {
-  margin: 14px 0;
-  border-color: color-mix(in srgb, var(--amber) 55%, transparent);
-  font-size: .72rem;
-  line-height: 1.45;
-}
-
 .customers-sync-form {
   display: grid;
   grid-template-columns: repeat(4, minmax(150px, 240px));

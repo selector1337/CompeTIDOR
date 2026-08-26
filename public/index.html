@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260826-customers-v2" />
+  <link rel="stylesheet" href="/styles.css?v=20260826-customers-v3" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -241,7 +241,6 @@
             <div><p class="eyebrow">Histórico transacional persistente</p><h2>Clientes das contas conectadas</h2><p class="customers-heading-copy">Cadastro consolidado por CPF, com compras, SKUs, contas e valores preservados na aplicação.</p></div>
             <div class="customers-heading-actions"><span id="customers-last-sync" class="customers-freshness">Ainda não importado</span><button id="customers-sync" class="primary" type="button">Importar clientes</button></div>
           </div>
-          <div class="notice customers-privacy-notice"><strong>Uso restrito:</strong> estes dados pessoais são disponibilizados para gestão da transação, suporte, prevenção de fraude e obrigações legais. O Mercado Livre não autoriza sua reutilização para spam ou prospecção sem consentimento próprio e válido do cliente.</div>
           <form id="customers-sync-form" class="customers-sync-form">
             <label>Conta<select name="account"><option value="all">Todas as contas</option></select></label>
             <label>Período para importação<select name="period"><option value="30">Últimos 30 dias</option><option value="90" selected>Últimos 90 dias</option><option value="180">Últimos 180 dias</option><option value="365">Últimos 12 meses</option><option value="custom">Personalizado</option></select></label>
@@ -1319,6 +1318,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260826-customers-v2"></script>
+  <script src="/app.js?v=20260826-customers-v3"></script>
   </body>
 </html>
