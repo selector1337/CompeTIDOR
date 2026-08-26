@@ -955,7 +955,9 @@ function renderCustomers() {
   const syncAccounts = Object.values(data.sync?.accounts || {});
   const missingDocuments = syncAccounts.reduce((sum, row) => sum + Number(row.missing_document || 0), 0);
   const missingLocations = syncAccounts.reduce((sum, row) => sum + Number(row.missing_location || 0), 0);
-  const reconciliation = syncAccounts.map((row) => `${escapeText(row.account || "Conta")}: ${Number(row.orders_seen || 0).toLocaleString("pt-BR")} encontrado(s), ${Number(row.new_orders || 0).toLocaleString("pt-BR")} novo(s), ${Number(row.reprocessed || 0).toLocaleString("pt-BR")} reprocessado(s), ${Number(row.pii_updated || 0).toLocaleString("pt-BR")} cadastro(s) completado(s)`).join("<br>");
+  const reconciliation = syncAccounts.map((row) => row.error
+    ? `${escapeText(row.account || "Conta")}: falha — ${escapeText(row.error)}`
+    : `${escapeText(row.account || "Conta")}: ${Number(row.orders_seen || 0).toLocaleString("pt-BR")} encontrado(s), ${Number(row.new_orders || 0).toLocaleString("pt-BR")} novo(s), ${Number(row.reprocessed || 0).toLocaleString("pt-BR")} reprocessado(s), ${Number(row.pii_updated || 0).toLocaleString("pt-BR")} cadastro(s) completado(s)`).join("<br>");
   if (!state.customersLoading && !state.customersError && (missingDocuments || missingLocations)) {
     const issueNames = {
       "billing:sem_billing_info_id": "pedido sem identificador fiscal",
@@ -1033,9 +1035,10 @@ async function syncCustomers() {
     const reprocessed = Number(result.reprocessed || 0);
     const piiUpdated = Number(result.pii_updated || 0);
     const missing = Number(result.missing_document || 0) + Number(result.missing_location || 0);
-    const message = found === 0
+    let message = found === 0
       ? `O Mercado Livre não retornou pedidos para a conta e o período selecionados (${result.date_from || "—"} a ${result.date_to || "—"}).`
       : `${found.toLocaleString("pt-BR")} pedido(s) encontrado(s): ${imported.toLocaleString("pt-BR")} novo(s), ${existing.toLocaleString("pt-BR")} já completo(s), ${reprocessed.toLocaleString("pt-BR")} reprocessado(s) e ${piiUpdated.toLocaleString("pt-BR")} cadastro(s) com CPF/endereço completado(s).`;
+    if (result.warnings?.length) message += ` ${result.warnings[0]}`;
     showToast(message, found === 0 || missing || result.warnings?.length ? "error" : "success");
     state.customersPage = 1;
     state.customers = null;

@@ -6197,6 +6197,7 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
     }
     warnings = []
     account_results = []
+    failed_accounts = 0
     with CUSTOMERS_SYNC_LOCK:
         store = read_customers_store()
         for customer in store.get("customers", {}).values():
@@ -6204,13 +6205,14 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
         for account in accounts:
             try:
                 client = account_client(account)
-                orders, truncated = fetch_statistics_orders(client, account.get("seller_id"), start, end)
+                orders, truncated, search = fetch_customer_orders(client, account, start, end)
                 store, result = sync_customers_from_orders(account, client, orders, store=store, persist=True)
                 for field in totals:
                     totals[field] += int(result.get(field) or 0)
                 account_results.append({
                     "account": account.get("nickname") or "Conta Mercado Livre",
                     **{field: int(result.get(field) or 0) for field in totals},
+                    "search_strategy": search.get("strategy") or "",
                 })
                 if result.get("missing_document"):
                     issues = result.get("issues") or {}
@@ -6222,8 +6224,22 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
                 if truncated:
                     warnings.append(f"{account.get('nickname')}: o limite de pedidos da consulta foi atingido.")
             except Exception as exc:
-                warnings.append(f"{account.get('nickname')}: {policy_error_message(exc, 'a importação de clientes')}")
+                failed_accounts += 1
+                message = policy_error_message(exc, "a importação de clientes")
+                warnings.append(f"{account.get('nickname')}: {message}")
+                account_results.append({
+                    "account": account.get("nickname") or "Conta Mercado Livre",
+                    "error": message,
+                })
+                store.setdefault("sync", {}).setdefault("accounts", {})[
+                    str(account.get("id") or account.get("seller_id"))
+                ] = {
+                    "account": account.get("nickname") or "Conta Mercado Livre",
+                    "updated_at": now_label(), "orders_seen": 0, "error": message,
+                }
         write_customers_store(store)
+    if failed_accounts == len(accounts):
+        raise RuntimeError("A importação falhou em todas as contas: " + " | ".join(warnings[:4]))
     return {
         "ok": True, **totals, "customers": len(store.get("customers") or {}),
         "account_results": account_results, "warnings": warnings,
@@ -11999,6 +12015,98 @@ def fetch_statistics_orders(client, seller_id, start, end):
             truncated = True
             break
     return orders, truncated
+
+
+def fetch_customer_orders_without_date_filter(client, seller_id, start, end):
+    """Fallback for accounts where the orders date filter unexpectedly returns no rows."""
+    maximum = max(1, int(os.getenv("MELI_CUSTOMERS_ORDERS_LIMIT", "50000")))
+    orders = []
+    seen = set()
+    offset = 0
+    truncated = False
+    while len(orders) < maximum:
+        data = client.seller_orders(seller_id, limit=50, offset=offset)
+        if not isinstance(data, dict):
+            raise RuntimeError("A busca de pedidos retornou um formato inválido.")
+        batch = data.get("results") or []
+        if not batch:
+            break
+        reached_before_period = False
+        for order in batch:
+            created_at = parse_meli_datetime(order.get("date_created") or order.get("date_closed"))
+            if created_at and created_at.date() < start:
+                reached_before_period = True
+                continue
+            if created_at and created_at.date() > end:
+                continue
+            order_id = str(order.get("id") or "")
+            signature = order_id or json.dumps(order, sort_keys=True, ensure_ascii=False)
+            if signature not in seen:
+                seen.add(signature)
+                orders.append(order)
+                if len(orders) >= maximum:
+                    truncated = True
+                    break
+        total = int((data.get("paging") or {}).get("total") or len(batch))
+        offset += len(batch)
+        if reached_before_period or offset >= total or len(orders) >= maximum:
+            break
+    return orders, truncated
+
+
+def fetch_customer_orders(client, account, start, end):
+    stored_seller_id = str(account.get("seller_id") or "").strip()
+    seller_ids = [stored_seller_id] if stored_seller_id.isdigit() else []
+    identity_error = None
+    try:
+        authenticated = client.me() or {}
+        authenticated_id = str(authenticated.get("id") or "").strip()
+        if authenticated_id.isdigit() and authenticated_id not in seller_ids:
+            seller_ids.append(authenticated_id)
+    except Exception as exc:
+        identity_error = customer_enrichment_error(exc)
+    if not seller_ids:
+        raise RuntimeError("A conta conectada não possui um ID de vendedor válido.")
+
+    attempts = []
+    successful_search = False
+    for seller_id in seller_ids:
+        try:
+            orders, truncated = fetch_statistics_orders(client, seller_id, start, end)
+            successful_search = True
+            attempts.append({"seller_id_match": seller_id == stored_seller_id, "strategy": "date_filter", "orders": len(orders)})
+            if orders:
+                return orders, truncated, {"strategy": "date_filter", "attempts": attempts}
+        except Exception as exc:
+            attempts.append({
+                "seller_id_match": seller_id == stored_seller_id,
+                "strategy": "date_filter", "orders": 0,
+                "error": customer_enrichment_error(exc),
+            })
+        try:
+            orders, truncated = fetch_customer_orders_without_date_filter(client, seller_id, start, end)
+            successful_search = True
+            attempts.append({"seller_id_match": seller_id == stored_seller_id, "strategy": "local_date_filter", "orders": len(orders)})
+            if orders:
+                return orders, truncated, {"strategy": "local_date_filter", "attempts": attempts}
+        except Exception as exc:
+            attempts.append({
+                "seller_id_match": seller_id == stored_seller_id,
+                "strategy": "local_date_filter", "orders": 0,
+                "error": customer_enrichment_error(exc),
+            })
+    if not successful_search:
+        reasons = [
+            (row.get("error") or {}).get("reason")
+            for row in attempts if row.get("error")
+        ]
+        if identity_error:
+            reasons.append(identity_error.get("reason"))
+        raise RuntimeError(
+            "Não foi possível consultar os pedidos desta conta no Mercado Livre"
+            + (f" ({', '.join(filter(None, reasons))})." if reasons else ".")
+        )
+    return [], False, {"strategy": "no_orders", "attempts": attempts}
 
 
 def shipment_id_from_order(order):
