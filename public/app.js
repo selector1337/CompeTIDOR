@@ -969,6 +969,8 @@ function renderCustomers() {
       "delivery:sem_shipment_id": "pedido sem código de envio",
       "delivery:resposta_sem_endereco": "resposta logística sem endereço",
       "delivery:acesso_negado": "acesso logístico negado pela credencial",
+      "shipment_billing:acesso_negado": "acesso ao CPF do envio negado pela credencial",
+      "shipment_billing:resposta_sem_documento": "envio sem CPF/CNPJ na resposta fiscal",
     };
     const issueTotals = {};
     syncAccounts.forEach((row) => Object.entries(row.issues || {}).forEach(([key, value]) => { issueTotals[key] = (issueTotals[key] || 0) + Number(value || 0); }));

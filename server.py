@@ -222,6 +222,7 @@ SAFE_ML_BILLING_ORDER_DETAILS_PATH = re.compile(
 )
 SAFE_ORDER_BILLING_INFO_PATH = re.compile(r"^/orders/billing-info/[A-Z]{3}/[^/?]+$")
 SAFE_LEGACY_ORDER_BILLING_INFO_PATH = re.compile(r"^/orders/[0-9]+/billing_info$")
+SAFE_SHIPMENT_BILLING_INFO_PATH = re.compile(r"^/shipments/[^/?]+/billing_info$")
 ALLOWED_MELI_PATHS = (
     re.compile(r"^/users/me$"),
     re.compile(r"^/users/[^/]+$"),
@@ -243,6 +244,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/orders/[0-9]+/shipments\?list_all=true$"),
     SAFE_ORDER_BILLING_INFO_PATH,
     SAFE_LEGACY_ORDER_BILLING_INFO_PATH,
+    SAFE_SHIPMENT_BILLING_INFO_PATH,
     re.compile(r"^/shipments/[^/]+(\?|$)"),
     re.compile(r"^/shipments/[^/]+/costs(\?|$)"),
     re.compile(r"^/shipments/[^/]+/sla(\?|$)"),
@@ -1596,6 +1598,7 @@ def validate_meli_path(path):
         SAFE_ML_BILLING_ORDER_DETAILS_PATH.match(path or "")
         or SAFE_ORDER_BILLING_INFO_PATH.match(path or "")
         or SAFE_LEGACY_ORDER_BILLING_INFO_PATH.match(path or "")
+        or SAFE_SHIPMENT_BILLING_INFO_PATH.match(path or "")
     )
     if any(term in lowered for term in SENSITIVE_MELI_PATH_TERMS) and not safe_ml_billing:
         raise RuntimeError("Endpoint bloqueado por segurança: Mercado Pago, pagamentos e dados financeiros sensíveis não são permitidos.")
@@ -2006,6 +2009,17 @@ class MercadoLivreClient:
         return self.get(
             f"/shipments/{clean_id}?views=destination",
             extra_headers={"x-format-new": "true", "X-Api-Version": "2"},
+            retries=2,
+            timeout=15,
+        )
+
+    def shipment_billing_info(self, shipment_id):
+        clean_id = re.sub(r"[^A-Za-z0-9_-]", "", str(shipment_id or ""))
+        if not clean_id:
+            return {}
+        return self.get(
+            f"/shipments/{clean_id}/billing_info",
+            extra_headers={"x-format-new": "true"},
             retries=2,
             timeout=15,
         )
@@ -5864,6 +5878,34 @@ def customer_delivery_source(payload):
     return next((row for row in candidates if isinstance(row, dict) and row), {})
 
 
+def customer_shipment_billing_payload(payload, order=None, shipment=None):
+    payload = payload if isinstance(payload, dict) else {}
+    receiver = payload.get("receiver") if isinstance(payload.get("receiver"), dict) else {}
+    document = receiver.get("document") if isinstance(receiver.get("document"), dict) else {}
+    document_type = customer_text_value(document.get("id") or document.get("type")).upper()
+    document_number = customer_digits(customer_text_value(document.get("value") or document.get("number")))
+    if not document_number:
+        return {}
+    delivery_source = customer_delivery_source(shipment or {})
+    buyer = (order or {}).get("buyer") if isinstance((order or {}).get("buyer"), dict) else {}
+    return {
+        "buyer": {
+            "cust_id": receiver.get("id") or buyer.get("id") or "",
+            "billing_info": {
+                "name": customer_text_value(
+                    delivery_source.get("receiver_name")
+                    or receiver.get("name")
+                    or buyer.get("first_name")
+                ),
+                "last_name": customer_text_value(buyer.get("last_name")),
+                "identification": {"type": document_type or "CPF", "number": document_number},
+                "address": delivery_source,
+            },
+        },
+        "source": "shipment_billing_info",
+    }
+
+
 def customer_enrichment_error(exc):
     text = str(exc or "").lower()
     status = re.search(r"(?:http|status)[^0-9]{0,8}([1-5][0-9]{2})", text)
@@ -6014,8 +6056,9 @@ def upsert_customer_order(store, order, account, billing=None, shipment=None, en
     return customer
 
 
-def customer_order_enrichment(client, account, order, diagnostics=None):
+def customer_order_enrichment(client, account, order, diagnostics=None, context=None):
     diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    context = context if isinstance(context, dict) else {}
     detailed = order or {}
     try:
         if order.get("id"):
@@ -6026,13 +6069,20 @@ def customer_order_enrichment(client, account, order, diagnostics=None):
         diagnostics["order_detail"] = customer_enrichment_error(exc)
     billing_id = customer_billing_id(detailed)
     billing = {}
-    if billing_id:
+    prefer_shipment_billing = bool(context.get("prefer_shipment_billing"))
+    if billing_id and not prefer_shipment_billing:
         try:
             billing = client.order_billing_info(account.get("site_id") or "MLB", billing_id) or {}
             diagnostics["billing"] = "ok"
         except Exception as exc:
             billing = {}
-            diagnostics["billing"] = customer_enrichment_error(exc)
+            billing_error = customer_enrichment_error(exc)
+            diagnostics["billing"] = billing_error
+            if billing_error.get("reason") in {"acesso_negado", "credencial_sem_autorizacao"}:
+                context["prefer_shipment_billing"] = True
+                prefer_shipment_billing = True
+    elif billing_id:
+        diagnostics["billing"] = "aguardando_shipment_billing_info"
     else:
         diagnostics["billing"] = "sem_billing_info_id"
     _, normalized_billing = customer_billing_parts(billing)
@@ -6042,7 +6092,7 @@ def customer_order_enrichment(client, account, order, diagnostics=None):
         not customer_digits(identification.get("number") or identification.get("value"))
         or not normalized_address.get("formatted")
     )
-    if needs_compatible_billing and detailed.get("id"):
+    if needs_compatible_billing and detailed.get("id") and not prefer_shipment_billing:
         try:
             legacy_billing = client.legacy_order_billing_info(detailed.get("id")) or {}
             _, legacy_info = customer_billing_parts(legacy_billing)
@@ -6084,6 +6134,23 @@ def customer_order_enrichment(client, account, order, diagnostics=None):
             diagnostics["delivery"] = customer_enrichment_error(exc)
     else:
         diagnostics["delivery"] = "sem_shipment_id"
+    _, final_billing_info = customer_billing_parts(billing)
+    final_identification = final_billing_info.get("identification") or {}
+    if (
+        not customer_digits(customer_text_value(final_identification.get("number") or final_identification.get("value")))
+        and shipment_id
+    ):
+        try:
+            shipment_billing = client.shipment_billing_info(shipment_id) or {}
+            fiscal_payload = customer_shipment_billing_payload(shipment_billing, detailed, shipment)
+            if fiscal_payload:
+                billing = fiscal_payload
+                diagnostics["billing"] = "ok_shipment_billing_info"
+                diagnostics["shipment_billing"] = "ok"
+            else:
+                diagnostics["shipment_billing"] = "resposta_sem_documento"
+        except Exception as exc:
+            diagnostics["shipment_billing"] = customer_enrichment_error(exc)
     return detailed, billing, shipment
 
 
@@ -6098,6 +6165,7 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
     imported = updated = missing_document = missing_location = 0
     already_existing = reprocessed = pii_updated = status_only = 0
     enrichment_issues = {}
+    enrichment_context = {}
     total = len(orders or [])
     for index, order in enumerate(orders or [], 1):
         order_id = str(order.get("id") or "")
@@ -6126,7 +6194,9 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
         before_billing_address = bool(((known_customer or {}).get("billing_address") or {}).get("formatted"))
         before_delivery_address = bool(((known_customer or {}).get("delivery_address") or {}).get("formatted"))
         diagnostics = {}
-        detailed, billing, shipment = customer_order_enrichment(client, account, order, diagnostics)
+        detailed, billing, shipment = customer_order_enrichment(
+            client, account, order, diagnostics, enrichment_context
+        )
         customer = upsert_customer_order(store, detailed, account, billing, shipment, diagnostics)
         if known_customer:
             reprocessed += 1
@@ -6143,7 +6213,7 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
             missing_document += 1
         if not after_billing_address or (bool(shipment_id_from_order(detailed)) and not after_delivery_address):
             missing_location += 1
-        for source in ("order_detail", "billing", "shipment_lookup", "delivery"):
+        for source in ("order_detail", "billing", "shipment_lookup", "delivery", "shipment_billing"):
             outcome = diagnostics.get(source)
             if isinstance(outcome, dict):
                 key = f"{source}:{outcome.get('reason') or 'falha_api'}"
