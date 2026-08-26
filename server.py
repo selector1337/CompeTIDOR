@@ -221,6 +221,7 @@ SAFE_ML_BILLING_ORDER_DETAILS_PATH = re.compile(
     r"^/billing/integration/group/ML/order/details\?order_ids=[0-9,%]+(?:&(?:sort_by|order_by)=[A-Za-z]+)*$"
 )
 SAFE_ORDER_BILLING_INFO_PATH = re.compile(r"^/orders/billing-info/[A-Z]{3}/[^/?]+$")
+SAFE_LEGACY_ORDER_BILLING_INFO_PATH = re.compile(r"^/orders/[0-9]+/billing_info$")
 ALLOWED_MELI_PATHS = (
     re.compile(r"^/users/me$"),
     re.compile(r"^/users/[^/]+$"),
@@ -241,6 +242,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/orders/[0-9]+$"),
     re.compile(r"^/orders/[0-9]+/shipments\?list_all=true$"),
     SAFE_ORDER_BILLING_INFO_PATH,
+    SAFE_LEGACY_ORDER_BILLING_INFO_PATH,
     re.compile(r"^/shipments/[^/]+(\?|$)"),
     re.compile(r"^/shipments/[^/]+/costs(\?|$)"),
     re.compile(r"^/shipments/[^/]+/sla(\?|$)"),
@@ -1593,6 +1595,7 @@ def validate_meli_path(path):
     safe_ml_billing = bool(
         SAFE_ML_BILLING_ORDER_DETAILS_PATH.match(path or "")
         or SAFE_ORDER_BILLING_INFO_PATH.match(path or "")
+        or SAFE_LEGACY_ORDER_BILLING_INFO_PATH.match(path or "")
     )
     if any(term in lowered for term in SENSITIVE_MELI_PATH_TERMS) and not safe_ml_billing:
         raise RuntimeError("Endpoint bloqueado por segurança: Mercado Pago, pagamentos e dados financeiros sensíveis não são permitidos.")
@@ -1953,6 +1956,17 @@ class MercadoLivreClient:
         if not clean_id:
             return {}
         return self.get(f"/orders/billing-info/{clean_site}/{clean_id}", retries=2, timeout=15)
+
+    def legacy_order_billing_info(self, order_id):
+        clean_id = str(order_id or "").strip()
+        if not clean_id.isdigit():
+            return {}
+        return self.get(
+            f"/orders/{clean_id}/billing_info",
+            extra_headers={"x-version": "2"},
+            retries=2,
+            timeout=15,
+        )
 
     def order_shipments(self, order_id):
         clean_id = str(order_id or "").strip()
@@ -5774,13 +5788,92 @@ def customer_address(source):
     return row
 
 
+def customer_billing_parts(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    buyer = payload.get("buyer") if isinstance(payload.get("buyer"), dict) else {}
+    billing_info = buyer.get("billing_info") if isinstance(buyer.get("billing_info"), dict) else {}
+    if not billing_info and isinstance(payload.get("billing_info"), dict):
+        billing_info = payload["billing_info"]
+    if not billing_info and any(key in payload for key in ("identification", "address", "additional_info")):
+        billing_info = payload
+
+    additional = billing_info.get("additional_info") if isinstance(billing_info, dict) else []
+    if isinstance(additional, list) and additional:
+        fields = {
+            str(row.get("type") or "").strip().upper(): row.get("value")
+            for row in additional if isinstance(row, dict)
+        }
+        billing_info = {
+            **billing_info,
+            "name": billing_info.get("name") or fields.get("FIRST_NAME") or fields.get("NAME") or "",
+            "last_name": billing_info.get("last_name") or fields.get("LAST_NAME") or "",
+            "identification": billing_info.get("identification") or {
+                "type": fields.get("DOC_TYPE") or fields.get("DOCUMENT_TYPE") or "",
+                "number": fields.get("DOC_NUMBER") or fields.get("DOCUMENT_NUMBER") or "",
+            },
+            "address": billing_info.get("address") or {
+                "street_name": fields.get("STREET_NAME") or "",
+                "street_number": fields.get("STREET_NUMBER") or "",
+                "comment": fields.get("COMMENT") or "",
+                "neighborhood": fields.get("NEIGHBORHOOD") or "",
+                "city_name": fields.get("CITY_NAME") or "",
+                "state_name": fields.get("STATE_NAME") or "",
+                "state_id": fields.get("STATE_ID") or "",
+                "zip_code": fields.get("ZIP_CODE") or "",
+                "country_id": fields.get("COUNTRY_ID") or "BR",
+            },
+        }
+    return buyer, billing_info if isinstance(billing_info, dict) else {}
+
+
+def customer_billing_id(order):
+    order = order if isinstance(order, dict) else {}
+    buyer = order.get("buyer") if isinstance(order.get("buyer"), dict) else {}
+    candidate = buyer.get("billing_info")
+    if isinstance(candidate, dict):
+        candidate = candidate.get("id") or candidate.get("billing_info_id")
+    return candidate or buyer.get("billing_info_id") or order.get("billing_info_id") or ""
+
+
+def customer_delivery_source(payload):
+    if not isinstance(payload, dict):
+        return {}
+    candidates = [payload.get("receiver_address"), payload.get("shipping_address")]
+    for key in ("destination", "shipping", "shipment"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.extend([nested.get("receiver_address"), nested.get("shipping_address"), nested.get("address")])
+    receiver = payload.get("receiver")
+    if isinstance(receiver, dict):
+        candidates.extend([receiver.get("address"), receiver.get("receiver_address")])
+    return next((row for row in candidates if isinstance(row, dict) and row), {})
+
+
+def customer_enrichment_error(exc):
+    text = str(exc or "").lower()
+    status = re.search(r"(?:http|status)[^0-9]{0,8}([1-5][0-9]{2})", text)
+    if "403" in text or "forbidden" in text:
+        reason = "acesso_negado"
+    elif "401" in text or "unauthorized" in text:
+        reason = "credencial_sem_autorizacao"
+    elif "404" in text or "not found" in text:
+        reason = "nao_encontrado"
+    elif "429" in text or "rate limit" in text:
+        reason = "limite_temporario"
+    elif "timeout" in text or "timed out" in text:
+        reason = "tempo_esgotado"
+    else:
+        reason = "falha_api"
+    return {"reason": reason, "http_status": status.group(1) if status else ""}
+
+
 def customer_order_identity(order, billing):
     buyer = (order or {}).get("buyer") or {}
-    billing_buyer = (billing or {}).get("buyer") or {}
-    billing_info = billing_buyer.get("billing_info") or {}
+    buyer = buyer if isinstance(buyer, dict) else {}
+    billing_buyer, billing_info = customer_billing_parts(billing)
     identification = billing_info.get("identification") or {}
-    document_type = str(identification.get("type") or "").upper()
-    document = customer_digits(identification.get("number"))
+    document_type = str(identification.get("type") or identification.get("id") or "").upper()
+    document = customer_digits(identification.get("number") or identification.get("value"))
     buyer_id = str(buyer.get("id") or billing_buyer.get("cust_id") or "")
     name = " ".join(filter(None, [
         billing_info.get("name") or buyer.get("first_name"),
@@ -5858,7 +5951,7 @@ def recalculate_customer(customer):
     return customer
 
 
-def upsert_customer_order(store, order, account, billing=None, shipment=None):
+def upsert_customer_order(store, order, account, billing=None, shipment=None, enrichment=None):
     key, identity = customer_order_identity(order, billing or {})
     if key == "BUYER:":
         key = f"ORDER:{order.get('id')}"
@@ -5884,10 +5977,12 @@ def upsert_customer_order(store, order, account, billing=None, shipment=None):
     if identity.get("billing_address", {}).get("formatted"):
         customer["billing_address"] = identity["billing_address"]
     shipment = shipment or {}
-    delivery_source = shipment.get("receiver_address") or shipment.get("shipping_address") or {}
+    delivery_source = customer_delivery_source(shipment)
     delivery = customer_address(delivery_source)
     if delivery.get("formatted"):
         customer["delivery_address"] = delivery
+    if enrichment:
+        customer["last_enrichment"] = enrichment
     purchases = {row.get("id"): row for row in customer.get("purchases") or []}
     for purchase in customer_purchase_rows(order, account):
         purchases[purchase["id"]] = {**(purchases.get(purchase["id"]) or {}), **purchase}
@@ -5896,21 +5991,42 @@ def upsert_customer_order(store, order, account, billing=None, shipment=None):
     return customer
 
 
-def customer_order_enrichment(client, account, order):
+def customer_order_enrichment(client, account, order, diagnostics=None):
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
     detailed = order or {}
     try:
         if order.get("id"):
             detailed = client.order(order.get("id")) or order
-    except Exception:
+            diagnostics["order_detail"] = "ok"
+    except Exception as exc:
         detailed = order
-    buyer = detailed.get("buyer") or {}
-    billing_id = ((buyer.get("billing_info") or {}).get("id") or "")
+        diagnostics["order_detail"] = customer_enrichment_error(exc)
+    billing_id = customer_billing_id(detailed)
     billing = {}
     if billing_id:
         try:
             billing = client.order_billing_info(account.get("site_id") or "MLB", billing_id) or {}
-        except Exception:
+            diagnostics["billing"] = "ok"
+        except Exception as exc:
             billing = {}
+            diagnostics["billing"] = customer_enrichment_error(exc)
+    else:
+        diagnostics["billing"] = "sem_billing_info_id"
+    _, normalized_billing = customer_billing_parts(billing)
+    identification = normalized_billing.get("identification") or {}
+    if not customer_digits(identification.get("number") or identification.get("value")) and detailed.get("id"):
+        try:
+            legacy_billing = client.legacy_order_billing_info(detailed.get("id")) or {}
+            _, legacy_info = customer_billing_parts(legacy_billing)
+            legacy_identification = legacy_info.get("identification") or {}
+            if customer_digits(legacy_identification.get("number") or legacy_identification.get("value")):
+                billing = legacy_billing
+                diagnostics["billing"] = "ok_compatibilidade"
+            elif diagnostics.get("billing") == "ok":
+                diagnostics["billing"] = "resposta_sem_documento"
+        except Exception as exc:
+            if not billing:
+                diagnostics["billing"] = customer_enrichment_error(exc)
     shipment = {}
     shipment_id = shipment_id_from_order(detailed)
     if not shipment_id and detailed.get("id"):
@@ -5919,13 +6035,19 @@ def customer_order_enrichment(client, account, order):
             shipment_rows = shipment_bundle if isinstance(shipment_bundle, list) else shipment_bundle.get("shipments") or shipment_bundle.get("results") or []
             shipment = next((row for row in shipment_rows if str(row.get("type") or "forward").lower() != "return"), shipment_rows[0] if shipment_rows else {})
             shipment_id = shipment.get("id") or ""
-        except Exception:
+        except Exception as exc:
             shipment = {}
+            diagnostics["shipment_lookup"] = customer_enrichment_error(exc)
     if shipment_id:
         try:
-            shipment = client.shipment_destination(shipment_id) or {}
-        except Exception:
-            shipment = {}
+            destination = client.shipment_destination(shipment_id) or {}
+            if isinstance(destination, dict):
+                shipment = {**shipment, **destination}
+            diagnostics["delivery"] = "ok" if customer_delivery_source(shipment) else "resposta_sem_endereco"
+        except Exception as exc:
+            diagnostics["delivery"] = customer_enrichment_error(exc)
+    else:
+        diagnostics["delivery"] = "sem_shipment_id"
     return detailed, billing, shipment
 
 
@@ -5937,7 +6059,8 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
         for purchase in customer.get("purchases") or []
         if purchase.get("order_id")
     }
-    imported = updated = missing_document = 0
+    imported = updated = missing_document = missing_location = 0
+    enrichment_issues = {}
     total = len(orders or [])
     for index, order in enumerate(orders or [], 1):
         order_id = str(order.get("id") or "")
@@ -5959,10 +6082,22 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
                     recalculate_customer(customer)
                     updated += 1
             continue
-        detailed, billing, shipment = customer_order_enrichment(client, account, order)
-        customer = upsert_customer_order(store, detailed, account, billing, shipment)
+        diagnostics = {}
+        detailed, billing, shipment = customer_order_enrichment(client, account, order, diagnostics)
+        customer = upsert_customer_order(store, detailed, account, billing, shipment, diagnostics)
         if not customer.get("document"):
             missing_document += 1
+        if not (customer.get("delivery_address") or customer.get("billing_address") or {}).get("formatted"):
+            missing_location += 1
+        for source in ("order_detail", "billing", "shipment_lookup", "delivery"):
+            outcome = diagnostics.get(source)
+            if isinstance(outcome, dict):
+                key = f"{source}:{outcome.get('reason') or 'falha_api'}"
+            elif outcome and not str(outcome).startswith("ok"):
+                key = f"{source}:{outcome}"
+            else:
+                continue
+            enrichment_issues[key] = enrichment_issues.get(key, 0) + 1
         imported += 0 if known_customer else 1
         updated += 1 if known_customer else 0
         update_async_operation_progress(
@@ -5975,10 +6110,15 @@ def sync_customers_from_orders(account, client, orders, store=None, persist=True
     sync["last_sync_at"] = now_label()
     sync.setdefault("accounts", {})[str(account.get("id") or account.get("seller_id"))] = {
         "account": account.get("nickname"), "updated_at": now_label(), "orders_seen": total,
+        "missing_document": missing_document, "missing_location": missing_location,
+        "issues": enrichment_issues,
     }
     if persist:
         write_customers_store(store)
-    return store, {"imported": imported, "updated": updated, "missing_document": missing_document, "orders_seen": total}
+    return store, {
+        "imported": imported, "updated": updated, "missing_document": missing_document,
+        "missing_location": missing_location, "orders_seen": total, "issues": enrichment_issues,
+    }
 
 
 def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90):
@@ -6003,7 +6143,7 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
     ]
     if not accounts:
         raise RuntimeError("Nenhuma conta oficial conectada corresponde ao filtro selecionado.")
-    totals = {"imported": 0, "updated": 0, "missing_document": 0, "orders_seen": 0}
+    totals = {"imported": 0, "updated": 0, "missing_document": 0, "missing_location": 0, "orders_seen": 0}
     warnings = []
     with CUSTOMERS_SYNC_LOCK:
         store = read_customers_store()
@@ -6014,6 +6154,13 @@ def sync_customers_operation(account_ids=None, date_from="", date_to="", days=90
                 store, result = sync_customers_from_orders(account, client, orders, store=store, persist=True)
                 for field in totals:
                     totals[field] += int(result.get(field) or 0)
+                if result.get("missing_document"):
+                    issues = result.get("issues") or {}
+                    summary = ", ".join(f"{key} ({value})" for key, value in sorted(issues.items())[:4])
+                    warnings.append(
+                        f"{account.get('nickname')}: {result['missing_document']} pedido(s) sem documento"
+                        + (f" — {summary}" if summary else " — a API não devolveu identificação fiscal.")
+                    )
                 if truncated:
                     warnings.append(f"{account.get('nickname')}: o limite de pedidos da consulta foi atingido.")
             except Exception as exc:
@@ -6126,6 +6273,9 @@ def query_customers(query, include_sensitive=False):
             "purchases": sum(int(row.get("purchase_count") or 0) for row in all_customers),
             "revenue": round(sum(float(row.get("total_spent") or 0) for row in all_customers), 2),
             "with_document": sum(1 for row in all_customers if row.get("document")),
+            "with_location": sum(1 for row in all_customers if (
+                (row.get("delivery_address") or row.get("billing_address") or {}).get("formatted")
+            )),
         },
         "sync": store.get("sync") or {},
         "options": {"accounts": sorted({account for row in all_customers for account in row.get("accounts") or []})},
