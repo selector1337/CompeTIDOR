@@ -5766,26 +5766,40 @@ def customer_digits(value):
     return re.sub(r"\D", "", str(value or ""))
 
 
+def customer_text_value(value):
+    if value in (None, ""):
+        return ""
+    if isinstance(value, dict):
+        for key in ("name", "value", "description", "label", "id", "code"):
+            normalized = customer_text_value(value.get(key))
+            if normalized:
+                return normalized
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(filter(None, (customer_text_value(item) for item in value)))
+    return str(value).strip()
+
+
 def customer_address(source):
     source = source if isinstance(source, dict) else {}
     state = source.get("state") if isinstance(source.get("state"), dict) else {}
     city = source.get("city") if isinstance(source.get("city"), dict) else {}
     country = source.get("country") if isinstance(source.get("country"), dict) else {}
     row = {
-        "street_name": source.get("street_name") or source.get("address_line") or "",
-        "street_number": source.get("street_number") or "",
-        "comment": source.get("comment") or source.get("address_line_2") or "",
-        "neighborhood": source.get("neighborhood") or "",
-        "city": source.get("city_name") or city.get("name") or "",
-        "state": state.get("name") or source.get("state_name") or "",
-        "state_code": state.get("id") or state.get("code") or source.get("state_id") or "",
-        "zip_code": customer_digits(source.get("zip_code") or source.get("postal_code")),
-        "country": source.get("country_id") or country.get("id") or "BR",
+        "street_name": customer_text_value(source.get("street_name") or source.get("address_line")),
+        "street_number": customer_text_value(source.get("street_number")),
+        "comment": customer_text_value(source.get("comment") or source.get("address_line_2")),
+        "neighborhood": customer_text_value(source.get("neighborhood")),
+        "city": customer_text_value(source.get("city_name") or city.get("name") or source.get("city")),
+        "state": customer_text_value(state.get("name") or source.get("state_name") or source.get("state")),
+        "state_code": customer_text_value(state.get("id") or state.get("code") or source.get("state_id")),
+        "zip_code": customer_digits(customer_text_value(source.get("zip_code") or source.get("postal_code"))),
+        "country": customer_text_value(source.get("country_id") or country.get("id")) or "BR",
     }
-    row["formatted"] = ", ".join(filter(None, [
+    row["formatted"] = ", ".join(filter(None, (customer_text_value(value) for value in [
         " ".join(filter(None, [str(row["street_name"]), str(row["street_number"])])),
         row["neighborhood"], row["city"], row["state"], row["zip_code"],
-    ]))
+    ])))
     return row
 
 
@@ -5873,13 +5887,13 @@ def customer_order_identity(order, billing):
     buyer = buyer if isinstance(buyer, dict) else {}
     billing_buyer, billing_info = customer_billing_parts(billing)
     identification = billing_info.get("identification") or {}
-    document_type = str(identification.get("type") or identification.get("id") or "").upper()
-    document = customer_digits(identification.get("number") or identification.get("value"))
+    document_type = customer_text_value(identification.get("type") or identification.get("id")).upper()
+    document = customer_digits(customer_text_value(identification.get("number") or identification.get("value")))
     buyer_id = str(buyer.get("id") or billing_buyer.get("cust_id") or "")
     name = " ".join(filter(None, [
-        billing_info.get("name") or buyer.get("first_name"),
-        billing_info.get("last_name") or buyer.get("last_name"),
-    ])).strip() or buyer.get("nickname") or "Cliente Mercado Livre"
+        customer_text_value(billing_info.get("name") or buyer.get("first_name")),
+        customer_text_value(billing_info.get("last_name") or buyer.get("last_name")),
+    ])).strip() or customer_text_value(buyer.get("nickname")) or "Cliente Mercado Livre"
     key = f"{document_type or 'DOC'}:{document}" if document else f"BUYER:{buyer_id}"
     return key, {
         "name": name,
@@ -12104,7 +12118,10 @@ def fetch_customer_orders(client, account, start, end):
             reasons.append(identity_error.get("reason"))
         raise RuntimeError(
             "Não foi possível consultar os pedidos desta conta no Mercado Livre"
-            + (f" ({', '.join(filter(None, reasons))})." if reasons else ".")
+            + (
+                f" ({', '.join(filter(None, (customer_text_value(reason) for reason in reasons)))})."
+                if reasons else "."
+            )
         )
     return [], False, {"strategy": "no_orders", "attempts": attempts}
 
