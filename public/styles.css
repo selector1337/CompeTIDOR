@@ -9870,11 +9870,11 @@ textarea:focus {
   min-width: 145px;
   max-width: min(240px, calc(100% - 12px));
   padding: 9px 11px;
-  border: 1px solid color-mix(in srgb, #3b82f6 55%, transparent);
+  border: 1px solid color-mix(in srgb, var(--analytics-tooltip-color, #137de0) 78%, white);
   border-radius: 7px;
-  background: color-mix(in srgb, #137de0 92%, var(--panel));
+  background: var(--analytics-tooltip-color, #137de0);
   box-shadow: 0 12px 26px rgba(0, 0, 0, .34);
-  color: #fff;
+  color: var(--analytics-tooltip-text, #fff);
   pointer-events: none;
   transform: translateZ(0);
 }
@@ -9891,7 +9891,8 @@ textarea:focus {
 }
 
 .analytics-donut-tooltip span {
-  color: rgba(255, 255, 255, .9);
+  color: var(--analytics-tooltip-text, #fff);
+  opacity: .9;
   font-size: .66rem;
   font-weight: 700;
 }

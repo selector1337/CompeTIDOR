@@ -809,7 +809,8 @@ function analyticsDonut(entries, valueField, shareField, total, currency = false
     const value = currency ? money.format(row[valueField] || 0) : Number(row[valueField] || 0).toLocaleString("pt-BR");
     const title = `${row.label} · ${share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${value}`;
     const expandable = Array.isArray(row.children) && row.children.length;
-    return `<circle class="analytics-donut-segment${expandable ? " expandable" : ""}" data-donut-tooltip data-tooltip-label="${escapeAttr(row.label)}" data-tooltip-detail="${escapeAttr(`${share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${value}`)}" ${expandable ? `data-expand-other-brands aria-expanded="false"` : ""} cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="${analyticsPalette[index % analyticsPalette.length]}" stroke-width="24" stroke-dasharray="${Math.min(100, share)} ${Math.max(0, 100 - share)}" stroke-dashoffset="${-offset}" transform="rotate(-90 60 60)" tabindex="0" aria-label="${escapeAttr(`${title}${expandable ? ". Clique para detalhar." : ""}`)}"></circle>`;
+    const color = analyticsPalette[index % analyticsPalette.length];
+    return `<circle class="analytics-donut-segment${expandable ? " expandable" : ""}" data-donut-tooltip data-tooltip-label="${escapeAttr(row.label)}" data-tooltip-detail="${escapeAttr(`${share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${value}`)}" data-tooltip-color="${color}" ${expandable ? `data-expand-other-brands aria-expanded="false"` : ""} cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="${color}" stroke-width="24" stroke-dasharray="${Math.min(100, share)} ${Math.max(0, 100 - share)}" stroke-dashoffset="${-offset}" transform="rotate(-90 60 60)" tabindex="0" aria-label="${escapeAttr(`${title}${expandable ? ". Clique para detalhar." : ""}`)}"></circle>`;
   }).join("");
   const expandableRow = rows.find((row) => Array.isArray(row.children) && row.children.length);
   const detail = expandableRow ? `<div class="analytics-other-brands-detail" data-other-brands-detail hidden><div class="analytics-other-brands-heading"><span><strong>Detalhamento de outras marcas</strong><small>${expandableRow.children.length} marca(s) agrupada(s)</small></span><button type="button" class="ghost compact" data-expand-other-brands aria-expanded="false">Fechar</button></div><div class="analytics-other-brands-list">${expandableRow.children.map((child) => `<div><strong>${escapeText(child.label)}</strong><span>${Number(child.revenue_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%</span><b>${money.format(child.revenue || 0)}</b></div>`).join("")}</div></div>` : "";
@@ -5620,6 +5621,14 @@ function showAnalyticsDonutTooltip(segment, clientX, clientY) {
   const tooltip = block?.querySelector("[data-donut-floating-tooltip]");
   if (!block || !tooltip) return;
   hideAnalyticsDonutTooltips(tooltip);
+  const color = segment.dataset.tooltipColor || "#137de0";
+  const hex = color.replace("#", "");
+  const red = Number.parseInt(hex.slice(0, 2), 16) || 0;
+  const green = Number.parseInt(hex.slice(2, 4), 16) || 0;
+  const blue = Number.parseInt(hex.slice(4, 6), 16) || 0;
+  const textColor = (red * 299 + green * 587 + blue * 114) / 1000 > 150 ? "#101722" : "#ffffff";
+  tooltip.style.setProperty("--analytics-tooltip-color", color);
+  tooltip.style.setProperty("--analytics-tooltip-text", textColor);
   tooltip.innerHTML = `<strong>${escapeText(segment.dataset.tooltipLabel || "—")}</strong><span>${escapeText(segment.dataset.tooltipDetail || "")}</span>`;
   tooltip.hidden = false;
   const blockRect = block.getBoundingClientRect();
