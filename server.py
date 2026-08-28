@@ -14872,10 +14872,13 @@ def analytics_brand_rows(brands, total_revenue, maximum=8):
             "revenue": round(sum(row["revenue"] for row in remainder), 2),
             "orders": sum(row["orders"] for row in remainder),
             "units": sum(row["units"] for row in remainder),
+            "children": remainder,
         })
         rows = visible
     for row in rows:
         row["revenue_share"] = round(row["revenue"] / total_revenue * 100, 2) if total_revenue else 0.0
+        for child in row.get("children") or []:
+            child["revenue_share"] = round(child["revenue"] / total_revenue * 100, 2) if total_revenue else 0.0
     return rows
 
 
