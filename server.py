@@ -115,7 +115,7 @@ RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
 ANALYTICS_CACHE_VERSION = 2
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
-PURCHASE_OPPORTUNITIES_CACHE_VERSION = 4
+PURCHASE_OPPORTUNITIES_CACHE_VERSION = 5
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -14151,21 +14151,69 @@ def purchase_opportunity_picture(source):
 
 def purchase_opportunity_catalog_match(product, catalog):
     product_id = str(product.get("catalog_product_id") or product.get("id") or "")
+    user_product_id = str(
+        product.get("user_product_id")
+        or (product.get("id") if str(product.get("id") or "").startswith("MLBU") else "")
+        or ""
+    )
     gtin = re.sub(r"\W", "", str(product.get("gtin") or "")).upper()
     matched = []
     reason = ""
     for item in catalog or []:
         same_product = product_id and str(item.get("catalog_product_id") or "") == product_id
+        same_user_product = user_product_id and str(item.get("user_product_id") or "") == user_product_id
         item_gtin = re.sub(r"\W", "", str(item.get("gtin") or "")).upper()
         same_gtin = bool(gtin and item_gtin and gtin == item_gtin)
-        if same_product or same_gtin:
+        if same_product or same_user_product or same_gtin:
             matched.append(item)
-            reason = "Produto de catálogo já anunciado" if same_product else "GTIN já anunciado"
+            reason = (
+                "Produto de catálogo já anunciado" if same_product
+                else "Produto de usuário já anunciado" if same_user_product
+                else "GTIN já anunciado"
+            )
     return {
         "worked": bool(matched),
         "worked_reason": reason,
         "own_listings": len(matched),
         "own_accounts": sorted({str(item.get("account") or "") for item in matched if item.get("account")}),
+    }
+
+
+def purchase_opportunity_restricted_user_product(highlight, category, catalog, brand):
+    reference_id = str((highlight or {}).get("id") or "")
+    matches = [
+        item for item in catalog or []
+        if str(item.get("user_product_id") or "") == reference_id
+    ]
+    own = matches[0] if matches else {}
+    price = optional_money(own.get("price"))
+    logistic_type = customer_text_value(own.get("shipping_logistic_type"))
+    return {
+        "id": reference_id,
+        "user_product_id": reference_id,
+        "catalog_product_id": customer_text_value(own.get("catalog_product_id")),
+        "highlight_id": reference_id,
+        "highlight_type": "USER_PRODUCT",
+        "title": customer_text_value(own.get("title") or f"Produto de usuário {reference_id}"),
+        "brand": customer_text_value(own.get("brand") or brand),
+        "gtin": customer_text_value(own.get("gtin")),
+        "thumbnail": customer_text_value(own.get("thumbnail") or own.get("picture")),
+        "category_id": category.get("id"),
+        "category": category.get("name") or category.get("id"),
+        "position": max(1, int((highlight or {}).get("position") or 20)),
+        "ranking_available": True,
+        "restricted_detail": True,
+        "known_from_own_catalog": bool(own),
+        "winner_item_id": customer_text_value(own.get("id")),
+        "winner_seller_id": "",
+        "winner_price": round(float(price), 2) if price is not None else None,
+        "price_label": "Preço do seu anúncio" if own and price is not None else "Preço vencedor",
+        "currency_id": customer_text_value(own.get("currency_id") or "BRL"),
+        "competitors": len(matches) or None,
+        "logistic_type": logistic_type,
+        "full": logistic_type.lower() == "fulfillment",
+        "free_shipping": bool(own.get("free_shipping")),
+        "permalink": customer_text_value(own.get("permalink")),
     }
 
 
@@ -14270,6 +14318,8 @@ def purchase_opportunity_resolve(client, highlight, category, search_products):
         "category_id": category.get("id"),
         "category": category.get("name") or category.get("id"),
         "position": position,
+        "ranking_available": bool((highlight or {}).get("_ranking_available", True)),
+        "restricted_detail": False,
         "winner_item_id": winner_item_id,
         "winner_seller_id": customer_text_value(winner.get("seller_id")),
         "winner_price": round(float(price), 2) if price is not None else None,
@@ -14287,7 +14337,7 @@ def purchase_opportunity_resolve(client, highlight, category, search_products):
 
 def purchase_opportunity_score(row, history):
     position = max(1, min(20, int(row.get("position") or 20)))
-    demand_score = round(60 * (21 - position) / 20, 2)
+    demand_score = round(60 * (21 - position) / 20, 2) if row.get("ranking_available", True) else 10
     history_days = len((history or {}).get("observations") or {})
     persistence_score = round(min(15, history_days * 1.5), 2)
     competitors = row.get("competitors")
@@ -14317,7 +14367,7 @@ def query_purchase_opportunities(payload, request):
     price_max = optional_money((request or {}).get("price_max"))
     only_new = str((request or {}).get("only_new") or "true").lower() not in {"0", "false", "no"}
     catalog_signature = hashlib.sha1("|".join(sorted(
-        f"{item.get('catalog_product_id') or ''}:{item.get('gtin') or ''}"
+        f"{item.get('catalog_product_id') or ''}:{item.get('user_product_id') or ''}:{item.get('gtin') or ''}"
         for item in payload.get("catalog") or []
     )).encode("utf-8")).hexdigest()[:16]
     query_key = purchase_opportunity_query_key({**(request or {}), "catalog_signature": catalog_signature})
@@ -14502,37 +14552,60 @@ def query_purchase_opportunities(payload, request):
             # A dimensão categoria+marca legitimately returns 404 when the brand
             # has no dedicated top list. In that case consult the category top
             # and validate BRAND after resolving each public item/product.
-            if not brand_value_id:
+            not_found = "404" in str(exc) or "NOT_FOUND" in str(exc).upper()
+            if not brand_value_id and not not_found:
                 warnings.append(f"{category['name']}: {policy_error_message(exc, 'o ranking de mais vendidos')}")
         if not content and brand_value_id:
             try:
                 response = client.category_highlights(category["id"], "")
                 content = response.get("content") if isinstance(response, dict) else []
             except Exception as exc:
-                warnings.append(f"{category['name']}: {policy_error_message(exc, 'o ranking de mais vendidos')}")
+                if "404" not in str(exc) and "NOT_FOUND" not in str(exc).upper():
+                    warnings.append(f"{category['name']}: {policy_error_message(exc, 'o ranking de mais vendidos')}")
         for row in content or []:
             if isinstance(row, dict) and row.get("id"):
                 highlights.append({**row, "_category": category})
     if not highlights:
-        raise RuntimeError("O Mercado Livre não retornou produtos no ranking desta marca e categoria.")
+        default_category = categories[0]
+        for product in list(search_products.values())[:result_limit]:
+            product_id = str(product.get("id") or "")
+            if not product_id:
+                continue
+            product_category_id = str(product.get("category_id") or "")
+            product_category = next(
+                (row for row in categories if row.get("id") == product_category_id),
+                default_category,
+            )
+            highlights.append({
+                "id": product_id,
+                "type": "PRODUCT",
+                "position": 20,
+                "_category": product_category,
+                "_ranking_available": False,
+            })
 
     unique_highlights = {}
     for row in sorted(highlights, key=lambda item: (int(item.get("position") or 999), str(item.get("id") or ""))):
         unique_highlights.setdefault(str(row.get("id")), row)
-    # Third-party USER_PRODUCT entries can appear in the official ranking, but
-    # their details are seller-scoped. The API may return 403 for our connected
-    # account; omit them silently instead of presenting an actionable-error wall.
-    inaccessible_user_products = sum(
+    restricted_user_products = sum(
         1 for row in unique_highlights.values()
         if str(row.get("type") or "").upper() in {"USER_PRODUCT", "USERPRODUCT"}
         or str(row.get("id") or "").startswith("MLBU")
     )
+    ranked_selection = list(unique_highlights.values())[:result_limit]
     selected = [
-        row for row in unique_highlights.values()
+        row for row in ranked_selection
         if str(row.get("type") or "").upper() not in {"USER_PRODUCT", "USERPRODUCT"}
         and not str(row.get("id") or "").startswith("MLBU")
-    ][:result_limit]
-    resolved = []
+    ]
+    resolved = [
+        purchase_opportunity_restricted_user_product(
+            row, row.get("_category") or {}, payload.get("catalog") or [], brand,
+        )
+        for row in ranked_selection
+        if str(row.get("type") or "").upper() in {"USER_PRODUCT", "USERPRODUCT"}
+        or str(row.get("id") or "").startswith("MLBU")
+    ]
     workers = max(1, min(8, int(os.getenv("MELI_PURCHASE_OPPORTUNITIES_WORKERS", "6"))))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="purchase-opportunities") as executor:
         future_rows = {
@@ -14579,7 +14652,11 @@ def query_purchase_opportunities(payload, request):
                 "score": score,
                 "opportunity": level,
                 "history_days": history_days,
-                "demand_signal": f"Top {int(row.get('position') or 20)} da categoria",
+                "demand_signal": (
+                    f"Top {int(row.get('position') or 20)} da categoria"
+                    if row.get("ranking_available", True)
+                    else "Encontrado na busca de catálogo"
+                ),
             }
             if only_new and enriched["worked"]:
                 continue
@@ -14604,7 +14681,7 @@ def query_purchase_opportunities(payload, request):
                 "categories": len(categories),
                 "very_high": sum(1 for row in rows if row.get("opportunity") == "Muito alta"),
                 "already_worked": sum(1 for row in resolved if purchase_opportunity_catalog_match(row, payload.get("catalog") or [])["worked"]),
-                "restricted_user_products": inaccessible_user_products,
+                "restricted_user_products": restricted_user_products,
             },
             "warnings": warnings[:20],
             "cache": {"hit": False, "age_seconds": 0},
