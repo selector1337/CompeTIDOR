@@ -809,7 +809,7 @@ function analyticsDonut(entries, valueField, shareField, total, currency = false
     const value = currency ? money.format(row[valueField] || 0) : Number(row[valueField] || 0).toLocaleString("pt-BR");
     const title = `${row.label} · ${share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${value}`;
     const expandable = Array.isArray(row.children) && row.children.length;
-    return `<circle class="analytics-donut-segment${expandable ? " expandable" : ""}" ${expandable ? `data-expand-other-brands aria-expanded="false"` : ""} cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="${analyticsPalette[index % analyticsPalette.length]}" stroke-width="24" stroke-dasharray="${Math.min(100, share)} ${Math.max(0, 100 - share)}" stroke-dashoffset="${-offset}" transform="rotate(-90 60 60)" tabindex="0" aria-label="${escapeAttr(`${title}${expandable ? ". Clique para detalhar." : ""}`)}"><title>${escapeText(`${title}${expandable ? " · Clique para detalhar" : ""}`)}</title></circle>`;
+    return `<circle class="analytics-donut-segment${expandable ? " expandable" : ""}" data-donut-tooltip data-tooltip-label="${escapeAttr(row.label)}" data-tooltip-detail="${escapeAttr(`${share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${value}`)}" ${expandable ? `data-expand-other-brands aria-expanded="false"` : ""} cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="${analyticsPalette[index % analyticsPalette.length]}" stroke-width="24" stroke-dasharray="${Math.min(100, share)} ${Math.max(0, 100 - share)}" stroke-dashoffset="${-offset}" transform="rotate(-90 60 60)" tabindex="0" aria-label="${escapeAttr(`${title}${expandable ? ". Clique para detalhar." : ""}`)}"></circle>`;
   }).join("");
   const expandableRow = rows.find((row) => Array.isArray(row.children) && row.children.length);
   const detail = expandableRow ? `<div class="analytics-other-brands-detail" data-other-brands-detail hidden><div class="analytics-other-brands-heading"><span><strong>Detalhamento de outras marcas</strong><small>${expandableRow.children.length} marca(s) agrupada(s)</small></span><button type="button" class="ghost compact" data-expand-other-brands aria-expanded="false">Fechar</button></div><div class="analytics-other-brands-list">${expandableRow.children.map((child) => `<div><strong>${escapeText(child.label)}</strong><span>${Number(child.revenue_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%</span><b>${money.format(child.revenue || 0)}</b></div>`).join("")}</div></div>` : "";
@@ -821,7 +821,7 @@ function analyticsDonut(entries, valueField, shareField, total, currency = false
       const tag = expandable ? "button" : "div";
       return `<${tag} ${expandable ? `type="button" data-expand-other-brands aria-expanded="false"` : ""} title="${escapeAttr(`${row.label} — ${detail}${expandable ? " — clique para detalhar" : ""}`)}"><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><span><strong>${escapeText(row.label)}${expandable ? " ›" : ""}</strong><small>${detail}</small></span></${tag}>`;
     }).join("") : `<p class="muted">Sem vendas no período.</p>`}</div>
-  </div>${detail}</div>`;
+  </div><div class="analytics-donut-tooltip" data-donut-floating-tooltip hidden></div>${detail}</div>`;
 }
 
 function updateAnalyticsPeriodFields() {
@@ -5607,7 +5607,55 @@ document.querySelector("#analytics-form")?.addEventListener("submit", async (eve
   await loadAnalytics();
 });
 
-document.querySelector("#analytics-content")?.addEventListener("click", (event) => {
+const analyticsContent = document.querySelector("#analytics-content");
+
+function hideAnalyticsDonutTooltips(except = null) {
+  analyticsContent?.querySelectorAll("[data-donut-floating-tooltip]").forEach((tooltip) => {
+    if (tooltip !== except) tooltip.hidden = true;
+  });
+}
+
+function showAnalyticsDonutTooltip(segment, clientX, clientY) {
+  const block = segment?.closest(".analytics-donut-block");
+  const tooltip = block?.querySelector("[data-donut-floating-tooltip]");
+  if (!block || !tooltip) return;
+  hideAnalyticsDonutTooltips(tooltip);
+  tooltip.innerHTML = `<strong>${escapeText(segment.dataset.tooltipLabel || "—")}</strong><span>${escapeText(segment.dataset.tooltipDetail || "")}</span>`;
+  tooltip.hidden = false;
+  const blockRect = block.getBoundingClientRect();
+  const segmentRect = segment.getBoundingClientRect();
+  const pointerX = Number.isFinite(clientX) ? clientX : segmentRect.left + segmentRect.width / 2;
+  const pointerY = Number.isFinite(clientY) ? clientY : segmentRect.top + segmentRect.height / 2;
+  const gap = 14;
+  let left = pointerX - blockRect.left + gap;
+  let top = pointerY - blockRect.top - tooltip.offsetHeight / 2;
+  if (left + tooltip.offsetWidth > blockRect.width - 6) {
+    left = pointerX - blockRect.left - tooltip.offsetWidth - gap;
+  }
+  left = Math.max(6, Math.min(left, blockRect.width - tooltip.offsetWidth - 6));
+  top = Math.max(6, Math.min(top, blockRect.height - tooltip.offsetHeight - 6));
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${top}px`;
+}
+
+analyticsContent?.addEventListener("pointermove", (event) => {
+  const segment = event.target.closest?.("[data-donut-tooltip]");
+  if (segment) showAnalyticsDonutTooltip(segment, event.clientX, event.clientY);
+  else hideAnalyticsDonutTooltips();
+});
+
+analyticsContent?.addEventListener("pointerleave", () => hideAnalyticsDonutTooltips());
+
+analyticsContent?.addEventListener("focusin", (event) => {
+  const segment = event.target.closest?.("[data-donut-tooltip]");
+  if (segment) showAnalyticsDonutTooltip(segment);
+});
+
+analyticsContent?.addEventListener("focusout", (event) => {
+  if (event.target.closest?.("[data-donut-tooltip]")) hideAnalyticsDonutTooltips();
+});
+
+analyticsContent?.addEventListener("click", (event) => {
   const trigger = event.target.closest("[data-expand-other-brands]");
   if (!trigger) return;
   const block = trigger.closest(".analytics-donut-block");

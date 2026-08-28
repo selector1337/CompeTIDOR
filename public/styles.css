@@ -9825,6 +9825,10 @@ textarea:focus {
   min-height: 245px;
 }
 
+.analytics-donut-block {
+  position: relative;
+}
+
 .analytics-donut {
   position: relative;
   width: 100%;
@@ -9856,6 +9860,40 @@ textarea:focus {
 
 .analytics-donut-segment.expandable {
   cursor: pointer;
+}
+
+.analytics-donut-tooltip {
+  position: absolute;
+  z-index: 6;
+  display: grid;
+  gap: 3px;
+  min-width: 145px;
+  max-width: min(240px, calc(100% - 12px));
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, #3b82f6 55%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, #137de0 92%, var(--panel));
+  box-shadow: 0 12px 26px rgba(0, 0, 0, .34);
+  color: #fff;
+  pointer-events: none;
+  transform: translateZ(0);
+}
+
+.analytics-donut-tooltip[hidden] {
+  display: none;
+}
+
+.analytics-donut-tooltip strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: .72rem;
+}
+
+.analytics-donut-tooltip span {
+  color: rgba(255, 255, 255, .9);
+  font-size: .66rem;
+  font-weight: 700;
 }
 
 .analytics-donut > div {
