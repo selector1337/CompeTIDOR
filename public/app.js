@@ -1900,7 +1900,11 @@ function renderPurchaseOpportunities() {
   const warning = (report.warnings || []).length
     ? `<details class="purchase-opportunity-warning"><summary>${report.warnings.length} aviso(s) da consulta</summary><p>${escapeText(report.warnings.join(" "))}</p></details>`
     : "";
-  const cacheNote = `<div class="purchase-opportunity-cache"><span>${cache.hit ? "⚡ Resultado reaproveitado do cache" : "✓ Ranking consultado agora"}</span><small>A API não fornece vendas exatas de terceiros; a prioridade usa posição oficial, permanência, concorrência e preço vencedor.</small></div>`;
+  const restricted = Number(totals.restricted_user_products || 0);
+  const restrictionNote = restricted
+    ? ` ${restricted.toLocaleString("pt-BR")} produto(s) de usuário de terceiros não foram exibidos porque os detalhes são privados para o vendedor.`
+    : "";
+  const cacheNote = `<div class="purchase-opportunity-cache"><span>${cache.hit ? "⚡ Resultado reaproveitado do cache" : "✓ Ranking consultado agora"}</span><small>A API não fornece vendas exatas de terceiros; a prioridade usa posição oficial, permanência, concorrência e preço vencedor.${escapeText(restrictionNote)}</small></div>`;
   results.innerHTML = `${cacheNote}${warning}${rows.length ? `<div class="purchase-opportunity-grid">${rows.map((row) => {
     const tone = purchaseOpportunityTone(row.opportunity);
     const logistics = [row.full ? "Full" : "", row.free_shipping ? "Frete grátis" : ""].filter(Boolean).join(" · ") || "Logística não informada";

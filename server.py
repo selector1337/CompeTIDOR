@@ -115,7 +115,7 @@ RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
 ANALYTICS_CACHE_VERSION = 2
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
-PURCHASE_OPPORTUNITIES_CACHE_VERSION = 3
+PURCHASE_OPPORTUNITIES_CACHE_VERSION = 4
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -14494,21 +14494,44 @@ def query_purchase_opportunities(payload, request):
     highlights = []
     warnings = list(category_warnings)
     for category in categories:
+        content = []
         try:
             response = client.category_highlights(category["id"], brand_value_id)
             content = response.get("content") if isinstance(response, dict) else []
-            for row in content or []:
-                if isinstance(row, dict) and row.get("id"):
-                    highlights.append({**row, "_category": category})
         except Exception as exc:
-            warnings.append(f"{category['name']}: {policy_error_message(exc, 'o ranking de mais vendidos')}")
+            # A dimensão categoria+marca legitimately returns 404 when the brand
+            # has no dedicated top list. In that case consult the category top
+            # and validate BRAND after resolving each public item/product.
+            if not brand_value_id:
+                warnings.append(f"{category['name']}: {policy_error_message(exc, 'o ranking de mais vendidos')}")
+        if not content and brand_value_id:
+            try:
+                response = client.category_highlights(category["id"], "")
+                content = response.get("content") if isinstance(response, dict) else []
+            except Exception as exc:
+                warnings.append(f"{category['name']}: {policy_error_message(exc, 'o ranking de mais vendidos')}")
+        for row in content or []:
+            if isinstance(row, dict) and row.get("id"):
+                highlights.append({**row, "_category": category})
     if not highlights:
         raise RuntimeError("O Mercado Livre não retornou produtos no ranking desta marca e categoria.")
 
     unique_highlights = {}
     for row in sorted(highlights, key=lambda item: (int(item.get("position") or 999), str(item.get("id") or ""))):
         unique_highlights.setdefault(str(row.get("id")), row)
-    selected = list(unique_highlights.values())[:result_limit]
+    # Third-party USER_PRODUCT entries can appear in the official ranking, but
+    # their details are seller-scoped. The API may return 403 for our connected
+    # account; omit them silently instead of presenting an actionable-error wall.
+    inaccessible_user_products = sum(
+        1 for row in unique_highlights.values()
+        if str(row.get("type") or "").upper() in {"USER_PRODUCT", "USERPRODUCT"}
+        or str(row.get("id") or "").startswith("MLBU")
+    )
+    selected = [
+        row for row in unique_highlights.values()
+        if str(row.get("type") or "").upper() not in {"USER_PRODUCT", "USERPRODUCT"}
+        and not str(row.get("id") or "").startswith("MLBU")
+    ][:result_limit]
     resolved = []
     workers = max(1, min(8, int(os.getenv("MELI_PURCHASE_OPPORTUNITIES_WORKERS", "6"))))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="purchase-opportunities") as executor:
@@ -14581,6 +14604,7 @@ def query_purchase_opportunities(payload, request):
                 "categories": len(categories),
                 "very_high": sum(1 for row in rows if row.get("opportunity") == "Muito alta"),
                 "already_worked": sum(1 for row in resolved if purchase_opportunity_catalog_match(row, payload.get("catalog") or [])["worked"]),
+                "restricted_user_products": inaccessible_user_products,
             },
             "warnings": warnings[:20],
             "cache": {"hit": False, "age_seconds": 0},
