@@ -115,7 +115,7 @@ RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
 ANALYTICS_CACHE_VERSION = 2
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
-PURCHASE_OPPORTUNITIES_CACHE_VERSION = 7
+PURCHASE_OPPORTUNITIES_CACHE_VERSION = 8
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -245,6 +245,8 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/products/[^/]+(\?|$)"),
     re.compile(r"^/products/[^/]+/items(\?|$)"),
     re.compile(r"^/highlights/[A-Z]{3}/category/[^/?]+(\?|$)"),
+    re.compile(r"^/highlights/[A-Z]{3}/product/[^/?]+(\?|$)"),
+    re.compile(r"^/highlights/[A-Z]{3}/item/[^/?]+(\?|$)"),
     re.compile(r"^/user-products/[^/]+(\?|$)"),
     re.compile(r"^/orders/search(\?|$)"),
     re.compile(r"^/orders/[0-9]+$"),
@@ -1891,6 +1893,12 @@ class MercadoLivreClient:
         suffix = f"?{urlencode(params)}" if params else ""
         return self.get(
             f"/highlights/{site_id or 'MLB'}/category/{category_id}{suffix}",
+            **interactive_request_options(),
+        )
+
+    def product_highlight(self, product_id, site_id="MLB"):
+        return self.get(
+            f"/highlights/{site_id or 'MLB'}/product/{product_id}",
             **interactive_request_options(),
         )
 
@@ -14138,6 +14146,53 @@ def purchase_opportunity_brand_matches(source, brand_key):
     return bool(title_key and brand_key in title_key)
 
 
+def purchase_opportunity_diverse_products(products, limit):
+    """Interleave product domains so a frequent family cannot hide the rest."""
+    groups = {}
+    for product in (products or {}).values():
+        domain = customer_text_value(product.get("domain_id")) or "__sem_dominio__"
+        groups.setdefault(domain, []).append(product)
+    ordered = []
+    group_names = list(groups)
+    while group_names and len(ordered) < max(0, int(limit or 0)):
+        remaining = []
+        for group_name in group_names:
+            rows = groups.get(group_name) or []
+            if rows and len(ordered) < limit:
+                ordered.append(rows.pop(0))
+            if rows:
+                remaining.append(group_name)
+        group_names = remaining
+    return ordered
+
+
+def purchase_opportunity_product_ranking(response):
+    """Normalize the official product-highlight response across API variants."""
+    candidates = []
+    if isinstance(response, dict):
+        candidates.append(response)
+        for key in ("content", "results", "highlights"):
+            value = response.get(key)
+            if isinstance(value, list):
+                candidates.extend(row for row in value if isinstance(row, dict))
+            elif isinstance(value, dict):
+                candidates.append(value)
+    for row in candidates:
+        raw_category = customer_text_value(
+            row.get("category_id") or row.get("category") or row.get("id")
+        ).upper()
+        match = re.search(r"MLB\d+", raw_category)
+        position = optional_money(row.get("position") or row.get("rank"))
+        if not match or position is None or int(position) <= 0:
+            continue
+        return {
+            "category_id": match.group(0),
+            "position": max(1, int(position)),
+            "label": customer_text_value(row.get("label") or row.get("category_name")),
+        }
+    return {}
+
+
 def purchase_opportunity_picture(source):
     pictures = (source or {}).get("pictures") or []
     first = pictures[0] if pictures else {}
@@ -14395,6 +14450,7 @@ def purchase_opportunity_resolve(client, highlight, category, search_products):
         "category": category.get("name") or category.get("id"),
         "position": position,
         "ranking_available": bool((highlight or {}).get("_ranking_available", True)),
+        "ranking_source": customer_text_value((highlight or {}).get("_ranking_source")),
         "restricted_detail": False,
         "winner_item_id": winner_item_id,
         "winner_seller_id": customer_text_value(winner.get("seller_id")),
@@ -14468,13 +14524,20 @@ def query_purchase_opportunities(payload, request):
     discovery_warnings = []
     search_rows = []
     try:
-        for offset in (0, 50):
+        search_target = max(100, min(
+            500, int(os.getenv("MELI_PURCHASE_BRAND_SEARCH_PRODUCTS", "300"))
+        ))
+        for offset in range(0, search_target, 50):
             response = client.product_search(brand, limit=50, offset=offset)
             batch = response.get("results") if isinstance(response, dict) else []
             if not isinstance(batch, list) or not batch:
                 break
             search_rows.extend(batch)
             if len(batch) < 50:
+                break
+            paging = response.get("paging") if isinstance(response.get("paging"), dict) else {}
+            total = optional_money(paging.get("total"))
+            if total is not None and offset + len(batch) >= int(total):
                 break
     except Exception as exc:
         discovery_warnings.append(
@@ -14507,7 +14570,10 @@ def query_purchase_opportunities(payload, request):
         discovery = getattr(client, "domain_discovery", None)
         predictor_inputs = []
         seen_inputs = set()
-        for product in search_products.values():
+        prediction_limit = max(16, min(
+            60, int(os.getenv("MELI_PURCHASE_CATEGORY_PREDICTIONS", "36"))
+        ))
+        for product in purchase_opportunity_diverse_products(search_products, prediction_limit):
             title = customer_text_value(product.get("name") or product.get("title"))
             domain_id = customer_text_value(product.get("domain_id"))
             key = (normalized_attribute_label(title), domain_id)
@@ -14515,8 +14581,6 @@ def query_purchase_opportunities(payload, request):
                 continue
             seen_inputs.add(key)
             predictor_inputs.append((title, domain_id))
-            if len(predictor_inputs) >= 16:
-                break
         if callable(discovery) and predictor_inputs:
             prediction_rows = []
             workers = max(1, min(6, len(predictor_inputs)))
@@ -14566,6 +14630,46 @@ def query_purchase_opportunities(payload, request):
                         suggestion.get("category_name") or category_id
                     )
 
+    # Category discovery is broad, but the official per-product highlight is
+    # the strongest relevance signal available: it confirms both that the
+    # exact product is ranked and in which leaf category. Probe a domain-diverse
+    # sample so common families cannot crowd out cables or other product lines.
+    direct_product_rankings = {}
+    highlight_lookup = getattr(client, "product_highlight", None)
+    if callable(highlight_lookup) and search_products:
+        probe_limit = max(result_limit, min(
+            120, int(os.getenv("MELI_PURCHASE_PRODUCT_RANKING_PROBES", "90"))
+        ))
+        probe_rows = purchase_opportunity_diverse_products(search_products, probe_limit)
+        lookup_failures = 0
+        workers = max(1, min(8, len(probe_rows)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="purchase-product-ranking") as executor:
+            futures = {
+                executor.submit(
+                    run_meli_work, "interactive", highlight_lookup, str(product.get("id") or "")
+                ): str(product.get("id") or "")
+                for product in probe_rows if product.get("id")
+            }
+            for future in as_completed(futures):
+                product_id = futures[future]
+                try:
+                    ranking = purchase_opportunity_product_ranking(future.result())
+                except Exception as exc:
+                    if "404" not in str(exc) and "NOT_FOUND" not in str(exc).upper():
+                        lookup_failures += 1
+                    continue
+                if not ranking:
+                    continue
+                direct_product_rankings[product_id] = ranking
+                category_id = ranking["category_id"]
+                category_counts[category_id] = category_counts.get(category_id, 0) + 100
+                if ranking.get("label"):
+                    category_name_hints.setdefault(category_id, ranking["label"])
+        if lookup_failures:
+            discovery_warnings.append(
+                f"{lookup_failures} consulta(s) individuais de ranking não puderam ser confirmadas."
+            )
+
     if not category_counts:
         # Last resort for uncommon responses where both searches omit a leaf
         # category: resolve a small sample instead of failing the whole query.
@@ -14593,9 +14697,10 @@ def query_purchase_opportunities(payload, request):
 
     explicit_category = re.fullmatch(r"MLB\d+", category_filter.upper()) if category_filter else None
     candidate_ids = [explicit_category.group(0)] if explicit_category else [
-        row[0] for row in sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))[:20]
+        row[0] for row in sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))[:50]
     ]
     categories = []
+    category_names_seen = set()
     category_warnings = list(discovery_warnings)
     for category_id in candidate_ids:
         try:
@@ -14608,6 +14713,11 @@ def query_purchase_opportunities(payload, request):
             haystack = normalized_attribute_label(f"{category['id']} {category['name']}")
             if normalized_attribute_label(category_filter) not in haystack:
                 continue
+        category_name_key = normalized_attribute_label(category["name"])
+        if category_name_key and category_name_key in category_names_seen:
+            continue
+        if category_name_key:
+            category_names_seen.add(category_name_key)
         categories.append(category)
         if len(categories) >= maximum_categories:
             break
@@ -14618,7 +14728,20 @@ def query_purchase_opportunities(payload, request):
             raise RuntimeError(f"Nenhuma categoria corresponde ao filtro informado.{suffix}")
         raise RuntimeError(f"O Mercado Livre não retornou categorias para os produtos encontrados desta marca.{suffix}")
 
-    highlights = []
+    selected_categories = {row["id"]: row for row in categories}
+    highlights = [
+        {
+            "id": product_id,
+            "type": "PRODUCT",
+            "position": ranking["position"],
+            "_category": selected_categories[ranking["category_id"]],
+            "_ranking_available": True,
+            "_ranking_source": "product_highlight",
+            "_brand_confirmed_by_ranking": True,
+        }
+        for product_id, ranking in direct_product_rankings.items()
+        if ranking.get("category_id") in selected_categories
+    ]
     warnings = list(category_warnings)
     for category in categories:
         content = []
@@ -14646,6 +14769,7 @@ def query_purchase_opportunities(payload, request):
                 highlights.append({
                     **row,
                     "_category": category,
+                    "_ranking_source": "category_highlight",
                     "_brand_confirmed_by_ranking": brand_confirmed_by_ranking,
                 })
     unique_highlights = {}
@@ -14670,6 +14794,7 @@ def query_purchase_opportunities(payload, request):
             "position": 20,
             "_category": product_category,
             "_ranking_available": False,
+            "_ranking_source": "catalog_search",
             "_brand_confirmed_by_ranking": False,
         })
         if len(supplemental) >= result_limit:
@@ -14738,7 +14863,9 @@ def query_purchase_opportunities(payload, request):
                 "opportunity": level,
                 "history_days": history_days,
                 "demand_signal": (
-                    f"Top {int(row.get('position') or 20)} da categoria"
+                    f"Top {int(row.get('position') or 20)} confirmado para este produto"
+                    if row.get("ranking_source") == "product_highlight"
+                    else f"Top {int(row.get('position') or 20)} da categoria"
                     if row.get("ranking_available", True)
                     else "Encontrado na busca de catálogo"
                 ),
@@ -14772,7 +14899,10 @@ def query_purchase_opportunities(payload, request):
             "warnings": warnings[:20],
             "cache": {"hit": False, "age_seconds": 0},
             "generated_at": now_label(),
-            "methodology": "Ranking oficial de mais vendidos, permanência histórica, concorrência e qualidade dos dados públicos.",
+            "methodology": (
+                "Busca ampliada e distribuída por família de produto; ranking oficial individual e por categoria, "
+                "permanência histórica, concorrência e qualidade dos dados públicos."
+            ),
         }
         queries = store.setdefault("queries", {})
         queries[query_key] = {"updated_at": now_epoch, "result": result}
