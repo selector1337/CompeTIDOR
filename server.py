@@ -113,6 +113,7 @@ SKU_LAST_SALES_FILE = "sku_last_sales.json"
 SYNC_PROGRESS_FILE = "sync_progress.json"
 RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
+ANALYTICS_CACHE_VERSION = 2
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -14598,6 +14599,7 @@ def empty_analytics_snapshot(start, end):
         "ticket": 0.0,
         "daily_average": 0.0,
         "best_day": None,
+        "brands": {},
         "daily": [
             {
                 "index": index + 1,
@@ -14606,13 +14608,56 @@ def empty_analytics_snapshot(start, end):
                 "revenue": 0.0,
                 "orders": 0,
                 "units": 0,
+                "brands": {},
             }
             for index in range(days)
         ],
     }
 
 
-def add_orders_to_analytics_snapshot(snapshot, orders):
+def analytics_order_brand_allocations(order, amount, brand_by_item=None):
+    brand_by_item = brand_by_item or {}
+    lines = []
+    for line in (order or {}).get("order_items") or []:
+        item = line.get("item") if isinstance(line.get("item"), dict) else {}
+        item_id = str(item.get("id") or "")
+        brand = customer_text_value(
+            brand_by_item.get(item_id)
+            or source_attribute_value(item, ["BRAND"])
+            or "Sem marca"
+        )
+        quantity = max(1, int(line.get("quantity") or 1))
+        gross = max(0.0, float(line.get("unit_price") or line.get("full_unit_price") or 0)) * quantity
+        lines.append({"brand": brand or "Sem marca", "quantity": quantity, "gross": gross})
+    if not lines:
+        return [{"brand": "Sem marca", "revenue": round(float(amount or 0), 2), "orders": 1, "units": 0}]
+    total_gross = sum(row["gross"] for row in lines)
+    allocations = {}
+    remaining = round(float(amount or 0), 2)
+    for index, line in enumerate(lines):
+        if index == len(lines) - 1:
+            revenue = remaining
+        else:
+            ratio = line["gross"] / total_gross if total_gross > 0 else 1 / len(lines)
+            revenue = round(float(amount or 0) * ratio, 2)
+            remaining = round(remaining - revenue, 2)
+        bucket = allocations.setdefault(line["brand"], {"brand": line["brand"], "revenue": 0.0, "orders": 0, "units": 0})
+        bucket["revenue"] += revenue
+        bucket["units"] += line["quantity"]
+    for bucket in allocations.values():
+        bucket["orders"] = 1
+        bucket["revenue"] = round(bucket["revenue"], 2)
+    return list(allocations.values())
+
+
+def merge_analytics_brand_bucket(target, source):
+    for brand, values in (source or {}).items():
+        bucket = target.setdefault(brand, {"revenue": 0.0, "orders": 0, "units": 0})
+        for field in ("revenue", "orders", "units"):
+            bucket[field] += values.get(field) or 0
+
+
+def add_orders_to_analytics_snapshot(snapshot, orders, brand_by_item=None):
     ignored_statuses = {"cancelled", "canceled", "invalid"}
     daily_by_date = {row["date"]: row for row in snapshot["daily"]}
     seen = set()
@@ -14639,6 +14684,11 @@ def add_orders_to_analytics_snapshot(snapshot, orders):
         day["revenue"] += amount
         day["orders"] += 1
         day["units"] += units
+        for allocation in analytics_order_brand_allocations(order, amount, brand_by_item):
+            brand = allocation["brand"]
+            values = {field: allocation[field] for field in ("revenue", "orders", "units")}
+            merge_analytics_brand_bucket(snapshot["brands"], {brand: values})
+            merge_analytics_brand_bucket(day["brands"], {brand: values})
     return finalize_analytics_snapshot(snapshot)
 
 
@@ -14648,6 +14698,10 @@ def finalize_analytics_snapshot(snapshot):
     snapshot["daily_average"] = round(snapshot["revenue"] / snapshot["days"], 2) if snapshot["days"] else 0.0
     for day in snapshot["daily"]:
         day["revenue"] = round(day["revenue"], 2)
+        for values in (day.get("brands") or {}).values():
+            values["revenue"] = round(float(values.get("revenue") or 0), 2)
+    for values in (snapshot.get("brands") or {}).values():
+        values["revenue"] = round(float(values.get("revenue") or 0), 2)
     snapshot["best_day"] = max(snapshot["daily"], key=lambda row: (row["revenue"], row["orders"])) if snapshot["orders"] else None
     return snapshot
 
@@ -14661,11 +14715,13 @@ def merge_analytics_snapshot(target, source):
         for field in ("revenue", "orders", "units"):
             target_day[field] += source_day.get(field) or 0
             target[field] += source_day.get(field) or 0
+        merge_analytics_brand_bucket(target_day.setdefault("brands", {}), source_day.get("brands") or {})
+    merge_analytics_brand_bucket(target.setdefault("brands", {}), source.get("brands") or {})
     return finalize_analytics_snapshot(target)
 
 
 def analytics_cache_fresh(entry, day, today, now_epoch):
-    if not isinstance(entry, dict) or int(entry.get("version") or 0) != 1:
+    if not isinstance(entry, dict) or int(entry.get("version") or 0) != ANALYTICS_CACHE_VERSION:
         return False
     updated_at = float(entry.get("updated_at") or 0)
     if day >= today:
@@ -14700,25 +14756,28 @@ def analytics_contiguous_windows(days):
 
 def analytics_cache_day(day, updated_at, daily):
     return {
-        "version": 1,
+        "version": ANALYTICS_CACHE_VERSION,
         "date": day.isoformat(),
         "revenue": round(float(daily.get("revenue") or 0), 2),
         "orders": int(daily.get("orders") or 0),
         "units": int(daily.get("units") or 0),
+        "brands": daily.get("brands") or {},
         "updated_at": float(updated_at),
     }
 
 
-def fetch_analytics_account_snapshot(client, seller_id, account_id, start, end, today=None, now_epoch=None):
+def fetch_analytics_account_snapshot(
+    client, seller_id, account_id, start, end, today=None, now_epoch=None, brand_by_item=None
+):
     """Return daily analytics while only refreshing missing or volatile days."""
     today = today or datetime.now(APP_TZ).date()
     now_epoch = float(now_epoch if now_epoch is not None else time.time())
     account_key = str(account_id or seller_id or "").strip()
     requested_days = [start + timedelta(days=index) for index in range((end - start).days + 1)]
     with ANALYTICS_DAILY_CACHE_LOCK:
-        store = read_json(ANALYTICS_DAILY_CACHE_FILE, {"version": 1, "accounts": {}})
-        if int(store.get("version") or 0) != 1:
-            store = {"version": 1, "accounts": {}}
+        store = read_json(ANALYTICS_DAILY_CACHE_FILE, {"version": ANALYTICS_CACHE_VERSION, "accounts": {}})
+        if int(store.get("version") or 0) != ANALYTICS_CACHE_VERSION:
+            store = {"version": ANALYTICS_CACHE_VERSION, "accounts": {}}
         cached_days = dict((((store.get("accounts") or {}).get(account_key) or {}).get("days") or {}))
 
     refresh_days = [
@@ -14734,7 +14793,7 @@ def fetch_analytics_account_snapshot(client, seller_id, account_id, start, end, 
         api_windows += 1
         truncated = truncated or window_truncated
         window_snapshot = add_orders_to_analytics_snapshot(
-            empty_analytics_snapshot(window_start, window_end), orders
+            empty_analytics_snapshot(window_start, window_end), orders, brand_by_item
         )
         fetched_snapshots.append(window_snapshot)
         if not window_truncated:
@@ -14745,9 +14804,9 @@ def fetch_analytics_account_snapshot(client, seller_id, account_id, start, end, 
 
     if refreshed_entries:
         with ANALYTICS_DAILY_CACHE_LOCK:
-            latest = read_json(ANALYTICS_DAILY_CACHE_FILE, {"version": 1, "accounts": {}})
-            if int(latest.get("version") or 0) != 1:
-                latest = {"version": 1, "accounts": {}}
+            latest = read_json(ANALYTICS_DAILY_CACHE_FILE, {"version": ANALYTICS_CACHE_VERSION, "accounts": {}})
+            if int(latest.get("version") or 0) != ANALYTICS_CACHE_VERSION:
+                latest = {"version": ANALYTICS_CACHE_VERSION, "accounts": {}}
             accounts_cache = latest.setdefault("accounts", {})
             account_cache = accounts_cache.setdefault(account_key, {"days": {}})
             account_cache.setdefault("days", {}).update(refreshed_entries)
@@ -14771,6 +14830,8 @@ def fetch_analytics_account_snapshot(client, seller_id, account_id, start, end, 
         for field in ("revenue", "orders", "units"):
             target[field] = entry.get(field) or 0
             result[field] += entry.get(field) or 0
+        merge_analytics_brand_bucket(target["brands"], entry.get("brands") or {})
+        merge_analytics_brand_bucket(result["brands"], entry.get("brands") or {})
     for snapshot in fetched_snapshots:
         merge_analytics_snapshot(result, snapshot)
     finalize_analytics_snapshot(result)
@@ -14788,6 +14849,34 @@ def analytics_change(current, previous):
     if previous == 0:
         return None
     return round((current - previous) / previous * 100, 2)
+
+
+def analytics_brand_rows(brands, total_revenue, maximum=8):
+    rows = [
+        {
+            "label": brand or "Sem marca",
+            "revenue": round(float(values.get("revenue") or 0), 2),
+            "orders": int(values.get("orders") or 0),
+            "units": int(values.get("units") or 0),
+        }
+        for brand, values in (brands or {}).items()
+        if float(values.get("revenue") or 0) > 0
+    ]
+    rows.sort(key=lambda row: (-row["revenue"], row["label"]))
+    maximum = max(2, int(maximum or 8))
+    if len(rows) > maximum:
+        visible = rows[:maximum - 1]
+        remainder = rows[maximum - 1:]
+        visible.append({
+            "label": f"Outras marcas ({len(remainder)})",
+            "revenue": round(sum(row["revenue"] for row in remainder), 2),
+            "orders": sum(row["orders"] for row in remainder),
+            "units": sum(row["units"] for row in remainder),
+        })
+        rows = visible
+    for row in rows:
+        row["revenue_share"] = round(row["revenue"] / total_revenue * 100, 2) if total_revenue else 0.0
+    return rows
 
 
 def query_analytics_report(payload, request):
@@ -14814,6 +14903,11 @@ def query_analytics_report(payload, request):
     truncated = False
     successful_accounts = 0
     cache_summary = {"requested_days": 0, "cached_days": 0, "refreshed_days": 0, "api_windows": 0}
+    brand_by_item = {
+        str(item.get("id") or ""): customer_text_value(item.get("brand") or "Sem marca")
+        for item in payload.get("catalog") or []
+        if item.get("id")
+    }
     for account in accounts:
         account_id = str(account.get("id") or account.get("seller_id") or account.get("nickname") or "")
         channel = {
@@ -14833,7 +14927,8 @@ def query_analytics_report(payload, request):
         ):
             try:
                 account_snapshot, account_truncated, account_cache = fetch_analytics_account_snapshot(
-                    client, account.get("seller_id"), account_id, start, end
+                    client, account.get("seller_id"), account_id, start, end,
+                    brand_by_item=brand_by_item,
                 )
                 truncated = truncated or account_truncated
                 account_ok = True
@@ -14883,6 +14978,7 @@ def query_analytics_report(payload, request):
             "ticket": analytics_change(current["ticket"], comparison["ticket"]),
         },
         "channels": channel_rows,
+        "brands": analytics_brand_rows(current.get("brands"), current.get("revenue")),
         "warnings": warnings,
         "truncated": truncated,
         "cache": cache_summary,

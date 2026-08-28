@@ -754,6 +754,16 @@ function analyticsSeriesChart(current, comparison, field, currency = false) {
   const xTicks = tickIndexes.map((index) => `<text x="${x(index)}" y="${height - 12}" text-anchor="middle" class="analytics-axis-label">${index}</text>`).join("");
   const gradientId = field === "revenue" ? "analytics-current-revenue" : "analytics-current-orders";
   const comparisonGradientId = `${gradientId}-comparison`;
+  const exactValue = (value) => currency
+    ? money.format(Number(value || 0))
+    : Number(value || 0).toLocaleString("pt-BR");
+  const pointsFor = (rows, tone, seriesLabel) => rows.map((row) => {
+    const title = `${seriesLabel} · ${analyticsDateLabel(row.date)} · ${exactValue(row[field])}`;
+    return `<g class="analytics-point-group ${tone}" tabindex="0" aria-label="${escapeAttr(title)}">
+      <circle cx="${x(row.index).toFixed(1)}" cy="${y(row[field]).toFixed(1)}" r="10" class="analytics-point-hit"><title>${escapeText(title)}</title></circle>
+      <circle cx="${x(row.index).toFixed(1)}" cy="${y(row[field]).toFixed(1)}" r="3" class="analytics-point" aria-hidden="true"/>
+    </g>`;
+  }).join("");
   return `<div class="analytics-chart-scroll"><svg class="analytics-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Comparativo de ${field === "revenue" ? "faturamento" : "pedidos"}">
     <defs>
       <linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3b82f6" stop-opacity=".42"/><stop offset="1" stop-color="#3b82f6" stop-opacity=".03"/></linearGradient>
@@ -764,21 +774,28 @@ function analyticsSeriesChart(current, comparison, field, currency = false) {
     ${areaFor(currentRows) ? `<path d="${areaFor(currentRows)}" fill="url(#${gradientId})"/>` : ""}
     ${pathFor(comparisonRows) ? `<path d="${pathFor(comparisonRows)}" class="analytics-line comparison"/>` : ""}
     ${pathFor(currentRows) ? `<path d="${pathFor(currentRows)}" class="analytics-line current"/>` : ""}
+    ${pointsFor(comparisonRows, "comparison", comparison?.label || "Período anterior")}
+    ${pointsFor(currentRows, "current", current?.label || "Período atual")}
   </svg></div>`;
 }
 
-function analyticsDonut(channels, valueField, shareField, total, currency = false) {
-  const rows = (channels || []).filter((row) => Number(row[valueField] || 0) > 0);
+function analyticsDonut(entries, valueField, shareField, total, currency = false) {
+  const rows = (entries || []).filter((row) => Number(row[valueField] || 0) > 0);
   let cursor = 0;
-  const stops = rows.map((row, index) => {
-    const start = cursor;
-    cursor += Number(row[shareField] || 0);
-    return `${analyticsPalette[index % analyticsPalette.length]} ${start}% ${Math.min(100, cursor)}%`;
-  });
-  const background = stops.length ? `conic-gradient(${stops.join(",")})` : "conic-gradient(var(--panel-2) 0 100%)";
+  const segments = rows.map((row, index) => {
+    const share = Math.max(0, Number(row[shareField] || 0));
+    const offset = cursor;
+    cursor += share;
+    const value = currency ? money.format(row[valueField] || 0) : Number(row[valueField] || 0).toLocaleString("pt-BR");
+    const title = `${row.label} · ${share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${value}`;
+    return `<circle class="analytics-donut-segment" cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="${analyticsPalette[index % analyticsPalette.length]}" stroke-width="24" stroke-dasharray="${Math.min(100, share)} ${Math.max(0, 100 - share)}" stroke-dashoffset="${-offset}" transform="rotate(-90 60 60)" tabindex="0" aria-label="${escapeAttr(title)}"><title>${escapeText(title)}</title></circle>`;
+  }).join("");
   return `<div class="analytics-donut-layout">
-    <div class="analytics-donut" style="background:${background}"><div><small>Total</small><strong>${currency ? money.format(total || 0) : Number(total || 0).toLocaleString("pt-BR")}</strong></div></div>
-    <div class="analytics-channel-legend">${rows.length ? rows.map((row, index) => `<div><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><span><strong>${escapeText(row.label)}</strong><small>${Number(row[shareField] || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${currency ? money.format(row[valueField] || 0) : Number(row[valueField] || 0).toLocaleString("pt-BR")}</small></span></div>`).join("") : `<p class="muted">Sem vendas no período.</p>`}</div>
+    <div class="analytics-donut"><svg class="analytics-donut-svg" viewBox="0 0 120 120" role="img" aria-label="Gráfico de participação">${segments || `<circle cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="var(--panel-2)" stroke-width="24"/>`}</svg><div><small>Total</small><strong>${currency ? money.format(total || 0) : Number(total || 0).toLocaleString("pt-BR")}</strong></div></div>
+    <div class="analytics-channel-legend">${rows.length ? rows.map((row, index) => {
+      const detail = `${Number(row[shareField] || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${currency ? money.format(row[valueField] || 0) : Number(row[valueField] || 0).toLocaleString("pt-BR")}`;
+      return `<div title="${escapeAttr(`${row.label} — ${detail}`)}"><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><span><strong>${escapeText(row.label)}</strong><small>${detail}</small></span></div>`;
+    }).join("") : `<p class="muted">Sem vendas no período.</p>`}</div>
   </div>`;
 }
 
@@ -815,6 +832,7 @@ function renderAnalytics() {
   const comparison = report.comparison || {};
   const changes = report.changes || {};
   const channels = report.channels || [];
+  const brands = report.brands || [];
   const cache = report.cache || {};
   const cacheNote = Number(cache.requested_days || 0) > 0
     ? `<div class="analytics-cache-note"><span>⚡</span><strong>Consulta otimizada:</strong> ${Number(cache.cached_days || 0).toLocaleString("pt-BR")} dia(s)-conta reaproveitados do cache · ${Number(cache.refreshed_days || 0).toLocaleString("pt-BR")} atualizado(s) agora</div>`
@@ -841,6 +859,7 @@ function renderAnalytics() {
     <div class="analytics-share-grid">
       <article class="panel analytics-share-card"><div class="analytics-card-heading"><div><span>Participação por canal</span><h3>Faturamento</h3></div></div>${analyticsDonut(channels, "revenue", "revenue_share", current.revenue, true)}</article>
       <article class="panel analytics-share-card"><div class="analytics-card-heading"><div><span>Participação por canal</span><h3>Pedidos</h3></div></div>${analyticsDonut(channels, "orders", "orders_share", current.orders)}</article>
+      <article class="panel analytics-share-card analytics-brand-card"><div class="analytics-card-heading"><div><span>Participação por marca</span><h3>Faturamento por marca</h3></div><small class="analytics-card-hint">Passe o mouse sobre as fatias para ver os detalhes</small></div>${analyticsDonut(brands, "revenue", "revenue_share", current.revenue, true)}</article>
     </div>
     <article class="panel analytics-table-card"><div class="analytics-card-heading"><div><span>Detalhamento</span><h3>Desempenho por conta / canal</h3></div></div><div class="analytics-table-wrap"><table class="analytics-table"><thead><tr><th>Canal</th><th>Faturamento</th><th>Participação</th><th>Variação</th><th>Pedidos</th><th>Participação</th><th>Variação</th><th>Unidades</th><th>Ticket médio</th></tr></thead><tbody>${channels.map((row, index) => `<tr><td><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><strong>${escapeText(row.label)}</strong></td><td>${money.format(row.revenue || 0)}</td><td>${Number(row.revenue_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</td><td>${analyticsDelta(row.revenue_change)}</td><td>${Number(row.orders || 0).toLocaleString("pt-BR")}</td><td>${Number(row.orders_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</td><td>${analyticsDelta(row.orders_change)}</td><td>${Number(row.units || 0).toLocaleString("pt-BR")}</td><td>${money.format(row.ticket || 0)}</td></tr>`).join("") || `<tr><td colspan="9">Sem dados no período.</td></tr>`}</tbody></table></div></article>`;
 }
