@@ -1912,16 +1912,13 @@ function renderPurchaseOpportunities() {
     const rank = row.ranking_available === false
       ? `<b>Catálogo</b><small>sem ranking disponível</small>`
       : `<b>#${Number(row.position || 0).toLocaleString("pt-BR")}</b><small>na categoria</small>`;
-    const detailBadge = row.restricted_detail
-      ? `<span title="O Mercado Livre mostrou este produto no ranking, mas restringiu seus detalhes ao vendedor proprietário.">Detalhes restritos</span>`
-      : "";
     const canSimulate = !row.restricted_detail || row.known_from_own_catalog;
     return `<article class="purchase-opportunity-card ${tone}">
       <div class="purchase-opportunity-card-top"><span class="purchase-opportunity-rank">${rank}</span><span class="purchase-opportunity-level ${tone}">${escapeText(row.opportunity || "Exploratória")}</span></div>
       <div class="purchase-opportunity-product">${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="purchase-opportunity-image-empty">◎</span>`}<div><strong>${escapeText(row.title || "Produto sem nome")}</strong><span>${escapeText(row.brand || report.brand || "Marca não informada")}</span><small>${escapeText(row.category || row.category_id || "Categoria não informada")}</small></div></div>
       <div class="purchase-opportunity-metrics"><div><span>${escapeText(row.price_label || "Preço vencedor")}</span><strong>${row.winner_price == null ? "Não informado" : money.format(row.winner_price)}</strong></div><div><span>Ofertas no catálogo</span><strong>${row.competitors == null ? "—" : Number(row.competitors).toLocaleString("pt-BR")}</strong></div><div><span>Índice</span><strong>${Number(row.score || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}<small>/100</small></strong></div></div>
       <div class="purchase-opportunity-signals"><span>↗ ${escapeText(row.demand_signal || "Ranking oficial")}</span><span>◉ ${escapeText(logistics)}</span><span>◷ ${escapeText(history)}</span></div>
-      <div class="purchase-opportunity-status"><span class="new">${row.worked ? "Já trabalhado" : "Novo na operação"}</span>${detailBadge}<small>${escapeText(row.catalog_product_id || row.highlight_id || "")}</small></div>
+      <div class="purchase-opportunity-status"><span class="new">${row.worked ? "Já trabalhado" : "Novo na operação"}</span><small>${escapeText(row.catalog_product_id || row.highlight_id || "")}</small></div>
       <div class="purchase-opportunity-actions">${canSimulate ? `<button type="button" class="mini-button" data-use-opportunity="${escapeAttr(row.catalog_product_id || row.id)}">Simular compra</button>` : ""}${row.permalink ? `<a class="mini-button ghost" href="${escapeAttr(row.permalink)}" target="_blank" rel="noopener noreferrer">Ver no Mercado Livre</a>` : ""}</div>
     </article>`;
   }).join("")}</div>` : `<div class="purchase-opportunity-empty"><span>⌕</span><strong>Nenhum produto corresponde aos filtros</strong><p>Experimente limpar a categoria, ampliar a faixa de preço ou exibir todos os níveis.</p></div>`}`;

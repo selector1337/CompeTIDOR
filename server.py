@@ -115,7 +115,7 @@ RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
 ANALYTICS_CACHE_VERSION = 2
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
-PURCHASE_OPPORTUNITIES_CACHE_VERSION = 5
+PURCHASE_OPPORTUNITIES_CACHE_VERSION = 6
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -14213,8 +14213,41 @@ def purchase_opportunity_restricted_user_product(highlight, category, catalog, b
         "logistic_type": logistic_type,
         "full": logistic_type.lower() == "fulfillment",
         "free_shipping": bool(own.get("free_shipping")),
-        "permalink": customer_text_value(own.get("permalink")),
+        "permalink": customer_text_value(
+            own.get("permalink") or f"https://www.mercadolivre.com.br/up/{reference_id}"
+        ),
     }
+
+
+def purchase_opportunity_resolve_user_product_accounts(
+    account_clients, highlight, category, search_products, catalog, brand,
+):
+    reference_id = str((highlight or {}).get("id") or "")
+    own_rows = [
+        item for item in catalog or []
+        if str(item.get("user_product_id") or "") == reference_id
+    ]
+    preferred_account_ids = {
+        str(item.get("account_id") or "") for item in own_rows if item.get("account_id")
+    }
+    ordered = sorted(
+        account_clients,
+        key=lambda pair: 0 if str((pair[0] or {}).get("id") or "") in preferred_account_ids else 1,
+    )
+    for _account, candidate_client in ordered:
+        try:
+            row = purchase_opportunity_resolve(
+                candidate_client, highlight, category, search_products,
+            )
+            row["user_product_id"] = reference_id
+            row["restricted_detail"] = False
+            row["known_from_own_catalog"] = bool(own_rows)
+            return row
+        except Exception:
+            continue
+    return purchase_opportunity_restricted_user_product(
+        highlight, category, catalog, brand,
+    )
 
 
 def purchase_opportunity_competitor_count(response):
@@ -14387,7 +14420,8 @@ def query_purchase_opportunities(payload, request):
     ]
     if not accounts:
         raise RuntimeError("Conecte ao menos uma conta oficial para consultar oportunidades.")
-    client = account_client(accounts[0])
+    account_clients = [(account, account_client(account)) for account in accounts]
+    client = account_clients[0][1]
     discovery_warnings = []
     search_rows = []
     try:
@@ -14587,34 +14621,28 @@ def query_purchase_opportunities(payload, request):
     unique_highlights = {}
     for row in sorted(highlights, key=lambda item: (int(item.get("position") or 999), str(item.get("id") or ""))):
         unique_highlights.setdefault(str(row.get("id")), row)
-    restricted_user_products = sum(
-        1 for row in unique_highlights.values()
-        if str(row.get("type") or "").upper() in {"USER_PRODUCT", "USERPRODUCT"}
-        or str(row.get("id") or "").startswith("MLBU")
-    )
     ranked_selection = list(unique_highlights.values())[:result_limit]
-    selected = [
-        row for row in ranked_selection
-        if str(row.get("type") or "").upper() not in {"USER_PRODUCT", "USERPRODUCT"}
-        and not str(row.get("id") or "").startswith("MLBU")
-    ]
-    resolved = [
-        purchase_opportunity_restricted_user_product(
-            row, row.get("_category") or {}, payload.get("catalog") or [], brand,
-        )
-        for row in ranked_selection
-        if str(row.get("type") or "").upper() in {"USER_PRODUCT", "USERPRODUCT"}
-        or str(row.get("id") or "").startswith("MLBU")
-    ]
+    resolved = []
     workers = max(1, min(8, int(os.getenv("MELI_PURCHASE_OPPORTUNITIES_WORKERS", "6"))))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="purchase-opportunities") as executor:
-        future_rows = {
-            executor.submit(
-                run_meli_work, "interactive", purchase_opportunity_resolve,
-                client, row, row.get("_category") or {}, search_products,
-            ): row
-            for row in selected
-        }
+        future_rows = {}
+        for row in ranked_selection:
+            is_user_product = (
+                str(row.get("type") or "").upper() in {"USER_PRODUCT", "USERPRODUCT"}
+                or str(row.get("id") or "").startswith("MLBU")
+            )
+            if is_user_product:
+                future = executor.submit(
+                    run_meli_work, "interactive", purchase_opportunity_resolve_user_product_accounts,
+                    account_clients, row, row.get("_category") or {}, search_products,
+                    payload.get("catalog") or [], brand,
+                )
+            else:
+                future = executor.submit(
+                    run_meli_work, "interactive", purchase_opportunity_resolve,
+                    client, row, row.get("_category") or {}, search_products,
+                )
+            future_rows[future] = row
         for future in as_completed(future_rows):
             row = future_rows[future]
             try:
@@ -14627,6 +14655,7 @@ def query_purchase_opportunities(payload, request):
     # matches the requested brand. Applying the same validation with an id also
     # protects against occasional unrelated entries in the ranking response.
     resolved = [row for row in resolved if purchase_opportunity_brand_matches(row, brand_key)]
+    restricted_user_products = sum(1 for row in resolved if row.get("restricted_detail"))
 
     today_key = datetime.now(APP_TZ).date().isoformat()
     with PURCHASE_OPPORTUNITIES_CACHE_LOCK:
