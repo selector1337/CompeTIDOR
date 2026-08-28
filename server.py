@@ -115,7 +115,7 @@ RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
 ANALYTICS_CACHE_VERSION = 2
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
-PURCHASE_OPPORTUNITIES_CACHE_VERSION = 1
+PURCHASE_OPPORTUNITIES_CACHE_VERSION = 2
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -264,6 +264,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/post-purchase/v1/claims/[^/]+/charges/return-cost(\?|$)"),
     re.compile(r"^/post-purchase/v2/claims/[^/]+/returns(\?|$)"),
     re.compile(r"^/post-purchase/v1/returns/[^/]+/reviews(\?|$)"),
+    re.compile(r"^/sites/[^/]+/search(\?|$)"),
     re.compile(r"^/sites/[^/]+/listing_prices(\?|$)"),
     re.compile(r"^/pictures/items/upload$"),
     SAFE_ML_BILLING_ORDER_DETAILS_PATH,
@@ -1891,6 +1892,14 @@ class MercadoLivreClient:
             f"/highlights/{site_id or 'MLB'}/category/{category_id}{suffix}",
             **interactive_request_options(),
         )
+
+    def site_items_search(self, query, site_id="MLB", limit=50, offset=0):
+        params = {
+            "q": str(query or "").strip(),
+            "limit": min(max(1, int(limit or 50)), 50),
+            "offset": max(0, int(offset or 0)),
+        }
+        return self.get(f"/sites/{site_id or 'MLB'}/search?{urlencode(params)}", **interactive_request_options())
 
     def user_product(self, user_product_id, interactive=False):
         options = interactive_request_options() if interactive else {}
@@ -14099,6 +14108,25 @@ def purchase_opportunity_attribute(source, attribute_id):
     return {"id": "", "name": ""}
 
 
+def purchase_opportunity_brand_matches(source, brand_key):
+    if not brand_key:
+        return True
+    direct_brand = (source or {}).get("brand")
+    if isinstance(direct_brand, dict):
+        direct_brand = direct_brand.get("name") or direct_brand.get("value_name")
+    direct_brand_key = normalized_attribute_label(direct_brand)
+    if direct_brand_key:
+        return brand_key in direct_brand_key or direct_brand_key in brand_key
+    source_brand = purchase_opportunity_attribute(source, "BRAND")
+    source_brand_key = normalized_attribute_label(source_brand.get("name"))
+    if source_brand_key:
+        return brand_key in source_brand_key or source_brand_key in brand_key
+    title_key = normalized_attribute_label(
+        f"{(source or {}).get('title') or ''} {(source or {}).get('name') or ''}"
+    )
+    return bool(title_key and brand_key in title_key)
+
+
 def purchase_opportunity_picture(source):
     pictures = (source or {}).get("pictures") or []
     first = pictures[0] if pictures else {}
@@ -14299,27 +14327,30 @@ def query_purchase_opportunities(payload, request):
     if not accounts:
         raise RuntimeError("Conecte ao menos uma conta oficial para consultar oportunidades.")
     client = account_client(accounts[0])
+    discovery_warnings = []
     search_rows = []
-    for offset in (0, 50):
-        response = client.product_search(brand, limit=50, offset=offset)
-        batch = response.get("results") if isinstance(response, dict) else []
-        if not isinstance(batch, list) or not batch:
-            break
-        search_rows.extend(batch)
-        if len(batch) < 50:
-            break
-    if not search_rows:
-        raise RuntimeError(f"Nenhum produto ativo foi encontrado para a marca {brand}.")
+    try:
+        for offset in (0, 50):
+            response = client.product_search(brand, limit=50, offset=offset)
+            batch = response.get("results") if isinstance(response, dict) else []
+            if not isinstance(batch, list) or not batch:
+                break
+            search_rows.extend(batch)
+            if len(batch) < 50:
+                break
+    except Exception as exc:
+        discovery_warnings.append(
+            f"Busca de produtos: {policy_error_message(exc, 'a identificação inicial da marca')}"
+        )
 
     brand_key = normalized_attribute_label(brand)
     brand_ids = {}
     category_counts = {}
     search_products = {}
     for product in search_rows:
-        product_brand = purchase_opportunity_attribute(product, "BRAND")
-        product_brand_key = normalized_attribute_label(product_brand.get("name"))
-        if brand_key and product_brand_key and brand_key not in product_brand_key and product_brand_key not in brand_key:
+        if not purchase_opportunity_brand_matches(product, brand_key):
             continue
+        product_brand = purchase_opportunity_attribute(product, "BRAND")
         if product_brand.get("id"):
             brand_ids[product_brand["id"]] = brand_ids.get(product_brand["id"], 0) + 1
         product_id = str(product.get("id") or "")
@@ -14329,10 +14360,42 @@ def query_purchase_opportunities(payload, request):
         category_id = str(product.get("category_id") or search_winner.get("category_id") or "")
         if category_id:
             category_counts[category_id] = category_counts.get(category_id, 0) + 1
+    # /products/search may expose only domain_id. The public item search returns
+    # the leaf category used by the official best-seller ranking and is therefore
+    # the reliable category-discovery fallback for brands without a buy box.
+    marketplace_rows = []
+    site_search = getattr(client, "site_items_search", None)
+    if callable(site_search):
+        try:
+            for offset in (0, 50):
+                response = site_search(brand, limit=50, offset=offset)
+                batch = response.get("results") if isinstance(response, dict) else []
+                if not isinstance(batch, list) or not batch:
+                    break
+                marketplace_rows.extend(batch)
+                if len(batch) < 50:
+                    break
+        except Exception as exc:
+            discovery_warnings.append(
+                f"Busca de anúncios: {policy_error_message(exc, 'as categorias da marca')}"
+            )
+    for item in marketplace_rows:
+        if not purchase_opportunity_brand_matches(item, brand_key):
+            continue
+        item_brand = purchase_opportunity_attribute(item, "BRAND")
+        if item_brand.get("id"):
+            brand_ids[item_brand["id"]] = brand_ids.get(item_brand["id"], 0) + 1
+        category_id = str(item.get("category_id") or "")
+        if category_id:
+            category_counts[category_id] = category_counts.get(category_id, 0) + 1
+        catalog_product_id = str(item.get("catalog_product_id") or "")
+        if catalog_product_id and catalog_product_id not in search_products:
+            search_products[catalog_product_id] = item
+
     if not category_counts:
-        # Product search commonly returns domain_id but may omit category_id.
-        # Resolve a bounded sample and obtain the winner's operational category.
-        sample = list(search_products.items())[:min(20, len(search_products))]
+        # Last resort for uncommon responses where both searches omit a leaf
+        # category: resolve a small sample instead of failing the whole query.
+        sample = list(search_products.items())[:min(8, len(search_products))]
         for product_id, product in sample:
             try:
                 detail = client.product(product_id, interactive=True) or {}
@@ -14343,16 +14406,23 @@ def query_purchase_opportunities(payload, request):
             category_id = str(detail.get("category_id") or detail_winner.get("category_id") or "")
             if category_id:
                 category_counts[category_id] = category_counts.get(category_id, 0) + 1
+
+    if not search_rows and not marketplace_rows:
+        detail = " ".join(discovery_warnings).strip()
+        suffix = f" {detail}" if detail else ""
+        raise RuntimeError(f"Nenhum produto ativo foi encontrado para a marca {brand}.{suffix}")
     brand_value_id = max(brand_ids, key=brand_ids.get) if brand_ids else ""
     if not brand_value_id:
-        raise RuntimeError(f"A API não retornou o identificador oficial da marca {brand}.")
+        discovery_warnings.append(
+            "O identificador interno da marca não foi retornado; o ranking foi consultado sem filtro e validado produto a produto."
+        )
 
     explicit_category = re.fullmatch(r"MLB\d+", category_filter.upper()) if category_filter else None
     candidate_ids = [explicit_category.group(0)] if explicit_category else [
         row[0] for row in sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))[:20]
     ]
     categories = []
-    category_warnings = []
+    category_warnings = list(discovery_warnings)
     for category_id in candidate_ids:
         try:
             detail = client.category(category_id) or {}
@@ -14404,6 +14474,12 @@ def query_purchase_opportunities(payload, request):
                 resolved.append(future.result())
             except Exception as exc:
                 warnings.append(f"Produto {row.get('id')}: {policy_error_message(exc, 'os detalhes da oportunidade')}")
+
+    # When the highlights endpoint cannot be filtered by a brand value id, keep
+    # only products whose official BRAND attribute (or, as a last resort, title)
+    # matches the requested brand. Applying the same validation with an id also
+    # protects against occasional unrelated entries in the ranking response.
+    resolved = [row for row in resolved if purchase_opportunity_brand_matches(row, brand_key)]
 
     today_key = datetime.now(APP_TZ).date().isoformat()
     with PURCHASE_OPPORTUNITIES_CACHE_LOCK:
