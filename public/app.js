@@ -97,6 +97,14 @@
   purchaseAbc: "all",
   purchaseXyz: "all",
   purchaseDecision: "all",
+  purchaseOpportunities: null,
+  purchaseOpportunityLoading: false,
+  purchaseOpportunityError: "",
+  purchaseOpportunityProgress: "",
+  purchaseOpportunityJobId: "",
+  purchaseOpportunitySearch: "",
+  purchaseOpportunityLevel: "all",
+  purchaseOpportunitySort: "score",
   spreadsheetPreview: null,
   spreadsheetProgress: null,
   shippingCostsLoading: false,
@@ -1823,7 +1831,134 @@ function applyPurchaseReference(rawSku) {
   showToast(`Premissas do SKU ${reference.sku} carregadas como referência.`);
 }
 
+function purchaseOpportunityRequest() {
+  const form = document.querySelector("#purchase-opportunity-form");
+  if (!form) return {};
+  const localized = (name) => {
+    const value = parseLocalizedNumber(form.elements[name]?.value || "");
+    return Number.isFinite(value) ? value : "";
+  };
+  return {
+    brand: form.elements.brand.value.trim(),
+    category: form.elements.category.value.trim(),
+    max_categories: form.elements.max_categories.value,
+    limit: form.elements.limit.value,
+    price_min: localized("price_min"),
+    price_max: localized("price_max"),
+    only_new: form.elements.only_new.checked,
+  };
+}
+
+function purchaseOpportunityTone(level) {
+  if (level === "Muito alta") return "very-high";
+  if (level === "Alta") return "high";
+  if (level === "Monitorar") return "watch";
+  return "exploratory";
+}
+
+function renderPurchaseOpportunities() {
+  const feedback = document.querySelector("#purchase-opportunity-feedback");
+  const summary = document.querySelector("#purchase-opportunity-summary");
+  const toolbar = document.querySelector("#purchase-opportunity-toolbar");
+  const results = document.querySelector("#purchase-opportunity-results");
+  if (!feedback || !summary || !toolbar || !results) return;
+  feedback.innerHTML = state.purchaseOpportunityLoading
+    ? `<div class="statistics-loading purchase-opportunity-loading"><span></span><strong>${escapeText(state.purchaseOpportunityProgress || "Mapeando os rankings oficiais...")}</strong></div>`
+    : state.purchaseOpportunityError
+      ? `<div class="notice danger-notice">${escapeText(state.purchaseOpportunityError)}</div>`
+      : "";
+  if (!state.purchaseOpportunities) {
+    summary.innerHTML = "";
+    toolbar.hidden = true;
+    if (!state.purchaseOpportunityLoading && !state.purchaseOpportunityError) {
+      results.innerHTML = `<div class="purchase-opportunity-empty"><span>◎</span><strong>Encontre produtos antes de decidir a compra</strong><p>Informe uma marca para cruzar ranking, preço vencedor, concorrência e o seu catálogo atual.</p></div>`;
+    }
+    return;
+  }
+  const report = state.purchaseOpportunities;
+  const totals = report.summary || {};
+  const cache = report.cache || {};
+  toolbar.hidden = false;
+  summary.innerHTML = `
+    <article><span>Oportunidades novas</span><strong>${Number(totals.opportunities || 0).toLocaleString("pt-BR")}</strong><small>Fora do catálogo conectado</small></article>
+    <article><span>Prioridade muito alta</span><strong>${Number(totals.very_high || 0).toLocaleString("pt-BR")}</strong><small>Maior sinal de demanda</small></article>
+    <article><span>Categorias analisadas</span><strong>${Number(totals.categories || 0).toLocaleString("pt-BR")}</strong><small>${escapeText((report.categories || []).map((row) => row.name).join(" · ") || "—")}</small></article>
+    <article><span>Produtos já trabalhados</span><strong>${Number(totals.already_worked || 0).toLocaleString("pt-BR")}</strong><small>Identificados e retirados do resultado</small></article>`;
+  const term = state.purchaseOpportunitySearch.trim().toLowerCase();
+  let rows = (report.rows || []).filter((row) => {
+    const haystack = `${row.title || ""} ${row.brand || ""} ${row.category || ""} ${row.catalog_product_id || ""}`.toLowerCase();
+    return (!term || haystack.includes(term))
+      && (state.purchaseOpportunityLevel === "all" || row.opportunity === state.purchaseOpportunityLevel);
+  });
+  rows = [...rows].sort((a, b) => {
+    if (state.purchaseOpportunitySort === "ranking") return Number(a.position || 999) - Number(b.position || 999);
+    if (state.purchaseOpportunitySort === "price_asc") return Number(a.winner_price ?? Infinity) - Number(b.winner_price ?? Infinity);
+    if (state.purchaseOpportunitySort === "price_desc") return Number(b.winner_price ?? -1) - Number(a.winner_price ?? -1);
+    if (state.purchaseOpportunitySort === "competition") return Number(a.competitors ?? Infinity) - Number(b.competitors ?? Infinity);
+    return Number(b.score || 0) - Number(a.score || 0);
+  });
+  const warning = (report.warnings || []).length
+    ? `<details class="purchase-opportunity-warning"><summary>${report.warnings.length} aviso(s) da consulta</summary><p>${escapeText(report.warnings.join(" "))}</p></details>`
+    : "";
+  const cacheNote = `<div class="purchase-opportunity-cache"><span>${cache.hit ? "⚡ Resultado reaproveitado do cache" : "✓ Ranking consultado agora"}</span><small>A API não fornece vendas exatas de terceiros; a prioridade usa posição oficial, permanência, concorrência e preço vencedor.</small></div>`;
+  results.innerHTML = `${cacheNote}${warning}${rows.length ? `<div class="purchase-opportunity-grid">${rows.map((row) => {
+    const tone = purchaseOpportunityTone(row.opportunity);
+    const logistics = [row.full ? "Full" : "", row.free_shipping ? "Frete grátis" : ""].filter(Boolean).join(" · ") || "Logística não informada";
+    const history = Number(row.history_days || 0) > 1 ? `${Number(row.history_days).toLocaleString("pt-BR")} dias observado` : "Primeira observação";
+    return `<article class="purchase-opportunity-card ${tone}">
+      <div class="purchase-opportunity-card-top"><span class="purchase-opportunity-rank"><b>#${Number(row.position || 0).toLocaleString("pt-BR")}</b><small>na categoria</small></span><span class="purchase-opportunity-level ${tone}">${escapeText(row.opportunity || "Exploratória")}</span></div>
+      <div class="purchase-opportunity-product">${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="purchase-opportunity-image-empty">◎</span>`}<div><strong>${escapeText(row.title || "Produto sem nome")}</strong><span>${escapeText(row.brand || report.brand || "Marca não informada")}</span><small>${escapeText(row.category || row.category_id || "Categoria não informada")}</small></div></div>
+      <div class="purchase-opportunity-metrics"><div><span>Preço vencedor</span><strong>${row.winner_price == null ? "Não informado" : money.format(row.winner_price)}</strong></div><div><span>Ofertas no catálogo</span><strong>${row.competitors == null ? "—" : Number(row.competitors).toLocaleString("pt-BR")}</strong></div><div><span>Índice</span><strong>${Number(row.score || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}<small>/100</small></strong></div></div>
+      <div class="purchase-opportunity-signals"><span>↗ ${escapeText(row.demand_signal || "Ranking oficial")}</span><span>◉ ${escapeText(logistics)}</span><span>◷ ${escapeText(history)}</span></div>
+      <div class="purchase-opportunity-status"><span class="new">Novo na operação</span><small>${escapeText(row.catalog_product_id || row.highlight_id || "")}</small></div>
+      <div class="purchase-opportunity-actions"><button type="button" class="mini-button" data-use-opportunity="${escapeAttr(row.catalog_product_id || row.id)}">Simular compra</button>${row.permalink ? `<a class="mini-button ghost" href="${escapeAttr(row.permalink)}" target="_blank" rel="noopener noreferrer">Ver no Mercado Livre</a>` : ""}</div>
+    </article>`;
+  }).join("")}</div>` : `<div class="purchase-opportunity-empty"><span>⌕</span><strong>Nenhum produto corresponde aos filtros</strong><p>Experimente limpar a categoria, ampliar a faixa de preço ou exibir todos os níveis.</p></div>`}`;
+}
+
+async function loadPurchaseOpportunities() {
+  const form = document.querySelector("#purchase-opportunity-form");
+  if (!form || state.purchaseOpportunityLoading) return;
+  if (!connectedAccounts().length) {
+    state.purchaseOpportunityError = "Conecte ao menos uma conta oficial do Mercado Livre para realizar a pesquisa.";
+    renderPurchaseOpportunities();
+    return;
+  }
+  state.purchaseOpportunityLoading = true;
+  state.purchaseOpportunityError = "";
+  state.purchaseOpportunities = null;
+  state.purchaseOpportunityProgress = "Identificando a marca e suas principais categorias...";
+  const actionId = beginManualAction("Pesquisando oportunidades", state.purchaseOpportunityProgress);
+  renderPurchaseOpportunities();
+  try {
+    let job = await api("/api/purchases/opportunities/query", {
+      method: "POST",
+      manualProgress: false,
+      body: JSON.stringify(purchaseOpportunityRequest()),
+    });
+    state.purchaseOpportunityJobId = job.id || "";
+    while (["queued", "processing"].includes(job.status)) {
+      state.purchaseOpportunityProgress = job.message || "Enriquecendo ranking, preços e concorrência...";
+      updateManualAction(actionId, { message: state.purchaseOpportunityProgress, progress: Number(job.progress || 0) });
+      renderPurchaseOpportunities();
+      await new Promise((resolve) => setTimeout(resolve, 1300));
+      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+    }
+    if (job.status !== "completed" || !job.result) throw new Error(job.message || "A pesquisa não foi concluída.");
+    state.purchaseOpportunities = job.result;
+    finishManualAction(actionId, "success", `${Number(job.result.summary?.opportunities || 0).toLocaleString("pt-BR")} oportunidade(s) encontrada(s).`);
+  } catch (error) {
+    state.purchaseOpportunityError = error.message || "Não foi possível pesquisar as oportunidades.";
+    finishManualAction(actionId, "error", state.purchaseOpportunityError);
+  } finally {
+    state.purchaseOpportunityLoading = false;
+    state.purchaseOpportunityProgress = "";
+    renderPurchaseOpportunities();
+  }
+}
+
 function renderPurchases() {
+  renderPurchaseOpportunities();
   const form = document.querySelector("#purchase-analysis-form");
   const feedback = document.querySelector("#purchase-feedback");
   const summary = document.querySelector("#purchase-summary");
@@ -5783,6 +5918,40 @@ document.querySelector("#brand-sales-report-form")?.addEventListener("change", (
 document.querySelector("#brand-sales-report-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   await loadBrandSalesReport();
+});
+
+document.querySelector("#purchase-opportunity-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadPurchaseOpportunities();
+});
+
+[
+  ["#purchase-opportunity-search", "purchaseOpportunitySearch"],
+  ["#purchase-opportunity-level", "purchaseOpportunityLevel"],
+  ["#purchase-opportunity-sort", "purchaseOpportunitySort"],
+].forEach(([selector, key]) => {
+  ["input", "change"].forEach((eventName) => document.querySelector(selector)?.addEventListener(eventName, (event) => {
+    state[key] = event.target.value;
+    renderPurchaseOpportunities();
+  }));
+});
+
+document.querySelector("#purchase-opportunity-results")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-use-opportunity]");
+  if (!button) return;
+  const row = (state.purchaseOpportunities?.rows || []).find((item) => String(item.catalog_product_id || item.id) === button.dataset.useOpportunity);
+  const form = document.querySelector("#purchase-calculator-form");
+  const status = document.querySelector("#purchase-reference-status");
+  if (!row || !form) return;
+  form.elements.product.value = row.title || "";
+  form.elements.comparable_sku.value = "";
+  setPurchaseCalculatorValue(form, "sale_price", row.winner_price);
+  if (status) {
+    status.className = "purchase-reference-status purchase-positive";
+    status.innerHTML = `<strong>Oportunidade #${Number(row.position || 0).toLocaleString("pt-BR")}</strong><span>Preço vencedor e produto carregados. Complete custo, tarifas e demanda antes de avaliar.</span>`;
+  }
+  document.querySelector(".purchase-calculator-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  form.elements.supplier_cost?.focus({ preventScroll: true });
 });
 
 document.querySelector("#purchase-analysis-form")?.addEventListener("change", (event) => {

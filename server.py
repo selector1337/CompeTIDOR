@@ -114,6 +114,8 @@ SYNC_PROGRESS_FILE = "sync_progress.json"
 RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
 ANALYTICS_CACHE_VERSION = 2
+PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
+PURCHASE_OPPORTUNITIES_CACHE_VERSION = 1
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -142,6 +144,7 @@ CATALOG_OFFERS_CACHE = {}
 STATISTICS_CACHE_LOCK = threading.RLock()
 STATISTICS_CACHE = {}
 ANALYTICS_DAILY_CACHE_LOCK = threading.RLock()
+PURCHASE_OPPORTUNITIES_CACHE_LOCK = threading.RLock()
 CUSTOMERS_DATA_LOCK = threading.RLock()
 CUSTOMERS_SYNC_LOCK = threading.RLock()
 STATISTICS_JOBS_LOCK = threading.RLock()
@@ -237,8 +240,11 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/item/[A-Z]{3}[0-9]+/performance(\?|$)"),
     re.compile(r"^/user-product/[^/]+/performance(\?|$)"),
     re.compile(r"^/categories/[^/]+/attributes(\?|$)"),
+    re.compile(r"^/categories/[^/]+(\?|$)"),
+    re.compile(r"^/products/search(\?|$)"),
     re.compile(r"^/products/[^/]+(\?|$)"),
     re.compile(r"^/products/[^/]+/items(\?|$)"),
+    re.compile(r"^/highlights/[A-Z]{3}/category/[^/?]+(\?|$)"),
     re.compile(r"^/user-products/[^/]+(\?|$)"),
     re.compile(r"^/orders/search(\?|$)"),
     re.compile(r"^/orders/[0-9]+$"),
@@ -339,7 +345,10 @@ def write_json(name, payload):
     with DATA_LOCK:
         path = DATA / name
         temporary = DATA / f".{name}.{uuid.uuid4().hex}.tmp"
-        compact = name in {CATALOG_DATA_FILE, RETURNS_DATA_FILE, ANALYTICS_DAILY_CACHE_FILE, CUSTOMERS_DATA_FILE}
+        compact = name in {
+            CATALOG_DATA_FILE, RETURNS_DATA_FILE, ANALYTICS_DAILY_CACHE_FILE,
+            PURCHASE_OPPORTUNITIES_CACHE_FILE, CUSTOMERS_DATA_FILE,
+        }
         with temporary.open("w", encoding="utf-8") as stream:
             json.dump(
                 payload,
@@ -1860,9 +1869,36 @@ class MercadoLivreClient:
         options = interactive_request_options() if interactive else {}
         return self.get(f"/products/{catalog_product_id}", **options)
 
+    def product_search(self, query, site_id="MLB", limit=50, offset=0):
+        params = {
+            "status": "active",
+            "site_id": site_id or "MLB",
+            "q": str(query or "").strip(),
+            "limit": min(max(1, int(limit or 50)), 50),
+            "offset": max(0, int(offset or 0)),
+        }
+        return self.get(f"/products/search?{urlencode(params)}", **interactive_request_options())
+
+    def category(self, category_id):
+        return self.get(f"/categories/{category_id}", **interactive_request_options())
+
+    def category_highlights(self, category_id, brand_value_id="", site_id="MLB"):
+        params = {}
+        if brand_value_id:
+            params = {"attribute": "BRAND", "attributeValue": brand_value_id}
+        suffix = f"?{urlencode(params)}" if params else ""
+        return self.get(
+            f"/highlights/{site_id or 'MLB'}/category/{category_id}{suffix}",
+            **interactive_request_options(),
+        )
+
     def user_product(self, user_product_id, interactive=False):
         options = interactive_request_options() if interactive else {}
         return self.get(f"/user-products/{user_product_id}", **options)
+
+    def user_product_items(self, user_id, user_product_id):
+        params = {"user_product_id": user_product_id, "limit": 50, "offset": 0}
+        return self.get(f"/users/{user_id}/items/search?{urlencode(params)}", **interactive_request_options())
 
     def item_shipping_cost(self, seller_id, item_id):
         params = {"item_id": item_id, "verbose": "true"}
@@ -14029,6 +14065,413 @@ def bounded_score(value, minimum=0.0, maximum=100.0):
         return round(minimum, 1)
 
 
+def purchase_opportunity_cache_store():
+    store = read_json(PURCHASE_OPPORTUNITIES_CACHE_FILE, {})
+    if not isinstance(store, dict) or int(store.get("version") or 0) != PURCHASE_OPPORTUNITIES_CACHE_VERSION:
+        return {"version": PURCHASE_OPPORTUNITIES_CACHE_VERSION, "queries": {}, "products": {}}
+    store.setdefault("queries", {})
+    store.setdefault("products", {})
+    return store
+
+
+def purchase_opportunity_query_key(request):
+    normalized = {
+        key: str((request or {}).get(key) or "").strip().lower()
+        for key in (
+            "brand", "category", "max_categories", "limit", "price_min", "price_max",
+            "only_new", "catalog_signature",
+        )
+    }
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def purchase_opportunity_attribute(source, attribute_id):
+    wanted = str(attribute_id or "").upper()
+    for attribute in (source or {}).get("attributes") or []:
+        if str(attribute.get("id") or "").upper() != wanted:
+            continue
+        values = attribute.get("values") or []
+        first_value = values[0] if values and isinstance(values[0], dict) else {}
+        return {
+            "id": customer_text_value(attribute.get("value_id") or first_value.get("id")),
+            "name": customer_text_value(attribute.get("value_name") or first_value.get("name")),
+        }
+    return {"id": "", "name": ""}
+
+
+def purchase_opportunity_picture(source):
+    pictures = (source or {}).get("pictures") or []
+    first = pictures[0] if pictures else {}
+    if isinstance(first, str):
+        return first
+    return customer_text_value(
+        (first or {}).get("secure_url") or (first or {}).get("url")
+        or (source or {}).get("thumbnail")
+    )
+
+
+def purchase_opportunity_catalog_match(product, catalog):
+    product_id = str(product.get("catalog_product_id") or product.get("id") or "")
+    gtin = re.sub(r"\W", "", str(product.get("gtin") or "")).upper()
+    matched = []
+    reason = ""
+    for item in catalog or []:
+        same_product = product_id and str(item.get("catalog_product_id") or "") == product_id
+        item_gtin = re.sub(r"\W", "", str(item.get("gtin") or "")).upper()
+        same_gtin = bool(gtin and item_gtin and gtin == item_gtin)
+        if same_product or same_gtin:
+            matched.append(item)
+            reason = "Produto de catálogo já anunciado" if same_product else "GTIN já anunciado"
+    return {
+        "worked": bool(matched),
+        "worked_reason": reason,
+        "own_listings": len(matched),
+        "own_accounts": sorted({str(item.get("account") or "") for item in matched if item.get("account")}),
+    }
+
+
+def purchase_opportunity_competitor_count(response):
+    if not isinstance(response, dict):
+        return None
+    paging = response.get("paging") if isinstance(response.get("paging"), dict) else {}
+    total = optional_money(paging.get("total"))
+    if total is None:
+        rows = response.get("results") or response.get("items")
+        total = len(rows) if isinstance(rows, list) else None
+    return int(total) if total is not None else None
+
+
+def purchase_opportunity_resolve(client, highlight, category, search_products):
+    reference_id = str((highlight or {}).get("id") or "")
+    reference_type = str((highlight or {}).get("type") or "PRODUCT").upper()
+    position = max(1, int((highlight or {}).get("position") or 20))
+    seed = search_products.get(reference_id) or {}
+    product = {}
+    item = {}
+    user_product = {}
+    catalog_product_id = ""
+    related_offers = None
+    try:
+        if reference_type in {"ITEM", "PUBLICATION"}:
+            item = client.item(reference_id) or {}
+            catalog_product_id = str(item.get("catalog_product_id") or "")
+        elif reference_type in {"USER_PRODUCT", "USERPRODUCT"} or reference_id.startswith("MLBU"):
+            user_product = client.user_product(reference_id, interactive=True) or {}
+            catalog_product_id = str(user_product.get("catalog_product_id") or "")
+            user_id = str(user_product.get("user_id") or "")
+            if user_id:
+                offers_response = client.user_product_items(user_id, reference_id)
+                offer_ids = offers_response.get("results") if isinstance(offers_response, dict) else []
+                related_offers = purchase_opportunity_competitor_count(offers_response)
+                if isinstance(offer_ids, list) and offer_ids:
+                    item = client.item(str(offer_ids[0])) or {}
+                    catalog_product_id = str(item.get("catalog_product_id") or catalog_product_id)
+        else:
+            product = client.product(reference_id, interactive=True) or {}
+            catalog_product_id = str(product.get("id") or reference_id)
+    except Exception:
+        if reference_type not in {"ITEM", "PUBLICATION"} and not reference_id.startswith("MLBU"):
+            item = client.item(reference_id) or {}
+            catalog_product_id = str(item.get("catalog_product_id") or "")
+        else:
+            raise
+    if catalog_product_id and not product:
+        try:
+            product = client.product(catalog_product_id, interactive=True) or {}
+        except Exception:
+            product = {}
+    source = product or user_product or item or seed
+    catalog_product_id = str(catalog_product_id or source.get("catalog_product_id") or "")
+    winner = source.get("buy_box_winner") if isinstance(source.get("buy_box_winner"), dict) else {}
+    if not winner and isinstance(source.get("winner"), dict):
+        winner = source.get("winner") or {}
+    winner_item_id = str(
+        winner.get("item_id") or winner.get("id")
+        or (item.get("id") if item else "")
+    )
+    price = optional_money(
+        winner.get("price") or winner.get("amount") or source.get("price") or item.get("price")
+    )
+    if winner_item_id:
+        try:
+            price_values = sale_price_values(client.sale_price(winner_item_id), price or 0)
+            price = optional_money(price_values.get("amount")) or price
+        except Exception:
+            pass
+    competitors = related_offers
+    if catalog_product_id:
+        try:
+            competitors = purchase_opportunity_competitor_count(client.product_winners(catalog_product_id))
+        except Exception:
+            competitors = related_offers
+    elif competitors is None and item:
+        competitors = 1
+    brand = purchase_opportunity_attribute(source, "BRAND")
+    gtin = purchase_opportunity_attribute(source, "GTIN")
+    if not gtin.get("name"):
+        gtin = purchase_opportunity_attribute(source, "EAN")
+    shipping = winner.get("shipping") if isinstance(winner.get("shipping"), dict) else {}
+    logistic_type = customer_text_value(
+        winner.get("logistic_type") or shipping.get("logistic_type") or item.get("shipping", {}).get("logistic_type")
+        if isinstance(item.get("shipping"), dict) else winner.get("logistic_type") or shipping.get("logistic_type")
+    )
+    free_shipping = bool(winner.get("free_shipping") or shipping.get("free_shipping"))
+    title = customer_text_value(
+        source.get("name") or source.get("title") or seed.get("name") or seed.get("title") or reference_id
+    )
+    return {
+        "id": catalog_product_id or reference_id,
+        "catalog_product_id": catalog_product_id,
+        "highlight_id": reference_id,
+        "highlight_type": reference_type,
+        "title": title,
+        "brand": brand.get("name"),
+        "gtin": gtin.get("name"),
+        "thumbnail": purchase_opportunity_picture(source) or purchase_opportunity_picture(seed),
+        "category_id": category.get("id"),
+        "category": category.get("name") or category.get("id"),
+        "position": position,
+        "winner_item_id": winner_item_id,
+        "winner_seller_id": customer_text_value(winner.get("seller_id")),
+        "winner_price": round(float(price), 2) if price is not None else None,
+        "currency_id": customer_text_value(winner.get("currency_id") or source.get("currency_id") or "BRL"),
+        "competitors": competitors,
+        "logistic_type": logistic_type,
+        "full": logistic_type.lower() == "fulfillment",
+        "free_shipping": free_shipping,
+        "permalink": customer_text_value(
+            item.get("permalink") or winner.get("permalink") or source.get("permalink")
+            or (f"https://www.mercadolivre.com.br/p/{catalog_product_id}" if catalog_product_id else "")
+        ),
+    }
+
+
+def purchase_opportunity_score(row, history):
+    position = max(1, min(20, int(row.get("position") or 20)))
+    demand_score = round(60 * (21 - position) / 20, 2)
+    history_days = len((history or {}).get("observations") or {})
+    persistence_score = round(min(15, history_days * 1.5), 2)
+    competitors = row.get("competitors")
+    competition_score = 7.5 if competitors is None else round(max(2, 15 - min(20, int(competitors)) * 0.65), 2)
+    data_score = 5 if row.get("winner_price") is not None else 0
+    logistics_score = 3 if row.get("full") else 2 if row.get("free_shipping") else 0
+    score = round(min(100, demand_score + persistence_score + competition_score + data_score + logistics_score), 1)
+    if score >= 75:
+        level = "Muito alta"
+    elif score >= 60:
+        level = "Alta"
+    elif score >= 45:
+        level = "Monitorar"
+    else:
+        level = "Exploratória"
+    return score, level, history_days
+
+
+def query_purchase_opportunities(payload, request):
+    brand = customer_text_value((request or {}).get("brand"))
+    if len(brand) < 2:
+        raise RuntimeError("Informe uma marca com pelo menos 2 caracteres.")
+    category_filter = customer_text_value((request or {}).get("category"))
+    maximum_categories = max(1, min(10, int((request or {}).get("max_categories") or 6)))
+    result_limit = max(10, min(60, int((request or {}).get("limit") or 30)))
+    price_min = optional_money((request or {}).get("price_min"))
+    price_max = optional_money((request or {}).get("price_max"))
+    only_new = str((request or {}).get("only_new") or "true").lower() not in {"0", "false", "no"}
+    catalog_signature = hashlib.sha1("|".join(sorted(
+        f"{item.get('catalog_product_id') or ''}:{item.get('gtin') or ''}"
+        for item in payload.get("catalog") or []
+    )).encode("utf-8")).hexdigest()[:16]
+    query_key = purchase_opportunity_query_key({**(request or {}), "catalog_signature": catalog_signature})
+    cache_ttl = max(900, int(os.getenv("MELI_PURCHASE_OPPORTUNITIES_CACHE_SECONDS", "21600")))
+    now_epoch = time.time()
+    with PURCHASE_OPPORTUNITIES_CACHE_LOCK:
+        cache_store = purchase_opportunity_cache_store()
+        cached = (cache_store.get("queries") or {}).get(query_key)
+    if cached and now_epoch - float(cached.get("updated_at") or 0) < cache_ttl:
+        result = copy.deepcopy(cached.get("result") or {})
+        result["cache"] = {"hit": True, "age_seconds": int(now_epoch - float(cached.get("updated_at") or now_epoch))}
+        return result
+
+    accounts = [
+        account for account in payload.get("accounts") or []
+        if account.get("official") and account.get("access_token") and account.get("status") == "connected"
+    ]
+    if not accounts:
+        raise RuntimeError("Conecte ao menos uma conta oficial para consultar oportunidades.")
+    client = account_client(accounts[0])
+    search_rows = []
+    for offset in (0, 50):
+        response = client.product_search(brand, limit=50, offset=offset)
+        batch = response.get("results") if isinstance(response, dict) else []
+        if not isinstance(batch, list) or not batch:
+            break
+        search_rows.extend(batch)
+        if len(batch) < 50:
+            break
+    if not search_rows:
+        raise RuntimeError(f"Nenhum produto ativo foi encontrado para a marca {brand}.")
+
+    brand_key = normalized_attribute_label(brand)
+    brand_ids = {}
+    category_counts = {}
+    search_products = {}
+    for product in search_rows:
+        product_brand = purchase_opportunity_attribute(product, "BRAND")
+        product_brand_key = normalized_attribute_label(product_brand.get("name"))
+        if brand_key and product_brand_key and brand_key not in product_brand_key and product_brand_key not in brand_key:
+            continue
+        if product_brand.get("id"):
+            brand_ids[product_brand["id"]] = brand_ids.get(product_brand["id"], 0) + 1
+        product_id = str(product.get("id") or "")
+        if product_id:
+            search_products[product_id] = product
+        search_winner = product.get("buy_box_winner") if isinstance(product.get("buy_box_winner"), dict) else {}
+        category_id = str(product.get("category_id") or search_winner.get("category_id") or "")
+        if category_id:
+            category_counts[category_id] = category_counts.get(category_id, 0) + 1
+    if not category_counts:
+        # Product search commonly returns domain_id but may omit category_id.
+        # Resolve a bounded sample and obtain the winner's operational category.
+        sample = list(search_products.items())[:min(20, len(search_products))]
+        for product_id, product in sample:
+            try:
+                detail = client.product(product_id, interactive=True) or {}
+            except Exception:
+                continue
+            search_products[product_id] = {**product, **detail}
+            detail_winner = detail.get("buy_box_winner") if isinstance(detail.get("buy_box_winner"), dict) else {}
+            category_id = str(detail.get("category_id") or detail_winner.get("category_id") or "")
+            if category_id:
+                category_counts[category_id] = category_counts.get(category_id, 0) + 1
+    brand_value_id = max(brand_ids, key=brand_ids.get) if brand_ids else ""
+    if not brand_value_id:
+        raise RuntimeError(f"A API não retornou o identificador oficial da marca {brand}.")
+
+    explicit_category = re.fullmatch(r"MLB\d+", category_filter.upper()) if category_filter else None
+    candidate_ids = [explicit_category.group(0)] if explicit_category else [
+        row[0] for row in sorted(category_counts.items(), key=lambda item: (-item[1], item[0]))[:20]
+    ]
+    categories = []
+    category_warnings = []
+    for category_id in candidate_ids:
+        try:
+            detail = client.category(category_id) or {}
+        except Exception as exc:
+            detail = {"id": category_id, "name": category_id}
+            category_warnings.append(f"Categoria {category_id}: {policy_error_message(exc, 'a identificação da categoria')}")
+        category = {"id": category_id, "name": customer_text_value(detail.get("name") or category_id)}
+        if category_filter and not explicit_category:
+            haystack = normalized_attribute_label(f"{category['id']} {category['name']}")
+            if normalized_attribute_label(category_filter) not in haystack:
+                continue
+        categories.append(category)
+        if len(categories) >= maximum_categories:
+            break
+    if not categories:
+        raise RuntimeError("Nenhuma categoria da marca corresponde ao filtro informado.")
+
+    highlights = []
+    warnings = list(category_warnings)
+    for category in categories:
+        try:
+            response = client.category_highlights(category["id"], brand_value_id)
+            content = response.get("content") if isinstance(response, dict) else []
+            for row in content or []:
+                if isinstance(row, dict) and row.get("id"):
+                    highlights.append({**row, "_category": category})
+        except Exception as exc:
+            warnings.append(f"{category['name']}: {policy_error_message(exc, 'o ranking de mais vendidos')}")
+    if not highlights:
+        raise RuntimeError("O Mercado Livre não retornou produtos no ranking desta marca e categoria.")
+
+    unique_highlights = {}
+    for row in sorted(highlights, key=lambda item: (int(item.get("position") or 999), str(item.get("id") or ""))):
+        unique_highlights.setdefault(str(row.get("id")), row)
+    selected = list(unique_highlights.values())[:result_limit]
+    resolved = []
+    workers = max(1, min(8, int(os.getenv("MELI_PURCHASE_OPPORTUNITIES_WORKERS", "6"))))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="purchase-opportunities") as executor:
+        future_rows = {
+            executor.submit(
+                run_meli_work, "interactive", purchase_opportunity_resolve,
+                client, row, row.get("_category") or {}, search_products,
+            ): row
+            for row in selected
+        }
+        for future in as_completed(future_rows):
+            row = future_rows[future]
+            try:
+                resolved.append(future.result())
+            except Exception as exc:
+                warnings.append(f"Produto {row.get('id')}: {policy_error_message(exc, 'os detalhes da oportunidade')}")
+
+    today_key = datetime.now(APP_TZ).date().isoformat()
+    with PURCHASE_OPPORTUNITIES_CACHE_LOCK:
+        store = purchase_opportunity_cache_store()
+        product_history = store.setdefault("products", {})
+        rows = []
+        for row in resolved:
+            product_key = str(row.get("catalog_product_id") or row.get("id") or "")
+            history = product_history.setdefault(product_key, {"observations": {}})
+            observations = history.setdefault("observations", {})
+            observations[today_key] = {
+                "position": int(row.get("position") or 20),
+                "price": row.get("winner_price"),
+                "category_id": row.get("category_id"),
+            }
+            cutoff = (datetime.now(APP_TZ).date() - timedelta(days=90)).isoformat()
+            history["observations"] = {key: value for key, value in observations.items() if key >= cutoff}
+            history["updated_at"] = now_epoch
+            match = purchase_opportunity_catalog_match(row, payload.get("catalog") or [])
+            score, level, history_days = purchase_opportunity_score(row, history)
+            enriched = {
+                **row, **match,
+                "score": score,
+                "opportunity": level,
+                "history_days": history_days,
+                "demand_signal": f"Top {int(row.get('position') or 20)} da categoria",
+            }
+            if only_new and enriched["worked"]:
+                continue
+            if price_min is not None and (enriched.get("winner_price") is None or enriched["winner_price"] < price_min):
+                continue
+            if price_max is not None and (enriched.get("winner_price") is None or enriched["winner_price"] > price_max):
+                continue
+            rows.append(enriched)
+        rows.sort(key=lambda row: (-float(row.get("score") or 0), int(row.get("position") or 999), row.get("title") or ""))
+        result = {
+            "ok": True,
+            "kind": "purchase_opportunities",
+            "brand": brand,
+            "brand_value_id": brand_value_id,
+            "category_filter": category_filter,
+            "categories": categories,
+            "rows": rows,
+            "summary": {
+                "ranked_products": len(unique_highlights),
+                "analyzed_products": len(resolved),
+                "opportunities": len(rows),
+                "categories": len(categories),
+                "very_high": sum(1 for row in rows if row.get("opportunity") == "Muito alta"),
+                "already_worked": sum(1 for row in resolved if purchase_opportunity_catalog_match(row, payload.get("catalog") or [])["worked"]),
+            },
+            "warnings": warnings[:20],
+            "cache": {"hit": False, "age_seconds": 0},
+            "generated_at": now_label(),
+            "methodology": "Ranking oficial de mais vendidos, permanência histórica, concorrência e qualidade dos dados públicos.",
+        }
+        queries = store.setdefault("queries", {})
+        queries[query_key] = {"updated_at": now_epoch, "result": result}
+        if len(queries) > 80:
+            keep = sorted(queries, key=lambda key: float(queries[key].get("updated_at") or 0), reverse=True)[:80]
+            store["queries"] = {key: queries[key] for key in keep}
+        if len(product_history) > 3000:
+            keep_products = sorted(product_history, key=lambda key: float(product_history[key].get("updated_at") or 0), reverse=True)[:3000]
+            store["products"] = {key: product_history[key] for key in keep_products}
+        write_json(PURCHASE_OPPORTUNITIES_CACHE_FILE, store)
+    return result
+
+
 def purchase_price_range(value):
     price = max(0.0, float(value or 0))
     if price <= 50:
@@ -15072,7 +15515,8 @@ def statistics_job_signature(request):
         "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
         "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
         "date_from", "date_to", "comparison_date_from", "comparison_date_to", "period",
-        "flex_carrier_cost", "shipping_method",
+        "flex_carrier_cost", "shipping_method", "category", "max_categories", "limit",
+        "price_min", "price_max", "only_new",
     )
     normalized = {key: str((request or {}).get(key) or "") for key in keys}
     return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
@@ -15099,7 +15543,8 @@ def start_statistics_job(request):
             "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
             "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
             "date_from", "date_to", "comparison_date_from", "comparison_date_to", "period",
-            "flex_carrier_cost", "shipping_method",
+            "flex_carrier_cost", "shipping_method", "category", "max_categories", "limit",
+            "price_min", "price_max", "only_new",
         )
     }
     signature = statistics_job_signature(safe_request)
@@ -15130,7 +15575,12 @@ def start_statistics_job(request):
         with STATISTICS_JOBS_LOCK:
             current = STATISTICS_JOBS.get(job_id)
             if current:
-                current.update({"status": "processing", "progress": 20, "message": "Consultando vendas oficiais no Mercado Livre."})
+                message = (
+                    "Mapeando rankings, produtos e ofertas vencedoras."
+                    if safe_request.get("kind") == "purchase_opportunities"
+                    else "Consultando vendas oficiais no Mercado Livre."
+                )
+                current.update({"status": "processing", "progress": 20, "message": message})
         try:
             source_payload = read_payload()
             if safe_request.get("kind") == "sales":
@@ -15141,6 +15591,8 @@ def start_statistics_job(request):
                 result = query_brand_sales_report(source_payload, safe_request)
             elif safe_request.get("kind") == "purchase_intelligence":
                 result = query_purchase_intelligence(source_payload, safe_request)
+            elif safe_request.get("kind") == "purchase_opportunities":
+                result = query_purchase_opportunities(source_payload, safe_request)
             elif safe_request.get("kind") == "sku_history":
                 result = query_sku_history(source_payload, safe_request)
             elif safe_request.get("kind") == "no_sales":
@@ -18268,6 +18720,14 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/purchases/query":
             try:
                 job = start_statistics_job({**request, "kind": "purchase_intelligence"})
+                self.send_json({"ok": True, **job}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/purchases/opportunities/query":
+            try:
+                job = start_statistics_job({**request, "kind": "purchase_opportunities"})
                 self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)

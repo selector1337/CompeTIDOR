@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260828-analytics-v5" />
+  <link rel="stylesheet" href="/styles.css?v=20260828-purchase-assistant-v1" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -483,6 +483,42 @@
       </section>
 
       <section class="page" id="page-compras">
+        <div class="panel purchase-opportunity-panel">
+          <div class="purchase-opportunity-hero">
+            <div>
+              <p class="eyebrow">Pesquisa de novos produtos</p>
+              <h2>Assistente de oportunidades de compra</h2>
+              <p class="panel-intro">Descubra os produtos mais vendidos de uma marca, veja o preço vencedor e priorize itens que ainda não fazem parte da sua operação.</p>
+            </div>
+            <div class="purchase-opportunity-source"><span>Dados oficiais</span><strong>Ranking Mercado Livre</strong><small>Mais vendidos · catálogo · oferta vencedora</small></div>
+          </div>
+          <form id="purchase-opportunity-form" class="purchase-opportunity-form">
+            <div class="purchase-opportunity-primary-fields">
+              <label><span>Marca que deseja pesquisar</span><input name="brand" type="search" placeholder="Ex.: O'Neal, Bosch, Stanley" autocomplete="off" required minlength="2" /><small>A aplicação identifica o código oficial da marca e suas principais categorias.</small></label>
+              <label><span>Categoria opcional</span><input name="category" type="search" placeholder="Automática, nome ou MLB1234" autocomplete="off" /><small>Deixe vazio para descobrir automaticamente onde a marca mais aparece.</small></label>
+              <button class="primary" type="submit"><span>Pesquisar oportunidades</span><small>Consultar ranking oficial</small></button>
+            </div>
+            <details class="purchase-opportunity-advanced">
+              <summary>Ajustar profundidade e faixa de preço</summary>
+              <div>
+                <label>Categorias analisadas<select name="max_categories"><option value="3">3 principais</option><option value="6" selected>6 principais</option><option value="10">10 principais</option></select></label>
+                <label>Produtos enriquecidos<select name="limit"><option value="20">Até 20</option><option value="30" selected>Até 30</option><option value="50">Até 50</option><option value="60">Até 60</option></select></label>
+                <label>Preço mínimo<span class="money-field"><input name="price_min" inputmode="decimal" placeholder="Sem mínimo" /></span></label>
+                <label>Preço máximo<span class="money-field"><input name="price_max" inputmode="decimal" placeholder="Sem máximo" /></span></label>
+                <label class="purchase-opportunity-check"><input name="only_new" type="checkbox" checked /><span><strong>Somente produtos que ainda não trabalhamos</strong><small>Compara produto de catálogo e GTIN com todas as contas conectadas.</small></span></label>
+              </div>
+            </details>
+          </form>
+          <div id="purchase-opportunity-feedback"></div>
+          <div id="purchase-opportunity-summary" class="purchase-opportunity-summary"></div>
+          <div id="purchase-opportunity-toolbar" class="purchase-opportunity-toolbar" hidden>
+            <label>Filtrar resultados<input id="purchase-opportunity-search" type="search" placeholder="Produto, categoria ou marca" /></label>
+            <label>Oportunidade<select id="purchase-opportunity-level"><option value="all">Todas</option><option value="Muito alta">Muito alta</option><option value="Alta">Alta</option><option value="Monitorar">Monitorar</option><option value="Exploratória">Exploratória</option></select></label>
+            <label>Ordenar<select id="purchase-opportunity-sort"><option value="score">Melhores oportunidades</option><option value="ranking">Melhor posição</option><option value="price_asc">Menor preço</option><option value="price_desc">Maior preço</option><option value="competition">Menor concorrência</option></select></label>
+          </div>
+          <div id="purchase-opportunity-results"><div class="purchase-opportunity-empty"><span>◎</span><strong>Encontre produtos antes de decidir a compra</strong><p>Informe uma marca para cruzar ranking, preço vencedor, concorrência e o seu catálogo atual.</p></div></div>
+        </div>
+
         <div class="panel purchases-panel">
           <div class="panel-heading">
             <div>
@@ -1318,6 +1354,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260828-analytics-v5"></script>
+  <script src="/app.js?v=20260828-purchase-assistant-v1"></script>
   </body>
 </html>
