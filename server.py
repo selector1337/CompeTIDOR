@@ -115,7 +115,7 @@ RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
 ANALYTICS_CACHE_VERSION = 2
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
-PURCHASE_OPPORTUNITIES_CACHE_VERSION = 2
+PURCHASE_OPPORTUNITIES_CACHE_VERSION = 3
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -265,6 +265,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/post-purchase/v2/claims/[^/]+/returns(\?|$)"),
     re.compile(r"^/post-purchase/v1/returns/[^/]+/reviews(\?|$)"),
     re.compile(r"^/sites/[^/]+/search(\?|$)"),
+    re.compile(r"^/sites/[^/]+/domain_discovery/search(\?|$)"),
     re.compile(r"^/sites/[^/]+/listing_prices(\?|$)"),
     re.compile(r"^/pictures/items/upload$"),
     SAFE_ML_BILLING_ORDER_DETAILS_PATH,
@@ -1900,6 +1901,16 @@ class MercadoLivreClient:
             "offset": max(0, int(offset or 0)),
         }
         return self.get(f"/sites/{site_id or 'MLB'}/search?{urlencode(params)}", **interactive_request_options())
+
+    def domain_discovery(self, query, site_id="MLB", limit=8):
+        params = {
+            "q": str(query or "").strip(),
+            "limit": min(max(1, int(limit or 8)), 8),
+        }
+        return self.get(
+            f"/sites/{site_id or 'MLB'}/domain_discovery/search?{urlencode(params)}",
+            **interactive_request_options(),
+        )
 
     def user_product(self, user_product_id, interactive=False):
         options = interactive_request_options() if interactive else {}
@@ -14346,6 +14357,7 @@ def query_purchase_opportunities(payload, request):
     brand_key = normalized_attribute_label(brand)
     brand_ids = {}
     category_counts = {}
+    category_name_hints = {}
     search_products = {}
     for product in search_rows:
         if not purchase_opportunity_brand_matches(product, brand_key):
@@ -14360,37 +14372,72 @@ def query_purchase_opportunities(payload, request):
         category_id = str(product.get("category_id") or search_winner.get("category_id") or "")
         if category_id:
             category_counts[category_id] = category_counts.get(category_id, 0) + 1
-    # /products/search may expose only domain_id. The public item search returns
-    # the leaf category used by the official best-seller ranking and is therefore
-    # the reliable category-discovery fallback for brands without a buy box.
-    marketplace_rows = []
-    site_search = getattr(client, "site_items_search", None)
-    if callable(site_search):
-        try:
-            for offset in (0, 50):
-                response = site_search(brand, limit=50, offset=offset)
-                batch = response.get("results") if isinstance(response, dict) else []
-                if not isinstance(batch, list) or not batch:
-                    break
-                marketplace_rows.extend(batch)
-                if len(batch) < 50:
-                    break
-        except Exception as exc:
-            discovery_warnings.append(
-                f"Busca de anúncios: {policy_error_message(exc, 'as categorias da marca')}"
-            )
-    for item in marketplace_rows:
-        if not purchase_opportunity_brand_matches(item, brand_key):
-            continue
-        item_brand = purchase_opportunity_attribute(item, "BRAND")
-        if item_brand.get("id"):
-            brand_ids[item_brand["id"]] = brand_ids.get(item_brand["id"], 0) + 1
-        category_id = str(item.get("category_id") or "")
-        if category_id:
-            category_counts[category_id] = category_counts.get(category_id, 0) + 1
-        catalog_product_id = str(item.get("catalog_product_id") or "")
-        if catalog_product_id and catalog_product_id not in search_products:
-            search_products[catalog_product_id] = item
+    # Product results commonly provide a domain but omit the leaf category. The
+    # old /sites/MLB/search?q=... fallback now returns 403. Predict categories
+    # from real product names and accept only predictions from the same domain,
+    # preventing unrelated guesses caused by ambiguous brand names.
+    if len(category_counts) < maximum_categories and search_products:
+        discovery = getattr(client, "domain_discovery", None)
+        predictor_inputs = []
+        seen_inputs = set()
+        for product in search_products.values():
+            title = customer_text_value(product.get("name") or product.get("title"))
+            domain_id = customer_text_value(product.get("domain_id"))
+            key = (normalized_attribute_label(title), domain_id)
+            if not title or key in seen_inputs:
+                continue
+            seen_inputs.add(key)
+            predictor_inputs.append((title, domain_id))
+            if len(predictor_inputs) >= 16:
+                break
+        if callable(discovery) and predictor_inputs:
+            prediction_rows = []
+            workers = max(1, min(6, len(predictor_inputs)))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="purchase-category-discovery") as executor:
+                futures = {
+                    executor.submit(run_meli_work, "interactive", discovery, title, "MLB", 8): (title, domain_id)
+                    for title, domain_id in predictor_inputs
+                }
+                for future in as_completed(futures):
+                    title, source_domain = futures[future]
+                    try:
+                        response = future.result()
+                        suggestions = response if isinstance(response, list) else []
+                        prediction_rows.append((source_domain, suggestions))
+                    except Exception as exc:
+                        discovery_warnings.append(
+                            f"Predição de categoria para {title[:45]}: "
+                            f"{policy_error_message(exc, 'a categoria do produto')}"
+                        )
+            for source_domain, suggestions in prediction_rows:
+                for suggestion in suggestions:
+                    if not isinstance(suggestion, dict):
+                        continue
+                    predicted_domain = customer_text_value(suggestion.get("domain_id"))
+                    predicted_brand = purchase_opportunity_attribute(suggestion, "BRAND")
+                    predicted_brand_key = normalized_attribute_label(predicted_brand.get("name"))
+                    if predicted_brand_key and not (
+                        brand_key in predicted_brand_key or predicted_brand_key in brand_key
+                    ):
+                        continue
+                    brand_confirmed = bool(
+                        predicted_brand_key
+                        and (brand_key in predicted_brand_key or predicted_brand_key in brand_key)
+                    )
+                    if (
+                        source_domain and predicted_domain and source_domain != predicted_domain
+                        and not brand_confirmed
+                    ):
+                        continue
+                    if predicted_brand.get("id"):
+                        brand_ids[predicted_brand["id"]] = brand_ids.get(predicted_brand["id"], 0) + 1
+                    category_id = customer_text_value(suggestion.get("category_id"))
+                    if not category_id:
+                        continue
+                    category_counts[category_id] = category_counts.get(category_id, 0) + 1
+                    category_name_hints[category_id] = customer_text_value(
+                        suggestion.get("category_name") or category_id
+                    )
 
     if not category_counts:
         # Last resort for uncommon responses where both searches omit a leaf
@@ -14407,7 +14454,7 @@ def query_purchase_opportunities(payload, request):
             if category_id:
                 category_counts[category_id] = category_counts.get(category_id, 0) + 1
 
-    if not search_rows and not marketplace_rows:
+    if not search_products:
         detail = " ".join(discovery_warnings).strip()
         suffix = f" {detail}" if detail else ""
         raise RuntimeError(f"Nenhum produto ativo foi encontrado para a marca {brand}.{suffix}")
@@ -14427,7 +14474,7 @@ def query_purchase_opportunities(payload, request):
         try:
             detail = client.category(category_id) or {}
         except Exception as exc:
-            detail = {"id": category_id, "name": category_id}
+            detail = {"id": category_id, "name": category_name_hints.get(category_id) or category_id}
             category_warnings.append(f"Categoria {category_id}: {policy_error_message(exc, 'a identificação da categoria')}")
         category = {"id": category_id, "name": customer_text_value(detail.get("name") or category_id)}
         if category_filter and not explicit_category:
@@ -14438,7 +14485,11 @@ def query_purchase_opportunities(payload, request):
         if len(categories) >= maximum_categories:
             break
     if not categories:
-        raise RuntimeError("Nenhuma categoria da marca corresponde ao filtro informado.")
+        diagnostics = " ".join(category_warnings).strip()
+        suffix = f" Detalhes: {diagnostics}" if diagnostics else ""
+        if category_filter and not explicit_category:
+            raise RuntimeError(f"Nenhuma categoria corresponde ao filtro informado.{suffix}")
+        raise RuntimeError(f"O Mercado Livre não retornou categorias para os produtos encontrados desta marca.{suffix}")
 
     highlights = []
     warnings = list(category_warnings)
