@@ -1902,7 +1902,7 @@ function renderPurchaseOpportunities() {
     : "";
   const restricted = Number(totals.restricted_user_products || 0);
   const restrictionNote = restricted
-    ? ` ${restricted.toLocaleString("pt-BR")} produto(s) de usuário aparecem com dados limitados porque os detalhes são privados para o vendedor.`
+    ? ` ${restricted.toLocaleString("pt-BR")} referência(s) MLBU sem anúncio verificável foram desconsideradas e substituídas por produtos validados da marca.`
     : "";
   const cacheNote = `<div class="purchase-opportunity-cache"><span>${cache.hit ? "⚡ Resultado reaproveitado do cache" : "✓ Ranking consultado agora"}</span><small>A API não fornece vendas exatas de terceiros; a prioridade usa posição oficial, permanência, concorrência e preço vencedor.${escapeText(restrictionNote)}</small></div>`;
   results.innerHTML = `${cacheNote}${warning}${rows.length ? `<div class="purchase-opportunity-grid">${rows.map((row) => {

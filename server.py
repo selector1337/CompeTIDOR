@@ -115,7 +115,7 @@ RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
 ANALYTICS_CACHE_VERSION = 2
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
-PURCHASE_OPPORTUNITIES_CACHE_VERSION = 6
+PURCHASE_OPPORTUNITIES_CACHE_VERSION = 7
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -14195,7 +14195,9 @@ def purchase_opportunity_restricted_user_product(highlight, category, catalog, b
         "highlight_id": reference_id,
         "highlight_type": "USER_PRODUCT",
         "title": customer_text_value(own.get("title") or f"Produto de usuário {reference_id}"),
-        "brand": customer_text_value(own.get("brand") or brand),
+        "brand": customer_text_value(
+            own.get("brand") or (brand if (highlight or {}).get("_brand_confirmed_by_ranking") else "")
+        ),
         "gtin": customer_text_value(own.get("gtin")),
         "thumbnail": customer_text_value(own.get("thumbnail") or own.get("picture")),
         "category_id": category.get("id"),
@@ -14220,7 +14222,7 @@ def purchase_opportunity_restricted_user_product(highlight, category, catalog, b
 
 
 def purchase_opportunity_resolve_user_product_accounts(
-    account_clients, highlight, category, search_products, catalog, brand,
+    payload, account_clients, highlight, category, search_products, catalog, brand,
 ):
     reference_id = str((highlight or {}).get("id") or "")
     own_rows = [
@@ -14242,12 +14244,53 @@ def purchase_opportunity_resolve_user_product_accounts(
             row["user_product_id"] = reference_id
             row["restricted_detail"] = False
             row["known_from_own_catalog"] = bool(own_rows)
-            return row
+            return purchase_opportunity_enrich_from_scan(payload, row)
         except Exception:
             continue
     return purchase_opportunity_restricted_user_product(
         highlight, category, catalog, brand,
     )
+
+
+def purchase_opportunity_enrich_from_scan(payload, row):
+    if not row or row.get("restricted_detail"):
+        return row
+    needs_scan = any(
+        not row.get(field)
+        for field in ("title", "thumbnail", "permalink", "winner_price", "competitors")
+    )
+    if not needs_scan:
+        return row
+    highlight_type = str(row.get("highlight_type") or "").upper()
+    target_id = (
+        row.get("catalog_product_id") if highlight_type == "PRODUCT"
+        else row.get("winner_item_id") or row.get("highlight_id") or row.get("id")
+    )
+    if not target_id or str(target_id).startswith("MLBU"):
+        return row
+    try:
+        scan = resolve_scan_target(payload, str(target_id))
+    except Exception:
+        return row
+    enriched = dict(row)
+    enriched["title"] = customer_text_value(scan.get("title") or enriched.get("title"))
+    enriched["thumbnail"] = customer_text_value(scan.get("thumbnail") or enriched.get("thumbnail"))
+    enriched["permalink"] = customer_text_value(scan.get("permalink") or enriched.get("permalink"))
+    scan_price = optional_money(scan.get("price"))
+    if scan_price is not None:
+        enriched["winner_price"] = round(float(scan_price), 2)
+    scan_offers = scan.get("_scan_offer_count")
+    if scan_offers is not None:
+        enriched["competitors"] = int(scan_offers)
+    enriched["winner_item_id"] = customer_text_value(scan.get("id") or enriched.get("winner_item_id"))
+    enriched["price_label"] = "Preço atual"
+    enriched["scan_enriched"] = True
+    return enriched
+
+
+def purchase_opportunity_resolve_with_scan(payload, client, highlight, category, search_products):
+    row = purchase_opportunity_resolve(client, highlight, category, search_products)
+    return purchase_opportunity_enrich_from_scan(payload, row)
 
 
 def purchase_opportunity_competitor_count(response):
@@ -14579,9 +14622,11 @@ def query_purchase_opportunities(payload, request):
     warnings = list(category_warnings)
     for category in categories:
         content = []
+        brand_confirmed_by_ranking = False
         try:
             response = client.category_highlights(category["id"], brand_value_id)
             content = response.get("content") if isinstance(response, dict) else []
+            brand_confirmed_by_ranking = bool(content and brand_value_id)
         except Exception as exc:
             # A dimensão categoria+marca legitimately returns 404 when the brand
             # has no dedicated top list. In that case consult the category top
@@ -14598,30 +14643,38 @@ def query_purchase_opportunities(payload, request):
                     warnings.append(f"{category['name']}: {policy_error_message(exc, 'o ranking de mais vendidos')}")
         for row in content or []:
             if isinstance(row, dict) and row.get("id"):
-                highlights.append({**row, "_category": category})
-    if not highlights:
-        default_category = categories[0]
-        for product in list(search_products.values())[:result_limit]:
-            product_id = str(product.get("id") or "")
-            if not product_id:
-                continue
-            product_category_id = str(product.get("category_id") or "")
-            product_category = next(
-                (row for row in categories if row.get("id") == product_category_id),
-                default_category,
-            )
-            highlights.append({
-                "id": product_id,
-                "type": "PRODUCT",
-                "position": 20,
-                "_category": product_category,
-                "_ranking_available": False,
-            })
-
+                highlights.append({
+                    **row,
+                    "_category": category,
+                    "_brand_confirmed_by_ranking": brand_confirmed_by_ranking,
+                })
     unique_highlights = {}
     for row in sorted(highlights, key=lambda item: (int(item.get("position") or 999), str(item.get("id") or ""))):
         unique_highlights.setdefault(str(row.get("id")), row)
     ranked_selection = list(unique_highlights.values())[:result_limit]
+    default_category = categories[0]
+    supplemental = []
+    known_ids = set(unique_highlights)
+    for product in search_products.values():
+        product_id = str(product.get("id") or "")
+        if not product_id or product_id in known_ids:
+            continue
+        product_category_id = str(product.get("category_id") or "")
+        product_category = next(
+            (row for row in categories if row.get("id") == product_category_id),
+            default_category,
+        )
+        supplemental.append({
+            "id": product_id,
+            "type": "PRODUCT",
+            "position": 20,
+            "_category": product_category,
+            "_ranking_available": False,
+            "_brand_confirmed_by_ranking": False,
+        })
+        if len(supplemental) >= result_limit:
+            break
+    ranked_selection.extend(supplemental)
     resolved = []
     workers = max(1, min(8, int(os.getenv("MELI_PURCHASE_OPPORTUNITIES_WORKERS", "6"))))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="purchase-opportunities") as executor:
@@ -14634,13 +14687,13 @@ def query_purchase_opportunities(payload, request):
             if is_user_product:
                 future = executor.submit(
                     run_meli_work, "interactive", purchase_opportunity_resolve_user_product_accounts,
-                    account_clients, row, row.get("_category") or {}, search_products,
+                    payload, account_clients, row, row.get("_category") or {}, search_products,
                     payload.get("catalog") or [], brand,
                 )
             else:
                 future = executor.submit(
-                    run_meli_work, "interactive", purchase_opportunity_resolve,
-                    client, row, row.get("_category") or {}, search_products,
+                    run_meli_work, "interactive", purchase_opportunity_resolve_with_scan,
+                    payload, client, row, row.get("_category") or {}, search_products,
                 )
             future_rows[future] = row
         for future in as_completed(future_rows):
@@ -14654,8 +14707,11 @@ def query_purchase_opportunities(payload, request):
     # only products whose official BRAND attribute (or, as a last resort, title)
     # matches the requested brand. Applying the same validation with an id also
     # protects against occasional unrelated entries in the ranking response.
-    resolved = [row for row in resolved if purchase_opportunity_brand_matches(row, brand_key)]
     restricted_user_products = sum(1 for row in resolved if row.get("restricted_detail"))
+    resolved = [
+        row for row in resolved
+        if not row.get("restricted_detail") and purchase_opportunity_brand_matches(row, brand_key)
+    ]
 
     today_key = datetime.now(APP_TZ).date().isoformat()
     with PURCHASE_OPPORTUNITIES_CACHE_LOCK:
@@ -14695,6 +14751,7 @@ def query_purchase_opportunities(payload, request):
                 continue
             rows.append(enriched)
         rows.sort(key=lambda row: (-float(row.get("score") or 0), int(row.get("position") or 999), row.get("title") or ""))
+        rows = rows[:result_limit]
         result = {
             "ok": True,
             "kind": "purchase_opportunities",
