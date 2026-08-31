@@ -1201,7 +1201,7 @@ function renderDashboard() {
     <article class="revenue-total">
       <span>Faturamento real mensal</span>
       <strong>${money.format(ops.total_monthly_revenue || 0)}</strong>
-      <small>${Number(ops.total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos oficiais no mês atual</small>
+      <small title="${escapeAttr(ops.revenue_calculation_basis || "Pedidos oficiais conciliados")}">${Number(ops.total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos oficiais faturáveis no mês atual</small>
       ${dashboardPreviousMonth({
         available: ops.previous_month_complete !== false,
         revenue: ops.previous_total_monthly_revenue,
@@ -1216,7 +1216,7 @@ function renderDashboard() {
       <article class="revenue-account">
         <div class="revenue-account-heading"><strong>${escapeText(item.account)}</strong>${dashboardReputation(item)}</div>
         <span>${money.format(item.monthly_revenue || 0)}</span>
-        <small>${Number(item.orders_count || 0).toLocaleString("pt-BR")} pedidos no mês atual</small>
+        <small title="${escapeAttr(ops.revenue_calculation_basis || "Pedidos oficiais conciliados")}">${Number(item.orders_count || 0).toLocaleString("pt-BR")} pedidos faturáveis${item.updated_at ? ` · atualizado ${formatDateBR(item.updated_at)}` : ""}</small>
         ${dashboardPreviousMonth({
           available: item.previous_month_available !== false,
           revenue: item.previous_month_revenue,

@@ -113,7 +113,7 @@ SKU_LAST_SALES_FILE = "sku_last_sales.json"
 SYNC_PROGRESS_FILE = "sync_progress.json"
 RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
-ANALYTICS_CACHE_VERSION = 2
+ANALYTICS_CACHE_VERSION = 3
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
 PURCHASE_OPPORTUNITIES_CACHE_VERSION = 9
 CUSTOMERS_DATA_FILE = "customers.json"
@@ -1243,6 +1243,47 @@ def account_record(records, account):
     )
 
 
+def analytics_cached_period_record(store, account, start, end):
+    """Return a complete canonical period from the shared per-day ledger."""
+    if not isinstance(store, dict) or int(store.get("version") or 0) != ANALYTICS_CACHE_VERSION:
+        return {}
+    account_key = str(account.get("id") or account.get("seller_id") or account.get("nickname") or "")
+    days = ((((store.get("accounts") or {}).get(account_key) or {}).get("days")) or {})
+    requested = [
+        (start + timedelta(days=index)).isoformat()
+        for index in range((end - start).days + 1)
+    ]
+    entries = [days.get(key) for key in requested]
+    if not entries or any(
+        not isinstance(entry, dict) or int(entry.get("version") or 0) != ANALYTICS_CACHE_VERSION
+        for entry in entries
+    ):
+        return {}
+    updated_epoch = max(float(entry.get("updated_at") or 0) for entry in entries)
+    return {
+        "account": account.get("nickname"),
+        "amount": round(sum(float(entry.get("revenue") or 0) for entry in entries), 2),
+        "orders_count": sum(int(entry.get("orders") or 0) for entry in entries),
+        "source": "Pedidos oficiais Mercado Livre",
+        "sync_status": "Conciliação diária canônica dos pedidos oficiais",
+        "updated_at": (
+            datetime.fromtimestamp(updated_epoch, APP_TZ).isoformat(timespec="seconds")
+            if updated_epoch > 0 else ""
+        ),
+        "calculation_basis": "total_amount de pedidos não cancelados com valor positivo",
+    }
+
+
+def analytics_cache_snapshot_if_available():
+    path = DATA / ANALYTICS_DAILY_CACHE_FILE
+    if not path.exists():
+        return {}
+    try:
+        return read_json(ANALYTICS_DAILY_CACHE_FILE, {})
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 def build_operations(payload):
     accounts = payload.get("accounts", [])
     catalog = payload.get("catalog", [])
@@ -1251,6 +1292,11 @@ def build_operations(payload):
     revenue_accounts = monthly.get("accounts") or {}
     previous_period = month_window(-1)[0]
     previous_accounts = (((monthly.get("history") or {}).get(previous_period) or {}).get("accounts") or {})
+    today = datetime.now(APP_TZ).date()
+    current_start = today.replace(day=1)
+    previous_end = current_start - timedelta(days=1)
+    previous_start = previous_end.replace(day=1)
+    canonical_store = analytics_cache_snapshot_if_available()
     metrics_by_account = {
         str(metric.get("account") or ""): metric
         for metric in payload.get("metrics") or []
@@ -1264,8 +1310,14 @@ def build_operations(payload):
     revenue = []
     revenue_source_accounts = [account for account in accounts if account.get("official")]
     for account in revenue_source_accounts:
-        record = account_record(revenue_accounts, account)
-        previous_record = account_record(previous_accounts, account)
+        record = (
+            analytics_cached_period_record(canonical_store, account, current_start, today)
+            or account_record(revenue_accounts, account)
+        )
+        previous_record = (
+            analytics_cached_period_record(canonical_store, account, previous_start, previous_end)
+            or account_record(previous_accounts, account)
+        )
         metric = (
             metrics_by_account_id.get(str(account.get("id") or account.get("seller_id") or ""))
             or metrics_by_account.get(str(account.get("nickname") or ""), {})
@@ -1423,6 +1475,7 @@ def build_operations(payload):
         "previous_month_pending_accounts": previous_pending_accounts,
         "total_revenue_change_percent": percentage_change(total_revenue, previous_total_revenue) if previous_month_complete else None,
         "total_orders_change_percent": percentage_change(total_orders, previous_total_orders) if previous_month_complete else None,
+        "revenue_calculation_basis": "total_amount dos pedidos oficiais com valor positivo, excluindo cancelados e inválidos",
         "attention_stock": stock[:200],
         "attention_catalog": catalog_attention[:200],
         "claims": claims,
@@ -5693,6 +5746,29 @@ def reconcile_order_sku_alias(payload, item_id, official_sku):
     return changed
 
 
+REVENUE_IGNORED_ORDER_STATUSES = {"cancelled", "canceled", "invalid"}
+
+
+def official_order_revenue_amount(order):
+    """Gross merchandise revenue: item/order total, never freight/payment extras."""
+    total = optional_money((order or {}).get("total_amount"))
+    if total is None:
+        # Compatibility with rare/legacy order payloads that omit total_amount.
+        total = optional_money((order or {}).get("paid_amount"))
+    if total is None:
+        total = sum(
+            max(0.0, float(line.get("unit_price") or line.get("full_unit_price") or 0))
+            * max(1, int(line.get("quantity") or 1))
+            for line in ((order or {}).get("order_items") or [])
+        )
+    return round(max(0.0, float(total or 0)), 2)
+
+
+def official_order_is_revenue(order):
+    status = str((order or {}).get("status") or "").strip().lower()
+    return status not in REVENUE_IGNORED_ORDER_STATUSES and official_order_revenue_amount(order) > 0
+
+
 def sync_recent_sales(payload, account, client):
     period, date_from, date_to = current_month_window()
     try:
@@ -5704,12 +5780,10 @@ def sync_recent_sales(payload, account, client):
     rows = []
     revenue_total = 0.0
     revenue_orders = 0
-    ignored_statuses = {"cancelled", "canceled", "invalid"}
     catalog_by_id = {item.get("id"): item for item in payload.get("catalog", []) if item.get("id")}
     for order in orders:
-        status = str(order.get("status") or "").lower()
-        order_total = float(order.get("total_amount") or order.get("paid_amount") or 0)
-        if order_total > 0 and status not in ignored_statuses:
+        order_total = official_order_revenue_amount(order)
+        if official_order_is_revenue(order):
             revenue_total += order_total
             revenue_orders += 1
         order_items = order.get("order_items") or []
@@ -5773,6 +5847,13 @@ def sync_recent_sales(payload, account, client):
     payload["daily_sku_sales"] = daily
     account["sales_sync_status"] = f"{revenue_orders} pedidos reais sincronizados no mês"
     upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"])
+    try:
+        today = datetime.now(APP_TZ).date()
+        cache_official_orders_for_analytics(payload, account, today.replace(day=1), today, orders)
+    except Exception:
+        # The monthly record remains available as a safe fallback; a later
+        # analytical query can rebuild the shared daily ledger.
+        pass
     sync_pending_shipments_from_orders(payload, account, orders)
     try:
         with CUSTOMERS_SYNC_LOCK:
@@ -6626,14 +6707,11 @@ def customer_detail(customer_id):
 
 
 def summarize_monthly_orders(orders):
-    ignored_statuses = {"cancelled", "canceled", "invalid"}
     amount = 0.0
     count = 0
     for order in orders or []:
-        status = str(order.get("status") or "").lower()
-        total = float(order.get("total_amount") or order.get("paid_amount") or 0)
-        if total > 0 and status not in ignored_statuses:
-            amount += total
+        if official_order_is_revenue(order):
+            amount += official_order_revenue_amount(order)
             count += 1
     return round(amount, 2), count
 
@@ -7931,7 +8009,15 @@ def sync_previous_month_revenue(payload, account, client):
     key = str(account.get("id") or account.get("seller_id") or account.get("nickname"))
     period_accounts = monthly.setdefault("history", {}).setdefault(period, {"accounts": {}}).setdefault("accounts", {})
     cached = account_record(period_accounts, account)
-    if cached.get("source") == "Pedidos oficiais Mercado Livre":
+    cached_at = parse_meli_datetime(cached.get("updated_at"))
+    closed_month_ttl = max(
+        3600, int(os.getenv("MELI_CLOSED_MONTH_REVENUE_CACHE_SECONDS", "86400"))
+    )
+    if (
+        cached.get("source") == "Pedidos oficiais Mercado Livre"
+        and cached_at
+        and (datetime.now(APP_TZ) - cached_at).total_seconds() < closed_month_ttl
+    ):
         period_accounts[key] = cached
         return cached
     failed_at = parse_meli_datetime(cached.get("updated_at"))
@@ -7944,6 +8030,14 @@ def sync_previous_month_revenue(payload, account, client):
     try:
         orders = fetch_seller_orders_window(client, account.get("seller_id"), date_from, date_to)
         amount, count = summarize_monthly_orders(orders)
+        previous_end = datetime.now(APP_TZ).date().replace(day=1) - timedelta(days=1)
+        previous_start = previous_end.replace(day=1)
+        try:
+            cache_official_orders_for_analytics(
+                payload, account, previous_start, previous_end, orders,
+            )
+        except Exception:
+            pass
         return upsert_monthly_revenue(
             payload, account, amount, count, period,
             f"{count} pedidos reais sincronizados no mês anterior",
@@ -15527,16 +15621,7 @@ def analytics_date_ranges(request, today=None):
 
 
 def analytics_order_amount(order):
-    amount = optional_money((order or {}).get("total_amount"))
-    if amount is None:
-        amount = optional_money((order or {}).get("paid_amount"))
-    if amount is not None:
-        return round(max(0.0, amount), 2)
-    return round(sum(
-        max(0.0, float(line.get("unit_price") or line.get("full_unit_price") or 0))
-        * max(1, int(line.get("quantity") or 1))
-        for line in ((order or {}).get("order_items") or [])
-    ), 2)
+    return official_order_revenue_amount(order)
 
 
 def empty_analytics_snapshot(start, end):
@@ -15611,11 +15696,10 @@ def merge_analytics_brand_bucket(target, source):
 
 
 def add_orders_to_analytics_snapshot(snapshot, orders, brand_by_item=None):
-    ignored_statuses = {"cancelled", "canceled", "invalid"}
     daily_by_date = {row["date"]: row for row in snapshot["daily"]}
     seen = set()
     for order in orders or []:
-        if str(order.get("status") or "").lower() in ignored_statuses:
+        if not official_order_is_revenue(order):
             continue
         order_id = str(order.get("id") or "")
         signature = order_id or json.dumps(order, sort_keys=True, ensure_ascii=False)
@@ -15684,9 +15768,11 @@ def analytics_cache_fresh(entry, day, today, now_epoch):
     if day >= today - timedelta(days=revalidate_days):
         ttl = max(300, int(os.getenv("MELI_ANALYTICS_RECENT_CACHE_SECONDS", "21600")))
         return now_epoch - updated_at < ttl
-    # Older completed days are immutable for the analytical workload. Changing
-    # the entry version intentionally invalidates them if the formula evolves.
-    return True
+    # Orders from completed days can still be cancelled, corrected or arrive
+    # late. Keep the cache efficient, but reconcile historical days daily so a
+    # closed month never becomes a permanently stale second source of truth.
+    ttl = max(3600, int(os.getenv("MELI_ANALYTICS_CLOSED_DAY_CACHE_SECONDS", "86400")))
+    return now_epoch - updated_at < ttl
 
 
 def analytics_contiguous_windows(days):
@@ -15717,6 +15803,36 @@ def analytics_cache_day(day, updated_at, daily):
         "brands": daily.get("brands") or {},
         "updated_at": float(updated_at),
     }
+
+
+def cache_official_orders_for_analytics(payload, account, start, end, orders, now_epoch=None):
+    """Publish a complete official-order window to the shared daily ledger."""
+    now_epoch = float(now_epoch if now_epoch is not None else time.time())
+    brand_by_item = {
+        str(item.get("id") or ""): customer_text_value(item.get("brand") or "Sem marca")
+        for item in payload.get("catalog") or []
+        if item.get("id")
+    }
+    snapshot = add_orders_to_analytics_snapshot(
+        empty_analytics_snapshot(start, end), orders, brand_by_item,
+    )
+    entries = {
+        daily["date"]: analytics_cache_day(date.fromisoformat(daily["date"]), now_epoch, daily)
+        for daily in snapshot.get("daily") or []
+    }
+    account_key = str(account.get("id") or account.get("seller_id") or account.get("nickname") or "")
+    if not account_key:
+        return snapshot
+    with ANALYTICS_DAILY_CACHE_LOCK:
+        store = read_json(ANALYTICS_DAILY_CACHE_FILE, {"version": ANALYTICS_CACHE_VERSION, "accounts": {}})
+        if int(store.get("version") or 0) != ANALYTICS_CACHE_VERSION:
+            store = {"version": ANALYTICS_CACHE_VERSION, "accounts": {}}
+        account_cache = store.setdefault("accounts", {}).setdefault(account_key, {"days": {}})
+        account_cache.setdefault("days", {}).update(entries)
+        account_cache["seller_id"] = str(account.get("seller_id") or "")
+        account_cache["updated_at"] = now_epoch
+        write_json(ANALYTICS_DAILY_CACHE_FILE, store)
+    return snapshot
 
 
 def fetch_analytics_account_snapshot(
@@ -15938,6 +16054,7 @@ def query_analytics_report(payload, request):
         "warnings": warnings,
         "truncated": truncated,
         "cache": cache_summary,
+        "calculation_basis": "total_amount dos pedidos oficiais com valor positivo, excluindo cancelados e inválidos",
         "generated_at": now_label(),
     }
 
