@@ -1878,12 +1878,13 @@ function renderPurchaseOpportunities() {
   const report = state.purchaseOpportunities;
   const totals = report.summary || {};
   const cache = report.cache || {};
+  const showingWorked = report.only_new === false;
   toolbar.hidden = false;
   summary.innerHTML = `
-    <article><span>Oportunidades novas</span><strong>${Number(totals.opportunities || 0).toLocaleString("pt-BR")}</strong><small>Fora do catálogo conectado</small></article>
+    <article><span>${showingWorked ? "Produtos encontrados" : "Oportunidades novas"}</span><strong>${Number(totals.opportunities || 0).toLocaleString("pt-BR")}</strong><small>${showingWorked ? "Novos e já trabalhados" : "Fora do catálogo conectado"}</small></article>
     <article><span>Prioridade muito alta</span><strong>${Number(totals.very_high || 0).toLocaleString("pt-BR")}</strong><small>Maior sinal de demanda</small></article>
     <article><span>Categorias analisadas</span><strong>${Number(totals.categories || 0).toLocaleString("pt-BR")}</strong><small>${escapeText((report.categories || []).map((row) => row.name).join(" · ") || "—")}</small></article>
-    <article><span>Produtos já trabalhados</span><strong>${Number(totals.already_worked || 0).toLocaleString("pt-BR")}</strong><small>Identificados e retirados do resultado</small></article>`;
+    <article><span>Produtos já trabalhados</span><strong>${Number(totals.already_worked || 0).toLocaleString("pt-BR")}</strong><small>${showingWorked ? "Incluídos nos resultados" : "Identificados e retirados do resultado"}</small></article>`;
   const term = state.purchaseOpportunitySearch.trim().toLowerCase();
   let rows = (report.rows || []).filter((row) => {
     const haystack = `${row.title || ""} ${row.brand || ""} ${row.category || ""} ${row.catalog_product_id || ""}`.toLowerCase();

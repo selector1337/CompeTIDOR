@@ -115,7 +115,7 @@ RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
 ANALYTICS_CACHE_VERSION = 2
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
-PURCHASE_OPPORTUNITIES_CACHE_VERSION = 8
+PURCHASE_OPPORTUNITIES_CACHE_VERSION = 9
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
@@ -14103,8 +14103,14 @@ def purchase_opportunity_cache_store():
 
 
 def purchase_opportunity_query_key(request):
+    def normalized_value(key):
+        value = (request or {}).get(key)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value if value is not None else "").strip().lower()
+
     normalized = {
-        key: str((request or {}).get(key) or "").strip().lower()
+        key: normalized_value(key)
         for key in (
             "brand", "category", "max_categories", "limit", "price_min", "price_max",
             "only_new", "catalog_signature",
@@ -14493,11 +14499,12 @@ def query_purchase_opportunities(payload, request):
     if len(brand) < 2:
         raise RuntimeError("Informe uma marca com pelo menos 2 caracteres.")
     category_filter = customer_text_value((request or {}).get("category"))
-    maximum_categories = max(1, min(10, int((request or {}).get("max_categories") or 6)))
-    result_limit = max(10, min(60, int((request or {}).get("limit") or 30)))
+    maximum_categories = max(1, min(20, int((request or {}).get("max_categories") or 10)))
+    result_limit = max(10, min(120, int((request or {}).get("limit") or 60)))
     price_min = optional_money((request or {}).get("price_min"))
     price_max = optional_money((request or {}).get("price_max"))
-    only_new = str((request or {}).get("only_new") or "true").lower() not in {"0", "false", "no"}
+    only_new_value = (request or {}).get("only_new", "true")
+    only_new = str(only_new_value).strip().lower() not in {"0", "false", "no", "off"}
     catalog_signature = hashlib.sha1("|".join(sorted(
         f"{item.get('catalog_product_id') or ''}:{item.get('user_product_id') or ''}:{item.get('gtin') or ''}"
         for item in payload.get("catalog") or []
@@ -14525,7 +14532,7 @@ def query_purchase_opportunities(payload, request):
     search_rows = []
     try:
         search_target = max(100, min(
-            500, int(os.getenv("MELI_PURCHASE_BRAND_SEARCH_PRODUCTS", "300"))
+            800, int(os.getenv("MELI_PURCHASE_BRAND_SEARCH_PRODUCTS", "500"))
         ))
         for offset in range(0, search_target, 50):
             response = client.product_search(brand, limit=50, offset=offset)
@@ -14562,6 +14569,33 @@ def query_purchase_opportunities(payload, request):
         category_id = str(product.get("category_id") or search_winner.get("category_id") or "")
         if category_id:
             category_counts[category_id] = category_counts.get(category_id, 0) + 1
+
+    # Disabling "only new" must also seed discovery with products from every
+    # connected account. A generic brand search does not guarantee that worked
+    # products are present in its first pages, regardless of their relevance.
+    own_brand_product_ids = []
+    if not only_new:
+        for listing in payload.get("catalog") or []:
+            if not purchase_opportunity_brand_matches(listing, brand_key):
+                continue
+            product_id = customer_text_value(listing.get("catalog_product_id"))
+            if not product_id or product_id in own_brand_product_ids:
+                continue
+            own_brand_product_ids.append(product_id)
+            search_products.setdefault(product_id, {
+                "id": product_id,
+                "name": customer_text_value(listing.get("title") or product_id),
+                "title": customer_text_value(listing.get("title") or product_id),
+                "brand": customer_text_value(listing.get("brand") or brand),
+                "category_id": customer_text_value(listing.get("category_id")),
+                "domain_id": customer_text_value(listing.get("domain_id")),
+                "thumbnail": customer_text_value(listing.get("thumbnail") or listing.get("picture")),
+                "permalink": customer_text_value(listing.get("permalink")),
+                "price": listing.get("price"),
+            })
+            category_id = customer_text_value(listing.get("category_id"))
+            if category_id:
+                category_counts[category_id] = category_counts.get(category_id, 0) + 2
     # Product results commonly provide a domain but omit the leaf category. The
     # old /sites/MLB/search?q=... fallback now returns 403. Predict categories
     # from real product names and accept only predictions from the same domain,
@@ -14571,7 +14605,7 @@ def query_purchase_opportunities(payload, request):
         predictor_inputs = []
         seen_inputs = set()
         prediction_limit = max(16, min(
-            60, int(os.getenv("MELI_PURCHASE_CATEGORY_PREDICTIONS", "36"))
+            100, int(os.getenv("MELI_PURCHASE_CATEGORY_PREDICTIONS", "60"))
         ))
         for product in purchase_opportunity_diverse_products(search_products, prediction_limit):
             title = customer_text_value(product.get("name") or product.get("title"))
@@ -14638,9 +14672,22 @@ def query_purchase_opportunities(payload, request):
     highlight_lookup = getattr(client, "product_highlight", None)
     if callable(highlight_lookup) and search_products:
         probe_limit = max(result_limit, min(
-            120, int(os.getenv("MELI_PURCHASE_PRODUCT_RANKING_PROBES", "90"))
+            240, int(os.getenv("MELI_PURCHASE_PRODUCT_RANKING_PROBES", "160"))
         ))
-        probe_rows = purchase_opportunity_diverse_products(search_products, probe_limit)
+        diverse_probe_rows = purchase_opportunity_diverse_products(search_products, probe_limit)
+        if not only_new and own_brand_product_ids:
+            own_id_set = set(own_brand_product_ids)
+            own_probe_rows = [
+                search_products[product_id]
+                for product_id in own_brand_product_ids
+                if product_id in search_products
+            ]
+            probe_rows = (
+                own_probe_rows
+                + [row for row in diverse_probe_rows if str(row.get("id") or "") not in own_id_set]
+            )[:probe_limit]
+        else:
+            probe_rows = diverse_probe_rows
         lookup_failures = 0
         workers = max(1, min(8, len(probe_rows)))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="purchase-product-ranking") as executor:
@@ -14775,18 +14822,36 @@ def query_purchase_opportunities(payload, request):
     unique_highlights = {}
     for row in sorted(highlights, key=lambda item: (int(item.get("position") or 999), str(item.get("id") or ""))):
         unique_highlights.setdefault(str(row.get("id")), row)
-    ranked_selection = list(unique_highlights.values())[:result_limit]
+    # Resolve beyond the visible limit. Brand validation and the "only new"
+    # filter happen later; cutting here previously discarded valid rows before
+    # they had a chance to enter the final list.
+    resolution_limit = max(result_limit, min(240, result_limit * 2))
+    ranked_selection = list(unique_highlights.values())[:resolution_limit]
     default_category = categories[0]
     supplemental = []
     known_ids = set(unique_highlights)
-    for product in search_products.values():
+    supplemental_products = []
+    if not only_new:
+        supplemental_products.extend(
+            search_products[product_id]
+            for product_id in own_brand_product_ids
+            if product_id in search_products
+        )
+    supplemental_products.extend(purchase_opportunity_diverse_products(search_products, resolution_limit))
+    supplemental_seen = set()
+    for product in supplemental_products:
         product_id = str(product.get("id") or "")
-        if not product_id or product_id in known_ids:
+        if not product_id or product_id in known_ids or product_id in supplemental_seen:
             continue
+        supplemental_seen.add(product_id)
         product_category_id = str(product.get("category_id") or "")
         product_category = next(
             (row for row in categories if row.get("id") == product_category_id),
-            default_category,
+            {
+                "id": product_category_id or default_category.get("id"),
+                "name": customer_text_value(product.get("category") or product_category_id)
+                or default_category.get("name"),
+            },
         )
         supplemental.append({
             "id": product_id,
@@ -14797,7 +14862,7 @@ def query_purchase_opportunities(payload, request):
             "_ranking_source": "catalog_search",
             "_brand_confirmed_by_ranking": False,
         })
-        if len(supplemental) >= result_limit:
+        if len(ranked_selection) + len(supplemental) >= resolution_limit:
             break
     ranked_selection.extend(supplemental)
     resolved = []
@@ -14885,6 +14950,7 @@ def query_purchase_opportunities(payload, request):
             "brand": brand,
             "brand_value_id": brand_value_id,
             "category_filter": category_filter,
+            "only_new": only_new,
             "categories": categories,
             "rows": rows,
             "summary": {
@@ -15962,7 +16028,14 @@ def statistics_job_signature(request):
         "flex_carrier_cost", "shipping_method", "category", "max_categories", "limit",
         "price_min", "price_max", "only_new",
     )
-    normalized = {key: str((request or {}).get(key) or "") for key in keys}
+    normalized = {
+        key: (
+            "true" if (request or {}).get(key) is True
+            else "false" if (request or {}).get(key) is False
+            else str((request or {}).get(key) if (request or {}).get(key) is not None else "")
+        )
+        for key in keys
+    }
     return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
 
 
@@ -15982,7 +16055,11 @@ def cleanup_statistics_jobs(now=None):
 def start_statistics_job(request):
     cleanup_statistics_jobs()
     safe_request = {
-        key: str((request or {}).get(key) or "")
+        key: (
+            "true" if (request or {}).get(key) is True
+            else "false" if (request or {}).get(key) is False
+            else str((request or {}).get(key) if (request or {}).get(key) is not None else "")
+        )
         for key in (
             "kind", "account", "sku", "brand", "flex", "ml_status", "coverage_days",
             "lead_time_days", "review_days", "service_level", "desired_margin", "abc_basis",
