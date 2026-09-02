@@ -4621,6 +4621,16 @@ async function loadBrandSalesReport() {
 }
 
 function currentReportFilters(reportType) {
+  if (reportType === "dashboard_stock") {
+    return {
+      period: state.stockPeriod,
+      date_from: state.stockCustomDate,
+      date_to: state.stockCustomEndDate,
+    };
+  }
+  if (reportType === "customers") {
+    return Object.fromEntries(customerQueryParams().entries());
+  }
   if (reportType === "purchases") {
     return purchaseRequestFromForm();
   }

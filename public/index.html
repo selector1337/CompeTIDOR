@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260831-revenue-reconciliation-v1" />
+  <link rel="stylesheet" href="/styles.css?v=20260902-filtered-exports-v1" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -107,6 +107,10 @@
               <div>
                 <p class="eyebrow">Atenção estoque</p>
                 <h2>Produtos sem estoque</h2>
+              </div>
+              <div class="report-actions" aria-label="Exportar produtos sem estoque">
+                <button class="mini-button" type="button" data-export-report="dashboard_stock" data-export-format="pdf">PDF</button>
+                <button class="mini-button" type="button" data-export-report="dashboard_stock" data-export-format="xlsx">Excel</button>
               </div>
             </div>
             <div class="mini-filter-bar" id="stock-period-filter">
@@ -263,7 +267,7 @@
             <label>Mínimo de compras<input name="min_orders" type="number" min="0" value="0" /></label><label>Gasto mínimo<input name="min_spent" type="number" min="0" step="0.01" value="0" /></label>
             <label>Ordenar<select name="sort"><option value="last_desc">Compra mais recente</option><option value="spent_desc">Maior valor gasto</option><option value="orders_desc">Mais compras</option><option value="name_asc">Nome A–Z</option></select></label>
             <label>Por página<select name="per_page"><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label>
-            <div class="customers-filter-actions"><button class="primary" type="submit">Aplicar filtros</button><button class="ghost" id="customers-clear-filters" type="button">Limpar</button></div>
+            <div class="customers-filter-actions"><button class="primary" type="submit">Aplicar filtros</button><button class="ghost" id="customers-clear-filters" type="button">Limpar</button><span class="customers-export-label">Exportar filtrados:</span><button class="mini-button" type="button" data-export-report="customers" data-export-format="pdf">PDF</button><button class="mini-button" type="button" data-export-report="customers" data-export-format="xlsx">Excel</button></div>
           </form>
           <div id="customers-feedback"></div><div id="customers-list" class="customers-list"></div>
         </div>
@@ -1354,6 +1358,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260831-revenue-reconciliation-v1"></script>
+  <script src="/app.js?v=20260902-filtered-exports-v1"></script>
   </body>
 </html>

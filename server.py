@@ -6586,7 +6586,7 @@ def masked_customer_document(value):
     return "Documento não disponível" if not digits else f"***{digits[-4:]}"
 
 
-def query_customers(query, include_sensitive=False):
+def query_customers(query, include_sensitive=False, export_all=False):
     store = read_customers_store()
     query = query or {}
     term = str((query.get("q") or [""])[0]).strip().lower()
@@ -6666,7 +6666,16 @@ def query_customers(query, include_sensitive=False):
             "accounts": customer.get("accounts") or [], "top_sku": customer.get("top_sku") or "-",
         }
         if include_sensitive:
-            row.update({"document": customer.get("document") or "", "buyer_ids": customer.get("buyer_ids") or [], "billing_address": customer.get("billing_address") or {}, "delivery_address": customer.get("delivery_address") or {}, "purchases": purchases})
+            purchase_filters_active = any([
+                filters["product"], filters["sku"], filters["account"], date_from, date_to, status_filter,
+            ])
+            row.update({
+                "document": customer.get("document") or "",
+                "buyer_ids": customer.get("buyer_ids") or [],
+                "billing_address": customer.get("billing_address") or {},
+                "delivery_address": customer.get("delivery_address") or {},
+                "purchases": matching_purchases if purchase_filters_active else purchases,
+            })
         rows.append(row)
     sort = str((query.get("sort") or ["last_desc"])[0])
     if sort == "spent_desc": rows.sort(key=lambda row: (-float(row["total_spent"]), str(row["name"])))
@@ -6677,7 +6686,7 @@ def query_customers(query, include_sensitive=False):
     offset = (page - 1) * per_page
     all_customers = list((store.get("customers") or {}).values())
     return {
-        "ok": True, "customers": rows[offset:offset + per_page], "total": total,
+        "ok": True, "customers": rows if export_all else rows[offset:offset + per_page], "total": total,
         "page": page, "per_page": per_page, "pages": max(1, math.ceil(total / per_page)),
         "summary": {
             "customers": len(all_customers),
@@ -16312,8 +16321,11 @@ def report_job_result(job_id, include_body=False):
 def start_report_job(request):
     report_type = str((request or {}).get("report_type") or "").lower()
     output_format = str((request or {}).get("format") or "xlsx").lower()
-    if report_type not in {"statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization"}:
-        raise RuntimeError("Selecione Vendas, Compras, Estatísticas, Catálogo, Anúncios ou Equalização para exportar.")
+    if report_type not in {
+        "statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization",
+        "dashboard_stock", "customers",
+    }:
+        raise RuntimeError("Selecione um relatório disponível para exportar.")
     if output_format not in {"xlsx", "pdf"}:
         raise RuntimeError("Formato de relatório inválido.")
     statistics_job_id = str((request or {}).get("statistics_job_id") or "")
@@ -16347,7 +16359,10 @@ def start_report_job(request):
             if report_type in {"statistics", "sales", "brand_sales", "purchases"} and statistics_job_id:
                 statistics_result = statistics_job_result(statistics_job_id).get("result")
             title, columns, rows, metadata = report_dataset(
-                read_payload(include_catalog=report_type in {"statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization"}),
+                read_payload(include_catalog=report_type in {
+                    "statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization",
+                    "dashboard_stock",
+                }),
                 report_type,
                 filters,
                 statistics_result,
@@ -16366,7 +16381,11 @@ def start_report_job(request):
                 body = build_report_xlsx(title, columns, rows, metadata)
                 content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             else:
-                body = build_report_pdf(title, columns, rows, metadata)
+                body = (
+                    build_customers_report_pdf(title, rows, metadata)
+                    if report_type == "customers"
+                    else build_report_pdf(title, columns, rows, metadata)
+                )
                 content_type = "application/pdf"
             filename = f"competidor-{report_type}-{stamp}.{output_format}"
             target = EXPORTS / f"{job_id}-{filename}"
@@ -16594,6 +16613,159 @@ def media_consistency_report_rows(payload, filters, report_mode):
 
 
 def report_dataset(payload, report_type, filters, statistics_result=None):
+    if report_type == "dashboard_stock":
+        period = str(filters.get("period") or "week").lower()
+        custom_from = str(filters.get("date_from") or "")[:10]
+        custom_to = str(filters.get("date_to") or custom_from)[:10]
+        today = datetime.now(APP_TZ).date()
+
+        def in_period(value):
+            occurred = parse_meli_datetime(value)
+            if not occurred:
+                return period == "week"
+            occurred_date = occurred.astimezone(APP_TZ).date()
+            if period == "today":
+                return occurred_date == today
+            if period == "yesterday":
+                return occurred_date == today - timedelta(days=1)
+            if period == "custom":
+                try:
+                    start = date.fromisoformat(custom_from)
+                    end = date.fromisoformat(custom_to)
+                except ValueError as exc:
+                    raise RuntimeError("Informe as datas inicial e final para exportar produtos sem estoque.") from exc
+                return start <= occurred_date <= end
+            return today - timedelta(days=7) <= occurred_date <= today
+
+        catalog_by_id = {
+            str(item.get("id") or ""): item for item in payload.get("catalog") or [] if item.get("id")
+        }
+        rows = []
+        for alert in payload.get("alerts") or []:
+            if alert.get("type") != "stock" or not alert.get("item_id") or not in_period(alert.get("created_at")):
+                continue
+            item = catalog_by_id.get(str(alert.get("item_id") or "")) or {}
+            rows.append({
+                "occurred_at": alert.get("created_at") or "",
+                "account": alert.get("account") or item.get("account") or "",
+                "sku": alert.get("sku") or item.get("sku") or "-",
+                "item_id": alert.get("item_id") or "",
+                "product": alert.get("product") or item.get("title") or alert.get("item_id") or "",
+                "stock": 0,
+                "price": item.get("price"),
+                "meli_status": normalized_meli_status(item.get("meli_status")) or item.get("status") or "",
+            })
+        rows.sort(key=lambda row: str(row.get("occurred_at") or ""), reverse=True)
+        period_labels = {
+            "today": "Hoje", "yesterday": "Ontem", "week": "Últimos 7 dias",
+            "custom": f"{custom_from} a {custom_to}",
+        }
+        return (
+            "Produtos sem estoque",
+            [
+                ("occurred_at", "Data da ocorrência", "datetime"),
+                ("account", "Conta", "text"),
+                ("sku", "SKU", "text"),
+                ("item_id", "Anúncio ML", "text"),
+                ("product", "Produto", "text"),
+                ("stock", "Estoque na ocorrência", "integer"),
+                ("price", "Preço atual", "currency"),
+                ("meli_status", "Status atual", "text"),
+            ],
+            rows,
+            {
+                "Período": period_labels.get(period, period_labels["week"]),
+                "Ocorrências": len(rows),
+                "Gerado em": now_label(),
+            },
+        )
+
+    if report_type == "customers":
+        customer_query = {
+            key: [str(value)] for key, value in (filters or {}).items()
+            if value not in (None, "")
+        }
+        customer_query["page"] = ["1"]
+        customer_query["per_page"] = ["100"]
+        result = query_customers(customer_query, include_sensitive=True, export_all=True)
+
+        def address_values(prefix, address):
+            address = address if isinstance(address, dict) else {}
+            return {
+                f"{prefix}_formatted": address.get("formatted") or "",
+                f"{prefix}_street": address.get("street_name") or "",
+                f"{prefix}_number": address.get("street_number") or "",
+                f"{prefix}_complement": address.get("comment") or "",
+                f"{prefix}_neighborhood": address.get("neighborhood") or "",
+                f"{prefix}_city": address.get("city") or "",
+                f"{prefix}_state": address.get("state") or "",
+                f"{prefix}_state_code": address.get("state_code") or "",
+                f"{prefix}_zip": address.get("zip_code") or "",
+                f"{prefix}_country": address.get("country") or "BR",
+            }
+
+        rows = []
+        for customer in result.get("customers") or []:
+            purchases = customer.get("purchases") or [{}]
+            for purchase in purchases:
+                rows.append({
+                    "customer_id": customer.get("id") or "",
+                    "name": customer.get("name") or "",
+                    "document_type": customer.get("document_type") or "",
+                    "document": customer.get("document") or "",
+                    "purchase_count": customer.get("purchase_count") or 0,
+                    "items_count": customer.get("items_count") or 0,
+                    "total_spent": customer.get("total_spent") or 0,
+                    **address_values("billing", customer.get("billing_address")),
+                    **address_values("delivery", customer.get("delivery_address")),
+                    "purchase_date": purchase.get("date") or "",
+                    "order_id": purchase.get("order_id") or "",
+                    "account": purchase.get("account") or "",
+                    "item_id": purchase.get("item_id") or "",
+                    "sku": purchase.get("sku") or "",
+                    "product": purchase.get("product") or "",
+                    "quantity": purchase.get("quantity") or 0,
+                    "unit_price": purchase.get("unit_price"),
+                    "line_total": purchase.get("line_total"),
+                    "order_total": purchase.get("order_total"),
+                    "status": purchase.get("status") or "",
+                    "shipping_id": purchase.get("shipping_id") or "",
+                })
+        columns = [
+            ("name", "Nome completo", "text"), ("document_type", "Tipo documento", "text"),
+            ("document", "CPF / CNPJ", "text"), ("billing_formatted", "Endereço fiscal completo", "text"),
+            ("billing_street", "Logradouro fiscal", "text"), ("billing_number", "Número fiscal", "text"),
+            ("billing_complement", "Complemento fiscal", "text"), ("billing_neighborhood", "Bairro fiscal", "text"),
+            ("billing_city", "Cidade fiscal", "text"), ("billing_state", "Estado fiscal", "text"),
+            ("billing_state_code", "UF fiscal", "text"), ("billing_zip", "CEP fiscal", "text"),
+            ("billing_country", "País fiscal", "text"), ("delivery_formatted", "Endereço de entrega completo", "text"),
+            ("delivery_street", "Logradouro entrega", "text"), ("delivery_number", "Número entrega", "text"),
+            ("delivery_complement", "Complemento entrega", "text"), ("delivery_neighborhood", "Bairro entrega", "text"),
+            ("delivery_city", "Cidade entrega", "text"), ("delivery_state", "Estado entrega", "text"),
+            ("delivery_state_code", "UF entrega", "text"), ("delivery_zip", "CEP entrega", "text"),
+            ("delivery_country", "País entrega", "text"), ("purchase_date", "Data da compra", "datetime"),
+            ("order_id", "Pedido", "text"), ("account", "Conta vendedora", "text"),
+            ("item_id", "Anúncio ML", "text"), ("sku", "SKU", "text"),
+            ("product", "Produto comprado", "text"), ("quantity", "Quantidade", "integer"),
+            ("unit_price", "Valor unitário", "currency"), ("line_total", "Total do item", "currency"),
+            ("order_total", "Valor pago no pedido", "currency"), ("status", "Status do pedido", "text"),
+            ("shipping_id", "Código do envio", "text"), ("purchase_count", "Compras do cliente", "integer"),
+            ("items_count", "Itens históricos", "integer"), ("total_spent", "Total histórico gasto", "currency"),
+        ]
+        return (
+            "Clientes filtrados para emissão de notas fiscais",
+            columns,
+            rows,
+            {
+                "Clientes filtrados": result.get("total") or 0,
+                "Linhas de compra": len(rows),
+                "Período das compras": f"{filters.get('date_from') or 'Início'} a {filters.get('date_to') or 'Hoje'}",
+                "Conta": filters.get("account") or "Todas",
+                "Uso": "Interno - emissão fiscal e logística",
+                "Gerado em": now_label(),
+            },
+        )
+
     if report_type == "purchases":
         result = statistics_result or query_purchase_intelligence(payload, filters)
         columns = [
@@ -16999,11 +17171,18 @@ def build_report_xlsx(title, columns, rows, metadata):
     header_fill = PatternFill("solid", fgColor="FFD600")
     header = []
     widths = [len(label) for _, label, _ in columns]
+    for row in rows:
+        for column_index, (key, _, _) in enumerate(columns):
+            value = row.get(key, "") if row.get(key, "") is not None else ""
+            widths[column_index] = max(widths[column_index], len(str(value or "")))
+    for column_index, width in enumerate(widths, 1):
+        sheet.column_dimensions[get_column_letter(column_index)].width = min(max(width + 2, 12), 46)
+    sheet.row_dimensions[1].height = 30
     for _, label, _ in columns:
         cell = WriteOnlyCell(sheet, value=label)
         cell.fill = header_fill
         cell.font = Font(bold=True, color="111827")
-        cell.alignment = Alignment(vertical="center")
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
         header.append(cell)
     sheet.append(header)
     for row in rows:
@@ -17018,12 +17197,14 @@ def build_report_xlsx(title, columns, rows, metadata):
                 cell.number_format = '0.00%'
             elif kind == "integer" and cell.value not in (None, ""):
                 cell.number_format = '#,##0'
-            widths[column_index] = max(widths[column_index], len(str(value or "")))
+            elif kind == "datetime" and cell.value not in (None, ""):
+                parsed = parse_meli_datetime(cell.value)
+                if parsed:
+                    cell.value = parsed.astimezone(APP_TZ).replace(tzinfo=None)
+                    cell.number_format = 'dd/mm/yyyy hh:mm'
             cells.append(cell)
         sheet.append(cells)
     sheet.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(rows) + 1}"
-    for column_index, width in enumerate(widths, 1):
-        sheet.column_dimensions[get_column_letter(column_index)].width = min(max(width + 2, 12), 46)
     info = workbook.create_sheet("FILTROS")
     title_cell = WriteOnlyCell(info, value=title)
     title_cell.font = Font(size=16, bold=True)
@@ -17035,6 +17216,150 @@ def build_report_xlsx(title, columns, rows, metadata):
     info.column_dimensions["B"].width = 65
     stream = BytesIO()
     workbook.save(stream)
+    return stream.getvalue()
+
+
+def build_customers_report_pdf(title, rows, metadata):
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    stream = BytesIO()
+    page_size = landscape(A4)
+    document = SimpleDocTemplate(
+        stream, pagesize=page_size, leftMargin=10 * mm, rightMargin=10 * mm,
+        topMargin=13 * mm, bottomMargin=12 * mm, title=title,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "customer-title", parent=styles["Title"], fontName="Helvetica-Bold",
+        fontSize=15, leading=18, textColor=colors.HexColor("#111827"), alignment=TA_LEFT,
+    )
+    label_style = ParagraphStyle(
+        "customer-label", parent=styles["BodyText"], fontName="Helvetica-Bold",
+        fontSize=7, leading=9, textColor=colors.HexColor("#6B7280"),
+    )
+    value_style = ParagraphStyle(
+        "customer-value", parent=styles["BodyText"], fontName="Helvetica",
+        fontSize=8, leading=10, textColor=colors.HexColor("#111827"),
+    )
+    table_header_style = ParagraphStyle(
+        "customer-table-header", parent=value_style, fontName="Helvetica-Bold",
+        fontSize=6.5, leading=7.5, alignment=TA_CENTER,
+    )
+    table_cell_style = ParagraphStyle(
+        "customer-table-cell", parent=value_style, fontSize=6.4, leading=7.5,
+    )
+    groups = {}
+    for row in rows:
+        key = str(row.get("customer_id") or row.get("document") or row.get("name") or "cliente")
+        groups.setdefault(key, []).append(row)
+
+    def field(label, value):
+        return [Paragraph(html.escape(label), label_style), Paragraph(html.escape(str(value or "Não informado")), value_style)]
+
+    def purchase_date_label(value):
+        parsed = parse_meli_datetime(value)
+        return parsed.astimezone(APP_TZ).strftime("%d/%m/%Y %H:%M") if parsed else str(value or "-")
+
+    def page_decor(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(colors.HexColor("#6B7280"))
+        canvas.setFont("Helvetica", 7)
+        canvas.drawString(10 * mm, 6 * mm, "CompeTIDOR - uso interno para emissão fiscal e logística")
+        canvas.drawRightString(page_size[0] - 10 * mm, 6 * mm, f"Página {doc.page}")
+        canvas.restoreState()
+
+    story = [Paragraph(html.escape(title), title_style)]
+    story.append(Paragraph(
+        " · ".join(
+            f"<b>{html.escape(str(key))}:</b> {html.escape(str(value))}"
+            for key, value in metadata.items()
+        ), value_style,
+    ))
+    story.append(Spacer(1, 5 * mm))
+    for group_index, purchases in enumerate(groups.values()):
+        if group_index:
+            story.append(PageBreak())
+        customer = purchases[0]
+        heading = Table(
+            [[
+                field("Nome completo", customer.get("name")),
+                field(customer.get("document_type") or "CPF / CNPJ", customer.get("document")),
+                field("Compras / itens", f"{customer.get('purchase_count') or 0} / {customer.get('items_count') or 0}"),
+                field("Total histórico", brl(customer.get("total_spent") or 0)),
+            ]],
+            colWidths=[92 * mm, 55 * mm, 42 * mm, 52 * mm],
+        )
+        heading.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFF7CC")),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#D6B500")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E5E7EB")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.extend([heading, Spacer(1, 3 * mm)])
+        addresses = Table(
+            [[
+                field("Endereço fiscal", customer.get("billing_formatted")),
+                field("Complemento / CEP fiscal", " · ".join(filter(None, [
+                    str(customer.get("billing_complement") or ""), str(customer.get("billing_zip") or ""),
+                ]))),
+                field("Endereço de entrega", customer.get("delivery_formatted")),
+                field("Complemento / CEP entrega", " · ".join(filter(None, [
+                    str(customer.get("delivery_complement") or ""), str(customer.get("delivery_zip") or ""),
+                ]))),
+            ]],
+            colWidths=[85 * mm, 40 * mm, 85 * mm, 40 * mm],
+        )
+        addresses.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F4F6")),
+            ("BOX", (0, 0), (-1, -1), 0.35, colors.HexColor("#9CA3AF")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D1D5DB")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.extend([addresses, Spacer(1, 4 * mm), Paragraph("Compras filtradas", styles["Heading3"])])
+        purchase_header = [
+            "Data", "Pedido", "Conta", "Produto", "SKU", "Qtd.", "Unitário",
+            "Total item", "Pago pedido", "Status",
+        ]
+        purchase_rows = [[Paragraph(value, table_header_style) for value in purchase_header]]
+        for purchase in purchases:
+            purchase_rows.append([
+                Paragraph(html.escape(purchase_date_label(purchase.get("purchase_date"))), table_cell_style),
+                Paragraph(html.escape(str(purchase.get("order_id") or "-")), table_cell_style),
+                Paragraph(html.escape(str(purchase.get("account") or "-")), table_cell_style),
+                Paragraph(html.escape(str(purchase.get("product") or "-")), table_cell_style),
+                Paragraph(html.escape(str(purchase.get("sku") or "-")), table_cell_style),
+                Paragraph(html.escape(str(purchase.get("quantity") or 0)), table_cell_style),
+                Paragraph(html.escape(brl(purchase.get("unit_price") or 0)), table_cell_style),
+                Paragraph(html.escape(brl(purchase.get("line_total") or 0)), table_cell_style),
+                Paragraph(html.escape(brl(purchase.get("order_total") or 0)), table_cell_style),
+                Paragraph(html.escape(str(purchase.get("status") or "-")), table_cell_style),
+            ])
+        purchase_table = Table(
+            purchase_rows,
+            colWidths=[25 * mm, 28 * mm, 27 * mm, 60 * mm, 25 * mm, 12 * mm, 25 * mm, 25 * mm, 27 * mm, 22 * mm],
+            repeatRows=1,
+        )
+        purchase_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#FFD600")),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#9CA3AF")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F9FAFB")]),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.append(purchase_table)
+    if not groups:
+        story.append(Paragraph("Nenhum cliente corresponde aos filtros aplicados.", value_style))
+    document.build(story, onFirstPage=page_decor, onLaterPages=page_decor)
     return stream.getvalue()
 
 
@@ -17093,6 +17418,10 @@ def build_report_pdf(title, columns, rows, metadata):
                     value = brl(value)
                 elif kind == "percent" and value not in (None, ""):
                     value = f"{float(value):.2f}%"
+                elif kind == "datetime" and value not in (None, ""):
+                    parsed = parse_meli_datetime(value)
+                    if parsed:
+                        value = parsed.astimezone(APP_TZ).strftime("%d/%m/%Y %H:%M")
                 values.append(Paragraph(html.escape(str(value if value not in (None, "") else "-")), cell_style))
             table_rows.append(values)
         table = LongTable(table_rows, colWidths=widths, repeatRows=1, hAlign="LEFT")
@@ -18671,6 +19000,8 @@ class App(BaseHTTPRequestHandler):
             job = report_job_result(job_id, include_body=download)
             if not job:
                 self.send_json({"error": "Relatório não encontrado ou expirado."}, status=404)
+            elif job.get("report_type") == "customers" and not can_manage_users(self.current_user(payload)):
+                self.send_json({"error": "Somente master e administradores podem baixar dados pessoais de clientes."}, status=403)
             elif download:
                 if job.get("status") != "completed" or not job.get("path"):
                     self.send_json({"error": job.get("message") or "O relatório ainda não está pronto."}, status=409)
@@ -19373,6 +19704,9 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/reports/export":
             try:
+                if str(request.get("report_type") or "").lower() == "customers" and not can_manage_users(self.current_user(payload)):
+                    self.send_json({"error": "Somente master e administradores podem exportar dados pessoais de clientes."}, status=403)
+                    return
                 job = start_report_job(request)
                 self.send_json({"ok": True, **job}, status=202)
             except Exception as exc:
