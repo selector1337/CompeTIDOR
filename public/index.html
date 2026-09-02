@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260902-filtered-exports-v1" />
+  <link rel="stylesheet" href="/styles.css?v=20260902-assisted-publisher-v1" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -42,6 +42,7 @@
         <a href="#/contas" data-route="contas" aria-label="Contas" title="Contas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8-6h5v2h-5V5Zm0 4h5v2h-5V9ZM3 21v-2a5 5 0 0 1 10 0v2H3Zm12-6h6v2h-6v-2Zm0 4h6v2h-6v-2Z"/></svg></span><strong>Contas</strong></a>
         <a href="#/catalogo" data-route="catalogo" aria-label="Catálogo" title="Catálogo"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8ZM7.5 8.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/></svg></span><strong>Catálogo</strong></a>
         <a href="#/anuncios" data-route="anuncios" aria-label="Anúncios" title="Anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16v4H4V5Zm0 6h16v8H4v-8Zm3 2v2h7v-2H7Zm0 3v1h10v-1H7Z"/></svg></span><strong>Anúncios</strong></a>
+        <a href="#/anunciar" data-route="anunciar" aria-label="Anunciar Produtos" title="Anunciar Produtos"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 3h12l4 4v14H4V3Zm11 1.8V8h3.2L15 4.8ZM8 11v2h3v3h2v-3h3v-2h-3V8h-2v3H8Zm0 7h8v-2H8v2Z"/></svg></span><strong>Anunciar Produtos</strong></a>
         <a href="#/copiar" data-route="copiar" aria-label="Copiar anúncios" title="Copiar anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 8h11v13H8V8Zm-3 8H3V3h13v2H5v11Z"/></svg></span><strong>Copiar anúncios</strong></a>
         <a href="#/kits" data-route="kits" aria-label="Anunciar Kits" title="Anunciar Kits"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Zm-7 9 7 4 7-4v6l-7 4-7-4v-6Zm7-1.3L16.9 7 12 4.3 7.1 7 12 9.7Z"/></svg></span><strong>Anunciar Kits</strong></a>
         <a href="#/scan" data-route="scan" aria-label="Scan" title="Scan"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2Zm1 1v10l7.1 7.1 1.4-1.4-6.5-6.5V3h-2Zm-1 5a4 4 0 1 0 4 4h-2a2 2 0 1 1-2-2V8Z"/></svg></span><strong>Scan</strong></a>
@@ -949,6 +950,85 @@
         </div>
       </section>
 
+      <section class="page" id="page-anunciar">
+        <div class="panel assisted-publisher">
+          <div class="panel-heading compact publisher-heading">
+            <div>
+              <p class="eyebrow">Cadastro inteligente por link</p>
+              <h2>Anunciar Produtos</h2>
+              <p class="publisher-subtitle">Importe dados públicos, traduza e adapte o conteúdo, confira a ficha técnica e publique nas contas selecionadas.</p>
+            </div>
+            <div class="publisher-stepper" aria-label="Etapas do cadastro"><span class="active" data-publisher-step="1">1 Importar</span><span data-publisher-step="2">2 Revisar</span><span data-publisher-step="3">3 Publicar</span></div>
+          </div>
+          <form id="product-import-form" class="publisher-import-form">
+            <label>Link do produto
+              <input name="url" type="url" inputmode="url" placeholder="https://www.mercadolivre.com.br/..." required />
+              <small>Mercado Livre, Amazon, B&amp;H Photo ou Sweetwater.</small>
+            </label>
+            <button class="primary" type="submit">Importar e preparar</button>
+          </form>
+          <div id="product-import-progress" class="manual-progress publisher-progress" hidden><strong>Preparando produto</strong><div><span></span></div><small></small></div>
+          <div id="product-draft-empty" class="publisher-empty"><span>＋</span><strong>Comece colando o link de um produto</strong><small>A aplicação aproveitará título, especificações e fotos e consultará categoria, atributos e catálogo no Mercado Livre.</small></div>
+          <form id="product-publish-form" hidden>
+            <div class="publisher-source-card">
+              <img id="publisher-source-thumb" alt="Imagem principal do produto" />
+              <div><small>Produto identificado</small><strong id="publisher-source-title"></strong><a id="publisher-source-link" href="#" target="_blank" rel="noreferrer">Abrir página de origem</a></div>
+              <span id="publisher-source-badge">Dados importados</span>
+            </div>
+            <div class="publisher-grid">
+              <section class="publisher-editor-card">
+                <div class="item-picker-head"><strong>Conteúdo do anúncio</strong><small>Revise antes de publicar</small></div>
+                <div class="publisher-fields-grid">
+                  <label class="span-2">Título sugerido <input name="title" maxlength="60" required /><small id="publisher-title-counter">0/60</small></label>
+                  <label>Marca <input name="brand" /></label>
+                  <label>Modelo <input name="model" /></label>
+                  <label>MPN / part number <input name="mpn" /></label>
+                  <label>EAN / UPC / GTIN <input name="gtin" inputmode="numeric" /></label>
+                  <label class="span-2">Categoria prevista
+                    <select name="category_id" required></select>
+                    <small>Você pode escolher uma das três previsões oficiais.</small>
+                  </label>
+                  <label class="span-2">Produto de catálogo
+                    <select name="catalog_product_id"><option value="">Anúncio tradicional / sem vínculo automático</option></select>
+                  </label>
+                  <label class="publisher-check span-2"><input name="catalog_listing" type="checkbox" /><span><strong>Publicar diretamente no catálogo</strong><small>Use somente quando a correspondência acima for exatamente o mesmo produto.</small></span></label>
+                  <label class="span-2">Descrição adaptada <textarea name="description" rows="12" maxlength="50000"></textarea></label>
+                </div>
+              </section>
+              <section class="publisher-editor-card">
+                <div class="item-picker-head"><strong>Fotos importadas</strong><small>Desmarque o que não deseja usar</small></div>
+                <div id="publisher-pictures" class="publisher-pictures"></div>
+                <div class="notice span-2">As imagens selecionadas serão enviadas diretamente ao Mercado Livre na ordem exibida.</div>
+              </section>
+              <section class="publisher-editor-card span-2">
+                <div class="item-picker-head"><strong>Ficha técnica</strong><small>Campos obrigatórios aparecem primeiro</small></div>
+                <div id="publisher-attributes" class="publisher-attributes"></div>
+              </section>
+              <section class="publisher-editor-card">
+                <div class="item-picker-head"><strong>Dados comerciais</strong><small>Preencha o que muda na sua operação</small></div>
+                <div class="publisher-fields-grid">
+                  <label>SKU <input name="sku" required /></label>
+                  <label>Estoque <input name="stock" type="number" min="0" step="1" value="1" required /></label>
+                  <label>Disponibilidade <span class="unit-field"><input name="manufacturing_time" type="number" min="0" max="45" step="1" value="0" /><span>dias</span></span><small>Use 0 para envio imediato.</small></label>
+                  <label>Condição <select name="condition"><option value="new">Novo</option><option value="used">Usado</option></select></label>
+                </div>
+                <div class="publisher-variants">
+                  <label><input name="variant_classic" type="checkbox" checked /><span><strong>Clássico</strong><small>gold_special</small></span><span class="money-field"><input name="classic_price" type="number" min="0.01" step="0.01" placeholder="Preço" /></span></label>
+                  <label><input name="variant_premium" type="checkbox" /><span><strong>Premium</strong><small>gold_pro</small></span><span class="money-field"><input name="premium_price" type="number" min="0.01" step="0.01" placeholder="Preço" /></span></label>
+                </div>
+              </section>
+              <section class="publisher-editor-card">
+                <div class="item-picker-head"><strong>Contas para publicação</strong><small>Crie em uma ou várias contas</small></div>
+                <div id="publisher-accounts" class="publisher-accounts"></div>
+              </section>
+            </div>
+            <div id="publisher-validation" class="publisher-validation" hidden></div>
+            <div class="publisher-actions"><button id="publisher-validate" class="ghost" type="button">Validar no Mercado Livre</button><button class="primary" type="submit">Publicar anúncios</button></div>
+          </form>
+          <div id="publisher-results" class="publisher-results"></div>
+        </div>
+      </section>
+
       <section class="page" id="page-usuarios">
         <div class="panel">
           <div class="panel-heading">
@@ -1358,6 +1438,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260902-filtered-exports-v1"></script>
+  <script src="/app.js?v=20260902-assisted-publisher-v1"></script>
   </body>
 </html>

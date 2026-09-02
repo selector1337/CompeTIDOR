@@ -143,6 +143,9 @@
   kitDragIndex: null,
   kitLoading: false,
   kitPendingFields: [],
+  productDraft: null,
+  productImportLoading: false,
+  productPublishing: false,
   returnsData: null,
   returnsLoading: false,
   returnsError: "",
@@ -189,6 +192,7 @@ const pageTitles = {
   contas: ["OAuth oficial", "Contas Mercado Livre"],
   catalogo: ["Catálogo Mercado Livre", "Disputa de catálogo"],
   anuncios: ["Gestão operacional", "Anúncios"],
+  anunciar: ["Cadastro inteligente", "Anunciar Produtos"],
   copiar: ["Multiplicar anúncios", "Copiar anúncios específicos"],
   kits: ["Composição de produtos", "Anunciar Kits"],
   concorrentes: ["Monitoramento", "Concorrentes"],
@@ -655,6 +659,7 @@ function renderRoute() {
     },
     catalogo: renderCatalog,
     anuncios: renderAds,
+    anunciar: renderAssistedPublisher,
     copiar: renderClone,
     kits: renderKits,
     concorrentes: renderCompetitors,
@@ -5021,6 +5026,130 @@ function renderClone() {
     .join("");
 }
 
+function renderAssistedPublisher() {
+  const form = document.querySelector("#product-publish-form");
+  const empty = document.querySelector("#product-draft-empty");
+  if (form) form.hidden = !state.productDraft;
+  if (empty) empty.hidden = Boolean(state.productDraft) || state.productImportLoading;
+  document.querySelectorAll("[data-publisher-step]").forEach((step) => {
+    step.classList.toggle("active", Number(step.dataset.publisherStep) <= (state.productDraft ? 2 : 1));
+  });
+}
+
+function publisherAttributeInput(attribute) {
+  const required = attribute.required ? "required" : "";
+  if (attribute.options?.length) {
+    const matched = attribute.options.find((option) => String(option.name).toLowerCase() === String(attribute.value || "").toLowerCase());
+    return `<select data-publisher-attribute="${escapeAttr(attribute.id)}" ${required}>
+      <option value="">Selecione</option>
+      ${attribute.options.map((option) => `<option value="${escapeAttr(option.id || option.name)}" data-value-name="${escapeAttr(option.name)}" ${matched && String(matched.id || matched.name) === String(option.id || option.name) ? "selected" : ""}>${escapeText(option.name)}</option>`).join("")}
+    </select>`;
+  }
+  return `<input data-publisher-attribute="${escapeAttr(attribute.id)}" value="${escapeAttr(attribute.value || "")}" ${required} />`;
+}
+
+function renderPublisherAttributes(attributes) {
+  const root = document.querySelector("#publisher-attributes");
+  if (!root) return;
+  const rows = [...(attributes || [])].sort((a, b) => Number(b.required) - Number(a.required));
+  root.innerHTML = rows.map((attribute) => `
+    <label class="${attribute.required ? "required" : ""}">${escapeText(attribute.name || attribute.id)}${attribute.required ? " *" : ""}
+      ${publisherAttributeInput(attribute)}
+      <small>${escapeText(attribute.id)}${attribute.required ? " · obrigatório" : ""}</small>
+    </label>
+  `).join("") || `<div class="notice">A categoria não retornou campos adicionais para preenchimento.</div>`;
+}
+
+function applyAssistedProduct(product) {
+  state.productDraft = product;
+  const form = document.querySelector("#product-publish-form");
+  if (!form) return;
+  form.hidden = false;
+  document.querySelector("#product-draft-empty").hidden = true;
+  form.elements.title.value = product.title || "";
+  form.elements.brand.value = product.brand || "";
+  form.elements.model.value = product.model || "";
+  form.elements.mpn.value = product.mpn || "";
+  form.elements.gtin.value = product.gtin || "";
+  form.elements.description.value = product.description || "";
+  form.elements.stock.value = 1;
+  form.elements.manufacturing_time.value = 0;
+  const sourcePrice = String(product.source_currency || "").toUpperCase() === "BRL" ? Number(product.source_price || 0) : 0;
+  form.elements.classic_price.value = sourcePrice || "";
+  form.elements.premium_price.value = sourcePrice || "";
+  document.querySelector("#publisher-source-title").textContent = product.source_title || product.title || "Produto importado";
+  const sourceLink = document.querySelector("#publisher-source-link");
+  sourceLink.href = product.source_url || "#";
+  const sourceThumb = document.querySelector("#publisher-source-thumb");
+  sourceThumb.src = product.pictures?.[0] || "";
+  sourceThumb.hidden = !product.pictures?.[0];
+  document.querySelector("#publisher-source-badge").textContent = product.translated ? "Traduzido e adaptado" : "Dados importados";
+  const categories = product.category_suggestions || [];
+  form.elements.category_id.innerHTML = categories.length
+    ? categories.map((row, index) => `<option value="${escapeAttr(row.category_id)}" data-domain-id="${escapeAttr(row.domain_id || "")}" ${row.category_id === product.category_id || (!product.category_id && index === 0) ? "selected" : ""}>${escapeText(row.category_name || row.category_id)} · ${escapeText(row.category_id)}</option>`).join("")
+    : `<option value="${escapeAttr(product.category_id || "")}">${escapeText(product.category_id || "Categoria não identificada")}</option>`;
+  const catalog = form.elements.catalog_product_id;
+  catalog.innerHTML = `<option value="">Anúncio tradicional / sem vínculo automático</option>${(product.catalog_candidates || []).map((row) => `<option value="${escapeAttr(row.id)}" ${row.id === product.catalog_product_id ? "selected" : ""}>${escapeText(row.name)} · ${escapeText(row.id)}${row.listing_strategy ? ` · ${escapeText(row.listing_strategy)}` : ""}</option>`).join("")}`;
+  document.querySelector("#publisher-pictures").innerHTML = (product.pictures || []).map((url, index) => `
+    <label class="publisher-picture"><input type="checkbox" data-publisher-picture value="${escapeAttr(url)}" checked /><span>${index + 1}</span><img src="${escapeAttr(url)}" alt="Foto ${index + 1}" loading="lazy" /></label>
+  `).join("") || `<div class="notice danger-notice">Nenhuma foto foi identificada. Use outro link com imagens públicas.</div>`;
+  renderPublisherAttributes(product.attributes || []);
+  const accounts = product.accounts?.length ? product.accounts : connectedAccounts();
+  document.querySelector("#publisher-accounts").innerHTML = accounts.map((account, index) => `
+    <label><input type="checkbox" data-publisher-account value="${escapeAttr(account.id)}" ${index === 0 ? "checked" : ""} /><span><strong>${escapeText(account.nickname)}</strong><small>Seller ${escapeText(account.seller_id || "-")}</small></span></label>
+  `).join("") || `<div class="notice danger-notice">Nenhuma conta oficial conectada.</div>`;
+  document.querySelector("#publisher-results").innerHTML = "";
+  document.querySelector("#publisher-validation").hidden = true;
+  updatePublisherTitleCounter();
+  renderAssistedPublisher();
+}
+
+function updatePublisherTitleCounter() {
+  const input = document.querySelector('#product-publish-form [name="title"]');
+  const counter = document.querySelector("#publisher-title-counter");
+  if (!input || !counter) return;
+  counter.textContent = `${input.value.length}/60`;
+  counter.classList.toggle("limit", input.value.length >= 55);
+}
+
+function collectAssistedPublication() {
+  const form = document.querySelector("#product-publish-form");
+  const values = new FormData(form);
+  const categoryOption = form.elements.category_id.selectedOptions[0];
+  const attributes = [...form.querySelectorAll("[data-publisher-attribute]")].map((input) => {
+    if (input.tagName === "SELECT") {
+      const option = input.selectedOptions[0];
+      return { id: input.dataset.publisherAttribute, value_id: input.value, value: option?.dataset.valueName || option?.textContent || "" };
+    }
+    return { id: input.dataset.publisherAttribute, value: input.value.trim() };
+  }).filter((row) => row.value || row.value_id);
+  const variants = [];
+  if (values.get("variant_classic")) variants.push({ listing_type_id: "gold_special", price: values.get("classic_price") });
+  if (values.get("variant_premium")) variants.push({ listing_type_id: "gold_pro", price: values.get("premium_price") });
+  return {
+    account_ids: [...form.querySelectorAll("[data-publisher-account]:checked")].map((input) => input.value),
+    variants,
+    draft: {
+      source_url: state.productDraft?.source_url || "",
+      title: values.get("title"), brand: values.get("brand"), model: values.get("model"), mpn: values.get("mpn"), gtin: values.get("gtin"),
+      description: values.get("description"), category_id: values.get("category_id"), domain_id: categoryOption?.dataset.domainId || "",
+      catalog_product_id: values.get("catalog_product_id"), catalog_listing: Boolean(values.get("catalog_listing")),
+      sku: values.get("sku"), stock: values.get("stock"), manufacturing_time: values.get("manufacturing_time"), condition: values.get("condition"),
+      pictures: [...form.querySelectorAll("[data-publisher-picture]:checked")].map((input) => input.value),
+      attributes,
+    },
+  };
+}
+
+function renderPublisherResults(result) {
+  const root = document.querySelector("#publisher-results");
+  if (!root) return;
+  root.innerHTML = `<div class="publisher-result-summary"><strong>${Number(result.created || 0)} anúncio(s) criado(s)</strong><span>${Number(result.failed || 0)} falha(s)</span></div>
+    <div class="publisher-result-grid">${(result.results || []).map((row) => row.status === "created" ? `
+      <a href="${escapeAttr(row.permalink || "#")}" target="_blank" rel="noreferrer"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"}</small><strong>${escapeText(row.item_id || "Criado")}</strong><span>${escapeText(row.title || "")}</span></a>
+    ` : `<article class="error"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"}</small><strong>Não publicado</strong><span>${escapeText(row.error || "Erro não identificado")}</span></article>`).join("")}</div>`;
+}
+
 function cloneCreatedHtml(items) {
   return `
     <div class="clone-created-grid">
@@ -7230,6 +7359,119 @@ function updateCloneTitleCounter() {
 }
 
 document.querySelector('[name="title_override"]')?.addEventListener("input", updateCloneTitleCounter);
+
+document.querySelector('#product-publish-form [name="title"]')?.addEventListener("input", updatePublisherTitleCounter);
+
+document.querySelector('#product-publish-form [name="category_id"]')?.addEventListener("change", async (event) => {
+  if (!state.productDraft) return;
+  const select = event.currentTarget;
+  select.disabled = true;
+  try {
+    const result = await api("/api/products/category", {
+      method: "POST",
+      body: JSON.stringify({ category_id: select.value, product: state.productDraft }),
+    });
+    state.productDraft.category_id = result.category_id;
+    state.productDraft.attributes = result.attributes || [];
+    renderPublisherAttributes(result.attributes || []);
+    showToast("Ficha técnica atualizada para a categoria selecionada.");
+  } catch (error) {
+    showToast(error.message || "Não foi possível carregar a ficha técnica desta categoria.", "error");
+  } finally {
+    select.disabled = false;
+  }
+});
+
+document.querySelector("#product-import-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  const progress = document.querySelector("#product-import-progress");
+  const progressBar = progress?.querySelector("span");
+  const progressText = progress?.querySelector("small");
+  const values = new FormData(event.currentTarget);
+  state.productImportLoading = true;
+  renderAssistedPublisher();
+  if (progress) progress.hidden = false;
+  if (progressBar) progressBar.style.width = "12%";
+  if (button) { button.disabled = true; button.textContent = "Lendo produto..."; }
+  try {
+    const queued = await api("/api/products/import", {
+      method: "POST",
+      body: JSON.stringify({ url: values.get("url") }),
+    });
+    const result = await waitForAsyncOperation(queued, (message) => {
+      if (progressText) progressText.textContent = message || "Consultando dados e categoria.";
+      if (progressBar) progressBar.style.width = message.includes("catálogo") ? "82%" : "55%";
+    });
+    if (progressBar) progressBar.style.width = "100%";
+    applyAssistedProduct(result.product);
+    showToast("Produto importado. Revise os dados antes de publicar.");
+  } catch (error) {
+    showToast(error.message || "Não foi possível importar este produto.", "error");
+    document.querySelector("#product-draft-empty").hidden = false;
+  } finally {
+    state.productImportLoading = false;
+    if (progress) progress.hidden = true;
+    if (button) { button.disabled = false; button.textContent = "Importar e preparar"; }
+    renderAssistedPublisher();
+  }
+});
+
+document.querySelector("#publisher-validate")?.addEventListener("click", async (event) => {
+  const form = document.querySelector("#product-publish-form");
+  if (!form.reportValidity()) return;
+  const button = event.currentTarget;
+  const validation = document.querySelector("#publisher-validation");
+  button.disabled = true;
+  button.textContent = "Validando...";
+  try {
+    const queued = await api("/api/products/validate", {
+      method: "POST",
+      body: JSON.stringify(collectAssistedPublication()),
+    });
+    const result = await waitForAsyncOperation(queued, () => {});
+    validation.hidden = false;
+    validation.className = `publisher-validation ${result.valid ? "success" : "error"}`;
+    validation.innerHTML = `<strong>${result.valid ? "Estrutura aceita" : "Ajuste necessário"}</strong><span>${escapeText(result.message || "")}</span>`;
+    showToast(result.message, result.valid ? "success" : "error");
+  } catch (error) {
+    validation.hidden = false;
+    validation.className = "publisher-validation error";
+    validation.innerHTML = `<strong>Não foi possível validar</strong><span>${escapeText(error.message || "Erro não identificado")}</span>`;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Validar no Mercado Livre";
+  }
+});
+
+document.querySelector("#product-publish-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!event.currentTarget.reportValidity() || state.productPublishing) return;
+  const request = collectAssistedPublication();
+  if (!request.account_ids.length) return showToast("Selecione ao menos uma conta.", "error");
+  if (!request.variants.length) return showToast("Selecione Clássico, Premium ou ambos.", "error");
+  if (!request.draft.pictures.length) return showToast("Selecione ao menos uma foto.", "error");
+  const total = request.account_ids.length * request.variants.length;
+  if (!window.confirm(`Publicar ${total} anúncio(s) oficialmente no Mercado Livre?`)) return;
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  state.productPublishing = true;
+  button.disabled = true;
+  button.textContent = "Publicando...";
+  document.querySelectorAll("[data-publisher-step]").forEach((step) => step.classList.add("active"));
+  try {
+    const queued = await api("/api/products/publish", { method: "POST", body: JSON.stringify(request) });
+    const result = await waitForAsyncOperation(queued, (message) => { button.textContent = message || "Publicando..."; });
+    renderPublisherResults(result);
+    showToast(`${result.created || 0} anúncio(s) criado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`, result.failed ? "error" : "success");
+    if (state.catalogLoaded) await loadCatalogInBackground(true);
+  } catch (error) {
+    showToast(error.message || "Não foi possível publicar os anúncios.", "error");
+  } finally {
+    state.productPublishing = false;
+    button.disabled = false;
+    button.textContent = "Publicar anúncios";
+  }
+});
 
 document.querySelector("#clone-form").addEventListener("submit", async (event) => {
   event.preventDefault();

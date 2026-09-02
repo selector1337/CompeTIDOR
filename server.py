@@ -2,7 +2,8 @@
 from pathlib import Path
 from datetime import date, datetime, time as datetime_time, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
+from html.parser import HTMLParser
 from io import BytesIO
 import base64
 import copy
@@ -2016,6 +2017,9 @@ class MercadoLivreClient:
     def create_item(self, payload):
         return self.post("/items", payload)
 
+    def validate_item(self, payload):
+        return self.post("/items/validate", payload)
+
     def upload_item_picture(self, content, filename="kit.jpg", content_type="image/jpeg"):
         path = "/pictures/items/upload"
         validate_meli_path(path)
@@ -2858,6 +2862,471 @@ def resolve_scan_target(payload, target_id):
         "_scan_validation_source": validation_source,
     }
     return item
+
+
+PRODUCT_IMPORT_HOSTS = {
+    "mercadolivre.com.br", "mercadolivre.com", "mercadolibre.com",
+    "amazon.com.br", "amazon.com", "a.co", "amzn.to",
+    "bhphotovideo.com", "sweetwater.com",
+}
+
+
+def product_import_host(url):
+    parsed = urlparse(str(url or "").strip())
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or not host:
+        raise RuntimeError("Informe um link HTTPS válido do Mercado Livre, Amazon, B&H Photo ou Sweetwater.")
+    allowed = next((domain for domain in PRODUCT_IMPORT_HOSTS if host == domain or host.endswith(f".{domain}")), "")
+    if not allowed:
+        raise RuntimeError("Este domínio ainda não é aceito no cadastro assistido.")
+    return host
+
+
+class ProductPageParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.meta = {}
+        self.images = []
+        self.title_parts = []
+        self.json_parts = []
+        self.in_title = False
+        self.in_json = False
+
+    def handle_starttag(self, tag, attrs):
+        values = {str(key).lower(): value for key, value in attrs}
+        tag = tag.lower()
+        if tag == "title":
+            self.in_title = True
+        elif tag == "script" and "ld+json" in str(values.get("type") or "").lower():
+            self.in_json = True
+            self.json_parts.append([])
+        elif tag == "meta":
+            key = str(values.get("property") or values.get("name") or "").lower()
+            content = values.get("content")
+            if key and content and key not in self.meta:
+                self.meta[key] = content
+        elif tag == "img":
+            source = values.get("data-old-hires") or values.get("data-zoom-image") or values.get("data-src") or values.get("src")
+            if source:
+                self.images.append(source)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self.in_title = False
+        elif tag.lower() == "script" and self.in_json:
+            self.in_json = False
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title_parts.append(data)
+        if self.in_json and self.json_parts:
+            self.json_parts[-1].append(data)
+
+
+def clean_product_text(value, maximum=12000):
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:maximum]
+
+
+def product_json_nodes(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from product_json_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from product_json_nodes(child)
+
+
+def first_product_json_ld(parser):
+    fallback = None
+    for parts in parser.json_parts:
+        raw = "".join(parts).strip()
+        if not raw:
+            continue
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        for node in product_json_nodes(decoded):
+            node_type = node.get("@type")
+            types = node_type if isinstance(node_type, list) else [node_type]
+            if any(str(value or "").lower() == "product" for value in types):
+                return node
+            if fallback is None and node.get("name") and (node.get("image") or node.get("offers")):
+                fallback = node
+    return fallback or {}
+
+
+def product_page_download(url):
+    product_import_host(url)
+    request = urllib.request.Request(
+        str(url).strip(),
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip",
+        },
+    )
+    maximum = max(512_000, min(8_000_000, int(os.getenv("COMPETIDOR_PRODUCT_IMPORT_MAX_BYTES", "4000000"))))
+    with urllib.request.urlopen(request, timeout=18) as response:
+        final_url = response.geturl()
+        product_import_host(final_url)
+        content_type = str(response.headers.get("Content-Type") or "").lower()
+        if "html" not in content_type:
+            raise RuntimeError("O link não retornou uma página de produto em HTML.")
+        body = response.read(maximum + 1)
+        if len(body) > maximum:
+            raise RuntimeError("A página do produto é maior do que o limite de importação.")
+        if str(response.headers.get("Content-Encoding") or "").lower() == "gzip":
+            body = gzip.decompress(body)
+        charset = response.headers.get_content_charset() or "utf-8"
+    return body.decode(charset, errors="replace"), final_url
+
+
+PRODUCT_TITLE_TRANSLATIONS = (
+    (r"\bpowered speaker\b", "caixa de som ativa"),
+    (r"\bstudio monitor\b", "monitor de áudio"),
+    (r"\baudio interface\b", "interface de áudio"),
+    (r"\bmixing console\b", "mesa de som"),
+    (r"\bmicrophone stand\b", "pedestal para microfone"),
+    (r"\bkeyboard stand\b", "suporte para teclado"),
+    (r"\binstrument cable\b", "cabo para instrumento"),
+    (r"\bguitar cable\b", "cabo para guitarra"),
+    (r"\bwireless microphone\b", "microfone sem fio"),
+    (r"\bdynamic microphone\b", "microfone dinâmico"),
+    (r"\bcondenser microphone\b", "microfone condensador"),
+    (r"\bheadphones\b", "fone de ouvido"),
+    (r"\bearphones\b", "fone de ouvido"),
+    (r"\bmicrophone\b", "microfone"),
+    (r"\bwireless\b", "sem fio"),
+    (r"\brecording\b", "gravação"),
+    (r"\bprofessional\b", "profissional"),
+    (r"\bdigital\b", "digital"),
+    (r"\bportable\b", "portátil"),
+    (r"\bcamera\b", "câmera"),
+    (r"\blens\b", "lente"),
+    (r"\btripod\b", "tripé"),
+    (r"\bfrequency response\b", "resposta de frequência"),
+    (r"\bfrequency\b", "frequência"),
+    (r"\bpolar pattern\b", "padrão polar"),
+    (r"\bcable length\b", "comprimento do cabo"),
+    (r"\bconnector type\b", "tipo de conector"),
+    (r"\bconnectors\b", "conectores"),
+    (r"\bimpedance\b", "impedância"),
+    (r"\bsensitivity\b", "sensibilidade"),
+    (r"\bdimensions\b", "dimensões"),
+    (r"\bweight\b", "peso"),
+    (r"\bcolor\b", "cor"),
+    (r"\bpower\b", "potência"),
+    (r"\bblack\b", "preto"),
+    (r"\bwhite\b", "branco"),
+    (r"\bsilver\b", "prata"),
+)
+
+
+def translate_product_text(value):
+    text = clean_product_text(value)
+    for pattern, replacement in PRODUCT_TITLE_TRANSLATIONS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def optimized_product_title(name, brand="", model=""):
+    title = translate_product_text(name)
+    title = re.split(r"\s+[|–—]\s+", title, maxsplit=1)[0]
+    title = re.sub(r"\b(?:free shipping|frete grátis|in stock|new)\b", "", title, flags=re.IGNORECASE)
+    parts = [re.sub(r"\s+", " ", title).strip(" -")]
+    for value in (brand, model):
+        clean = clean_product_text(value, 120)
+        if clean and clean.lower() not in " ".join(parts).lower():
+            parts.append(clean)
+    title = " ".join(filter(None, parts))
+    if title:
+        stop_words = {"a", "as", "com", "da", "das", "de", "do", "dos", "e", "em", "para", "por", "sem"}
+        words = title.split()
+        title = " ".join(
+            word.lower() if index and word.lower() in stop_words
+            else word.capitalize() if word.islower()
+            else word
+            for index, word in enumerate(words)
+        )
+    if len(title) <= 60:
+        return title
+    clipped = title[:60].rsplit(" ", 1)[0]
+    return (clipped or title[:60]).strip()
+
+
+def product_image_urls(values, base_url=""):
+    if isinstance(values, str):
+        values = [values]
+    rows = []
+    for value in values or []:
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("contentUrl") or value.get("secure_url")
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        url = urljoin(base_url, raw)
+        parsed = urlparse(url)
+        if parsed.scheme in {"http", "https"} and parsed.netloc and url not in rows:
+            rows.append(url)
+    return rows[:12]
+
+
+def product_offer_data(value):
+    if isinstance(value, list):
+        value = next((row for row in value if isinstance(row, dict)), {})
+    value = value if isinstance(value, dict) else {}
+    price = value.get("price") or value.get("lowPrice") or value.get("highPrice") or 0
+    try:
+        price = round(parse_decimal_number(price), 2)
+    except (TypeError, ValueError):
+        price = 0
+    return price, value.get("priceCurrency") or ""
+
+
+def parse_external_product_page(page_html, page_url):
+    parser = ProductPageParser()
+    parser.feed(page_html)
+    node = first_product_json_ld(parser)
+    brand = node.get("brand") or ""
+    if isinstance(brand, dict):
+        brand = brand.get("name") or ""
+    offers_price, currency = product_offer_data(node.get("offers"))
+    name = node.get("name") or parser.meta.get("og:title") or "".join(parser.title_parts)
+    description = node.get("description") or parser.meta.get("og:description") or parser.meta.get("description") or ""
+    images = product_image_urls(
+        [*(node.get("image") if isinstance(node.get("image"), list) else [node.get("image")]), parser.meta.get("og:image")],
+        page_url,
+    )
+    if not images:
+        images = product_image_urls(parser.images[:24], page_url)
+    specifications = []
+    properties = node.get("additionalProperty") or []
+    if isinstance(properties, dict):
+        properties = [properties]
+    for row in properties:
+        if not isinstance(row, dict):
+            continue
+        label = clean_product_text(row.get("name"), 120)
+        value = clean_product_text(row.get("value") or row.get("valueReference"), 300)
+        if label and value:
+            specifications.append({"name": label, "value": value})
+    gtin = next((clean_product_text(node.get(key), 60) for key in ("gtin14", "gtin13", "gtin12", "gtin8", "gtin") if node.get(key)), "")
+    return {
+        "source_url": page_url,
+        "source_host": product_import_host(page_url),
+        "source_title": clean_product_text(name, 500),
+        "title": optimized_product_title(name, brand, node.get("model") or node.get("mpn") or ""),
+        "brand": clean_product_text(brand, 120),
+        "model": clean_product_text(node.get("model") or node.get("mpn"), 120),
+        "mpn": clean_product_text(node.get("mpn") or node.get("sku"), 120),
+        "gtin": gtin,
+        "source_description": clean_product_text(description),
+        "source_price": offers_price,
+        "source_currency": currency,
+        "pictures": images,
+        "specifications": specifications[:80],
+    }
+
+
+def imported_meli_product(payload, item_id, source_url):
+    try:
+        item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
+    except Exception:
+        item = resolve_scan_target(payload, item_id)
+    description = ""
+    try:
+        detail = try_meli_sources(payload, [f"/items/{item.get('id') or item_id}/description"])
+        description = detail.get("plain_text") or detail.get("text") or ""
+    except Exception:
+        pass
+    attributes = item.get("attributes") or []
+    specs = []
+    for row in attributes:
+        value = clone_attribute_display_value(row)
+        if row.get("name") and value:
+            specs.append({"id": row.get("id"), "name": row.get("name"), "value": value})
+    return {
+        "source_url": source_url,
+        "source_host": "mercadolivre.com.br",
+        "source_item_id": item.get("id") or item_id,
+        "source_title": item.get("title") or "",
+        "title": optimized_product_title(item.get("title") or "", source_attribute_value(item, ["BRAND"]), source_attribute_value(item, ["MODEL"])),
+        "brand": source_attribute_value(item, ["BRAND"]),
+        "model": source_attribute_value(item, ["MODEL"]),
+        "mpn": source_attribute_value(item, ["MPN", "PART_NUMBER"]),
+        "gtin": ", ".join(source_clone_identifiers(item, {})),
+        "source_description": clean_product_text(description),
+        "source_price": optional_money(item.get("price")) or 0,
+        "source_currency": item.get("currency_id") or "BRL",
+        "pictures": product_image_urls(
+            item.get("pictures") or [item.get("secure_thumbnail") or item.get("thumbnail")], source_url
+        ),
+        "specifications": specs[:80],
+        "category_id": item.get("category_id") or "",
+        "domain_id": item.get("domain_id") or "",
+        "catalog_product_id": item.get("catalog_product_id") or "",
+        "raw_attributes": attributes,
+    }
+
+
+def generated_product_description(product):
+    title = product.get("title") or product.get("source_title") or "Produto"
+    brand = product.get("brand") or ""
+    model = product.get("model") or product.get("mpn") or ""
+    intro = f"{title}."
+    if brand:
+        intro += f" Produto da marca {brand}."
+    if model:
+        intro += f" Modelo {model}."
+    lines = [intro, "", "Principais características:"]
+    seen = set()
+    for row in product.get("specifications") or []:
+        label = translate_product_text(row.get("name"))
+        value = translate_product_text(row.get("value"))
+        signature = (label.lower(), value.lower())
+        if not label or not value or signature in seen:
+            continue
+        seen.add(signature)
+        lines.append(f"- {label}: {value}")
+        if len(seen) >= 30:
+            break
+    if not seen and product.get("source_description"):
+        lines.extend(["", translate_product_text(product.get("source_description"))[:2500]])
+    lines.extend(["", "Conteúdo da embalagem e compatibilidade podem variar conforme o fabricante. Confira as especificações antes da compra."])
+    return "\n".join(lines)[:50000]
+
+
+def attribute_seed_values(product):
+    result = {}
+    for row in product.get("raw_attributes") or []:
+        value = clone_attribute_display_value(row)
+        if row.get("id") and value:
+            result[str(row.get("id")).upper()] = value
+    for key, value in (("BRAND", product.get("brand")), ("MODEL", product.get("model")),
+                       ("MPN", product.get("mpn")), ("GTIN", product.get("gtin"))):
+        if value:
+            result.setdefault(key, value)
+    for row in product.get("specifications") or []:
+        label = normalized_attribute_label(row.get("id") or row.get("name"))
+        if label and row.get("value"):
+            result.setdefault(label, row.get("value"))
+    return result
+
+
+def publication_attribute_rows(product, definitions):
+    seeds = attribute_seed_values(product)
+    rows = []
+    for definition in definitions or []:
+        attr_id = str(definition.get("id") or "").upper()
+        if not attr_id or not clone_attribute_user_editable(definition, attr_id):
+            continue
+        required = clone_attribute_is_required(definition)
+        normalized_name = normalized_attribute_label(definition.get("name"))
+        value = seeds.get(attr_id) or seeds.get(normalized_name) or ""
+        options = [
+            {"id": option.get("id") or "", "name": option.get("name") or ""}
+            for option in (definition.get("values") or [])[:80]
+            if isinstance(option, dict) and option.get("name")
+        ]
+        if required or value or attr_id in {"BRAND", "MODEL", "GTIN", "MPN", "COLOR", "ITEM_CONDITION"}:
+            rows.append({
+                "id": attr_id,
+                "name": definition.get("name") or attr_id,
+                "required": required,
+                "value_type": definition.get("value_type") or "string",
+                "value": value,
+                "options": options,
+            })
+    return rows
+
+
+def catalog_candidate_rows(response):
+    results = response.get("results") if isinstance(response, dict) else response
+    rows = []
+    for product in results or []:
+        if not isinstance(product, dict) or not product.get("id"):
+            continue
+        rows.append({
+            "id": product.get("id"),
+            "name": product.get("name") or product.get("title") or product.get("id"),
+            "domain_id": product.get("domain_id") or "",
+            "category_id": product.get("category_id") or "",
+            "listing_strategy": first_present(product, ["settings.listing_strategy"], "") or "",
+            "thumbnail": product_thumbnail(product),
+        })
+    return rows[:8]
+
+
+def import_product_operation(payload, request):
+    source_url = str(request.get("url") or "").strip()
+    host = product_import_host(source_url)
+    update_async_operation_progress("Lendo os dados públicos do produto.", 1, 4)
+    item_id = extract_meli_item_id(source_url) if "mercado" in host else ""
+    if item_id:
+        product = imported_meli_product(payload, item_id, source_url)
+    else:
+        page_html, final_url = product_page_download(source_url)
+        product = parse_external_product_page(page_html, final_url)
+        blocked_title = normalized_attribute_label(product.get("source_title"))
+        if any(marker in blocked_title for marker in ("robot check", "access denied", "captcha", "sorry something went wrong")):
+            raise RuntimeError(
+                "O site bloqueou a leitura automática desta página. Tente outro link público do mesmo produto, "
+                "preferencialmente do fabricante ou do Mercado Livre."
+            )
+    if not product.get("title"):
+        raise RuntimeError("Não foi possível identificar o título deste produto. Confira se o link abre uma página pública.")
+    product["description"] = generated_product_description(product)
+    reader = official_reader_client(payload)
+    if not reader:
+        raise RuntimeError("Conecte ao menos uma conta oficial do Mercado Livre antes de preparar anúncios.")
+    update_async_operation_progress("Prevendo categoria e ficha técnica no Mercado Livre.", 2, 4)
+    suggestions = []
+    try:
+        suggestions = reader.domain_discovery(product.get("title"), "MLB", 3) or []
+    except Exception:
+        suggestions = []
+    if product.get("category_id"):
+        original = {
+            "category_id": product.get("category_id"), "category_name": "Categoria do anúncio de origem",
+            "domain_id": product.get("domain_id") or "", "domain_name": "Origem",
+        }
+        suggestions = [original, *[row for row in suggestions if row.get("category_id") != product.get("category_id")]]
+    category_id = (suggestions[0].get("category_id") if suggestions else product.get("category_id")) or ""
+    definitions = cached_category_attributes(reader, category_id) if category_id else []
+    product["category_id"] = category_id
+    product["category_suggestions"] = suggestions[:3]
+    product["attributes"] = publication_attribute_rows(product, definitions)
+    update_async_operation_progress("Procurando correspondências no catálogo oficial.", 3, 4)
+    catalog_candidates = []
+    search_query = product.get("gtin") or " ".join(filter(None, [product.get("brand"), product.get("model"), product.get("title")]))
+    try:
+        catalog_candidates = catalog_candidate_rows(reader.product_search(search_query, "MLB", 10, 0))
+    except Exception:
+        pass
+    product["catalog_candidates"] = catalog_candidates
+    if not product.get("catalog_product_id") and product.get("gtin") and len(catalog_candidates) == 1:
+        product["catalog_product_id"] = catalog_candidates[0].get("id") or ""
+    product["accounts"] = [public_account(account) for account in payload.get("accounts") or [] if account.get("official") and account.get("status") == "connected"]
+    product["translated"] = host.endswith(("bhphotovideo.com", "sweetwater.com", "amazon.com"))
+    update_async_operation_progress("Rascunho pronto para revisão.", 4, 4)
+    return {"product": product}
+
+
+def product_category_operation(payload, request):
+    category_id = clean_attribute_value(request.get("category_id"))
+    if not re.fullmatch(r"ML[A-Z]\d+", category_id):
+        raise RuntimeError("Selecione uma categoria válida.")
+    reader = official_reader_client(payload)
+    if not reader:
+        raise RuntimeError("Nenhuma conta oficial conectada.")
+    product = request.get("product") if isinstance(request.get("product"), dict) else {}
+    definitions = cached_category_attributes(reader, category_id)
+    return {"category_id": category_id, "attributes": publication_attribute_rows(product, definitions)}
 
 
 def offer_value(row, keys, default=""):
@@ -12306,6 +12775,218 @@ def clone_source_snapshot(payload, account_identifier, item_id):
     }
 
 
+def assisted_publication_attributes(draft):
+    rows = []
+    seen = set()
+    for attribute in draft.get("attributes") or []:
+        attr_id = canonical_clone_attribute_id(attribute.get("id"))
+        value = clean_attribute_value(attribute.get("value"))
+        value_id = clean_attribute_value(attribute.get("value_id"))
+        if not attr_id or (not value and not value_id):
+            continue
+        row = {"id": attr_id}
+        if value_id:
+            row["value_id"] = value_id
+        else:
+            row["value_name"] = value
+        rows.append(row)
+        seen.add(attr_id)
+    for attr_id, value in (
+        ("BRAND", draft.get("brand")), ("MODEL", draft.get("model")),
+        ("MPN", draft.get("mpn")), ("GTIN", draft.get("gtin")),
+    ):
+        clean = clean_attribute_value(value)
+        if attr_id == "GTIN" and clean:
+            codes = normalize_clone_identifier_codes(clean)
+            clean = codes[0] if codes else ""
+        if clean and attr_id not in seen:
+            rows.append({"id": attr_id, "value_name": clean})
+            seen.add(attr_id)
+    sku = clean_attribute_value(draft.get("sku"))
+    if sku and not seen.intersection({"SELLER_SKU", "SKU"}):
+        rows.append({"id": "SELLER_SKU", "value_name": sku})
+    return rows
+
+
+def build_assisted_publication_payload(draft, variant):
+    title = clean_product_text(draft.get("title"), 200)[:60]
+    category_id = clean_attribute_value(draft.get("category_id"))
+    sku = clean_attribute_value(draft.get("sku"))
+    if not title:
+        raise RuntimeError("Informe o título do anúncio.")
+    if not re.fullmatch(r"ML[A-Z]\d+", category_id):
+        raise RuntimeError("Selecione uma categoria válida do Mercado Livre.")
+    if not sku:
+        raise RuntimeError("Informe o SKU do produto.")
+    try:
+        price = round(float(variant.get("price")), 2)
+        stock = int(float(draft.get("stock") or 0))
+        manufacturing_time = int(float(draft.get("manufacturing_time") or 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Informe preço, estoque e disponibilidade válidos.") from exc
+    if price <= 0:
+        raise RuntimeError("O preço precisa ser maior que zero.")
+    if stock < 0:
+        raise RuntimeError("O estoque não pode ser negativo.")
+    if not 0 <= manufacturing_time <= 45:
+        raise RuntimeError("A disponibilidade precisa estar entre 0 e 45 dias.")
+    listing_type_id = clean_attribute_value(variant.get("listing_type_id"))
+    if listing_type_id not in {"gold_special", "gold_pro"}:
+        raise RuntimeError("Selecione anúncio Clássico ou Premium.")
+    pictures = product_image_urls(draft.get("pictures") or [])
+    if not pictures:
+        raise RuntimeError("Selecione ao menos uma imagem para o anúncio.")
+    attributes = assisted_publication_attributes(draft)
+    source_item = {
+        "title": title,
+        "category_id": category_id,
+        "domain_id": clean_attribute_value(draft.get("domain_id")),
+        "price": price,
+        "currency_id": "BRL",
+        "available_quantity": stock,
+        "buying_mode": "buy_it_now",
+        "listing_type_id": listing_type_id,
+        "condition": clean_attribute_value(draft.get("condition")) or "new",
+        "pictures": [{"url": url} for url in pictures],
+        "attributes": attributes,
+        "sale_terms": [],
+        "seller_custom_field": sku,
+    }
+    if manufacturing_time:
+        source_item["sale_terms"].append({"id": "MANUFACTURING_TIME", "value_name": f"{manufacturing_time} dias"})
+    catalog_product_id = clean_attribute_value(draft.get("catalog_product_id"))
+    if catalog_product_id:
+        source_item["catalog_product_id"] = catalog_product_id
+    if draft.get("catalog_listing") and catalog_product_id:
+        source_item["catalog_listing"] = True
+    payload = build_clone_item_payload(source_item, {
+        "title": title, "sku": sku, "price": price, "stock": stock,
+        "listing_type_id": listing_type_id, "gtin": draft.get("gtin"),
+    })
+    if manufacturing_time:
+        payload["sale_terms"] = source_item["sale_terms"]
+    return payload, source_item
+
+
+def assisted_publication_variants(request):
+    variants = []
+    seen = set()
+    for row in request.get("variants") or []:
+        listing_type_id = clean_attribute_value(row.get("listing_type_id"))
+        if listing_type_id in {"gold_special", "gold_pro"} and listing_type_id not in seen:
+            variants.append({"listing_type_id": listing_type_id, "price": row.get("price")})
+            seen.add(listing_type_id)
+    if not variants:
+        raise RuntimeError("Selecione ao menos uma versão: Clássico ou Premium.")
+    return variants
+
+
+def validate_assisted_product_operation(payload, request):
+    account_ids = [str(value) for value in request.get("account_ids") or [] if value]
+    account = next(
+        (row for row in payload.get("accounts") or [] if str(row.get("id")) in account_ids and row.get("official") and row.get("status") == "connected"),
+        None,
+    )
+    if not account:
+        raise RuntimeError("Selecione ao menos uma conta conectada.")
+    draft = request.get("draft") or {}
+    variant = assisted_publication_variants(request)[0]
+    create_payload, _ = build_assisted_publication_payload(draft, variant)
+    try:
+        response = run_interactive_meli_call(account_client(account).validate_item, create_payload)
+        return {
+            "valid": True,
+            "account": account.get("nickname"),
+            "listing_type_id": variant.get("listing_type_id"),
+            "message": "O Mercado Livre aceitou a estrutura deste anúncio.",
+            "official": response or {},
+        }
+    except Exception as exc:
+        return {
+            "valid": False,
+            "account": account.get("nickname"),
+            "listing_type_id": variant.get("listing_type_id"),
+            "message": friendly_clone_error(exc),
+            "official_error": str(exc),
+        }
+
+
+def publish_assisted_product_operation(payload, request, actor=None):
+    if (actor or {}).get("role") == "viewer":
+        raise RuntimeError("Usuários com acesso somente para leitura não podem publicar anúncios.")
+    account_ids = list(dict.fromkeys(str(value) for value in request.get("account_ids") or [] if value))
+    accounts = [
+        account for account in payload.get("accounts") or []
+        if str(account.get("id")) in account_ids and account.get("official") and account.get("status") == "connected"
+    ]
+    if not accounts:
+        raise RuntimeError("Selecione ao menos uma conta conectada.")
+    variants = assisted_publication_variants(request)
+    if len(accounts) * len(variants) > 12:
+        raise RuntimeError("Publique no máximo 12 combinações de conta e tipo por operação.")
+    draft = request.get("draft") or {}
+    description = str(draft.get("description") or "").strip()[:50000]
+    results = []
+    total = len(accounts) * len(variants)
+    progress = 0
+    for account in accounts:
+        client = account_client(account)
+        category_id = clean_attribute_value(draft.get("category_id"))
+        definitions = cached_category_attributes(client, category_id) if category_id else []
+        for variant in variants:
+            progress += 1
+            label = "Premium" if variant.get("listing_type_id") == "gold_pro" else "Clássico"
+            update_async_operation_progress(
+                f"Publicando {label} na conta {account.get('nickname')}.", progress - 1, total
+            )
+            try:
+                create_payload, source_item = build_assisted_publication_payload(draft, variant)
+                created = create_item_with_clone_retries(
+                    client, create_payload, source_item,
+                    category_attributes=definitions,
+                    publication_name=draft.get("title") or "",
+                )
+                item_id = created.get("id")
+                if description and item_id:
+                    client.create_item_description(item_id, description)
+                try:
+                    verified = client.item_for_clone(item_id) if item_id else {}
+                except Exception:
+                    verified = {}
+                official = {**source_item, **created, **verified}
+                normalized = synced_catalog_item(account, official)
+                normalized["description_override"] = description
+                payload.setdefault("catalog", []).append(normalized)
+                append_item_log(payload, normalized, actor or {}, "Cadastro assistido por link", {
+                    "source_url": {"from": draft.get("source_url") or "", "to": item_id or ""},
+                    "listing_type_id": {"from": "", "to": variant.get("listing_type_id")},
+                })
+                results.append({
+                    "status": "created", "account": account.get("nickname"), "account_id": account.get("id"),
+                    "listing_type_id": variant.get("listing_type_id"), "item_id": item_id,
+                    "title": official.get("title") or draft.get("title"),
+                    "permalink": official.get("permalink") or created.get("permalink") or "",
+                })
+            except Exception as exc:
+                results.append({
+                    "status": "error", "account": account.get("nickname"), "account_id": account.get("id"),
+                    "listing_type_id": variant.get("listing_type_id"), "error": friendly_clone_error(exc),
+                })
+            update_async_operation_progress(
+                f"Processado {progress} de {total} anúncio(s).", progress, total, results[-1]
+            )
+    created_count = sum(row.get("status") == "created" for row in results)
+    if not created_count:
+        detail = "; ".join(row.get("error") or "falha não identificada" for row in results[:3])
+        raise RuntimeError(f"Nenhum anúncio foi criado. {detail}")
+    write_payload(payload)
+    return {
+        "created": created_count,
+        "failed": sum(row.get("status") == "error" for row in results),
+        "results": results,
+    }
+
+
 def statistics_date_window(date_from, date_to):
     try:
         start = date.fromisoformat(str(date_from or "")[:10])
@@ -19235,6 +19916,9 @@ class App(BaseHTTPRequestHandler):
             "/api/clone/preview",
             "/api/clone/execute",
             "/api/clone/execute-batch",
+            "/api/products/import",
+            "/api/products/category",
+            "/api/products/validate",
             "/api/kits/preview",
             "/api/kits/picture",
             "/api/kits/create",
@@ -19562,6 +20246,55 @@ class App(BaseHTTPRequestHandler):
                         }
                     )
                 self.send_json({"ok": True, "chats": chats, "raw_count": len(updates.get("result", []) or [])})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/products/import":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "product_import",
+                    lambda: import_product_operation(payload, request_copy),
+                    "Importação e tradução do produto adicionadas à fila.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/products/validate":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "product_validate",
+                    lambda: validate_assisted_product_operation(payload, request_copy),
+                    "Validação oficial do anúncio adicionada à fila.",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/products/category":
+            try:
+                self.send_json({"ok": True, **product_category_operation(payload, request)})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/products/publish":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                actor = self.current_user(payload)
+                operation = start_async_operation(
+                    "product_publish",
+                    lambda: publish_assisted_product_operation(payload, request_copy, actor),
+                    "Publicação dos novos anúncios adicionada à fila.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return
