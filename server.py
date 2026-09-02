@@ -2971,22 +2971,67 @@ def product_page_download(url):
         },
     )
     maximum = max(512_000, min(8_000_000, int(os.getenv("COMPETIDOR_PRODUCT_IMPORT_MAX_BYTES", "4000000"))))
-    with urllib.request.urlopen(request, timeout=18) as response:
-        final_url = response.geturl()
-        product_import_host(final_url)
-        content_type = str(response.headers.get("Content-Type") or "").lower()
-        if "html" not in content_type:
-            raise RuntimeError("O link não retornou uma página de produto em HTML.")
-        body = response.read(maximum + 1)
-        if len(body) > maximum:
-            raise RuntimeError("A página do produto é maior do que o limite de importação.")
-        if str(response.headers.get("Content-Encoding") or "").lower() == "gzip":
-            body = gzip.decompress(body)
-        charset = response.headers.get_content_charset() or "utf-8"
-    return body.decode(charset, errors="replace"), final_url
+    try:
+        with urllib.request.urlopen(request, timeout=18) as response:
+            final_url = response.geturl()
+            product_import_host(final_url)
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if "html" not in content_type:
+                raise RuntimeError("O link não retornou uma página de produto em HTML.")
+            body = response.read(maximum + 1)
+            if len(body) > maximum:
+                raise RuntimeError("A página do produto é maior do que o limite de importação.")
+            if str(response.headers.get("Content-Encoding") or "").lower() == "gzip":
+                body = gzip.decompress(body)
+            charset = response.headers.get_content_charset() or "utf-8"
+        return body.decode(charset, errors="replace"), final_url
+    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        if isinstance(exc, urllib.error.HTTPError) and exc.code not in {403, 429, 503}:
+            raise
+        # Sweetwater e B&H usam proteção de borda que recusa clientes sem
+        # JavaScript. O leitor devolve o conteúdo público em Markdown, sem
+        # executar scripts nem reutilizar cookies do visitante.
+        reader_url = f"https://r.jina.ai/{str(url).strip()}"
+        reader_request = urllib.request.Request(
+            reader_url,
+            headers={"Accept": "text/plain", "User-Agent": "Competidor-Product-Importer/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(reader_request, timeout=28) as response:
+                body = response.read(maximum + 1)
+                if len(body) > maximum:
+                    raise RuntimeError("A página do produto é maior do que o limite de importação.")
+                charset = response.headers.get_content_charset() or "utf-8"
+            return body.decode(charset, errors="replace"), str(url).strip()
+        except Exception as reader_exc:
+            raise RuntimeError(
+                "O site bloqueou a leitura direta e a leitura pública alternativa também falhou. "
+                "Tente novamente em alguns minutos."
+            ) from reader_exc
 
 
 PRODUCT_TITLE_TRANSLATIONS = (
+    (r"\bmodeling and effects processor\b", "processador de modelagem e efeitos"),
+    (r"\bmodeling processor\b", "processador de modelagem"),
+    (r"\beffects processor\b", "processador de efeitos"),
+    (r"\bstandalone sampler and composer\b", "sampler e compositor autônomo"),
+    (r"\bsampler and composer\b", "sampler e compositor"),
+    (r"\bstandalone\b", "autônomo"),
+    (r"\bbuilt-in effects\b", "efeitos integrados"),
+    (r"\bbuilt-in\b", "integrado"),
+    (r"\bsample memory\b", "memória de samples"),
+    (r"\bstereo input\b", "entrada estéreo"),
+    (r"\bstereo output\b", "saída estéreo"),
+    (r"\banalog input\b", "entrada analógica"),
+    (r"\banalog output\b", "saída analógica"),
+    (r"\binput\b", "entrada"),
+    (r"\boutput\b", "saída"),
+    (r"\bincludes\b", "inclui"),
+    (r"\bcompatible with\b", "compatível com"),
+    (r"\bdesigned for\b", "desenvolvido para"),
+    (r"\bup to\b", "até"),
+    (r"\bchannels\b", "canais"),
+    (r"\bchannel\b", "canal"),
     (r"\bpowered speaker\b", "caixa de som ativa"),
     (r"\bstudio monitor\b", "monitor de áudio"),
     (r"\baudio interface\b", "interface de áudio"),
@@ -3036,13 +3081,19 @@ def translate_product_text(value):
 
 def optimized_product_title(name, brand="", model=""):
     title = translate_product_text(name)
+    title = re.sub(r"^\s*(?:amazon(?:\.com(?:\.br)?)?|sweetwater|b&h(?: photo)?)\s*[:|\-]\s*", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\b(?:sweetwater exclusive|amazon exclusive|visit the .+? store)\b", "", title, flags=re.IGNORECASE)
     title = re.split(r"\s+[|–—]\s+", title, maxsplit=1)[0]
-    title = re.sub(r"\b(?:free shipping|frete grátis|in stock|new)\b", "", title, flags=re.IGNORECASE)
-    parts = [re.sub(r"\s+", " ", title).strip(" -")]
-    for value in (brand, model):
-        clean = clean_product_text(value, 120)
-        if clean and clean.lower() not in " ".join(parts).lower():
-            parts.append(clean)
+    title = re.sub(r"\b(?:free shipping|free delivery|frete grátis|in stock|new)\b", "", title, flags=re.IGNORECASE)
+    clean_title = re.sub(r"\s+", " ", title).strip(" -")
+    clean_brand = clean_product_text(brand, 120)
+    clean_model = clean_product_text(model, 120)
+    parts = []
+    if clean_brand and clean_brand.lower() not in clean_title.lower():
+        parts.append(clean_brand)
+    parts.append(clean_title)
+    if clean_model and clean_model.lower() not in " ".join(parts).lower():
+        parts.append(clean_model)
     title = " ".join(filter(None, parts))
     if title:
         stop_words = {"a", "as", "com", "da", "das", "de", "do", "dos", "e", "em", "para", "por", "sem"}
@@ -3056,7 +3107,33 @@ def optimized_product_title(name, brand="", model=""):
     if len(title) <= 60:
         return title
     clipped = title[:60].rsplit(" ", 1)[0]
+    clipped = re.sub(r"\s+(?:a|as|com|da|das|de|do|dos|e|em|para|por|sem)$", "", clipped, flags=re.IGNORECASE)
     return (clipped or title[:60]).strip()
+
+
+def normalized_product_image_url(value, base_url=""):
+    url = urljoin(base_url, str(value or "").strip())
+    # Amazon insere modificadores de miniatura entre dois pontos. Removê-los
+    # recupera o arquivo original de alta resolução.
+    url = re.sub(r"\.(_[A-Z0-9,]+_)\.(?=[A-Za-z]{2,5}(?:\?|$))", ".", url, flags=re.IGNORECASE)
+    return url
+
+
+def usable_product_image(value, base_url=""):
+    url = normalized_product_image_url(value, base_url)
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    signature = normalized_attribute_label(f"{parsed.netloc} {parsed.path}")
+    blocked = {
+        "sprite", "icon", "logo", "prime", "smile", "loading", "placeholder",
+        "transparent", "pixel", "favicon", "tech essentials", "delivery",
+    }
+    if any(marker in signature for marker in blocked):
+        return ""
+    if parsed.path.lower().endswith((".svg", ".gif")):
+        return ""
+    return url
 
 
 def product_image_urls(values, base_url=""):
@@ -3069,11 +3146,123 @@ def product_image_urls(values, base_url=""):
         raw = str(value or "").strip()
         if not raw:
             continue
-        url = urljoin(base_url, raw)
-        parsed = urlparse(url)
-        if parsed.scheme in {"http", "https"} and parsed.netloc and url not in rows:
+        url = usable_product_image(raw, base_url)
+        signature = ""
+        if url:
+            parsed = urlparse(url)
+            signature = f"{parsed.netloc.lower()}{parsed.path.lower()}"
+        existing_signatures = {f"{urlparse(row).netloc.lower()}{urlparse(row).path.lower()}" for row in rows}
+        if url and signature not in existing_signatures:
             rows.append(url)
     return rows[:12]
+
+
+def html_element_text(page_html, element_id):
+    match = re.search(
+        rf"<(?P<tag>[a-z0-9]+)[^>]*\bid=[\"']{re.escape(element_id)}[\"'][^>]*>(?P<body>.*?)</(?P=tag)>",
+        page_html, flags=re.IGNORECASE | re.DOTALL,
+    )
+    return clean_product_text(match.group("body"), 12000) if match else ""
+
+
+def amazon_product_page(page_html, page_url):
+    title = html_element_text(page_html, "productTitle")
+    if not title:
+        return {}
+    byline = html_element_text(page_html, "bylineInfo")
+    brand = re.sub(r"^(?:visit the|brand:)\s+|\s+store$", "", byline, flags=re.IGNORECASE).strip()
+    bullets_block = re.search(r"\bid=[\"']feature-bullets[\"'][^>]*>(.*?)</(?:div|ul)>", page_html, flags=re.IGNORECASE | re.DOTALL)
+    bullets = []
+    if bullets_block:
+        for value in re.findall(r"<span[^>]*>(.*?)</span>", bullets_block.group(1), flags=re.IGNORECASE | re.DOTALL):
+            value = clean_product_text(value, 1200)
+            if value and len(value) > 8:
+                bullets.append(value)
+    image_rows = []
+    for raw_json in re.findall(r"data-a-dynamic-image\s*=\s*([\"'])(.*?)\1", page_html, flags=re.IGNORECASE | re.DOTALL):
+        try:
+            decoded = json.loads(html.unescape(raw_json[1]))
+            ordered = sorted(decoded.items(), key=lambda row: (row[1] or [0, 0])[0] * (row[1] or [0, 0])[1], reverse=True)
+            image_rows.extend(url for url, _size in ordered)
+        except (TypeError, ValueError):
+            pass
+    image_rows.extend(re.findall(r'[\"\'](?:hiRes|large)[\"\']\s*:\s*[\"\'](https?[^\"\']+)', page_html))
+    model = ""
+    for label in ("Model Name", "Model Number", "Item model number"):
+        match = re.search(rf"{re.escape(label)}\s*</?(?:th|td|span)[^>]*>\s*(?:</[^>]+>\s*)?<[^>]+>(.*?)</", page_html, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            model = clean_product_text(match.group(1), 120)
+            break
+    if not brand:
+        brand_match = re.search(r"Brand\s*</?(?:th|td|span)[^>]*>.*?<[^>]+>(.*?)</", page_html, flags=re.IGNORECASE | re.DOTALL)
+        brand = clean_product_text(brand_match.group(1), 120) if brand_match else ""
+    return {
+        "name": title, "brand": brand, "model": model,
+        "description": "\n".join(bullets),
+        "images": product_image_urls(image_rows, page_url),
+        "specifications": [{"name": "Característica", "value": value} for value in bullets[:20]],
+    }
+
+
+def markdown_product_page(content, page_url):
+    if not re.search(r"^(?:Title:|Markdown Content:|# )", content, flags=re.MULTILINE):
+        return {}
+    title_match = re.search(r"^Title:\s*(.+)$", content, flags=re.MULTILINE)
+    if not title_match:
+        title_match = re.search(r"^#\s+(.+)$", content, flags=re.MULTILINE)
+    title = clean_product_text(title_match.group(1), 500) if title_match else ""
+    title = re.sub(r"\s*[|\-]\s*(?:Sweetwater|B&H.*)$", "", title, flags=re.IGNORECASE)
+    image_candidates = []
+    for alt, url in re.findall(r"!\[([^\]]*)\]\((https?://[^)\s]+)", content):
+        alt_key = normalized_attribute_label(alt)
+        if not alt_key or any(word in alt_key for word in ("logo", "icon", "payment", "banner", "avatar")):
+            continue
+        image_candidates.append(url)
+    specs = []
+    for label, value in re.findall(r"^\s*[-*]?\s*\*\*([^*:\n]{2,60})\*\*\s*:?\s*(.{2,300})$", content, flags=re.MULTILINE):
+        label, value = clean_product_text(label, 80), clean_product_text(value, 300)
+        if label and value:
+            specs.append({"name": label, "value": value})
+    brand = ""
+    model = ""
+    for row in specs:
+        key = normalized_attribute_label(row["name"])
+        if key in {"brand", "manufacturer", "marca", "fabricante"}:
+            brand = row["value"]
+        if key in {"model", "model number", "modelo", "part number"}:
+            model = row["value"]
+    description_match = re.search(r"(?:^##?\s+(?:Product Description|Description|Features|Key Features).*?\n)(.*?)(?=^##?\s+|\Z)", content, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+    description = clean_product_text(description_match.group(1), 5000) if description_match else ""
+    return {"name": title, "brand": brand, "model": model, "description": description, "images": product_image_urls(image_candidates, page_url), "specifications": specs[:80]}
+
+
+def retailer_product_page(page_html, page_url, parser):
+    host = product_import_host(page_url)
+    if not any(domain in host for domain in ("sweetwater.com", "bhphotovideo.com")):
+        return {}
+    brand = parser.meta.get("product:brand") or parser.meta.get("brand") or ""
+    raw_urls = re.findall(r"https?:(?:\\?/\\?/)[^\"'<>\s]+", page_html)
+    raw_urls = [html.unescape(url.replace("\\/", "/")) for url in raw_urls]
+    if "sweetwater.com" in host:
+        raw_urls = [
+            *[url for url in raw_urls if "media.sweetwater.com/m/products/image/" in url],
+            *[url for url in parser.images if "/m/products/image/" in str(url)],
+        ]
+    else:
+        raw_urls = [
+            *[url for url in raw_urls if "bhphoto.com/images/" in url or "static.bhphoto.com" in url],
+            *[url for url in parser.images if "bhphoto.com" in str(url) or "/images/" in str(url)],
+        ]
+    specs = []
+    pairs = re.findall(
+        r"<(?:dt|th)[^>]*>(.*?)</(?:dt|th)>\s*<(?:dd|td)[^>]*>(.*?)</(?:dd|td)>",
+        page_html, flags=re.IGNORECASE | re.DOTALL,
+    )
+    for label, value in pairs:
+        label, value = clean_product_text(label, 100), clean_product_text(value, 400)
+        if 1 < len(label) < 100 and value and len(value) < 400:
+            specs.append({"name": label, "value": value})
+    return {"brand": clean_product_text(brand, 120), "images": product_image_urls(raw_urls, page_url), "specifications": specs[:80]}
 
 
 def product_offer_data(value):
@@ -3092,19 +3281,23 @@ def parse_external_product_page(page_html, page_url):
     parser = ProductPageParser()
     parser.feed(page_html)
     node = first_product_json_ld(parser)
+    host = product_import_host(page_url)
+    specific = amazon_product_page(page_html, page_url) if "amazon." in host else markdown_product_page(page_html, page_url)
+    retailer = retailer_product_page(page_html, page_url, parser)
     brand = node.get("brand") or ""
     if isinstance(brand, dict):
         brand = brand.get("name") or ""
+    brand = specific.get("brand") or retailer.get("brand") or brand
     offers_price, currency = product_offer_data(node.get("offers"))
-    name = node.get("name") or parser.meta.get("og:title") or "".join(parser.title_parts)
-    description = node.get("description") or parser.meta.get("og:description") or parser.meta.get("description") or ""
+    name = specific.get("name") or node.get("name") or parser.meta.get("og:title") or "".join(parser.title_parts)
+    description = specific.get("description") or node.get("description") or parser.meta.get("og:description") or parser.meta.get("description") or ""
     images = product_image_urls(
-        [*(node.get("image") if isinstance(node.get("image"), list) else [node.get("image")]), parser.meta.get("og:image")],
+        [*(specific.get("images") or []), *(retailer.get("images") or []), *(node.get("image") if isinstance(node.get("image"), list) else [node.get("image")]), parser.meta.get("og:image")],
         page_url,
     )
-    if not images:
+    if not images and "amazon." not in host:
         images = product_image_urls(parser.images[:24], page_url)
-    specifications = []
+    specifications = [*(specific.get("specifications") or []), *(retailer.get("specifications") or [])]
     properties = node.get("additionalProperty") or []
     if isinstance(properties, dict):
         properties = [properties]
@@ -3116,13 +3309,18 @@ def parse_external_product_page(page_html, page_url):
         if label and value:
             specifications.append({"name": label, "value": value})
     gtin = next((clean_product_text(node.get(key), 60) for key in ("gtin14", "gtin13", "gtin12", "gtin8", "gtin") if node.get(key)), "")
+    model = specific.get("model") or node.get("model") or node.get("mpn") or ""
+    if "sweetwater.com" in host and (not model or re.fullmatch(r"\d+", str(model))):
+        detail_code = re.search(r"/store/detail/([^/?#-]+)--", page_url, flags=re.IGNORECASE)
+        if detail_code:
+            model = detail_code.group(1)
     return {
         "source_url": page_url,
         "source_host": product_import_host(page_url),
         "source_title": clean_product_text(name, 500),
-        "title": optimized_product_title(name, brand, node.get("model") or node.get("mpn") or ""),
+        "title": optimized_product_title(name, brand, model),
         "brand": clean_product_text(brand, 120),
-        "model": clean_product_text(node.get("model") or node.get("mpn"), 120),
+        "model": clean_product_text(model, 120),
         "mpn": clean_product_text(node.get("mpn") or node.get("sku"), 120),
         "gtin": gtin,
         "source_description": clean_product_text(description),
@@ -3139,12 +3337,43 @@ def imported_meli_product(payload, item_id, source_url):
     except Exception:
         item = resolve_scan_target(payload, item_id)
     description = ""
+    catalog_product = {}
+    owner = next(
+        (
+            account for account in payload.get("accounts") or []
+            if account.get("official") and account.get("status") == "connected"
+            and str(account.get("seller_id") or "") == str(item.get("seller_id") or "")
+        ),
+        None,
+    )
+    if owner:
+        try:
+            bundle = clone_source_bundle(payload, owner.get("id") or owner.get("nickname"), item.get("id") or item_id, include_description=True)
+            item = bundle.get("source_item") or item
+            catalog_product = bundle.get("catalog_product") or {}
+            description = bundle.get("description") or ""
+        except Exception:
+            pass
+    if not catalog_product and item.get("catalog_product_id"):
+        reader = official_reader_client(payload)
+        if reader:
+            try:
+                catalog_product = call_interactive_client_method(reader.product, item.get("catalog_product_id")) or {}
+            except Exception:
+                catalog_product = {}
     try:
-        detail = try_meli_sources(payload, [f"/items/{item.get('id') or item_id}/description"])
-        description = detail.get("plain_text") or detail.get("text") or ""
+        if not description:
+            detail = try_meli_sources(payload, [f"/items/{item.get('id') or item_id}/description"])
+            description = detail.get("plain_text") or detail.get("text") or ""
     except Exception:
         pass
-    attributes = item.get("attributes") or []
+    attributes_by_id = {}
+    for container in (catalog_product, item):
+        for row in container.get("attributes") or []:
+            if row.get("id"):
+                attributes_by_id[str(row.get("id")).upper()] = row
+    attributes = list(attributes_by_id.values())
+    item["attributes"] = attributes
     specs = []
     for row in attributes:
         value = clone_attribute_display_value(row)
@@ -3163,9 +3392,11 @@ def imported_meli_product(payload, item_id, source_url):
         "source_description": clean_product_text(description),
         "source_price": optional_money(item.get("price")) or 0,
         "source_currency": item.get("currency_id") or "BRL",
-        "pictures": product_image_urls(
-            item.get("pictures") or [item.get("secure_thumbnail") or item.get("thumbnail")], source_url
-        ),
+        "pictures": product_image_urls([
+            *(item.get("pictures") or []),
+            *(catalog_product.get("pictures") or []),
+            item.get("secure_thumbnail") or item.get("thumbnail"),
+        ], source_url),
         "specifications": specs[:80],
         "category_id": item.get("category_id") or "",
         "domain_id": item.get("domain_id") or "",
@@ -3192,7 +3423,10 @@ def generated_product_description(product):
         if not label or not value or signature in seen:
             continue
         seen.add(signature)
-        lines.append(f"- {label}: {value}")
+        if normalized_attribute_label(label) in {"caracteristica", "feature", "key feature"}:
+            lines.append(f"- {value.rstrip('.')}.")
+        else:
+            lines.append(f"- {label}: {value}")
         if len(seen) >= 30:
             break
     if not seen and product.get("source_description"):
@@ -3319,11 +3553,29 @@ def import_product_operation(payload, request):
 
 def product_category_operation(payload, request):
     category_id = clean_attribute_value(request.get("category_id"))
-    if not re.fullmatch(r"ML[A-Z]\d+", category_id):
-        raise RuntimeError("Selecione uma categoria válida.")
     reader = official_reader_client(payload)
     if not reader:
         raise RuntimeError("Nenhuma conta oficial conectada.")
+    query = clean_product_text(request.get("query"), 240)
+    if query and not category_id:
+        if re.fullmatch(r"ML[A-Z]\d+", query.upper()):
+            category_id = query.upper()
+            try:
+                category = reader.category(category_id) or {}
+            except Exception as exc:
+                raise RuntimeError("A categoria informada não existe ou não está disponível.") from exc
+            return {"suggestions": [{
+                "category_id": category_id,
+                "category_name": category.get("name") or category_id,
+                "domain_id": "",
+            }]}
+        try:
+            suggestions = reader.domain_discovery(query, "MLB", 8) or []
+        except Exception as exc:
+            raise RuntimeError("Não foi possível consultar categorias agora.") from exc
+        return {"suggestions": suggestions[:8]}
+    if not re.fullmatch(r"ML[A-Z]\d+", category_id):
+        raise RuntimeError("Selecione uma categoria válida.")
     product = request.get("product") if isinstance(request.get("product"), dict) else {}
     definitions = cached_category_attributes(reader, category_id)
     return {"category_id": category_id, "attributes": publication_attribute_rows(product, definitions)}

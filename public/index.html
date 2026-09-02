@@ -986,8 +986,12 @@
                   <label>EAN / UPC / GTIN <input name="gtin" inputmode="numeric" /></label>
                   <label class="span-2">Categoria prevista
                     <select name="category_id" required></select>
-                    <small>Você pode escolher uma das três previsões oficiais.</small>
+                    <small>Escolha uma previsão oficial ou pesquise outra categoria abaixo.</small>
                   </label>
+                  <div class="publisher-category-search span-2">
+                    <input id="publisher-category-query" type="search" placeholder="Buscar por nome da categoria ou código MLB..." />
+                    <button id="publisher-category-search" class="ghost" type="button">Buscar outra categoria</button>
+                  </div>
                   <label class="span-2">Produto de catálogo
                     <select name="catalog_product_id"><option value="">Anúncio tradicional / sem vínculo automático</option></select>
                   </label>

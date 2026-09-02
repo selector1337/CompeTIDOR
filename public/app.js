@@ -7382,6 +7382,45 @@ document.querySelector('#product-publish-form [name="category_id"]')?.addEventLi
   }
 });
 
+document.querySelector("#publisher-category-search")?.addEventListener("click", async (event) => {
+  const query = document.querySelector("#publisher-category-query")?.value.trim();
+  const select = document.querySelector('#product-publish-form [name="category_id"]');
+  if (!query || !select) {
+    showToast("Digite o nome da categoria ou um código MLB.", "error");
+    return;
+  }
+  const button = event.currentTarget;
+  button.disabled = true;
+  button.textContent = "Buscando...";
+  try {
+    const result = await api("/api/products/category", {
+      method: "POST",
+      body: JSON.stringify({ query }),
+    });
+    const suggestions = result.suggestions || [];
+    if (!suggestions.length) throw new Error("Nenhuma categoria relacionada foi encontrada.");
+    const existing = new Map([...select.options].map((option) => [option.value, option]));
+    suggestions.forEach((row) => {
+      let option = existing.get(row.category_id);
+      if (!option) {
+        option = document.createElement("option");
+        option.value = row.category_id;
+        select.appendChild(option);
+      }
+      option.textContent = `${row.category_name || row.category_id} · ${row.category_id}`;
+      option.dataset.domainId = row.domain_id || "";
+    });
+    select.value = suggestions[0].category_id;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    showToast(`${suggestions.length} categoria(s) encontrada(s).`);
+  } catch (error) {
+    showToast(error.message || "Não foi possível pesquisar categorias.", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Buscar outra categoria";
+  }
+});
+
 document.querySelector("#product-import-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = event.currentTarget.querySelector('button[type="submit"]');
