@@ -5037,7 +5037,8 @@ function renderAssistedPublisher() {
 }
 
 function publisherAttributeInput(attribute) {
-  const required = attribute.required ? "required" : "";
+  const identifierChoice = ["GTIN", "EAN", "UPC", "EMPTY_GTIN_REASON"].includes(String(attribute.id || "").toUpperCase());
+  const required = attribute.required && !identifierChoice ? "required" : "";
   if (attribute.options?.length) {
     const matched = attribute.options.find((option) => String(option.name).toLowerCase() === String(attribute.value || "").toLowerCase());
     return `<select data-publisher-attribute="${escapeAttr(attribute.id)}" ${required}>
@@ -5052,13 +5053,50 @@ function renderPublisherAttributes(attributes) {
   const root = document.querySelector("#publisher-attributes");
   if (!root) return;
   const rows = [...(attributes || [])].sort((a, b) => Number(b.required) - Number(a.required));
-  root.innerHTML = rows.map((attribute) => `
-    <label class="${attribute.required ? "required" : ""}">${escapeText(attribute.name || attribute.id)}${attribute.required ? " *" : ""}
+  root.innerHTML = rows.map((attribute) => {
+    const identifierChoice = ["GTIN", "EAN", "UPC", "EMPTY_GTIN_REASON"].includes(String(attribute.id || "").toUpperCase());
+    return `
+    <label data-publisher-attribute-label="${escapeAttr(attribute.id)}" class="${attribute.required && !identifierChoice ? "required" : ""} ${identifierChoice ? "identifier-choice" : ""}">${escapeText(attribute.name || attribute.id)}${attribute.required ? (identifierChoice ? " * (alternativo)" : " *") : ""}
       ${publisherAttributeInput(attribute)}
-      <small>${escapeText(attribute.id)}${attribute.required ? " · obrigatório" : ""}</small>
-    </label>
-  `).join("") || `<div class="notice">A categoria não retornou campos adicionais para preenchimento.</div>`;
+      <small>${escapeText(attribute.id)}${attribute.required ? (identifierChoice ? " · informe este campo ou a alternativa" : " · obrigatório") : ""}</small>
+    </label>`;
+  }).join("") || `<div class="notice">A categoria não retornou campos adicionais para preenchimento.</div>`;
+  updatePublisherIdentifierRequirements();
 }
+
+function updatePublisherIdentifierRequirements() {
+  const root = document.querySelector("#publisher-attributes");
+  if (!root) return;
+  const gtin = root.querySelector('[data-publisher-attribute="GTIN"], [data-publisher-attribute="EAN"], [data-publisher-attribute="UPC"]');
+  const reason = root.querySelector('[data-publisher-attribute="EMPTY_GTIN_REASON"]');
+  if (!gtin || !reason) return;
+  const mainGtin = document.querySelector('#product-publish-form [name="gtin"]');
+  if (!gtin.value && mainGtin?.value) gtin.value = mainGtin.value.trim();
+  if (gtin.value && mainGtin && mainGtin.value !== gtin.value) mainGtin.value = gtin.value.trim();
+  const gtinFilled = Boolean(String(gtin.value || mainGtin?.value || "").trim());
+  const reasonFilled = Boolean(String(reason.value || "").trim());
+  gtin.disabled = reasonFilled;
+  reason.disabled = gtinFilled;
+  gtin.required = false;
+  reason.required = false;
+  gtin.setCustomValidity(!gtinFilled && !reasonFilled ? "Informe o GTIN ou selecione o motivo para não informá-lo." : "");
+  const gtinLabel = gtin.closest("label");
+  const reasonLabel = reason.closest("label");
+  gtinLabel?.classList.toggle("required", gtinFilled);
+  reasonLabel?.classList.toggle("required", reasonFilled);
+  gtinLabel?.classList.toggle("choice-required", !gtinFilled && !reasonFilled);
+  reasonLabel?.classList.toggle("choice-required", !gtinFilled && !reasonFilled);
+}
+
+document.querySelector("#publisher-attributes")?.addEventListener("input", updatePublisherIdentifierRequirements);
+document.querySelector("#publisher-attributes")?.addEventListener("change", updatePublisherIdentifierRequirements);
+document.querySelector('#product-publish-form [name="gtin"]')?.addEventListener("input", (event) => {
+  if (String(event.currentTarget.value || "").trim()) {
+    const reason = document.querySelector('#publisher-attributes [data-publisher-attribute="EMPTY_GTIN_REASON"]');
+    if (reason) reason.value = "";
+  }
+  updatePublisherIdentifierRequirements();
+});
 
 function applyAssistedProduct(product) {
   state.productDraft = product;
