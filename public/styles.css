@@ -9721,6 +9721,8 @@ textarea:focus {
 .publisher-picture:has(input:not(:checked)) { opacity: .38; filter: grayscale(1); }
 .publisher-package-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-top: 8px; padding-top: 12px; border-top: 1px solid rgba(148,163,184,.18); }
 .publisher-package-heading small { color: var(--muted); font-weight: 500; text-align: right; }
+.publisher-upload-button { margin-top: 2px; }
+.publisher-upload-status { display: inline-block; margin-left: 10px; color: var(--muted); }
 .publisher-attributes { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-top: 14px; }
 .publisher-attributes label { display: grid; gap: 5px; min-width: 0; font-size: .73rem; }
 .publisher-attributes label.required { padding: 9px; border: 1px solid rgba(255,230,0,.35); border-radius: 10px; background: rgba(255,230,0,.06); }

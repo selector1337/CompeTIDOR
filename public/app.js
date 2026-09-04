@@ -144,6 +144,7 @@
   kitLoading: false,
   kitPendingFields: [],
   productDraft: null,
+  productUploadedPictures: [],
   productImportLoading: false,
   productPublishing: false,
   returnsData: null,
@@ -5088,6 +5089,34 @@ function updatePublisherIdentifierRequirements() {
   reasonLabel?.classList.toggle("choice-required", !gtinFilled && !reasonFilled);
 }
 
+function renderPublisherPictures() {
+  const root = document.querySelector("#publisher-pictures");
+  if (!root) return;
+  const imported = (state.productDraft?.pictures || []).map((url) => ({ source: url, preview: url }));
+  const rows = [...imported, ...(state.productUploadedPictures || [])].slice(0, 12);
+  root.innerHTML = rows.map((picture, index) => `
+    <label class="publisher-picture">
+      <input type="checkbox" ${picture.id ? "data-publisher-uploaded-picture" : "data-publisher-picture"}
+        value="${escapeAttr(picture.id || picture.source)}" checked />
+      <span>${index + 1}</span>
+      <img src="${escapeAttr(picture.preview || picture.source || "")}" alt="Foto ${index + 1}" loading="lazy" />
+    </label>
+  `).join("") || `<div class="notice danger-notice">Nenhuma foto foi identificada. Importe fotos do computador.</div>`;
+  root.querySelectorAll(".publisher-picture img").forEach((image) => {
+    image.addEventListener("error", () => {
+      const card = image.closest(".publisher-picture");
+      const input = card?.querySelector("input");
+      if (input?.hasAttribute("data-publisher-picture") && state.productDraft) {
+        state.productDraft.pictures = (state.productDraft.pictures || []).filter((url) => url !== input.value);
+      }
+      card?.remove();
+      root.querySelectorAll(".publisher-picture > span").forEach((span, index) => { span.textContent = String(index + 1); });
+    }, { once: true });
+  });
+  const status = document.querySelector("#publisher-picture-upload-status");
+  if (status) status.textContent = `${rows.length} de 12 fotos`;
+}
+
 document.querySelector("#publisher-attributes")?.addEventListener("input", updatePublisherIdentifierRequirements);
 document.querySelector("#publisher-attributes")?.addEventListener("change", updatePublisherIdentifierRequirements);
 document.querySelector('#product-publish-form [name="gtin"]')?.addEventListener("input", (event) => {
@@ -5100,6 +5129,7 @@ document.querySelector('#product-publish-form [name="gtin"]')?.addEventListener(
 
 function applyAssistedProduct(product) {
   state.productDraft = product;
+  state.productUploadedPictures = [];
   const form = document.querySelector("#product-publish-form");
   if (!form) return;
   form.hidden = false;
@@ -5134,12 +5164,7 @@ function applyAssistedProduct(product) {
     : `<option value="${escapeAttr(product.category_id || "")}">${escapeText(product.category_id || "Categoria não identificada")}</option>`;
   const catalog = form.elements.catalog_product_id;
   catalog.innerHTML = `<option value="">Anúncio tradicional / sem vínculo automático</option>${(product.catalog_candidates || []).map((row) => `<option value="${escapeAttr(row.id)}" ${row.id === product.catalog_product_id ? "selected" : ""}>${escapeText(row.name)} · ${escapeText(row.id)}${row.listing_strategy ? ` · ${escapeText(row.listing_strategy)}` : ""}</option>`).join("")}`;
-  document.querySelector("#publisher-pictures").innerHTML = (product.pictures || []).map((url, index) => `
-    <label class="publisher-picture"><input type="checkbox" data-publisher-picture value="${escapeAttr(url)}" checked /><span>${index + 1}</span><img src="${escapeAttr(url)}" alt="Foto ${index + 1}" loading="lazy" /></label>
-  `).join("") || `<div class="notice danger-notice">Nenhuma foto foi identificada. Use outro link com imagens públicas.</div>`;
-  document.querySelectorAll("#publisher-pictures .publisher-picture img").forEach((image) => {
-    image.addEventListener("error", () => image.closest(".publisher-picture")?.remove(), { once: true });
-  });
+  renderPublisherPictures();
   renderPublisherAttributes(product.attributes || []);
   const accounts = product.accounts?.length ? product.accounts : connectedAccounts();
   document.querySelector("#publisher-accounts").innerHTML = accounts.map((account, index) => `
@@ -5185,6 +5210,7 @@ function collectAssistedPublication() {
       package_weight: values.get("package_weight"), package_height: values.get("package_height"),
       package_width: values.get("package_width"), package_length: values.get("package_length"),
       pictures: [...form.querySelectorAll("[data-publisher-picture]:checked")].map((input) => input.value),
+      uploaded_picture_ids: [...form.querySelectorAll("[data-publisher-uploaded-picture]:checked")].map((input) => input.value),
       attributes,
     },
   };
@@ -7503,6 +7529,42 @@ document.querySelector("#product-import-form")?.addEventListener("submit", async
     if (button) { button.disabled = false; button.textContent = "Importar e preparar"; }
     renderAssistedPublisher();
   }
+});
+
+document.querySelector("#publisher-picture-upload")?.addEventListener("change", async (event) => {
+  const selectedAccount = document.querySelector("[data-publisher-account]:checked")?.value;
+  if (!selectedAccount) {
+    showToast("Selecione primeiro ao menos uma conta para enviar as fotos.", "error");
+    event.target.value = "";
+    return;
+  }
+  const files = [...event.target.files];
+  for (const file of files) {
+    if ((state.productDraft?.pictures?.length || 0) + state.productUploadedPictures.length >= 12) {
+      showToast("O Mercado Livre aceita no máximo 12 fotos por anúncio.", "error");
+      break;
+    }
+    try {
+      const status = document.querySelector("#publisher-picture-upload-status");
+      if (status) status.textContent = `Enviando ${file.name}...`;
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      const queued = await api("/api/products/picture", {
+        method: "POST",
+        body: JSON.stringify({ account_id: selectedAccount, filename: file.name, data_url: dataUrl }),
+      });
+      const uploaded = await waitForAsyncOperation(queued);
+      state.productUploadedPictures.push({ id: uploaded.id, preview: dataUrl });
+      renderPublisherPictures();
+    } catch (error) {
+      showToast(`${file.name}: ${error.message || "falha no upload"}`, "error");
+    }
+  }
+  event.target.value = "";
 });
 
 document.querySelector("#publisher-validate")?.addEventListener("click", async (event) => {

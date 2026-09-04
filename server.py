@@ -3019,7 +3019,7 @@ def product_page_download(url):
         )):
             raise urllib.error.HTTPError(str(url), 403, "Blocked product page", {}, None)
         return decoded, final_url
-    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
         if isinstance(exc, urllib.error.HTTPError) and exc.code not in {403, 429, 503}:
             raise
         # Alguns varejistas usam proteção de borda que recusa clientes sem
@@ -3190,6 +3190,8 @@ def normalized_product_image_url(value, base_url=""):
     url = re.sub(r"\._[^./?]+_\.(?=[A-Za-z]{2,5}(?:\?|$))", ".", url, flags=re.IGNORECASE)
     url = re.sub(r"/images/smallimages/", "/images/images2500x2500/", url, flags=re.IGNORECASE)
     url = re.sub(r"/images/multiple_images/thumbnails/", "/images/multiple_images/images2500x2500/", url, flags=re.IGNORECASE)
+    if "media.guitarcenter.com" in (urlparse(url).hostname or "").lower() and "/is/image/" in urlparse(url).path.lower():
+        url = url.split("?", 1)[0]
     return url
 
 
@@ -3311,6 +3313,7 @@ def markdown_product_page(content, page_url):
     title = re.sub(r"^\s*Amazon(?:\.com(?:\.br)?)?\s*:\s*", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\s*[|\-]\s*(?:Amazon.*|B&H.*|Thomann.*|Guitar Center.*)$", "", title, flags=re.IGNORECASE)
     image_candidates = []
+    host = product_import_host(page_url)
     source_product = re.search(r"/c/product/(\d+)", page_url, flags=re.IGNORECASE)
     source_product_id = source_product.group(1) if source_product else ""
     paired_images = re.findall(
@@ -3329,6 +3332,32 @@ def markdown_product_page(content, page_url):
         alt_key = normalized_attribute_label(alt)
         if alt_key and not any(word in alt_key for word in ("logo", "icon", "payment", "banner", "avatar")):
             image_candidates.append(url)
+    if "amazon." in host:
+        # The public Amazon rendering contains ads, recommendations and review
+        # photos. Its real gallery is the compact image block immediately
+        # before the product H1.
+        heading = re.search(r"^#\s+(.+)$", content, flags=re.MULTILINE)
+        gallery_scope = content[max(0, (heading.start() if heading else 0) - 12000):(heading.end() if heading else 0) + 1200]
+        amazon_images = re.findall(
+            r"!\[[^\]]*\]\((https?://(?:m\.)?media-amazon\.com/images/I/[^)\s]+)",
+            gallery_scope, flags=re.IGNORECASE,
+        )
+        image_candidates = amazon_images
+    elif "thomann" in host:
+        image_candidates = [
+            url for url in image_candidates
+            if "static-thomann.de" in url.lower() and "/pics/bdb/" in url.lower()
+        ]
+    elif "guitarcenter.com" in host:
+        image_candidates = [
+            url for url in image_candidates
+            if "media.guitarcenter.com/is/image/mmgs7/" in url.lower()
+        ]
+        large_images = [
+            url for url in image_candidates
+            if not re.search(r"-(?:[1-4]?\d{1,2})x(?:[1-4]?\d{1,2})\.(?:jpe?g|png|webp)(?:$|\?)", url, flags=re.IGNORECASE)
+        ]
+        image_candidates = large_images or image_candidates
     specs = []
     for label, value in re.findall(r"^\s*[-*]?\s*\*\*([^*:\n]{2,60})\*\*\s*:?\s*(.{2,300})$", content, flags=re.MULTILINE):
         label, value = clean_product_text(label, 80), clean_product_text(value, 300)
@@ -3347,14 +3376,30 @@ def markdown_product_page(content, page_url):
         if identity:
             brand = brand or identity.group(1).strip()
             model = model or identity.group(2).strip()
+    if ("guitarcenter.com" in host or "thomann" in host) and (not brand or not model):
+        identity = re.search(r"\b([A-Z]{1,8})[\s-]+(\d{2,}[A-Z0-9-]*)\b", title, flags=re.IGNORECASE)
+        if identity:
+            model = model or f"{identity.group(1).upper()}-{identity.group(2).upper()}"
+            brand = brand or title[:identity.start()].strip(" -|:")
+    if "amazon." in host:
+        brand_match = re.search(r"^\s*(?:Brand|Brand Name)\s+([^\n|]{2,120})\s*$", content, flags=re.IGNORECASE | re.MULTILINE)
+        if not brand_match:
+            brand_match = re.search(r"^\s*\|\s*Brand(?: Name)?\s*\|\s*([^|\n]+)", content, flags=re.IGNORECASE | re.MULTILINE)
+        model_match = re.search(r"^\s*(?:Model Name|Model Number)\s+([^\n|]{1,120})\s*$", content, flags=re.IGNORECASE | re.MULTILINE)
+        if not model_match:
+            model_match = re.search(r"^\s*\|\s*Model(?: Name| Number)?\s*\|\s*([^|\n]+)", content, flags=re.IGNORECASE | re.MULTILINE)
+        brand = clean_product_text(brand_match.group(1), 120) if brand_match else brand
+        model = clean_product_text(model_match.group(1), 120) if model_match else model
     description_match = re.search(
-        r"^##?\s+(?:Product Description|Description|Features|Key Features|.+?\sOverview)\s*\n(.*?)(?=^##?\s+|\Z)",
+        r"^##?\s+(?:About this item|Product Description|Description|Features|Key Features|.+?\sOverview)\s*\n(.*?)(?=^##?\s+|\Z)",
         content, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
     )
-    description = clean_product_text(description_match.group(1), 5000) if description_match else ""
+    description_block = description_match.group(1) if description_match else ""
+    description_block = re.sub(r"!?\[[^\]]*\]\([^)]*\)", " ", description_block)
+    description = clean_product_text(description_block, 5000)
     gtin_match = re.search(r"\b(?:UPC|EAN|GTIN)\s*:\s*([0-9][0-9\s-]{7,20})", content, flags=re.IGNORECASE)
     gtin = re.sub(r"\D", "", gtin_match.group(1)) if gtin_match else ""
-    mpn_match = re.search(r"\b(?:MFR|Manufacturer|Part)\s*#?\s*:?\s*([A-Z0-9][A-Z0-9._/-]{2,})", content, flags=re.IGNORECASE)
+    mpn_match = None if ("amazon." in host or "guitarcenter.com" in host) else re.search(r"\b(?:MFR|Manufacturer|Part)\s*#?\s*:?\s*([A-Z0-9][A-Z0-9._/-]{2,})", content, flags=re.IGNORECASE)
     mpn = clean_product_text(mpn_match.group(1), 120) if mpn_match else model
     known_labels = (
         "Speaker Type", "Configuration", "Total Output Power", "LF Driver", "HF Driver",
@@ -3369,6 +3414,11 @@ def markdown_product_page(content, page_url):
                 if value:
                     specs.append({"name": label, "value": value})
                 break
+    if "amazon." in host and description:
+        for feature in re.split(r"\s+[*•]\s+|\s{2,}", description):
+            feature = clean_product_text(feature, 1000)
+            if len(feature) > 20:
+                specs.append({"name": "Característica", "value": feature})
     return {
         "name": title, "brand": brand, "model": model, "mpn": mpn, "gtin": gtin,
         "description": description, "images": product_image_urls(image_candidates, page_url),
@@ -3380,7 +3430,7 @@ def retailer_product_page(page_html, page_url, parser):
     host = product_import_host(page_url)
     if not any(domain in host for domain in ("bhphotovideo.com", "thomannmusic.com", "thomann.de", "guitarcenter.com")):
         return {}
-    if "bhphotovideo.com" in host and re.search(r"^Markdown Content:\s*$", page_html, flags=re.MULTILINE):
+    if re.search(r"^Markdown Content:\s*$", page_html, flags=re.MULTILINE):
         return {}
     brand = parser.meta.get("product:brand") or parser.meta.get("brand") or ""
     raw_urls = re.findall(r"https?:(?:\\?/\\?/)[^\"'<>\s]+", page_html)
@@ -11015,6 +11065,10 @@ def clone_picture_payload(item):
     pictures = item.get("pictures") or []
     rows = []
     for picture in pictures:
+        picture_id = clean_attribute_value(picture.get("id"))
+        if picture_id:
+            rows.append({"id": picture_id})
+            continue
         url = picture.get("secure_url") or picture.get("url")
         if url:
             rows.append({"source": url})
@@ -13410,7 +13464,11 @@ def build_assisted_publication_payload(draft, variant):
     if listing_type_id not in {"gold_special", "gold_pro"}:
         raise RuntimeError("Selecione anúncio Clássico ou Premium.")
     pictures = product_image_urls(draft.get("pictures") or [])
-    if not pictures:
+    uploaded_picture_ids = list(dict.fromkeys(
+        clean_attribute_value(value) for value in draft.get("uploaded_picture_ids") or []
+        if clean_attribute_value(value)
+    ))
+    if not pictures and not uploaded_picture_ids:
         raise RuntimeError("Selecione ao menos uma imagem para o anúncio.")
     attributes = apply_assisted_item_condition(
         assisted_publication_attributes(draft), draft.get("condition")
@@ -13425,7 +13483,10 @@ def build_assisted_publication_payload(draft, variant):
         "buying_mode": "buy_it_now",
         "listing_type_id": listing_type_id,
         "condition": clean_attribute_value(draft.get("condition")) or "new",
-        "pictures": [{"url": url} for url in pictures],
+        "pictures": [
+            *({"url": url} for url in pictures),
+            *({"id": picture_id} for picture_id in uploaded_picture_ids),
+        ],
         "attributes": attributes,
         "sale_terms": [],
         "seller_custom_field": sku,
@@ -13471,9 +13532,13 @@ def validate_assisted_product_operation(payload, request):
         raise RuntimeError("Selecione ao menos uma conta conectada.")
     draft = request.get("draft") or {}
     variant = assisted_publication_variants(request)[0]
-    create_payload, _ = build_assisted_publication_payload(draft, variant)
+    create_payload, source_item = build_assisted_publication_payload(draft, variant)
+    client = account_client(account)
+    stores = target_official_stores(client, account, payload.get("catalog") or [])
+    destination_store_id = target_official_store_id(client, account, source_item, stores)
+    prepare_cross_account_official_store_payload(create_payload, destination_store_id)
     try:
-        response = run_interactive_meli_call(account_client(account).validate_item, create_payload)
+        response = run_interactive_meli_call(client.validate_item, create_payload)
         return {
             "valid": True,
             "account": account.get("nickname"),
@@ -13482,6 +13547,20 @@ def validate_assisted_product_operation(payload, request):
             "official": response or {},
         }
     except Exception as exc:
+        if official_store_error_kind(exc) == "required":
+            retry_store_id = official_store_retry_id(exc, source_item, destination_store_id)
+            if retry_store_id not in (None, ""):
+                try:
+                    prepare_cross_account_official_store_payload(create_payload, retry_store_id)
+                    response = run_interactive_meli_call(client.validate_item, create_payload)
+                    return {
+                        "valid": True, "account": account.get("nickname"),
+                        "listing_type_id": variant.get("listing_type_id"),
+                        "message": "O Mercado Livre aceitou a estrutura e a Loja Oficial própria desta conta.",
+                        "official": response or {},
+                    }
+                except Exception as retry_exc:
+                    exc = retry_exc
         return {
             "valid": False,
             "account": account.get("nickname"),
@@ -13521,9 +13600,18 @@ def publish_assisted_product_operation(payload, request, actor=None):
             )
             try:
                 create_payload, source_item = build_assisted_publication_payload(draft, variant)
+                destination_stores = target_official_stores(
+                    client, account, payload.get("catalog") or [],
+                )
+                destination_store_id = target_official_store_id(
+                    client, account, source_item, destination_stores,
+                )
                 created = create_item_with_clone_retries(
                     client, create_payload, source_item,
                     category_attributes=definitions,
+                    cross_account=True,
+                    destination_store_id=destination_store_id,
+                    destination_stores=destination_stores,
                     publication_name=draft.get("title") or "",
                 )
                 item_id = created.get("id")
@@ -20499,6 +20587,7 @@ class App(BaseHTTPRequestHandler):
             "/api/products/import",
             "/api/products/category",
             "/api/products/validate",
+            "/api/products/picture",
             "/api/kits/preview",
             "/api/kits/picture",
             "/api/kits/create",
@@ -21654,6 +21743,20 @@ class App(BaseHTTPRequestHandler):
                     "kit_picture",
                     lambda: upload_kit_picture(request_copy),
                     "Validando e enviando a imagem ao Mercado Livre.",
+                    priority="manual",
+                )
+                self.send_json({"ok": True, **operation}, status=202)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/products/picture":
+            try:
+                request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+                operation = start_async_operation(
+                    "product_picture",
+                    lambda: upload_kit_picture(request_copy),
+                    "Validando e enviando a foto do produto ao Mercado Livre.",
                     priority="manual",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
