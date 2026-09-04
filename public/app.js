@@ -146,6 +146,7 @@
   productDraft: null,
   productUploadedPictures: [],
   productImportLoading: false,
+  productImportRequestToken: 0,
   productPublishing: false,
   returnsData: null,
   returnsLoading: false,
@@ -5125,7 +5126,7 @@ function renderPublisherPictures() {
 function updatePublisherStoreRequirements() {
   document.querySelectorAll(".publisher-account-row").forEach((row) => {
     const checked = Boolean(row.querySelector("[data-publisher-account]")?.checked);
-    const store = row.querySelector("select[data-publisher-official-store]");
+    const store = row.querySelector("[data-publisher-official-store]");
     if (store) store.required = checked;
   });
 }
@@ -5185,10 +5186,10 @@ function applyAssistedProduct(product) {
     const stores = account.official_store_options || [];
     return `<article class="publisher-account-row">
       <label><input type="checkbox" data-publisher-account value="${escapeAttr(accountId)}" ${index === 0 ? "checked" : ""} /><span><strong>${escapeText(account.nickname)}</strong><small>Seller ${escapeText(account.seller_id || "-")}</small></span></label>
-      ${stores.length > 1 ? `<select data-publisher-official-store="${escapeAttr(accountId)}" aria-label="Loja Oficial de ${escapeAttr(account.nickname)}">
+      ${stores.length ? `<select data-publisher-official-store="${escapeAttr(accountId)}" aria-label="Loja Oficial de ${escapeAttr(account.nickname)}">
         <option value="">Escolha a Loja Oficial</option>
         ${stores.map((store) => `<option value="${escapeAttr(store.value)}" ${String(store.value) === String(account.official_store_id || "") ? "selected" : ""}>${escapeText(store.label)}</option>`).join("")}
-      </select>` : stores.length === 1 ? `<input type="hidden" data-publisher-official-store="${escapeAttr(accountId)}" value="${escapeAttr(stores[0].value)}" />` : ""}
+      </select>` : ""}
     </article>`;
   }).join("") || `<div class="notice danger-notice">Nenhuma conta oficial conectada.</div>`;
   updatePublisherStoreRequirements();
@@ -5248,10 +5249,36 @@ function collectAssistedPublication() {
 function renderPublisherResults(result) {
   const root = document.querySelector("#publisher-results");
   if (!root) return;
+  applyPublisherPendingFields(result?.results || []);
   root.innerHTML = `<div class="publisher-result-summary"><strong>${Number(result.created || 0)} anúncio(s) criado(s)</strong><span>${Number(result.failed || 0)} falha(s)</span></div>
     <div class="publisher-result-grid">${(result.results || []).map((row) => row.status === "created" ? `
       <a href="${escapeAttr(row.permalink || "#")}" target="_blank" rel="noreferrer"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"}</small><strong>${escapeText(row.item_id || "Criado")}</strong><span>${escapeText(row.title || "")}</span></a>
-    ` : `<article class="error"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"}</small><strong>Não publicado</strong><span>${escapeText(row.error || "Erro não identificado")}</span></article>`).join("")}</div>`;
+    ` : `<article class="${row.pending_fields?.length ? "review" : "error"}"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"}</small><strong>${row.pending_fields?.length ? "Seleção necessária" : "Não publicado"}</strong><span>${escapeText(row.error || "Erro não identificado")}</span>${row.pending_fields?.length ? `<em>Selecione a Loja Oficial na conta acima e publique novamente.</em>` : ""}</article>`).join("")}</div>`;
+}
+
+function applyPublisherPendingFields(rows) {
+  const applied = new Set();
+  for (const row of rows || []) {
+    const accountId = String(row.account_id || "");
+    if (!accountId || applied.has(accountId)) continue;
+    const field = (row.pending_fields || []).find((item) => item.id === "official_store_id");
+    if (!field) continue;
+    const accountInput = [...document.querySelectorAll("[data-publisher-account]")]
+      .find((input) => String(input.value) === accountId);
+    const accountRow = accountInput?.closest(".publisher-account-row");
+    if (!accountRow) continue;
+    accountRow.querySelector("[data-publisher-official-store]")?.remove();
+    const wrapper = document.createElement("label");
+    wrapper.className = "publisher-store-required";
+    const options = Array.isArray(field.options) ? field.options : [];
+    wrapper.innerHTML = options.length
+      ? `<span>${escapeText(field.label || "Loja Oficial")}</span><select data-publisher-official-store="${escapeAttr(accountId)}" required><option value="">Selecione a loja</option>${options.map((option) => `<option value="${escapeAttr(option.value)}">${escapeText(option.label || option.value)}</option>`).join("")}</select><small>${escapeText(field.message || "Escolha a Loja Oficial desta conta.")}</small>`
+      : `<span>${escapeText(field.label || "ID da Loja Oficial")}</span><input type="number" min="1" step="1" data-publisher-official-store="${escapeAttr(accountId)}" placeholder="Informe o ID da Loja Oficial" required /><small>${escapeText(field.message || "Informe o ID da Loja Oficial desta conta.")}</small>`;
+    accountRow.appendChild(wrapper);
+    accountInput.checked = true;
+    applied.add(accountId);
+  }
+  updatePublisherStoreRequirements();
 }
 
 function cloneCreatedHtml(items) {
@@ -7466,21 +7493,61 @@ document.querySelector('[name="title_override"]')?.addEventListener("input", upd
 
 document.querySelector('#product-publish-form [name="title"]')?.addEventListener("input", updatePublisherTitleCounter);
 
-document.querySelector("#publisher-clear-all")?.addEventListener("click", () => {
+function resetAssistedPublisher() {
+  state.productImportRequestToken += 1;
   state.productDraft = null;
   state.productUploadedPictures = [];
   state.productImportLoading = false;
+  state.productPublishing = false;
   document.querySelector("#product-import-form")?.reset();
   document.querySelector("#product-publish-form")?.reset();
+  const importButton = document.querySelector('#product-import-form button[type="submit"]');
+  if (importButton) { importButton.disabled = false; importButton.textContent = "Importar e preparar"; }
+  const publishButton = document.querySelector('#product-publish-form button[type="submit"]');
+  if (publishButton) { publishButton.disabled = false; publishButton.textContent = "Publicar anúncios"; }
   for (const selector of ["#publisher-pictures", "#publisher-attributes", "#publisher-accounts", "#publisher-results"]) {
     const element = document.querySelector(selector);
     if (element) element.innerHTML = "";
   }
   const validation = document.querySelector("#publisher-validation");
-  if (validation) validation.hidden = true;
+  if (validation) {
+    validation.hidden = true;
+    validation.className = "publisher-validation";
+    validation.innerHTML = "";
+  }
   const progress = document.querySelector("#product-import-progress");
-  if (progress) progress.hidden = true;
+  if (progress) {
+    progress.hidden = true;
+    const bar = progress.querySelector("span");
+    const text = progress.querySelector("small");
+    if (bar) bar.style.width = "0%";
+    if (text) text.textContent = "";
+  }
+  const publishForm = document.querySelector("#product-publish-form");
+  if (publishForm) publishForm.hidden = true;
+  const empty = document.querySelector("#product-draft-empty");
+  if (empty) empty.hidden = false;
+  const sourceThumb = document.querySelector("#publisher-source-thumb");
+  if (sourceThumb) { sourceThumb.removeAttribute("src"); sourceThumb.hidden = true; }
+  const sourceTitle = document.querySelector("#publisher-source-title");
+  if (sourceTitle) sourceTitle.textContent = "";
+  const sourceLink = document.querySelector("#publisher-source-link");
+  if (sourceLink) sourceLink.href = "#";
+  const upload = document.querySelector("#publisher-picture-upload");
+  if (upload) upload.value = "";
   renderAssistedPublisher();
+  const urlInput = document.querySelector('#product-import-form [name="url"]');
+  urlInput?.focus();
+}
+
+// Delegation keeps the reset reliable even if this panel is re-rendered.
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#publisher-clear-all")) return;
+  if (state.productPublishing) {
+    showToast("Aguarde a publicação em andamento terminar antes de limpar o cadastro.", "error");
+    return;
+  }
+  resetAssistedPublisher();
   showToast("Cadastro limpo. Você já pode importar outro produto.");
 });
 
@@ -7545,6 +7612,7 @@ document.querySelector("#publisher-category-search")?.addEventListener("click", 
 
 document.querySelector("#product-import-form")?.addEventListener("submit", async (event) => {
   event.preventDefault();
+  const requestToken = ++state.productImportRequestToken;
   const button = event.currentTarget.querySelector('button[type="submit"]');
   const progress = document.querySelector("#product-import-progress");
   const progressBar = progress?.querySelector("span");
@@ -7561,16 +7629,20 @@ document.querySelector("#product-import-form")?.addEventListener("submit", async
       body: JSON.stringify({ url: values.get("url") }),
     });
     const result = await waitForAsyncOperation(queued, (message) => {
+      if (requestToken !== state.productImportRequestToken) return;
       if (progressText) progressText.textContent = message || "Consultando dados e categoria.";
       if (progressBar) progressBar.style.width = message.includes("catálogo") ? "82%" : "55%";
     });
+    if (requestToken !== state.productImportRequestToken) return;
     if (progressBar) progressBar.style.width = "100%";
     applyAssistedProduct(result.product);
     showToast("Produto importado. Revise os dados antes de publicar.");
   } catch (error) {
+    if (requestToken !== state.productImportRequestToken) return;
     showToast(error.message || "Não foi possível importar este produto.", "error");
     document.querySelector("#product-draft-empty").hidden = false;
   } finally {
+    if (requestToken !== state.productImportRequestToken) return;
     state.productImportLoading = false;
     if (progress) progress.hidden = true;
     if (button) { button.disabled = false; button.textContent = "Importar e preparar"; }
@@ -7627,6 +7699,9 @@ document.querySelector("#publisher-validate")?.addEventListener("click", async (
       body: JSON.stringify(collectAssistedPublication()),
     });
     const result = await waitForAsyncOperation(queued, () => {});
+    if (result.pending_fields?.length) {
+      applyPublisherPendingFields([result]);
+    }
     validation.hidden = false;
     validation.className = `publisher-validation ${result.valid ? "success" : "error"}`;
     validation.innerHTML = `<strong>${result.valid ? "Estrutura aceita" : "Ajuste necessário"}</strong><span>${escapeText(result.message || "")}</span>`;
@@ -7659,7 +7734,12 @@ document.querySelector("#product-publish-form")?.addEventListener("submit", asyn
     const queued = await api("/api/products/publish", { method: "POST", body: JSON.stringify(request) });
     const result = await waitForAsyncOperation(queued, (message) => { button.textContent = message || "Publicando..."; });
     renderPublisherResults(result);
-    showToast(`${result.created || 0} anúncio(s) criado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`, result.failed ? "error" : "success");
+    showToast(
+      result.requires_review
+        ? "Selecione a Loja Oficial indicada e publique novamente."
+        : `${result.created || 0} anúncio(s) criado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`,
+      result.failed ? "error" : "success",
+    );
     if (state.catalogLoaded) await loadCatalogInBackground(true);
   } catch (error) {
     showToast(error.message || "Não foi possível publicar os anúncios.", "error");

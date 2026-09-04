@@ -960,7 +960,6 @@
             </div>
             <div class="publisher-heading-actions">
               <div class="publisher-stepper" aria-label="Etapas do cadastro"><span class="active" data-publisher-step="1">1 Importar</span><span data-publisher-step="2">2 Revisar</span><span data-publisher-step="3">3 Publicar</span></div>
-              <button id="publisher-clear-all" class="ghost" type="button">Limpar tudo</button>
             </div>
           </div>
           <form id="product-import-form" class="publisher-import-form">
@@ -968,7 +967,10 @@
               <input name="url" type="url" inputmode="url" placeholder="https://www.mercadolivre.com.br/..." required />
               <small>Mercado Livre, Amazon, B&amp;H Photo, Thomann ou Guitar Center.</small>
             </label>
-            <button class="primary" type="submit">Importar e preparar</button>
+            <div class="publisher-import-actions">
+              <button class="primary" type="submit">Importar e preparar</button>
+              <button id="publisher-clear-all" class="ghost" type="button">Limpar tudo</button>
+            </div>
           </form>
           <div id="product-import-progress" class="manual-progress publisher-progress" hidden><strong>Preparando produto</strong><div><span></span></div><small></small></div>
           <div id="product-draft-empty" class="publisher-empty"><span>＋</span><strong>Comece colando o link de um produto</strong><small>A aplicação aproveitará título, especificações e fotos e consultará categoria, atributos e catálogo no Mercado Livre.</small></div>

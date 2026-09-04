@@ -12000,7 +12000,10 @@ def target_official_stores(target_client, target_account, catalog=None):
     now = time.time()
     with OFFICIAL_STORE_CACHE_LOCK:
         cached = OFFICIAL_STORE_CACHE.get(seller_id)
-    if cached and now - cached.get("time", 0) < ttl:
+    # Never keep an empty discovery result for hours. A transient permission or
+    # network failure used to hide the official-store selector until the cache
+    # expired, even when Mercado Livre later required a store during publish.
+    if cached and cached.get("brands") and now - cached.get("time", 0) < ttl:
         brands = cached.get("brands") or []
     else:
         try:
@@ -12008,8 +12011,9 @@ def target_official_stores(target_client, target_account, catalog=None):
             brands = response.get("brands") or [] if isinstance(response, dict) else []
         except Exception:
             brands = []
-        with OFFICIAL_STORE_CACHE_LOCK:
-            OFFICIAL_STORE_CACHE[seller_id] = {"time": now, "brands": brands}
+        if brands:
+            with OFFICIAL_STORE_CACHE_LOCK:
+                OFFICIAL_STORE_CACHE[seller_id] = {"time": now, "brands": brands}
     available = [
         brand for brand in brands
         if brand.get("official_store_id") not in (None, "")
@@ -13588,6 +13592,7 @@ def validate_assisted_product_operation(payload, request):
         }
     except Exception as exc:
         if official_store_error_kind(exc) == "required":
+            stores = merge_official_stores(stores, official_stores_from_error(exc))
             retry_store_id = official_store_retry_id(exc, source_item, destination_store_id)
             if retry_store_id not in (None, ""):
                 try:
@@ -13601,12 +13606,18 @@ def validate_assisted_product_operation(payload, request):
                     }
                 except Exception as retry_exc:
                     exc = retry_exc
+                    stores = merge_official_stores(stores, official_stores_from_error(retry_exc))
+        pending_fields = list(getattr(exc, "pending_fields", []) or [])
+        if official_store_error_kind(exc) == "required" and not pending_fields:
+            pending_fields = [official_store_pending_field("", stores)]
         return {
             "valid": False,
             "account": account.get("nickname"),
             "listing_type_id": variant.get("listing_type_id"),
             "message": friendly_clone_error(exc),
             "official_error": str(exc),
+            "account_id": account.get("id"),
+            "pending_fields": pending_fields,
         }
 
 
@@ -13635,6 +13646,7 @@ def publish_assisted_product_operation(payload, request, actor=None):
         definitions = cached_category_attributes(client, category_id) if category_id else []
         for variant in variants:
             progress += 1
+            destination_stores = []
             label = "Premium" if variant.get("listing_type_id") == "gold_pro" else "Clássico"
             update_async_operation_progress(
                 f"Publicando {label} na conta {account.get('nickname')}.", progress - 1, total
@@ -13684,22 +13696,37 @@ def publish_assisted_product_operation(payload, request, actor=None):
                     "permalink": official.get("permalink") or created.get("permalink") or "",
                 })
             except Exception as exc:
-                results.append({
+                pending_fields = list(getattr(exc, "pending_fields", []) or [])
+                if official_store_error_kind(exc) == "required" and not pending_fields:
+                    pending_fields = [official_store_pending_field(
+                        "",
+                        merge_official_stores(
+                            destination_stores,
+                            official_stores_from_error(exc),
+                        ),
+                    )]
+                error_result = {
                     "status": "error", "account": account.get("nickname"), "account_id": account.get("id"),
                     "listing_type_id": variant.get("listing_type_id"), "error": friendly_clone_error(exc),
-                })
+                }
+                if pending_fields:
+                    error_result["pending_fields"] = pending_fields
+                results.append(error_result)
             update_async_operation_progress(
                 f"Processado {progress} de {total} anúncio(s).", progress, total, results[-1]
             )
     created_count = sum(row.get("status") == "created" for row in results)
-    if not created_count:
+    has_pending_fields = any(row.get("pending_fields") for row in results)
+    if not created_count and not has_pending_fields:
         detail = "; ".join(row.get("error") or "falha não identificada" for row in results[:3])
         raise RuntimeError(f"Nenhum anúncio foi criado. {detail}")
-    write_payload(payload)
+    if created_count:
+        write_payload(payload)
     return {
         "created": created_count,
         "failed": sum(row.get("status") == "error" for row in results),
         "results": results,
+        "requires_review": has_pending_fields,
     }
 
 
