@@ -2701,24 +2701,34 @@ def item_list_price(item, regular_amount=None):
 def extract_meli_item_id(value):
     raw = (value or "").strip()
     # Product pages (/p and /up) may expose a catalog/user-product id in the
-    # path and the concrete seller listing in `wid`. The seller listing is the
-    # public source that contains price, pictures and attributes, so it must
-    # always win over MLBU/MLB product identifiers from the path.
+    # path and the concrete seller listing in `wid` or `pdp_filters=item_id:`.
+    # The seller listing is the source that contains price and commercial
+    # fields, so these explicit offer identifiers must win over the catalog
+    # product identifier from /p/MLB... and the user-product MLBU path.
     try:
         parsed = urlparse(raw)
         parameters = {
             **parse_qs(parsed.query),
             **parse_qs(parsed.fragment),
         }
-        for key, values in parameters.items():
-            if str(key).lower() != "wid":
-                continue
-            for candidate in values or []:
-                match = re.search(r"\b(MLB\d{5,})\b", str(candidate), flags=re.I)
+        normalized_parameters = {str(key).lower(): values for key, values in parameters.items()}
+        for key in ("wid", "item_id", "itemid"):
+            for candidate in normalized_parameters.get(key) or []:
+                match = re.search(r"\b(MLB\d{5,})\b", unquote(str(candidate)), flags=re.I)
                 if match:
                     return match.group(1).upper()
+        for candidate in normalized_parameters.get("pdp_filters") or []:
+            match = re.search(r"(?:^|[|,;])\s*item_id\s*:\s*(MLB\d{5,})\b", unquote(str(candidate)), flags=re.I)
+            if match:
+                return match.group(1).upper()
     except Exception:
         pass
+    pdp_item_match = re.search(
+        r"pdp_filters=(?:[^#&]*?)(?:item_id(?::|%3A))(MLB\d{5,})\b",
+        raw, flags=re.I,
+    )
+    if pdp_item_match:
+        return pdp_item_match.group(1).upper()
     wid_match = re.search(r"(?:[?#&]|\b)wid=(MLB\d{5,})\b", raw, flags=re.I)
     if wid_match:
         return wid_match.group(1).upper()
@@ -2731,6 +2741,17 @@ def extract_meli_item_id(value):
     if match:
         return match.group(1)
     return text if re.fullmatch(r"ML[A-Z]\d{5,}", text) else ""
+
+
+def extract_meli_catalog_product_id(value):
+    """Return only the catalog product id carried by a Mercado Livre /p/ URL."""
+    raw = str(value or "").strip()
+    try:
+        path = unquote(urlparse(raw).path or "")
+    except Exception:
+        path = raw
+    match = re.search(r"/p/(MLB\d{5,})(?:/|$)", path, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else ""
 
 
 def resolve_competitor_seller(payload, reference):
@@ -4013,6 +4034,7 @@ def imported_meli_product(payload, item_id, source_url):
             return imported_meli_public_page(source_url)
         except Exception:
             pass
+    catalog_product = {}
     try:
         item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
     except Exception as exc:
@@ -4022,10 +4044,44 @@ def imported_meli_product(payload, item_id, source_url):
             return imported_meli_public_page(source_url)
         except Exception as page_exc:
             public_page_error = page_exc
+        # Search/catalog URLs now commonly carry the product id in /p/MLB...
+        # and the concrete offer in pdp_filters=item_id:MLB.... Even when the
+        # Items policy hides that seller's offer, /products/{id} remains the
+        # official source for title, pictures and technical attributes.
+        catalog_product_id = extract_meli_catalog_product_id(source_url)
+        if catalog_product_id:
+            try:
+                catalog_product = try_meli_sources(payload, [f"/products/{catalog_product_id}"])
+                if not isinstance(catalog_product, dict) or not (
+                    catalog_product.get("name") or catalog_product.get("title")
+                ):
+                    raise RuntimeError("Produto de catálogo sem título.")
+                catalog_price = first_present(
+                    catalog_product,
+                    [
+                        "buy_box_winner.price", "buy_box_winner.current_price",
+                        "price", "sale_price", "offers.0.price",
+                    ],
+                    0,
+                )
+                item = {
+                    "id": str(item_id or "").upper(),
+                    "title": catalog_product.get("name") or catalog_product.get("title") or "",
+                    "price": catalog_price or 0,
+                    "currency_id": catalog_product.get("currency_id") or "BRL",
+                    "pictures": catalog_product.get("pictures") or [],
+                    "attributes": catalog_product.get("attributes") or [],
+                    "category_id": catalog_product.get("category_id") or "",
+                    "domain_id": catalog_product.get("domain_id") or "",
+                    "catalog_product_id": catalog_product_id,
+                    "permalink": source_url,
+                }
+            except Exception:
+                catalog_product = {}
         # A concrete listing id extracted from `wid` must be read through the
         # Items API. Treating its 403 as an unknown catalog id caused a second
         # Scan request and replaced the useful diagnosis with a generic error.
-        if re.fullmatch(r"MLB\d{6,}", str(item_id or "").upper()) and (
+        if not catalog_product and re.fullmatch(r"MLB\d{6,}", str(item_id or "").upper()) and (
             "HTTP 403" in error_text
             or "PA_UNAUTHORIZED_RESULT_FROM_POLICIES" in error_text
             or "PolicyAgent" in error_text
@@ -4042,9 +4098,9 @@ def imported_meli_product(payload, item_id, source_url):
                 f"O navegador público de contingência também falhou. Diagnóstico: "
                 f"{page_reason or 'motivo não informado'}."
             ) from public_page_error
-        item = resolve_scan_target(payload, item_id)
+        if not catalog_product:
+            item = resolve_scan_target(payload, item_id)
     description = ""
-    catalog_product = {}
     owner = next(
         (
             account for account in payload.get("accounts") or []
