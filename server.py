@@ -3876,6 +3876,10 @@ def import_product_operation(payload, request):
     product["package_measurements"] = imported_package_measurements(product)
     product["description"] = generated_product_description(product)
     product_accounts = []
+    # Product import is queued with a lightweight payload. Reuse the complete
+    # synchronized catalog here so multi-store accounts get the same reliable
+    # official-store discovery already used by the kit workflow.
+    store_catalog = payload.get("catalog") or read_json(CATALOG_DATA_FILE, [])
     store_identity = {
         "attributes": [{"id": "BRAND", "value_name": product.get("brand") or ""}],
     }
@@ -3886,7 +3890,7 @@ def import_product_operation(payload, request):
         try:
             account_client_instance = account_client(account)
             stores = target_official_stores(
-                account_client_instance, account, payload.get("catalog") or [],
+                account_client_instance, account, store_catalog,
             )
             clean_account["official_store_options"] = [official_store_option(store) for store in stores]
             clean_account["official_store_id"] = target_official_store_id(
@@ -11106,6 +11110,51 @@ def clone_picture_payload(item):
         url = picture.get("secure_url") or picture.get("url")
         if url:
             rows.append({"source": url})
+    return rows
+
+
+def complete_clone_source_pictures(client, item_id, source_item):
+    """Return the richest seller-owned picture gallery available for an item."""
+    source_item = json.loads(json.dumps(source_item or {}, ensure_ascii=False))
+    candidates = [source_item.get("pictures") or []]
+    method = getattr(client, "item_pictures_bulk", None)
+    if callable(method):
+        try:
+            rows = method([item_id]) or []
+            matching = next(
+                (
+                    row for row in rows
+                    if isinstance(row, dict) and str(row.get("id") or "") == str(item_id or "")
+                ),
+                None,
+            )
+            if matching:
+                candidates.append(matching.get("pictures") or [])
+        except Exception:
+            pass
+    richest = max(candidates, key=lambda rows: len(rows or []), default=[])
+    if richest:
+        source_item["pictures"] = richest
+    return source_item
+
+
+def kit_picture_payload(item):
+    """Keep both the Mercado Livre ID and its preview URL for the kit editor."""
+    rows = []
+    seen = set()
+    for picture in (item or {}).get("pictures") or []:
+        picture_id = clean_attribute_value(picture.get("id"))
+        source = picture.get("secure_url") or picture.get("url")
+        signature = picture_id or source
+        if not signature or signature in seen:
+            continue
+        seen.add(signature)
+        row = {}
+        if picture_id:
+            row["id"] = picture_id
+        if source:
+            row["source"] = source
+        rows.append(row)
     return rows
 
 
@@ -19408,6 +19457,7 @@ def kit_components_from_request(payload, request, include_description=True):
     if not isinstance(rows, list) or not rows:
         raise RuntimeError("Selecione ao menos um anúncio para montar o kit.")
     components = []
+    source_client = account_client(source_account)
     for index, row in enumerate(rows):
         item_id = str((row or {}).get("item_id") or "").strip()
         quantity = max(1, int((row or {}).get("quantity") or 1))
@@ -19420,6 +19470,7 @@ def kit_components_from_request(payload, request, include_description=True):
             include_description=include_description,
         )
         source_item = bundle.get("source_item") or {}
+        source_item = complete_clone_source_pictures(source_client, item_id, source_item)
         sku = clean_attribute_value(item_sku(source_item))
         if not sku or sku == "-" or sku.upper() == item_id.upper():
             raise RuntimeError(
@@ -19436,7 +19487,7 @@ def kit_components_from_request(payload, request, include_description=True):
                 "price": float(source_item.get("price") or 0),
                 "stock": int(item_available_quantity(source_item) or 0),
                 "description": bundle.get("description") or "",
-                "pictures": clone_picture_payload(source_item),
+                "pictures": kit_picture_payload(source_item),
                 "source_item": source_item,
             }
         )

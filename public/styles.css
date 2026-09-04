@@ -9746,6 +9746,9 @@ textarea:focus {
 .publisher-account-row > label { margin: 0; }
 .publisher-account-row > select,
 .publisher-account-row > input[data-publisher-official-store] { min-width: 0; width: 100%; }
+.publisher-account-store { display: grid !important; gap: 5px !important; padding: 8px !important; cursor: default !important; }
+.publisher-account-store > span { display: block; font-size: .68rem; color: var(--muted); }
+.publisher-account-store > select { min-width: 0; width: 100%; }
 .publisher-store-required { display: grid; gap: 5px; padding: 9px; border: 1px solid rgba(255,230,0,.45); border-radius: 10px; background: rgba(255,230,0,.07); }
 .publisher-store-required small { color: var(--muted); font-size: .64rem; }
 .publisher-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; padding-top: 14px; border-top: 1px solid rgba(148,163,184,.2); }

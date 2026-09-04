@@ -5186,10 +5186,10 @@ function applyAssistedProduct(product) {
     const stores = account.official_store_options || [];
     return `<article class="publisher-account-row">
       <label><input type="checkbox" data-publisher-account value="${escapeAttr(accountId)}" ${index === 0 ? "checked" : ""} /><span><strong>${escapeText(account.nickname)}</strong><small>Seller ${escapeText(account.seller_id || "-")}</small></span></label>
-      ${stores.length ? `<select data-publisher-official-store="${escapeAttr(accountId)}" aria-label="Loja Oficial de ${escapeAttr(account.nickname)}">
-        <option value="">Escolha a Loja Oficial</option>
+      ${stores.length ? `<label class="publisher-account-store"><span>Loja Oficial</span><select data-publisher-official-store="${escapeAttr(accountId)}" aria-label="Loja Oficial de ${escapeAttr(account.nickname)}">
+        <option value="">Selecione a Loja Oficial</option>
         ${stores.map((store) => `<option value="${escapeAttr(store.value)}" ${String(store.value) === String(account.official_store_id || "") ? "selected" : ""}>${escapeText(store.label)}</option>`).join("")}
-      </select>` : ""}
+      </select></label>` : ""}
     </article>`;
   }).join("") || `<div class="notice danger-notice">Nenhuma conta oficial conectada.</div>`;
   updatePublisherStoreRequirements();
@@ -5267,7 +5267,10 @@ function applyPublisherPendingFields(rows) {
       .find((input) => String(input.value) === accountId);
     const accountRow = accountInput?.closest(".publisher-account-row");
     if (!accountRow) continue;
-    accountRow.querySelector("[data-publisher-official-store]")?.remove();
+    const currentStore = accountRow.querySelector("[data-publisher-official-store]");
+    const currentStoreWrapper = currentStore?.closest(".publisher-account-store, .publisher-store-required");
+    if (currentStoreWrapper) currentStoreWrapper.remove();
+    else currentStore?.remove();
     const wrapper = document.createElement("label");
     wrapper.className = "publisher-store-required";
     const options = Array.isArray(field.options) ? field.options : [];
@@ -5526,6 +5529,16 @@ function renderKitPictures() {
       </div>
     </article>
   `).join("");
+  list.querySelectorAll(".kit-picture img").forEach((image) => {
+    image.addEventListener("error", () => {
+      const card = image.closest("[data-kit-picture-index]");
+      const index = Number(card?.dataset.kitPictureIndex);
+      if (Number.isInteger(index) && index >= 0) {
+        state.kitPictures.splice(index, 1);
+        renderKitPictures();
+      }
+    }, { once: true });
+  });
 }
 
 function setKitProgress(percent, message, title = "Preparando kit") {
