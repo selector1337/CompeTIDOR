@@ -3051,10 +3051,16 @@ def product_page_download(url):
     request = urllib.request.Request(
         str(url).strip(),
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml",
             "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding": "gzip",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Upgrade-Insecure-Requests": "1",
         },
     )
     maximum = max(512_000, min(8_000_000, int(os.getenv("COMPETIDOR_PRODUCT_IMPORT_MAX_BYTES", "4000000"))))
@@ -3543,12 +3549,142 @@ def product_offer_data(value):
     return price, value.get("priceCurrency") or ""
 
 
+def json_object_after_marker(text, marker):
+    """Decode the first JSON object assigned after *marker* in an inline script."""
+    marker_at = str(text or "").find(marker)
+    start = str(text or "").find("{", marker_at + len(marker)) if marker_at >= 0 else -1
+    if start < 0:
+        return {}
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    decoded = json.loads(text[start:index + 1])
+                    return decoded if isinstance(decoded, dict) else {}
+                except (TypeError, ValueError):
+                    return {}
+    return {}
+
+
+def mercado_livre_public_page(page_html, page_url):
+    """Read the public PDP/UPP state used by Mercado Livre's own web page.
+
+    Some third-party seller items return PolicyAgent 403 in /items even with a
+    valid publication grant.  The product page still publishes title, gallery,
+    description and technical specifications in its Nordic rendering state.
+    """
+    script_match = re.search(
+        r"<script[^>]+id=[\"']__NORDIC_RENDERING_CTX__[\"'][^>]*>(.*?)</script>",
+        page_html or "", flags=re.IGNORECASE | re.DOTALL,
+    )
+    rendering = json_object_after_marker(script_match.group(1), "_n.ctx.r=") if script_match else {}
+    state = first_present(rendering, ["appProps.pageProps.initialState"], {}) or {}
+    components = state.get("components") if isinstance(state, dict) else {}
+    components = components if isinstance(components, dict) else {}
+    header = components.get("header") if isinstance(components.get("header"), dict) else {}
+    gallery = components.get("gallery") if isinstance(components.get("gallery"), dict) else {}
+    description = components.get("description") if isinstance(components.get("description"), dict) else {}
+    price_component = components.get("price") if isinstance(components.get("price"), dict) else {}
+    metadata = components.get("metadata") if isinstance(components.get("metadata"), dict) else {}
+
+    specifications = []
+    highlighted = components.get("highlighted_specs_attrs") or {}
+    for node in product_json_nodes(highlighted):
+        attributes = node.get("attributes") if isinstance(node, dict) else None
+        if not isinstance(attributes, list):
+            continue
+        for attribute in attributes:
+            if not isinstance(attribute, dict):
+                continue
+            label = clean_product_text(attribute.get("id") or attribute.get("name"), 120)
+            value = clean_product_text(attribute.get("text") or attribute.get("value"), 500)
+            if label and value and not any(
+                normalized_attribute_label(row.get("name")) == normalized_attribute_label(label)
+                and normalized_attribute_label(row.get("value")) == normalized_attribute_label(value)
+                for row in specifications
+            ):
+                specifications.append({"name": label, "value": value})
+
+    identities = {}
+    for row in specifications:
+        label = normalized_attribute_label(row.get("name"))
+        if label in {"marca", "brand", "fabricante", "manufacturer"}:
+            identities.setdefault("brand", row.get("value"))
+        elif label in {"modelo", "model"}:
+            identities.setdefault("model", row.get("value"))
+        elif label in {"mpn", "part number", "numero da peca"}:
+            identities.setdefault("mpn", row.get("value"))
+        elif label in {"gtin", "ean", "upc", "codigo universal de produto"}:
+            identities.setdefault("gtin", row.get("value"))
+
+    picture_config = gallery.get("picture_config") if isinstance(gallery.get("picture_config"), dict) else {}
+    picture_template = picture_config.get("template_zoom") or picture_config.get("template") or ""
+    pictures = []
+    for picture in gallery.get("pictures") or []:
+        if not isinstance(picture, dict):
+            continue
+        picture_id = str(picture.get("id") or "").strip()
+        if not picture_id:
+            continue
+        if picture_template:
+            pictures.append(
+                picture_template.replace("{id}", picture_id).replace(
+                    "{sanitizedTitle}", str(picture.get("sanitized_title") or "")
+                )
+            )
+        else:
+            pictures.append(f"https://http2.mlstatic.com/D_NQ_NP_{picture_id}-O.webp")
+
+    item_id = first_present(components, ["bookmark.item_id", "track.melidata_event.event_data.item_id"], "") or ""
+    if not item_id:
+        metadata_text = json.dumps(metadata, ensure_ascii=False)
+        match = re.search(r"meli://item\?id=(MLB\d+)", metadata_text, flags=re.IGNORECASE)
+        item_id = match.group(1).upper() if match else ""
+    event_data = first_present(components, ["track.melidata_event.event_data"], {}) or {}
+    title = header.get("title") or first_present(header, ["heading_label.text"], "") or ""
+    price = first_present(price_component, ["price.value"], 0) or 0
+    currency = first_present(price_component, ["price.currency_id"], "") or ""
+    return {
+        "name": clean_product_text(title, 500),
+        "brand": clean_product_text(identities.get("brand"), 120),
+        "model": clean_product_text(identities.get("model"), 120),
+        "mpn": clean_product_text(identities.get("mpn"), 120),
+        "gtin": clean_product_text(identities.get("gtin"), 80),
+        "description": clean_product_text(description.get("content"), 12000),
+        "images": product_image_urls(pictures, page_url),
+        "specifications": specifications[:80],
+        "price": price,
+        "currency": currency,
+        "source_item_id": item_id,
+        "category_id": event_data.get("category_id") or "",
+        "domain_id": event_data.get("domain_id") or "",
+    }
+
+
 def parse_external_product_page(page_html, page_url):
     parser = ProductPageParser()
     parser.feed(page_html)
     node = first_product_json_ld(parser)
     host = product_import_host(page_url)
-    specific = amazon_product_page(page_html, page_url) if "amazon." in host else markdown_product_page(page_html, page_url)
+    meli_page = mercado_livre_public_page(page_html, page_url) if "mercado" in host else {}
+    specific = meli_page or (amazon_product_page(page_html, page_url) if "amazon." in host else markdown_product_page(page_html, page_url))
     if "amazon." in host and not specific.get("name"):
         specific = markdown_product_page(page_html, page_url)
     retailer = retailer_product_page(page_html, page_url, parser)
@@ -3557,12 +3693,18 @@ def parse_external_product_page(page_html, page_url):
         brand = brand.get("name") or ""
     brand = specific.get("brand") or retailer.get("brand") or brand
     offers_price, currency = product_offer_data(node.get("offers"))
+    offers_price = specific.get("price") or offers_price
+    currency = specific.get("currency") or currency
     name = specific.get("name") or node.get("name") or parser.meta.get("og:title") or "".join(parser.title_parts)
     description = specific.get("description") or node.get("description") or parser.meta.get("og:description") or parser.meta.get("description") or ""
-    images = product_image_urls(
-        [*(specific.get("images") or []), *(retailer.get("images") or []), *(node.get("image") if isinstance(node.get("image"), list) else [node.get("image")]), parser.meta.get("og:image")],
-        page_url,
-    )
+    image_candidates = [*(specific.get("images") or [])]
+    if not meli_page:
+        image_candidates.extend([
+            *(retailer.get("images") or []),
+            *(node.get("image") if isinstance(node.get("image"), list) else [node.get("image")]),
+            parser.meta.get("og:image"),
+        ])
+    images = product_image_urls(image_candidates, page_url)
     if not images and "amazon." not in host:
         images = product_image_urls(parser.images[:24], page_url)
     specifications = [*(specific.get("specifications") or []), *(retailer.get("specifications") or [])]
@@ -3610,14 +3752,38 @@ def parse_external_product_page(page_html, page_url):
         "source_currency": currency,
         "pictures": images,
         "specifications": specifications[:80],
+        "source_item_id": specific.get("source_item_id") or "",
+        "category_id": specific.get("category_id") or "",
+        "domain_id": specific.get("domain_id") or "",
     }
 
 
+def imported_meli_public_page(source_url):
+    page_html, final_url = product_page_download(source_url)
+    product = parse_external_product_page(page_html, final_url)
+    title = normalized_attribute_label(product.get("title") or product.get("source_title"))
+    if not title or title in {"mercado livre", "mercado libre"}:
+        raise RuntimeError("A página pública não devolveu os dados do produto.")
+    return product
+
+
 def imported_meli_product(payload, item_id, source_url):
+    # /up/MLBU... is a User Product page, not an Items API id. Its public
+    # rendering state is the authoritative source and also exposes the concrete
+    # MLB offer even when the URL does not carry a `wid` fragment.
+    if str(item_id or "").upper().startswith("MLBU"):
+        try:
+            return imported_meli_public_page(source_url)
+        except Exception:
+            pass
     try:
         item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
     except Exception as exc:
         error_text = str(exc)
+        try:
+            return imported_meli_public_page(source_url)
+        except Exception:
+            pass
         # A concrete listing id extracted from `wid` must be read through the
         # Items API. Treating its 403 as an unknown catalog id caused a second
         # Scan request and replaced the useful diagnosis with a generic error.
