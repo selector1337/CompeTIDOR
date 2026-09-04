@@ -3058,7 +3058,7 @@ def product_reader_download(url, maximum=None):
 
 PRODUCT_BROWSER_EXECUTOR = None
 PRODUCT_BROWSER_EXECUTOR_LOCK = threading.Lock()
-PRODUCT_BROWSER_STATE = {"playwright": None, "browser": None}
+PRODUCT_BROWSER_STATE = {"playwright": None, "browser": None, "context": None}
 PRODUCT_BROWSER_PAGE_CACHE = {}
 PRODUCT_BROWSER_PAGE_CACHE_LOCK = threading.Lock()
 
@@ -3085,10 +3085,17 @@ def product_browser_executor():
 
 
 def reset_product_browser_worker():
+    context = PRODUCT_BROWSER_STATE.get("context")
     browser = PRODUCT_BROWSER_STATE.get("browser")
     manager = PRODUCT_BROWSER_STATE.get("playwright")
+    PRODUCT_BROWSER_STATE["context"] = None
     PRODUCT_BROWSER_STATE["browser"] = None
     PRODUCT_BROWSER_STATE["playwright"] = None
+    try:
+        if context:
+            context.close()
+    except Exception:
+        pass
     try:
         if browser:
             browser.close()
@@ -3124,14 +3131,21 @@ def product_browser_worker_download(url, maximum):
         PRODUCT_BROWSER_STATE["playwright"] = manager
         PRODUCT_BROWSER_STATE["browser"] = browser
 
-    context = None
-    try:
+    if not PRODUCT_BROWSER_STATE.get("context"):
         context = PRODUCT_BROWSER_STATE["browser"].new_context(
             locale="pt-BR",
             timezone_id="America/Sao_Paulo",
             viewport={"width": 1440, "height": 1000},
             extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"},
         )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        PRODUCT_BROWSER_STATE["context"] = context
+
+    page = None
+    try:
+        context = PRODUCT_BROWSER_STATE["context"]
         page = context.new_page()
         page.goto(str(url).strip(), wait_until="domcontentloaded", timeout=35_000)
         try:
@@ -3140,12 +3154,36 @@ def product_browser_worker_download(url, maximum):
                 timeout=12_000,
             )
         except Exception:
-            # A few item pages expose only JSON-LD; the regular parser below
-            # validates whether useful product data was actually returned.
-            page.wait_for_timeout(1_000)
+            # A first navigation can set edge cookies and still return a
+            # challenge shell. Reload once in the same browser session before
+            # falling back to JSON-LD/full-page parsing.
+            page.reload(wait_until="domcontentloaded", timeout=25_000)
+            try:
+                page.wait_for_function(
+                    "() => document.documentElement.innerHTML.includes('__NORDIC_RENDERING_CTX__')",
+                    timeout=8_000,
+                )
+            except Exception:
+                page.wait_for_timeout(1_000)
         final_url = page.url
         product_import_host(final_url)
-        decoded = page.content()
+        # page.content() on Mercado Livre can exceed several megabytes after
+        # hydration because it serializes menus, recommendations and overlays.
+        # The product itself is held in Nordic/JSON-LD structured state, so
+        # transport only those nodes whenever they contain a valid product.
+        structured = page.evaluate(
+            """() => {
+                const nodes = [
+                    ...document.querySelectorAll('#__NORDIC_RENDERING_CTX__'),
+                    ...document.querySelectorAll('script[type="application/ld+json"]'),
+                    ...document.querySelectorAll('meta[property^="og:"], meta[name="description"]')
+                ];
+                return '<html><head>' + nodes.map(node => node.outerHTML).join('') + '</head></html>';
+            }"""
+        )
+        decoded = str(structured or "")
+        if not mercado_livre_public_page(decoded, final_url).get("name"):
+            decoded = page.content()
         if len(decoded.encode("utf-8", errors="ignore")) > maximum:
             raise RuntimeError("A página do produto é maior do que o limite de importação.")
         blocked = normalized_attribute_label(decoded[:16000])
@@ -3161,8 +3199,8 @@ def product_browser_worker_download(url, maximum):
         raise
     finally:
         try:
-            if context:
-                context.close()
+            if page:
+                page.close()
         except Exception:
             reset_product_browser_worker()
 
@@ -3288,9 +3326,10 @@ def product_page_download(url):
             return product_reader_download(url, maximum)
         except Exception as reader_exc:
             if "mercado" in host and browser_page_error is not None:
+                browser_reason = re.sub(r"\s+", " ", str(browser_page_error or "")).strip()[:320]
                 raise RuntimeError(
                     "O Mercado Livre recusou os leitores HTTP e o navegador Chromium do servidor não conseguiu "
-                    "renderizar o produto. Verifique a instalação do navegador do módulo de importação."
+                    f"renderizar o produto. Diagnóstico do Chromium: {browser_reason or 'motivo não informado'}."
                 ) from browser_page_error
             raise RuntimeError(
                 "O site bloqueou a leitura direta e a leitura pública alternativa também falhou. "
@@ -3997,11 +4036,12 @@ def imported_meli_product(payload, item_id, source_url):
                     "não está completamente instalado no servidor. Isso não é falta de permissão da aplicação; "
                     "instale as dependências e o Chromium do módulo."
                 ) from public_page_error
+            page_reason = re.sub(r"\s+", " ", str(public_page_error or "")).strip()[:420]
             raise RuntimeError(
                 f"O Mercado Livre restringiu o anúncio {item_id} na API e também recusou a página pública ao servidor. "
-                "O navegador público de contingência também não conseguiu renderizar o produto; confira o diagnóstico "
-                "do serviço e a instalação do Chromium."
-            ) from exc
+                f"O navegador público de contingência também falhou. Diagnóstico: "
+                f"{page_reason or 'motivo não informado'}."
+            ) from public_page_error
         item = resolve_scan_target(payload, item_id)
     description = ""
     catalog_product = {}
