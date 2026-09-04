@@ -10,6 +10,7 @@ Type=simple
 WorkingDirectory=/opt/competidor
 EnvironmentFile=/etc/competidor.env
 Environment=PYTHONUNBUFFERED=1
+Environment=PLAYWRIGHT_BROWSERS_PATH=/var/lib/competidor/ms-playwright
 ExecStart=/opt/competidor/.venv/bin/python /opt/competidor/server.py
 Restart=always
 RestartSec=5

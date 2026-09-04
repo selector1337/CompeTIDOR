@@ -27,12 +27,17 @@ import unicodedata
 import urllib.error
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 
 try:
     from curl_cffi import requests as browser_http_requests
 except ImportError:  # Allows diagnostics/tests before production dependencies are installed.
     browser_http_requests = None
+
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:  # The application still starts while the optional browser is being installed.
+    sync_playwright = None
 
 
 PERFORMANCE_PROFILE = (os.getenv("COMPETIDOR_PERFORMANCE_PROFILE", "shared-8gb") or "shared-8gb").strip().lower()
@@ -3051,6 +3056,147 @@ def product_reader_download(url, maximum=None):
     return decoded, str(url).strip()
 
 
+PRODUCT_BROWSER_EXECUTOR = None
+PRODUCT_BROWSER_EXECUTOR_LOCK = threading.Lock()
+PRODUCT_BROWSER_STATE = {"playwright": None, "browser": None}
+PRODUCT_BROWSER_PAGE_CACHE = {}
+PRODUCT_BROWSER_PAGE_CACHE_LOCK = threading.Lock()
+
+
+def product_browser_is_installed():
+    browser_path = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+    if sync_playwright is None or not browser_path:
+        return False
+    try:
+        return Path(browser_path).is_dir() and any(Path(browser_path).iterdir())
+    except OSError:
+        return False
+
+
+def product_browser_executor():
+    global PRODUCT_BROWSER_EXECUTOR
+    if PRODUCT_BROWSER_EXECUTOR is None:
+        with PRODUCT_BROWSER_EXECUTOR_LOCK:
+            if PRODUCT_BROWSER_EXECUTOR is None:
+                # Playwright sync objects must always stay on their creator
+                # thread. One worker also bounds Chromium memory usage.
+                PRODUCT_BROWSER_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="product-browser")
+    return PRODUCT_BROWSER_EXECUTOR
+
+
+def reset_product_browser_worker():
+    browser = PRODUCT_BROWSER_STATE.get("browser")
+    manager = PRODUCT_BROWSER_STATE.get("playwright")
+    PRODUCT_BROWSER_STATE["browser"] = None
+    PRODUCT_BROWSER_STATE["playwright"] = None
+    try:
+        if browser:
+            browser.close()
+    except Exception:
+        pass
+    try:
+        if manager:
+            manager.stop()
+    except Exception:
+        pass
+
+
+def product_browser_worker_download(url, maximum):
+    if sync_playwright is None:
+        raise RuntimeError("O leitor Chromium não está instalado.")
+    if not PRODUCT_BROWSER_STATE.get("browser"):
+        manager = sync_playwright().start()
+        try:
+            browser = manager.chromium.launch(
+                headless=True,
+                channel="chromium",
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+        except Exception:
+            try:
+                browser = manager.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                )
+            except Exception:
+                manager.stop()
+                raise
+        PRODUCT_BROWSER_STATE["playwright"] = manager
+        PRODUCT_BROWSER_STATE["browser"] = browser
+
+    context = None
+    try:
+        context = PRODUCT_BROWSER_STATE["browser"].new_context(
+            locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
+            viewport={"width": 1440, "height": 1000},
+            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"},
+        )
+        page = context.new_page()
+        page.goto(str(url).strip(), wait_until="domcontentloaded", timeout=35_000)
+        try:
+            page.wait_for_function(
+                "() => document.documentElement.innerHTML.includes('__NORDIC_RENDERING_CTX__')",
+                timeout=12_000,
+            )
+        except Exception:
+            # A few item pages expose only JSON-LD; the regular parser below
+            # validates whether useful product data was actually returned.
+            page.wait_for_timeout(1_000)
+        final_url = page.url
+        product_import_host(final_url)
+        decoded = page.content()
+        if len(decoded.encode("utf-8", errors="ignore")) > maximum:
+            raise RuntimeError("A página do produto é maior do que o limite de importação.")
+        blocked = normalized_attribute_label(decoded[:16000])
+        if any(marker in blocked for marker in (
+            "access to this page has been denied", "access denied", "robot check",
+            "automated access", "captcha required", "just a moment", "checking your browser",
+        )):
+            raise RuntimeError("O navegador recebeu uma página de bloqueio.")
+        return decoded, final_url
+    except Exception:
+        if PRODUCT_BROWSER_STATE.get("browser") and not PRODUCT_BROWSER_STATE["browser"].is_connected():
+            reset_product_browser_worker()
+        raise
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            reset_product_browser_worker()
+
+
+def product_browser_download(url, maximum=None):
+    product_import_host(url)
+    maximum = maximum or max(512_000, min(8_000_000, int(os.getenv("COMPETIDOR_PRODUCT_IMPORT_MAX_BYTES", "4000000"))))
+    parsed = urlparse(str(url).strip())
+    cache_key = parsed._replace(query="", fragment="").geturl()
+    cache_seconds = max(60, min(86_400, int(os.getenv("COMPETIDOR_PRODUCT_BROWSER_CACHE_SECONDS", "1800"))))
+    now = time.time()
+    with PRODUCT_BROWSER_PAGE_CACHE_LOCK:
+        cached = PRODUCT_BROWSER_PAGE_CACHE.get(cache_key)
+        if cached and now - cached[0] <= cache_seconds:
+            return cached[1], cached[2]
+        if cached:
+            PRODUCT_BROWSER_PAGE_CACHE.pop(cache_key, None)
+    future = product_browser_executor().submit(product_browser_worker_download, url, maximum)
+    try:
+        decoded, final_url = future.result(timeout=52)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise RuntimeError("O navegador excedeu o tempo de leitura do produto.") from exc
+    # Never retain a challenge/generic shell as a valid product response.
+    if not mercado_livre_public_page(decoded, final_url).get("name"):
+        raise RuntimeError("O navegador abriu a página, mas ela não devolveu os dados do produto.")
+    with PRODUCT_BROWSER_PAGE_CACHE_LOCK:
+        PRODUCT_BROWSER_PAGE_CACHE[cache_key] = (now, decoded, final_url)
+        if len(PRODUCT_BROWSER_PAGE_CACHE) > 40:
+            oldest = min(PRODUCT_BROWSER_PAGE_CACHE, key=lambda key: PRODUCT_BROWSER_PAGE_CACHE[key][0])
+            PRODUCT_BROWSER_PAGE_CACHE.pop(oldest, None)
+    return decoded, final_url
+
+
 def product_page_download(url):
     host = product_import_host(url)
     maximum = max(512_000, min(8_000_000, int(os.getenv("COMPETIDOR_PRODUCT_IMPORT_MAX_BYTES", "4000000"))))
@@ -3088,6 +3234,14 @@ def product_page_download(url):
             # Keep the existing direct and public-reader fallbacks for temporary
             # edge failures and for deployments still installing the dependency.
             pass
+    # Some pages require JavaScript/cookies after accepting the TLS signature.
+    # Render those pages in a real browser before trying generic readers.
+    browser_page_error = None
+    if "mercado" in host:
+        try:
+            return product_browser_download(url, maximum)
+        except Exception as exc:
+            browser_page_error = exc
     request = urllib.request.Request(
         str(url).strip(),
         headers={
@@ -3133,6 +3287,11 @@ def product_page_download(url):
         try:
             return product_reader_download(url, maximum)
         except Exception as reader_exc:
+            if "mercado" in host and browser_page_error is not None:
+                raise RuntimeError(
+                    "O Mercado Livre recusou os leitores HTTP e o navegador Chromium do servidor não conseguiu "
+                    "renderizar o produto. Verifique a instalação do navegador do módulo de importação."
+                ) from browser_page_error
             raise RuntimeError(
                 "O site bloqueou a leitura direta e a leitura pública alternativa também falhou. "
                 "Tente novamente em alguns minutos."
@@ -3832,15 +3991,16 @@ def imported_meli_product(payload, item_id, source_url):
             or "PA_UNAUTHORIZED_RESULT_FROM_POLICIES" in error_text
             or "PolicyAgent" in error_text
         ):
-            if browser_http_requests is None:
+            if browser_http_requests is None or not product_browser_is_installed():
                 raise RuntimeError(
-                    "A API restringiu este anúncio de outro vendedor e o leitor público compatível com navegador "
-                    "não está instalado no servidor. Atualize as dependências com requirements.txt e reinicie a aplicação."
+                    "A API restringiu este anúncio de outro vendedor e o navegador público de contingência "
+                    "não está completamente instalado no servidor. Isso não é falta de permissão da aplicação; "
+                    "instale as dependências e o Chromium do módulo."
                 ) from public_page_error
             raise RuntimeError(
                 f"O Mercado Livre restringiu o anúncio {item_id} na API e também recusou a página pública ao servidor. "
-                "Isso não é falta de permissão da aplicação. Tente novamente; a consulta pública será renovada sem "
-                "reutilizar o bloqueio anterior."
+                "O navegador público de contingência também não conseguiu renderizar o produto; confira o diagnóstico "
+                "do serviço e a instalação do Chromium."
             ) from exc
         item = resolve_scan_target(payload, item_id)
     description = ""
@@ -20721,6 +20881,8 @@ class App(BaseHTTPRequestHandler):
                     "heavy_concurrent_jobs": HEAVY_CONCURRENT_JOBS,
                     "interactive_meli_max_in_flight": INTERACTIVE_MELI_MAX_IN_FLIGHT,
                     "background_meli_max_in_flight": BACKGROUND_MELI_MAX_IN_FLIGHT,
+                    "product_browser_module": sync_playwright is not None,
+                    "product_browser_installed": product_browser_is_installed(),
                 },
                 headers={"Cache-Control": "no-store"},
             )
