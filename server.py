@@ -3358,6 +3358,15 @@ def markdown_product_page(content, page_url):
             if not re.search(r"-(?:[1-4]?\d{1,2})x(?:[1-4]?\d{1,2})\.(?:jpe?g|png|webp)(?:$|\?)", url, flags=re.IGNORECASE)
         ]
         image_candidates = large_images or image_candidates
+        # Product gallery assets share the same MMGS7 prefix; recommendation
+        # cards use other prefixes on the same public image host.
+        grouped = {}
+        for url in image_candidates:
+            filename = urlparse(url).path.rsplit("/", 1)[-1]
+            key = re.sub(r"-\d{2}-\d+x\d+\.(?:jpe?g|png|webp)$", "", filename, flags=re.IGNORECASE)
+            grouped.setdefault(key, []).append(url)
+        if grouped:
+            image_candidates = max(grouped.values(), key=len)
     specs = []
     for label, value in re.findall(r"^\s*[-*]?\s*\*\*([^*:\n]{2,60})\*\*\s*:?\s*(.{2,300})$", content, flags=re.MULTILINE):
         label, value = clean_product_text(label, 80), clean_product_text(value, 300)
@@ -3699,7 +3708,11 @@ def imported_package_measurements(product):
                 result.setdefault("package_length", round(length * factor, 2))
                 result.setdefault("package_width", round(width * factor, 2))
                 result.setdefault("package_height", round(height * factor, 2))
-    return result
+    return {
+        field: max(1, math.ceil(float(value)))
+        for field, value in result.items()
+        if value not in (None, "")
+    }
 
 
 def attribute_seed_values(product):
@@ -3862,7 +3875,28 @@ def import_product_operation(payload, request):
         product["catalog_product_id"] = catalog_candidates[0].get("id") or ""
     product["package_measurements"] = imported_package_measurements(product)
     product["description"] = generated_product_description(product)
-    product["accounts"] = [public_account(account) for account in payload.get("accounts") or [] if account.get("official") and account.get("status") == "connected"]
+    product_accounts = []
+    store_identity = {
+        "attributes": [{"id": "BRAND", "value_name": product.get("brand") or ""}],
+    }
+    for account in payload.get("accounts") or []:
+        if not account.get("official") or account.get("status") != "connected":
+            continue
+        clean_account = public_account(account)
+        try:
+            account_client_instance = account_client(account)
+            stores = target_official_stores(
+                account_client_instance, account, payload.get("catalog") or [],
+            )
+            clean_account["official_store_options"] = [official_store_option(store) for store in stores]
+            clean_account["official_store_id"] = target_official_store_id(
+                account_client_instance, account, store_identity, stores,
+            ) or ""
+        except Exception:
+            clean_account["official_store_options"] = []
+            clean_account["official_store_id"] = ""
+        product_accounts.append(clean_account)
+    product["accounts"] = product_accounts
     product["translated"] = host.endswith(("bhphotovideo.com", "amazon.com", "thomannmusic.com", "thomann.de", "guitarcenter.com"))
     update_async_operation_progress("Rascunho pronto para revisão.", 4, 4)
     return {"product": product}
@@ -13390,7 +13424,8 @@ def assisted_publication_attributes(draft):
     ):
         value = clean_attribute_value(draft.get(field))
         if value and attr_id not in seen:
-            rows.append({"id": attr_id, "value_name": seller_package_api_value(field, f"{value} {unit}")})
+            rounded = max(1, math.ceil(parse_decimal_number(value)))
+            rows.append({"id": attr_id, "value_name": seller_package_api_value(field, f"{rounded} {unit}")})
             seen.add(attr_id)
     gtin_rows = [row for row in rows if str(row.get("id") or "").upper() in GTIN_IDENTIFIER_ATTRS]
     reason_rows = [row for row in rows if str(row.get("id") or "").upper() == "EMPTY_GTIN_REASON"]
@@ -13535,7 +13570,12 @@ def validate_assisted_product_operation(payload, request):
     create_payload, source_item = build_assisted_publication_payload(draft, variant)
     client = account_client(account)
     stores = target_official_stores(client, account, payload.get("catalog") or [])
-    destination_store_id = target_official_store_id(client, account, source_item, stores)
+    requested_stores = request.get("official_store_ids") if isinstance(request.get("official_store_ids"), dict) else {}
+    requested_store_id = clean_attribute_value(requested_stores.get(str(account.get("id"))))
+    allowed_store_ids = {str(store.get("official_store_id")) for store in stores if store.get("official_store_id") not in (None, "")}
+    if requested_store_id and allowed_store_ids and requested_store_id not in allowed_store_ids:
+        raise RuntimeError("A Loja Oficial selecionada não pertence à conta escolhida.")
+    destination_store_id = requested_store_id or target_official_store_id(client, account, source_item, stores)
     prepare_cross_account_official_store_payload(create_payload, destination_store_id)
     try:
         response = run_interactive_meli_call(client.validate_item, create_payload)
@@ -13584,6 +13624,7 @@ def publish_assisted_product_operation(payload, request, actor=None):
     if len(accounts) * len(variants) > 12:
         raise RuntimeError("Publique no máximo 12 combinações de conta e tipo por operação.")
     draft = request.get("draft") or {}
+    requested_stores = request.get("official_store_ids") if isinstance(request.get("official_store_ids"), dict) else {}
     description = str(draft.get("description") or "").strip()[:50000]
     results = []
     total = len(accounts) * len(variants)
@@ -13603,7 +13644,14 @@ def publish_assisted_product_operation(payload, request, actor=None):
                 destination_stores = target_official_stores(
                     client, account, payload.get("catalog") or [],
                 )
-                destination_store_id = target_official_store_id(
+                requested_store_id = clean_attribute_value(requested_stores.get(str(account.get("id"))))
+                allowed_store_ids = {
+                    str(store.get("official_store_id")) for store in destination_stores
+                    if store.get("official_store_id") not in (None, "")
+                }
+                if requested_store_id and allowed_store_ids and requested_store_id not in allowed_store_ids:
+                    raise RuntimeError("A Loja Oficial selecionada não pertence à conta escolhida.")
+                destination_store_id = requested_store_id or target_official_store_id(
                     client, account, source_item, destination_stores,
                 )
                 created = create_item_with_clone_retries(

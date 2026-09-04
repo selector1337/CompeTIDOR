@@ -5040,6 +5040,11 @@ function renderAssistedPublisher() {
 function publisherAttributeInput(attribute) {
   const identifierChoice = ["GTIN", "EAN", "UPC", "EMPTY_GTIN_REASON"].includes(String(attribute.id || "").toUpperCase());
   const required = attribute.required && !identifierChoice ? "required" : "";
+  if (String(attribute.id || "").toUpperCase() === "BRAND") {
+    const listId = "publisher-brand-suggestions";
+    return `<input data-publisher-attribute="${escapeAttr(attribute.id)}" value="${escapeAttr(attribute.value || "")}" list="${listId}" ${required} />
+      <datalist id="${listId}">${(attribute.options || []).map((option) => `<option value="${escapeAttr(option.name || "")}"></option>`).join("")}</datalist>`;
+  }
   if (attribute.options?.length) {
     const matched = attribute.options.find((option) => String(option.name).toLowerCase() === String(attribute.value || "").toLowerCase());
     return `<select data-publisher-attribute="${escapeAttr(attribute.id)}" ${required}>
@@ -5117,6 +5122,14 @@ function renderPublisherPictures() {
   if (status) status.textContent = `${rows.length} de 12 fotos`;
 }
 
+function updatePublisherStoreRequirements() {
+  document.querySelectorAll(".publisher-account-row").forEach((row) => {
+    const checked = Boolean(row.querySelector("[data-publisher-account]")?.checked);
+    const store = row.querySelector("select[data-publisher-official-store]");
+    if (store) store.required = checked;
+  });
+}
+
 document.querySelector("#publisher-attributes")?.addEventListener("input", updatePublisherIdentifierRequirements);
 document.querySelector("#publisher-attributes")?.addEventListener("change", updatePublisherIdentifierRequirements);
 document.querySelector('#product-publish-form [name="gtin"]')?.addEventListener("input", (event) => {
@@ -5167,14 +5180,25 @@ function applyAssistedProduct(product) {
   renderPublisherPictures();
   renderPublisherAttributes(product.attributes || []);
   const accounts = product.accounts?.length ? product.accounts : connectedAccounts();
-  document.querySelector("#publisher-accounts").innerHTML = accounts.map((account, index) => `
-    <label><input type="checkbox" data-publisher-account value="${escapeAttr(account.id)}" ${index === 0 ? "checked" : ""} /><span><strong>${escapeText(account.nickname)}</strong><small>Seller ${escapeText(account.seller_id || "-")}</small></span></label>
-  `).join("") || `<div class="notice danger-notice">Nenhuma conta oficial conectada.</div>`;
+  document.querySelector("#publisher-accounts").innerHTML = accounts.map((account, index) => {
+    const accountId = String(account.id || account.seller_id || "");
+    const stores = account.official_store_options || [];
+    return `<article class="publisher-account-row">
+      <label><input type="checkbox" data-publisher-account value="${escapeAttr(accountId)}" ${index === 0 ? "checked" : ""} /><span><strong>${escapeText(account.nickname)}</strong><small>Seller ${escapeText(account.seller_id || "-")}</small></span></label>
+      ${stores.length > 1 ? `<select data-publisher-official-store="${escapeAttr(accountId)}" aria-label="Loja Oficial de ${escapeAttr(account.nickname)}">
+        <option value="">Escolha a Loja Oficial</option>
+        ${stores.map((store) => `<option value="${escapeAttr(store.value)}" ${String(store.value) === String(account.official_store_id || "") ? "selected" : ""}>${escapeText(store.label)}</option>`).join("")}
+      </select>` : stores.length === 1 ? `<input type="hidden" data-publisher-official-store="${escapeAttr(accountId)}" value="${escapeAttr(stores[0].value)}" />` : ""}
+    </article>`;
+  }).join("") || `<div class="notice danger-notice">Nenhuma conta oficial conectada.</div>`;
+  updatePublisherStoreRequirements();
   document.querySelector("#publisher-results").innerHTML = "";
   document.querySelector("#publisher-validation").hidden = true;
   updatePublisherTitleCounter();
   renderAssistedPublisher();
 }
+
+document.querySelector("#publisher-accounts")?.addEventListener("change", updatePublisherStoreRequirements);
 
 function updatePublisherTitleCounter() {
   const input = document.querySelector('#product-publish-form [name="title"]');
@@ -5200,6 +5224,11 @@ function collectAssistedPublication() {
   if (values.get("variant_premium")) variants.push({ listing_type_id: "gold_pro", price: values.get("premium_price") });
   return {
     account_ids: [...form.querySelectorAll("[data-publisher-account]:checked")].map((input) => input.value),
+    official_store_ids: Object.fromEntries(
+      [...form.querySelectorAll("[data-publisher-official-store]")]
+        .filter((input) => String(input.value || "").trim())
+        .map((input) => [input.dataset.publisherOfficialStore, input.value])
+    ),
     variants,
     draft: {
       source_url: state.productDraft?.source_url || "",
@@ -7436,6 +7465,24 @@ function updateCloneTitleCounter() {
 document.querySelector('[name="title_override"]')?.addEventListener("input", updateCloneTitleCounter);
 
 document.querySelector('#product-publish-form [name="title"]')?.addEventListener("input", updatePublisherTitleCounter);
+
+document.querySelector("#publisher-clear-all")?.addEventListener("click", () => {
+  state.productDraft = null;
+  state.productUploadedPictures = [];
+  state.productImportLoading = false;
+  document.querySelector("#product-import-form")?.reset();
+  document.querySelector("#product-publish-form")?.reset();
+  for (const selector of ["#publisher-pictures", "#publisher-attributes", "#publisher-accounts", "#publisher-results"]) {
+    const element = document.querySelector(selector);
+    if (element) element.innerHTML = "";
+  }
+  const validation = document.querySelector("#publisher-validation");
+  if (validation) validation.hidden = true;
+  const progress = document.querySelector("#product-import-progress");
+  if (progress) progress.hidden = true;
+  renderAssistedPublisher();
+  showToast("Cadastro limpo. Você já pode importar outro produto.");
+});
 
 document.querySelector('#product-publish-form [name="category_id"]')?.addEventListener("change", async (event) => {
   if (!state.productDraft) return;

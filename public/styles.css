@@ -9679,6 +9679,7 @@ textarea:focus {
 /* Cadastro assistido de novos produtos */
 .assisted-publisher { overflow: visible; }
 .publisher-heading { align-items: flex-start; gap: 24px; }
+.publisher-heading-actions { display: flex; align-items: center; gap: 10px; margin-left: auto; }
 .publisher-subtitle { margin: 6px 0 0; max-width: 780px; color: var(--muted); font-size: .86rem; }
 .publisher-stepper { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .publisher-stepper span { padding: 8px 12px; border: 1px solid rgba(148,163,184,.25); border-radius: 999px; color: var(--muted); font-size: .72rem; white-space: nowrap; }
@@ -9739,6 +9740,9 @@ textarea:focus {
 .publisher-accounts input { width: auto; }
 .publisher-accounts span { display: grid; gap: 2px; }
 .publisher-accounts small { color: var(--muted); }
+.publisher-account-row { display: grid; grid-template-columns: minmax(0,1fr) minmax(190px,.75fr); gap: 8px; align-items: center; }
+.publisher-account-row > label { margin: 0; }
+.publisher-account-row > select { min-width: 0; }
 .publisher-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; padding-top: 14px; border-top: 1px solid rgba(148,163,184,.2); }
 .publisher-validation { display: flex; align-items: center; gap: 10px; margin-top: 14px; padding: 12px 14px; border-radius: 11px; }
 .publisher-validation.success { color: var(--green); border: 1px solid rgba(15,159,110,.42); background: var(--green-soft); }
@@ -9757,12 +9761,14 @@ textarea:focus {
 }
 
 @media (max-width: 700px) {
+  .publisher-heading-actions { width: 100%; margin-left: 0; flex-wrap: wrap; }
   .publisher-import-form,.publisher-fields-grid,.publisher-category-search { grid-template-columns: 1fr; }
   .publisher-fields-grid .span-2 { grid-column: auto; }
   .publisher-source-card { grid-template-columns: 60px minmax(0,1fr); }
   .publisher-source-card img { width: 60px; height: 60px; }
   .publisher-source-card > span { grid-column: 1/-1; width: fit-content; }
   .publisher-pictures,.publisher-attributes,.publisher-result-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .publisher-account-row { grid-template-columns: 1fr; }
   .publisher-actions { flex-direction: column; }
 }
 
