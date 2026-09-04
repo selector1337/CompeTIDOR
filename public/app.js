@@ -5112,6 +5112,11 @@ function applyAssistedProduct(product) {
   form.elements.description.value = product.description || "";
   form.elements.stock.value = 1;
   form.elements.manufacturing_time.value = 0;
+  const packageMeasures = product.package_measurements || {};
+  form.elements.package_weight.value = packageMeasures.package_weight || "";
+  form.elements.package_height.value = packageMeasures.package_height || "";
+  form.elements.package_width.value = packageMeasures.package_width || "";
+  form.elements.package_length.value = packageMeasures.package_length || "";
   const sourcePrice = String(product.source_currency || "").toUpperCase() === "BRL" ? Number(product.source_price || 0) : 0;
   form.elements.classic_price.value = sourcePrice || "";
   form.elements.premium_price.value = sourcePrice || "";
@@ -5121,6 +5126,7 @@ function applyAssistedProduct(product) {
   const sourceThumb = document.querySelector("#publisher-source-thumb");
   sourceThumb.src = product.pictures?.[0] || "";
   sourceThumb.hidden = !product.pictures?.[0];
+  sourceThumb.onerror = () => { sourceThumb.hidden = true; };
   document.querySelector("#publisher-source-badge").textContent = product.translated ? "Traduzido e adaptado" : "Dados importados";
   const categories = product.category_suggestions || [];
   form.elements.category_id.innerHTML = categories.length
@@ -5131,6 +5137,9 @@ function applyAssistedProduct(product) {
   document.querySelector("#publisher-pictures").innerHTML = (product.pictures || []).map((url, index) => `
     <label class="publisher-picture"><input type="checkbox" data-publisher-picture value="${escapeAttr(url)}" checked /><span>${index + 1}</span><img src="${escapeAttr(url)}" alt="Foto ${index + 1}" loading="lazy" /></label>
   `).join("") || `<div class="notice danger-notice">Nenhuma foto foi identificada. Use outro link com imagens públicas.</div>`;
+  document.querySelectorAll("#publisher-pictures .publisher-picture img").forEach((image) => {
+    image.addEventListener("error", () => image.closest(".publisher-picture")?.remove(), { once: true });
+  });
   renderPublisherAttributes(product.attributes || []);
   const accounts = product.accounts?.length ? product.accounts : connectedAccounts();
   document.querySelector("#publisher-accounts").innerHTML = accounts.map((account, index) => `
@@ -5173,6 +5182,8 @@ function collectAssistedPublication() {
       description: values.get("description"), category_id: values.get("category_id"), domain_id: categoryOption?.dataset.domainId || "",
       catalog_product_id: values.get("catalog_product_id"), catalog_listing: Boolean(values.get("catalog_listing")),
       sku: values.get("sku"), stock: values.get("stock"), manufacturing_time: values.get("manufacturing_time"), condition: values.get("condition"),
+      package_weight: values.get("package_weight"), package_height: values.get("package_height"),
+      package_width: values.get("package_width"), package_length: values.get("package_length"),
       pictures: [...form.querySelectorAll("[data-publisher-picture]:checked")].map((input) => input.value),
       attributes,
     },

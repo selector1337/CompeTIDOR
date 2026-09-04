@@ -2867,7 +2867,7 @@ def resolve_scan_target(payload, target_id):
 PRODUCT_IMPORT_HOSTS = {
     "mercadolivre.com.br", "mercadolivre.com", "mercadolibre.com",
     "amazon.com.br", "amazon.com", "a.co", "amzn.to",
-    "bhphotovideo.com", "sweetwater.com",
+    "bhphotovideo.com", "thomannmusic.com", "thomann.de", "guitarcenter.com",
 }
 
 
@@ -2875,7 +2875,7 @@ def product_import_host(url):
     parsed = urlparse(str(url or "").strip())
     host = (parsed.hostname or "").lower().rstrip(".")
     if parsed.scheme != "https" or not host:
-        raise RuntimeError("Informe um link HTTPS válido do Mercado Livre, Amazon, B&H Photo ou Sweetwater.")
+        raise RuntimeError("Informe um link HTTPS válido do Mercado Livre, Amazon, B&H Photo, Thomann ou Guitar Center.")
     allowed = next((domain for domain in PRODUCT_IMPORT_HOSTS if host == domain or host.endswith(f".{domain}")), "")
     if not allowed:
         raise RuntimeError("Este domínio ainda não é aceito no cadastro assistido.")
@@ -2959,6 +2959,33 @@ def first_product_json_ld(parser):
     return fallback or {}
 
 
+def product_reader_download(url, maximum=None):
+    product_import_host(url)
+    maximum = maximum or max(512_000, min(8_000_000, int(os.getenv("COMPETIDOR_PRODUCT_IMPORT_MAX_BYTES", "4000000"))))
+    reader_url = f"https://r.jina.ai/{str(url).strip()}"
+    reader_request = urllib.request.Request(
+        reader_url,
+        headers={
+            "Accept": "text/plain", "User-Agent": "Competidor-Product-Importer/1.0",
+            "X-No-Cache": "true", "X-Retain-Images": "all", "X-Respond-With": "markdown",
+            "X-Timeout": "25",
+        },
+    )
+    with urllib.request.urlopen(reader_request, timeout=28) as response:
+        body = response.read(maximum + 1)
+        if len(body) > maximum:
+            raise RuntimeError("A página do produto é maior do que o limite de importação.")
+        charset = response.headers.get_content_charset() or "utf-8"
+    decoded = body.decode(charset, errors="replace")
+    blocked = normalized_attribute_label(decoded[:12000])
+    if any(marker in blocked for marker in (
+        "access to this page has been denied", "access denied", "robot check",
+        "just a moment", "checking your browser",
+    )):
+        raise RuntimeError("A origem devolveu uma página de bloqueio em vez do produto.")
+    return decoded, str(url).strip()
+
+
 def product_page_download(url):
     product_import_host(url)
     request = urllib.request.Request(
@@ -2995,32 +3022,11 @@ def product_page_download(url):
     except (urllib.error.HTTPError, urllib.error.URLError) as exc:
         if isinstance(exc, urllib.error.HTTPError) and exc.code not in {403, 429, 503}:
             raise
-        # Sweetwater e B&H usam proteção de borda que recusa clientes sem
+        # Alguns varejistas usam proteção de borda que recusa clientes sem
         # JavaScript. O leitor devolve o conteúdo público em Markdown, sem
         # executar scripts nem reutilizar cookies do visitante.
-        reader_url = f"https://r.jina.ai/{str(url).strip()}"
-        reader_request = urllib.request.Request(
-            reader_url,
-            headers={
-                "Accept": "text/plain", "User-Agent": "Competidor-Product-Importer/1.0",
-                "X-No-Cache": "true", "X-Retain-Images": "all", "X-Respond-With": "markdown",
-                "X-Timeout": "25",
-            },
-        )
         try:
-            with urllib.request.urlopen(reader_request, timeout=28) as response:
-                body = response.read(maximum + 1)
-                if len(body) > maximum:
-                    raise RuntimeError("A página do produto é maior do que o limite de importação.")
-                charset = response.headers.get_content_charset() or "utf-8"
-            decoded = body.decode(charset, errors="replace")
-            blocked = normalized_attribute_label(decoded[:12000])
-            if any(marker in blocked for marker in (
-                "access to this page has been denied", "access denied", "robot check",
-                "just a moment", "checking your browser",
-            )):
-                raise RuntimeError("A origem devolveu uma página de bloqueio em vez do produto.")
-            return decoded, str(url).strip()
+            return product_reader_download(url, maximum)
         except Exception as reader_exc:
             raise RuntimeError(
                 "O site bloqueou a leitura direta e a leitura pública alternativa também falhou. "
@@ -3147,8 +3153,8 @@ def machine_translate_product_content(value, source_language="auto"):
 
 def optimized_product_title(name, brand="", model=""):
     title = translate_product_text(name)
-    title = re.sub(r"^\s*(?:amazon(?:\.com(?:\.br)?)?|sweetwater|b&h(?: photo)?)\s*[:|\-]\s*", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\b(?:sweetwater exclusive|amazon exclusive|visit the .+? store)\b", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^\s*(?:amazon(?:\.com(?:\.br)?)?|b&h(?: photo)?|thomann|guitar center)\s*[:|\-]\s*", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\b(?:amazon exclusive|thomann exclusive|guitar center exclusive|visit the .+? store)\b", "", title, flags=re.IGNORECASE)
     title = re.split(r"\s+[|–—]\s+", title, maxsplit=1)[0]
     title = re.sub(r"\b(?:free shipping|free delivery|frete grátis|in stock|new)\b", "", title, flags=re.IGNORECASE)
     clean_title = re.sub(r"\s+", " ", title).strip(" -")
@@ -3206,7 +3212,10 @@ def usable_product_image(value, base_url=""):
         or "/cdn-cgi/" in parsed.path.lower()
     ):
         return ""
-    if not re.search(r"\.(?:jpe?g|png|webp)(?:$|\?)", url, flags=re.IGNORECASE):
+    known_image_service = any(domain in (parsed.hostname or "").lower() for domain in (
+        "media.guitarcenter.com", "static.guitarcenter.com", "thumbs.static-thomann.de",
+    )) or "/is/image/" in parsed.path.lower()
+    if not known_image_service and not re.search(r"\.(?:jpe?g|png|webp)(?:$|\?)", url, flags=re.IGNORECASE):
         return ""
     return url
 
@@ -3299,7 +3308,8 @@ def markdown_product_page(content, page_url):
     if not title_match:
         title_match = re.search(r"^#\s+(.+)$", content, flags=re.MULTILINE)
     title = clean_product_text(title_match.group(1), 500) if title_match else ""
-    title = re.sub(r"\s*[|\-]\s*(?:Sweetwater|B&H.*)$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^\s*Amazon(?:\.com(?:\.br)?)?\s*:\s*", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*[|\-]\s*(?:Amazon.*|B&H.*|Thomann.*|Guitar Center.*)$", "", title, flags=re.IGNORECASE)
     image_candidates = []
     source_product = re.search(r"/c/product/(\d+)", page_url, flags=re.IGNORECASE)
     source_product_id = source_product.group(1) if source_product else ""
@@ -3368,17 +3378,22 @@ def markdown_product_page(content, page_url):
 
 def retailer_product_page(page_html, page_url, parser):
     host = product_import_host(page_url)
-    if not any(domain in host for domain in ("sweetwater.com", "bhphotovideo.com")):
+    if not any(domain in host for domain in ("bhphotovideo.com", "thomannmusic.com", "thomann.de", "guitarcenter.com")):
         return {}
     if "bhphotovideo.com" in host and re.search(r"^Markdown Content:\s*$", page_html, flags=re.MULTILINE):
         return {}
     brand = parser.meta.get("product:brand") or parser.meta.get("brand") or ""
     raw_urls = re.findall(r"https?:(?:\\?/\\?/)[^\"'<>\s]+", page_html)
     raw_urls = [html.unescape(url.replace("\\/", "/")) for url in raw_urls]
-    if "sweetwater.com" in host:
+    if "thomann" in host:
         raw_urls = [
-            *[url for url in raw_urls if "media.sweetwater.com/m/products/image/" in url],
-            *[url for url in parser.images if "/m/products/image/" in str(url)],
+            *[url for url in raw_urls if "static-thomann.de" in url or "/pics/bdb/" in url],
+            *[url for url in parser.images if "static-thomann.de" in str(url) or "/pics/bdb/" in str(url)],
+        ]
+    elif "guitarcenter.com" in host:
+        raw_urls = [
+            *[url for url in raw_urls if "guitarcenter.com/is/image/" in url or "media.guitarcenter.com" in url],
+            *[url for url in parser.images if "guitarcenter.com/is/image/" in str(url) or "media.guitarcenter.com" in str(url)],
         ]
     else:
         raw_urls = [
@@ -3415,6 +3430,8 @@ def parse_external_product_page(page_html, page_url):
     node = first_product_json_ld(parser)
     host = product_import_host(page_url)
     specific = amazon_product_page(page_html, page_url) if "amazon." in host else markdown_product_page(page_html, page_url)
+    if "amazon." in host and not specific.get("name"):
+        specific = markdown_product_page(page_html, page_url)
     retailer = retailer_product_page(page_html, page_url, parser)
     brand = node.get("brand") or ""
     if isinstance(brand, dict):
@@ -3447,13 +3464,19 @@ def parse_external_product_page(page_html, page_url):
             "financing", "delivery estimate", "protection plan",
         ))
     ]
+    spec_identity = {}
+    for row in specifications:
+        key = normalized_attribute_label(row.get("name") or row.get("id"))
+        if key in {"brand", "manufacturer", "marca", "fabricante"}:
+            spec_identity.setdefault("brand", row.get("value"))
+        elif key in {"model", "model number", "modelo"}:
+            spec_identity.setdefault("model", row.get("value"))
+        elif key in {"manufacturer part number", "part number", "mfr", "mpn"}:
+            spec_identity.setdefault("mpn", row.get("value"))
     gtin = specific.get("gtin") or next((clean_product_text(node.get(key), 60) for key in ("gtin14", "gtin13", "gtin12", "gtin8", "gtin") if node.get(key)), "")
-    mpn = specific.get("mpn") or node.get("mpn") or node.get("sku") or ""
-    model = specific.get("model") or node.get("model") or node.get("mpn") or ""
-    if "sweetwater.com" in host and (not model or re.fullmatch(r"\d+", str(model))):
-        detail_code = re.search(r"/store/detail/([^/?#-]+)--", page_url, flags=re.IGNORECASE)
-        if detail_code:
-            model = detail_code.group(1)
+    brand = brand or spec_identity.get("brand") or ""
+    mpn = specific.get("mpn") or node.get("mpn") or spec_identity.get("mpn") or node.get("sku") or ""
+    model = specific.get("model") or node.get("model") or spec_identity.get("model") or spec_identity.get("mpn") or node.get("mpn") or ""
     return {
         "source_url": page_url,
         "source_host": product_import_host(page_url),
@@ -3570,7 +3593,7 @@ def generated_product_description(product):
             feature_lines.append(f"- {label}: {value}")
         if len(seen) >= 30:
             break
-    english_source = product.get("source_host", "").endswith(("amazon.com", "amazon.com.br", "sweetwater.com", "bhphotovideo.com"))
+    english_source = product.get("source_host", "").endswith(("amazon.com", "amazon.com.br", "bhphotovideo.com", "thomannmusic.com", "thomann.de", "guitarcenter.com"))
     if feature_lines:
         feature_text = "\n".join(feature_lines)
         feature_text = machine_translate_product_content(feature_text, "en") if english_source else "\n".join(
@@ -3581,8 +3604,52 @@ def generated_product_description(product):
         source_description = clean_product_text(product.get("source_description"), 5000)[:2500]
         source_description = machine_translate_product_content(source_description, "en") if english_source else translate_product_text(source_description)
         lines.extend(["", source_description])
-    lines.extend(["", "Conteúdo da embalagem e compatibilidade podem variar conforme o fabricante. Confira as especificações antes da compra."])
     return "\n".join(lines)[:50000]
+
+
+def imported_package_measurements(product):
+    """Return real package measures found at the source, ready for numeric UI fields."""
+    result = {}
+    for row in product.get("raw_attributes") or []:
+        attr_id = str(row.get("id") or "").upper()
+        field = {
+            "SELLER_PACKAGE_WEIGHT": "package_weight",
+            "SELLER_PACKAGE_HEIGHT": "package_height",
+            "SELLER_PACKAGE_WIDTH": "package_width",
+            "SELLER_PACKAGE_LENGTH": "package_length",
+        }.get(attr_id)
+        if not field:
+            continue
+        value = clone_attribute_display_value(row)
+        try:
+            normalized = seller_package_api_value(field, value)
+            result[field] = parse_decimal_number(normalized)
+        except (RuntimeError, ValueError):
+            pass
+    for row in product.get("specifications") or []:
+        label = normalized_attribute_label(row.get("name") or row.get("id"))
+        value = clean_attribute_value(row.get("value"))
+        if not value:
+            continue
+        if "package weight" in label or "peso da embalagem" in label:
+            match = re.search(r"([\d.,]+)\s*(lb|lbs|oz|kg|g)\b", value, flags=re.IGNORECASE)
+            if match:
+                amount, unit = parse_decimal_number(match.group(1)), match.group(2).lower()
+                grams = amount * {"lb": 453.59237, "lbs": 453.59237, "oz": 28.349523125, "kg": 1000, "g": 1}[unit]
+                result.setdefault("package_weight", round(grams, 2))
+        if "box dimensions" in label or "package dimensions" in label or "dimensoes da embalagem" in label:
+            match = re.search(
+                r"([\d.,]+)\s*[x×]\s*([\d.,]+)\s*[x×]\s*([\d.,]+)\s*(?:inches|inch|in|\"|cm)?",
+                value, flags=re.IGNORECASE,
+            )
+            if match:
+                length, width, height = (parse_decimal_number(part) for part in match.groups())
+                is_inches = bool(re.search(r"(?:inches|inch|\bin\b|\")", value, flags=re.IGNORECASE))
+                factor = 2.54 if is_inches else 1
+                result.setdefault("package_length", round(length * factor, 2))
+                result.setdefault("package_width", round(width * factor, 2))
+                result.setdefault("package_height", round(height * factor, 2))
+    return result
 
 
 def attribute_seed_values(product):
@@ -3608,6 +3675,10 @@ def publication_attribute_rows(product, definitions):
     for definition in definitions or []:
         attr_id = str(definition.get("id") or "").upper()
         if not attr_id or not clone_attribute_user_editable(definition, attr_id):
+            continue
+        if not clone_attribute_applies_to_source(
+            {"condition": product.get("condition") or "new"}, attr_id, definition.get("name") or ""
+        ):
             continue
         required = clone_attribute_is_required(definition)
         normalized_name = normalized_attribute_label(definition.get("name"))
@@ -3656,6 +3727,14 @@ def import_product_operation(payload, request):
     else:
         page_html, final_url = product_page_download(source_url)
         product = parse_external_product_page(page_html, final_url)
+        # A Amazon às vezes responde HTTP 200 com um shell sem dados do produto.
+        # Nesse caso, force a leitura pública em Markdown antes de desistir.
+        if "amazon." in host and not product.get("title"):
+            try:
+                page_html, final_url = product_reader_download(source_url)
+                product = parse_external_product_page(page_html, final_url)
+            except Exception:
+                pass
         blocked_title = normalized_attribute_label(product.get("source_title"))
         if any(marker in blocked_title for marker in (
             "robot check", "access denied", "access to this page has been denied", "captcha",
@@ -3731,9 +3810,10 @@ def import_product_operation(payload, request):
                 product["attributes"] = publication_attribute_rows(product, definitions)
     if not product.get("catalog_product_id") and product.get("gtin") and len(catalog_candidates) == 1:
         product["catalog_product_id"] = catalog_candidates[0].get("id") or ""
+    product["package_measurements"] = imported_package_measurements(product)
     product["description"] = generated_product_description(product)
     product["accounts"] = [public_account(account) for account in payload.get("accounts") or [] if account.get("official") and account.get("status") == "connected"]
-    product["translated"] = host.endswith(("bhphotovideo.com", "sweetwater.com", "amazon.com"))
+    product["translated"] = host.endswith(("bhphotovideo.com", "amazon.com", "thomannmusic.com", "thomann.de", "guitarcenter.com"))
     update_async_operation_progress("Rascunho pronto para revisão.", 4, 4)
     return {"product": product}
 
@@ -13217,8 +13297,11 @@ def clone_source_snapshot(payload, account_identifier, item_id):
 def assisted_publication_attributes(draft):
     rows = []
     seen = set()
+    condition = clean_attribute_value(draft.get("condition")).lower() or "new"
     for attribute in draft.get("attributes") or []:
         attr_id = canonical_clone_attribute_id(attribute.get("id"))
+        if condition == "new" and clone_attribute_describes_refurbished_status(attr_id, attribute.get("name") or ""):
+            continue
         value = clean_attribute_value(attribute.get("value"))
         value_id = clean_attribute_value(attribute.get("value_id"))
         if not attr_id or (not value and not value_id):
@@ -13244,6 +13327,17 @@ def assisted_publication_attributes(draft):
     sku = clean_attribute_value(draft.get("sku"))
     if sku and not seen.intersection({"SELLER_SKU", "SKU"}):
         rows.append({"id": "SELLER_SKU", "value_name": sku})
+        seen.add("SELLER_SKU")
+    for field, attr_id, unit in (
+        ("package_height", "SELLER_PACKAGE_HEIGHT", "cm"),
+        ("package_width", "SELLER_PACKAGE_WIDTH", "cm"),
+        ("package_length", "SELLER_PACKAGE_LENGTH", "cm"),
+        ("package_weight", "SELLER_PACKAGE_WEIGHT", "g"),
+    ):
+        value = clean_attribute_value(draft.get(field))
+        if value and attr_id not in seen:
+            rows.append({"id": attr_id, "value_name": seller_package_api_value(field, f"{value} {unit}")})
+            seen.add(attr_id)
     gtin_rows = [row for row in rows if str(row.get("id") or "").upper() in GTIN_IDENTIFIER_ATTRS]
     reason_rows = [row for row in rows if str(row.get("id") or "").upper() == "EMPTY_GTIN_REASON"]
     identifier_choice_required = any(
@@ -13297,6 +13391,21 @@ def build_assisted_publication_payload(draft, variant):
         raise RuntimeError("O estoque não pode ser negativo.")
     if not 0 <= manufacturing_time <= 45:
         raise RuntimeError("A disponibilidade precisa estar entre 0 e 45 dias.")
+    package_labels = {
+        "package_weight": "peso", "package_height": "altura",
+        "package_width": "largura", "package_length": "comprimento",
+    }
+    missing_package = []
+    for field, label in package_labels.items():
+        try:
+            if parse_decimal_number(draft.get(field)) <= 0:
+                missing_package.append(label)
+        except (TypeError, ValueError):
+            missing_package.append(label)
+    if missing_package:
+        raise RuntimeError(
+            "Informe as medidas reais da embalagem antes de publicar: " + ", ".join(missing_package) + "."
+        )
     listing_type_id = clean_attribute_value(variant.get("listing_type_id"))
     if listing_type_id not in {"gold_special", "gold_pro"}:
         raise RuntimeError("Selecione anúncio Clássico ou Premium.")

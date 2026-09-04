@@ -963,7 +963,7 @@
           <form id="product-import-form" class="publisher-import-form">
             <label>Link do produto
               <input name="url" type="url" inputmode="url" placeholder="https://www.mercadolivre.com.br/..." required />
-              <small>Mercado Livre, Amazon, B&amp;H Photo ou Sweetwater.</small>
+              <small>Mercado Livre, Amazon, B&amp;H Photo, Thomann ou Guitar Center.</small>
             </label>
             <button class="primary" type="submit">Importar e preparar</button>
           </form>
@@ -1015,6 +1015,11 @@
                   <label>Estoque <input name="stock" type="number" min="0" step="1" value="1" required /></label>
                   <label>Disponibilidade <span class="unit-field"><input name="manufacturing_time" type="number" min="0" max="45" step="1" value="0" /><span>dias</span></span><small>Use 0 para envio imediato.</small></label>
                   <label>Condição <select name="condition"><option value="new">Novo</option><option value="used">Usado</option></select></label>
+                  <div class="publisher-package-heading span-2"><strong>Medidas da embalagem</strong><small>Obrigatórias para o cálculo de frete e a publicação no Mercado Livre.</small></div>
+                  <label>Peso <span class="unit-field"><input name="package_weight" type="number" min="1" step="0.01" required /><span>g</span></span></label>
+                  <label>Altura <span class="unit-field"><input name="package_height" type="number" min="0.1" step="0.01" required /><span>cm</span></span></label>
+                  <label>Largura <span class="unit-field"><input name="package_width" type="number" min="0.1" step="0.01" required /><span>cm</span></span></label>
+                  <label>Comprimento <span class="unit-field"><input name="package_length" type="number" min="0.1" step="0.01" required /><span>cm</span></span></label>
                 </div>
                 <div class="publisher-variants">
                   <label><input name="variant_classic" type="checkbox" checked /><span><strong>Clássico</strong><small>gold_special</small></span><span class="money-field"><input name="classic_price" type="number" min="0.01" step="0.01" placeholder="Preço" /></span></label>
