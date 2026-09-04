@@ -2789,17 +2789,40 @@ def policy_error_message(exc, action):
     if "PA_UNAUTHORIZED_RESULT_FROM_POLICIES" in text or "PolicyAgent" in text or "HTTP 403" in text:
         return (
             f"O Mercado Livre bloqueou {action} por política/permissão da aplicação. "
-            "Confirme no painel de desenvolvedores se a aplicação tem permissões de leitura de anúncios/vendas "
-            "e refaça o OAuth da conta conectada."
+            "No Mercado Livre Developers, habilite a permissão funcional “Publicação e sincronização” "
+            "com o escopo “Leitura e escrita”. Depois salve a aplicação e refaça o OAuth das contas "
+            "conectadas para que o novo Grant receba essa permissão."
         )
     return text
 
 
 def official_reader_client(payload):
-    account = next((item for item in payload.get("accounts", []) if item.get("official") and item.get("access_token")), None)
-    if not account:
-        return None
-    return account_client(account)
+    clients = official_reader_clients(payload)
+    return clients[0] if clients else None
+
+
+def official_reader_clients(payload):
+    """Build readers for every connected seller instead of trusting one token.
+
+    Reading a third-party item can be rejected for one grant while another
+    connected grant remains valid.  Product import must not depend on account
+    ordering in app_data.json.
+    """
+    clients = []
+    seen_tokens = set()
+    for account in payload.get("accounts", []) or []:
+        if not account.get("official"):
+            continue
+        token = str(account.get("access_token") or "").strip()
+        if not token or token in seen_tokens:
+            continue
+        try:
+            clients.append(account_client(account))
+            seen_tokens.add(str(account.get("access_token") or token))
+        except Exception:
+            # A stale grant must not prevent trying the other connected shops.
+            continue
+    return clients
 
 
 def meli_read(payload, path):
@@ -2816,15 +2839,29 @@ def meli_public_read(path):
 
 
 def try_meli_sources(payload, paths):
-    last_error = None
+    errors = []
+    clients = official_reader_clients(payload)
     for path in paths:
-        for reader in (lambda p: meli_read(payload, p), meli_public_read):
+        readers = [client.get for client in clients]
+        readers.append(meli_public_read)
+        for reader in readers:
             try:
                 return reader(path)
             except Exception as exc:
-                last_error = exc
-    if last_error:
-        raise last_error
+                errors.append(exc)
+    if errors:
+        # Keep the authenticated policy failure: the anonymous attempt commonly
+        # ends in the same 403 and used to hide which functional permission was
+        # actually missing from the OAuth grant.
+        policy_error = next(
+            (
+                exc for exc in errors
+                if "PA_UNAUTHORIZED_RESULT_FROM_POLICIES" in str(exc)
+                or "PolicyAgent" in str(exc)
+            ),
+            None,
+        )
+        raise policy_error or errors[-1]
     raise RuntimeError("Nenhuma rota Mercado Livre informada.")
 
 
@@ -2840,7 +2877,7 @@ def seller_name_for(payload, seller_id):
 
 def resolve_scan_target(payload, target_id):
     try:
-        item = meli_read(payload, f"/items/{target_id}")
+        item = try_meli_sources(payload, [f"/items/{target_id}?include_attributes=all", f"/items/{target_id}"])
         item["_scan_target_type"] = "item"
         return item
     except Exception as exc:
@@ -2849,8 +2886,8 @@ def resolve_scan_target(payload, target_id):
             raise RuntimeError(policy_error_message(exc, "a leitura deste anúncio no Scan")) from exc
 
     try:
-        product = meli_read(payload, f"/products/{target_id}")
-        offers = meli_read(payload, f"/products/{target_id}/items?site_id=MLB")
+        product = try_meli_sources(payload, [f"/products/{target_id}"])
+        offers = try_meli_sources(payload, [f"/products/{target_id}/items?site_id=MLB"])
     except Exception as exc:
         raise RuntimeError(
             "Não encontrei esse código como anúncio nem como produto de catálogo. "
@@ -3579,7 +3616,19 @@ def parse_external_product_page(page_html, page_url):
 def imported_meli_product(payload, item_id, source_url):
     try:
         item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
-    except Exception:
+    except Exception as exc:
+        error_text = str(exc)
+        # A concrete listing id extracted from `wid` must be read through the
+        # Items API. Treating its 403 as an unknown catalog id caused a second
+        # Scan request and replaced the useful diagnosis with a generic error.
+        if re.fullmatch(r"MLB\d{6,}", str(item_id or "").upper()) and (
+            "HTTP 403" in error_text
+            or "PA_UNAUTHORIZED_RESULT_FROM_POLICIES" in error_text
+            or "PolicyAgent" in error_text
+        ):
+            raise RuntimeError(
+                policy_error_message(exc, f"a consulta do anúncio {item_id} em GET /items/{item_id}")
+            ) from exc
         item = resolve_scan_target(payload, item_id)
     description = ""
     catalog_product = {}
