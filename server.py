@@ -12057,12 +12057,18 @@ def target_official_stores(target_client, target_account, catalog=None):
     else:
         try:
             response = target_client.user_brands(seller_id, interactive=True)
-            brands = response.get("brands") or [] if isinstance(response, dict) else []
+            brands = response.get("brands") or [] if isinstance(response, dict) else response if isinstance(response, list) else []
         except Exception:
             brands = []
+        if isinstance(brands, dict):
+            brands = [brands]
+        brands = [brand for brand in brands if isinstance(brand, dict)]
         if brands:
             with OFFICIAL_STORE_CACHE_LOCK:
                 OFFICIAL_STORE_CACHE[seller_id] = {"time": now, "brands": brands}
+    if isinstance(brands, dict):
+        brands = [brands]
+    brands = [brand for brand in brands if isinstance(brand, dict)]
     available = [
         brand for brand in brands
         if brand.get("official_store_id") not in (None, "")
@@ -12225,7 +12231,7 @@ def required_fields_from_error(exc):
             )
     detail = meli_error_detail(exc)
     if isinstance(detail, dict):
-        for cause in detail.get("cause") or []:
+        for cause in meli_error_causes(exc):
             code = str(cause.get("code") or "").lower()
             message = str(cause.get("message") or "")
             if "required" not in code and "required" not in message.lower() and "obrigat" not in message.lower():
@@ -12253,7 +12259,14 @@ def meli_error_detail(exc):
 def meli_error_causes(exc):
     detail = meli_error_detail(exc)
     causes = detail.get("cause") if isinstance(detail, dict) else []
-    return causes if isinstance(causes, list) else []
+    if causes in (None, ""):
+        return []
+    if not isinstance(causes, list):
+        causes = [causes]
+    return [
+        cause if isinstance(cause, dict) else {"message": str(cause)}
+        for cause in causes
+    ]
 
 
 def meli_error_text(exc):
@@ -12261,7 +12274,7 @@ def meli_error_text(exc):
     parts = [str(exc)]
     if isinstance(detail, dict):
         parts.extend(str(detail.get(key) or "") for key in ("message", "error"))
-        for cause in detail.get("cause") or []:
+        for cause in meli_error_causes(exc):
             parts.append(str(cause.get("message") or ""))
             parts.append(str(cause.get("code") or ""))
     return " ".join(part for part in parts if part)
@@ -12297,7 +12310,7 @@ def invalid_fields_from_error(exc):
         fields.extend(field.strip().strip("'\"") for field in match.group(1).split(",") if field.strip())
     detail = meli_error_detail(exc)
     if isinstance(detail, dict):
-        for cause in detail.get("cause") or []:
+        for cause in meli_error_causes(exc):
             code = str(cause.get("code") or cause.get("cause_id") or "")
             if "invalid_fields" not in code:
                 continue
@@ -13132,6 +13145,24 @@ def friendly_clone_error(exc):
     return " ".join(dict.fromkeys(messages)) or str(exc)
 
 
+def normalize_created_item_response(value):
+    """Normalize the few response shapes observed after POST /items."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        clean = value.strip()
+        try:
+            parsed = json.loads(clean)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        item_match = re.search(r"\bML[A-Z]\d+\b", clean, flags=re.I)
+        if item_match:
+            return {"id": item_match.group(0).upper()}
+    raise RuntimeError("O Mercado Livre criou o anúncio, mas retornou uma confirmação em formato inesperado.")
+
+
 def create_item_with_clone_retries(
     target_client,
     create_payload,
@@ -13170,7 +13201,7 @@ def create_item_with_clone_retries(
                         "campos": ["official_store_id"],
                         "destino": destination_store_id,
                     })
-            created = target_client.create_item(payload)
+            created = normalize_created_item_response(target_client.create_item(payload))
             if adjustments and isinstance(created, dict):
                 created["_clone_adjustments"] = adjustments
             return created
