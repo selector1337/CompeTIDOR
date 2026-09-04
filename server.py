@@ -29,6 +29,11 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+try:
+    from curl_cffi import requests as browser_http_requests
+except ImportError:  # Allows diagnostics/tests before production dependencies are installed.
+    browser_http_requests = None
+
 
 PERFORMANCE_PROFILE = (os.getenv("COMPETIDOR_PERFORMANCE_PROFILE", "shared-8gb") or "shared-8gb").strip().lower()
 PERFORMANCE_DEFAULTS = {
@@ -3047,7 +3052,42 @@ def product_reader_download(url, maximum=None):
 
 
 def product_page_download(url):
-    product_import_host(url)
+    host = product_import_host(url)
+    maximum = max(512_000, min(8_000_000, int(os.getenv("COMPETIDOR_PRODUCT_IMPORT_MAX_BYTES", "4000000"))))
+    # Mercado Livre's UPP pages may reject urllib/datacenter TLS signatures even
+    # though the same public URL works in Chrome. Reproduce the browser's TLS,
+    # HTTP/2 and request-header fingerprint before using the generic readers.
+    if "mercado" in host and browser_http_requests is not None:
+        try:
+            response = browser_http_requests.get(
+                str(url).strip(),
+                impersonate="chrome",
+                timeout=25,
+                allow_redirects=True,
+                headers={"Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"},
+            )
+            response.raise_for_status()
+            final_url = str(response.url)
+            product_import_host(final_url)
+            body = bytes(response.content or b"")
+            if len(body) > maximum:
+                raise RuntimeError("A página do produto é maior do que o limite de importação.")
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "html" not in content_type:
+                raise RuntimeError("O link não retornou uma página de produto em HTML.")
+            decoded = response.text
+            blocked = normalized_attribute_label(decoded[:12000])
+            if any(marker in blocked for marker in (
+                "access to this page has been denied", "access denied", "robot check",
+                "automated access", "captcha required", "just a moment", "checking your browser",
+            )):
+                raise RuntimeError("O Mercado Livre devolveu uma página de bloqueio.")
+            if mercado_livre_public_page(decoded, final_url).get("name"):
+                return decoded, final_url
+        except Exception:
+            # Keep the existing direct and public-reader fallbacks for temporary
+            # edge failures and for deployments still installing the dependency.
+            pass
     request = urllib.request.Request(
         str(url).strip(),
         headers={
@@ -3063,7 +3103,6 @@ def product_page_download(url):
             "Upgrade-Insecure-Requests": "1",
         },
     )
-    maximum = max(512_000, min(8_000_000, int(os.getenv("COMPETIDOR_PRODUCT_IMPORT_MAX_BYTES", "4000000"))))
     try:
         with urllib.request.urlopen(request, timeout=18) as response:
             final_url = response.geturl()
@@ -3780,10 +3819,11 @@ def imported_meli_product(payload, item_id, source_url):
         item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
     except Exception as exc:
         error_text = str(exc)
+        public_page_error = None
         try:
             return imported_meli_public_page(source_url)
-        except Exception:
-            pass
+        except Exception as page_exc:
+            public_page_error = page_exc
         # A concrete listing id extracted from `wid` must be read through the
         # Items API. Treating its 403 as an unknown catalog id caused a second
         # Scan request and replaced the useful diagnosis with a generic error.
@@ -3792,8 +3832,15 @@ def imported_meli_product(payload, item_id, source_url):
             or "PA_UNAUTHORIZED_RESULT_FROM_POLICIES" in error_text
             or "PolicyAgent" in error_text
         ):
+            if browser_http_requests is None:
+                raise RuntimeError(
+                    "A API restringiu este anúncio de outro vendedor e o leitor público compatível com navegador "
+                    "não está instalado no servidor. Atualize as dependências com requirements.txt e reinicie a aplicação."
+                ) from public_page_error
             raise RuntimeError(
-                policy_error_message(exc, f"a consulta do anúncio {item_id} em GET /items/{item_id}")
+                f"O Mercado Livre restringiu o anúncio {item_id} na API e também recusou a página pública ao servidor. "
+                "Isso não é falta de permissão da aplicação. Tente novamente; a consulta pública será renovada sem "
+                "reutilizar o bloqueio anterior."
             ) from exc
         item = resolve_scan_target(payload, item_id)
     description = ""
