@@ -9716,6 +9716,10 @@ textarea:focus {
 .publisher-check input { width: auto; margin-top: 3px; }
 .publisher-check span { display: grid; gap: 2px; }
 .publisher-check small { color: var(--muted); }
+.publisher-publication-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.publisher-publication-modes > strong { grid-column: 1 / -1; font-size: .75rem; }
+.publisher-publication-modes .publisher-check { min-width: 0; }
+.publisher-publication-modes .publisher-check.disabled { opacity: .5; cursor: not-allowed; }
 .publisher-pictures { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 9px; margin: 14px 0; }
 .publisher-picture { position: relative; display: block; min-width: 0; aspect-ratio: 1/1; border: 1px solid rgba(148,163,184,.25); border-radius: 11px; overflow: hidden; background: #fff; cursor: pointer; }
 .publisher-picture img { width: 100%; height: 100%; object-fit: contain; padding: 8px; }

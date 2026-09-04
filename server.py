@@ -2689,7 +2689,30 @@ def item_list_price(item, regular_amount=None):
 
 
 def extract_meli_item_id(value):
-    text = (value or "").strip().upper()
+    raw = (value or "").strip()
+    # Product pages (/p and /up) may expose a catalog/user-product id in the
+    # path and the concrete seller listing in `wid`. The seller listing is the
+    # public source that contains price, pictures and attributes, so it must
+    # always win over MLBU/MLB product identifiers from the path.
+    try:
+        parsed = urlparse(raw)
+        parameters = {
+            **parse_qs(parsed.query),
+            **parse_qs(parsed.fragment),
+        }
+        for key, values in parameters.items():
+            if str(key).lower() != "wid":
+                continue
+            for candidate in values or []:
+                match = re.search(r"\b(MLB\d{5,})\b", str(candidate), flags=re.I)
+                if match:
+                    return match.group(1).upper()
+    except Exception:
+        pass
+    wid_match = re.search(r"(?:[?#&]|\b)wid=(MLB\d{5,})\b", raw, flags=re.I)
+    if wid_match:
+        return wid_match.group(1).upper()
+    text = raw.upper()
     match = re.search(r"\b(ML[A-Z]\d{5,})\b", text)
     if match:
         return match.group(1)
@@ -13613,7 +13636,7 @@ def build_assisted_publication_payload(draft, variant):
     if manufacturing_time:
         source_item["sale_terms"].append({"id": "MANUFACTURING_TIME", "value_name": f"{manufacturing_time} dias"})
     catalog_product_id = clean_attribute_value(draft.get("catalog_product_id"))
-    if catalog_product_id:
+    if draft.get("catalog_listing") and catalog_product_id:
         source_item["catalog_product_id"] = catalog_product_id
     if draft.get("catalog_listing") and catalog_product_id:
         source_item["catalog_listing"] = True
@@ -13641,6 +13664,23 @@ def assisted_publication_variants(request):
     return variants
 
 
+def assisted_publication_modes(request):
+    draft = request.get("draft") or {}
+    requested = request.get("publication_modes")
+    if not isinstance(requested, list):
+        requested = ["catalog" if draft.get("catalog_listing") else "traditional"]
+    modes = []
+    for value in requested:
+        mode = clean_attribute_value(value).lower()
+        if mode in {"traditional", "catalog"} and mode not in modes:
+            modes.append(mode)
+    if not modes:
+        raise RuntimeError("Selecione anúncio tradicional, anúncio de catálogo ou ambos.")
+    if "catalog" in modes and not clean_attribute_value(draft.get("catalog_product_id")):
+        raise RuntimeError("Selecione o produto oficial correspondente antes de criar o anúncio de catálogo.")
+    return modes
+
+
 def validate_assisted_product_operation(payload, request):
     account_ids = [str(value) for value in request.get("account_ids") or [] if value]
     account = next(
@@ -13651,7 +13691,11 @@ def validate_assisted_product_operation(payload, request):
         raise RuntimeError("Selecione ao menos uma conta conectada.")
     draft = request.get("draft") or {}
     variant = assisted_publication_variants(request)[0]
-    create_payload, source_item = build_assisted_publication_payload(draft, variant)
+    publication_mode = assisted_publication_modes(request)[0]
+    mode_draft = {**draft, "catalog_listing": publication_mode == "catalog"}
+    if publication_mode == "traditional":
+        mode_draft["catalog_product_id"] = ""
+    create_payload, source_item = build_assisted_publication_payload(mode_draft, variant)
     client = account_client(account)
     stores = target_official_stores(client, account, payload.get("catalog") or [])
     requested_stores = request.get("official_store_ids") if isinstance(request.get("official_store_ids"), dict) else {}
@@ -13667,6 +13711,7 @@ def validate_assisted_product_operation(payload, request):
             "valid": True,
             "account": account.get("nickname"),
             "listing_type_id": variant.get("listing_type_id"),
+            "publication_mode": publication_mode,
             "message": "O Mercado Livre aceitou a estrutura deste anúncio.",
             "official": response or {},
         }
@@ -13681,6 +13726,7 @@ def validate_assisted_product_operation(payload, request):
                     return {
                         "valid": True, "account": account.get("nickname"),
                         "listing_type_id": variant.get("listing_type_id"),
+                        "publication_mode": publication_mode,
                         "message": "O Mercado Livre aceitou a estrutura e a Loja Oficial própria desta conta.",
                         "official": response or {},
                     }
@@ -13694,6 +13740,7 @@ def validate_assisted_product_operation(payload, request):
             "valid": False,
             "account": account.get("nickname"),
             "listing_type_id": variant.get("listing_type_id"),
+            "publication_mode": publication_mode,
             "message": friendly_clone_error(exc),
             "official_error": str(exc),
             "account_id": account.get("id"),
@@ -13712,27 +13759,36 @@ def publish_assisted_product_operation(payload, request, actor=None):
     if not accounts:
         raise RuntimeError("Selecione ao menos uma conta conectada.")
     variants = assisted_publication_variants(request)
-    if len(accounts) * len(variants) > 12:
+    publication_modes = assisted_publication_modes(request)
+    if len(accounts) * len(variants) * len(publication_modes) > 12:
         raise RuntimeError("Publique no máximo 12 combinações de conta e tipo por operação.")
     draft = request.get("draft") or {}
     requested_stores = request.get("official_store_ids") if isinstance(request.get("official_store_ids"), dict) else {}
     description = str(draft.get("description") or "").strip()[:50000]
     results = []
-    total = len(accounts) * len(variants)
+    total = len(accounts) * len(variants) * len(publication_modes)
     progress = 0
     for account in accounts:
         client = account_client(account)
         category_id = clean_attribute_value(draft.get("category_id"))
         definitions = cached_category_attributes(client, category_id) if category_id else []
-        for variant in variants:
+        for variant, publication_mode in (
+            (variant, publication_mode)
+            for variant in variants
+            for publication_mode in publication_modes
+        ):
             progress += 1
             destination_stores = []
             label = "Premium" if variant.get("listing_type_id") == "gold_pro" else "Clássico"
+            mode_label = "Catálogo" if publication_mode == "catalog" else "Tradicional"
             update_async_operation_progress(
-                f"Publicando {label} na conta {account.get('nickname')}.", progress - 1, total
+                f"Publicando {label} · {mode_label} na conta {account.get('nickname')}.", progress - 1, total
             )
             try:
-                create_payload, source_item = build_assisted_publication_payload(draft, variant)
+                mode_draft = {**draft, "catalog_listing": publication_mode == "catalog"}
+                if publication_mode == "traditional":
+                    mode_draft["catalog_product_id"] = ""
+                create_payload, source_item = build_assisted_publication_payload(mode_draft, variant)
                 destination_stores = target_official_stores(
                     client, account, payload.get("catalog") or [],
                 )
@@ -13772,6 +13828,7 @@ def publish_assisted_product_operation(payload, request, actor=None):
                 results.append({
                     "status": "created", "account": account.get("nickname"), "account_id": account.get("id"),
                     "listing_type_id": variant.get("listing_type_id"), "item_id": item_id,
+                    "publication_mode": publication_mode,
                     "title": official.get("title") or draft.get("title"),
                     "permalink": official.get("permalink") or created.get("permalink") or "",
                 })
@@ -13788,6 +13845,7 @@ def publish_assisted_product_operation(payload, request, actor=None):
                 error_result = {
                     "status": "error", "account": account.get("nickname"), "account_id": account.get("id"),
                     "listing_type_id": variant.get("listing_type_id"), "error": friendly_clone_error(exc),
+                    "publication_mode": publication_mode,
                 }
                 if pending_fields:
                     error_result["pending_fields"] = pending_fields

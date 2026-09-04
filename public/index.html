@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260904-official-store-kits-v3" />
+  <link rel="stylesheet" href="/styles.css?v=20260904-meli-wid-catalog-v4" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -1000,7 +1000,11 @@
                   <label class="span-2">Produto de catálogo
                     <select name="catalog_product_id"><option value="">Anúncio tradicional / sem vínculo automático</option></select>
                   </label>
-                  <label class="publisher-check span-2"><input name="catalog_listing" type="checkbox" /><span><strong>Publicar diretamente no catálogo</strong><small>Use somente quando a correspondência acima for exatamente o mesmo produto.</small></span></label>
+                  <div class="publisher-publication-modes span-2">
+                    <strong>Modalidade da publicação</strong>
+                    <label class="publisher-check"><input name="publication_traditional" type="checkbox" checked /><span><strong>Anúncio tradicional</strong><small>Cria uma publicação independente, sem competir no catálogo.</small></span></label>
+                    <label class="publisher-check"><input name="publication_catalog" type="checkbox" /><span><strong>Anúncio de catálogo</strong><small>Disponível quando o produto oficial correspondente estiver selecionado.</small></span></label>
+                  </div>
                   <label class="span-2">Descrição adaptada <textarea name="description" rows="12" maxlength="50000"></textarea></label>
                 </div>
               </section>
@@ -1456,6 +1460,6 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260904-official-store-kits-v3"></script>
+  <script src="/app.js?v=20260904-meli-wid-catalog-v4"></script>
   </body>
 </html>

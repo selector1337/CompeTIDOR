@@ -5131,6 +5131,18 @@ function updatePublisherStoreRequirements() {
   });
 }
 
+function updatePublisherPublicationModes() {
+  const form = document.querySelector("#product-publish-form");
+  if (!form) return;
+  const catalogMode = form.elements.publication_catalog;
+  const catalogProduct = form.elements.catalog_product_id;
+  if (!catalogMode || !catalogProduct) return;
+  const available = Boolean(String(catalogProduct.value || "").trim());
+  catalogMode.disabled = !available;
+  if (!available) catalogMode.checked = false;
+  catalogMode.closest("label")?.classList.toggle("disabled", !available);
+}
+
 document.querySelector("#publisher-attributes")?.addEventListener("input", updatePublisherIdentifierRequirements);
 document.querySelector("#publisher-attributes")?.addEventListener("change", updatePublisherIdentifierRequirements);
 document.querySelector('#product-publish-form [name="gtin"]')?.addEventListener("input", (event) => {
@@ -5178,6 +5190,9 @@ function applyAssistedProduct(product) {
     : `<option value="${escapeAttr(product.category_id || "")}">${escapeText(product.category_id || "Categoria não identificada")}</option>`;
   const catalog = form.elements.catalog_product_id;
   catalog.innerHTML = `<option value="">Anúncio tradicional / sem vínculo automático</option>${(product.catalog_candidates || []).map((row) => `<option value="${escapeAttr(row.id)}" ${row.id === product.catalog_product_id ? "selected" : ""}>${escapeText(row.name)} · ${escapeText(row.id)}${row.listing_strategy ? ` · ${escapeText(row.listing_strategy)}` : ""}</option>`).join("")}`;
+  form.elements.publication_traditional.checked = true;
+  form.elements.publication_catalog.checked = false;
+  updatePublisherPublicationModes();
   renderPublisherPictures();
   renderPublisherAttributes(product.attributes || []);
   const accounts = product.accounts?.length ? product.accounts : connectedAccounts();
@@ -5200,6 +5215,7 @@ function applyAssistedProduct(product) {
 }
 
 document.querySelector("#publisher-accounts")?.addEventListener("change", updatePublisherStoreRequirements);
+document.querySelector('#product-publish-form [name="catalog_product_id"]')?.addEventListener("change", updatePublisherPublicationModes);
 
 function updatePublisherTitleCounter() {
   const input = document.querySelector('#product-publish-form [name="title"]');
@@ -5223,6 +5239,9 @@ function collectAssistedPublication() {
   const variants = [];
   if (values.get("variant_classic")) variants.push({ listing_type_id: "gold_special", price: values.get("classic_price") });
   if (values.get("variant_premium")) variants.push({ listing_type_id: "gold_pro", price: values.get("premium_price") });
+  const publicationModes = [];
+  if (values.get("publication_traditional")) publicationModes.push("traditional");
+  if (values.get("publication_catalog")) publicationModes.push("catalog");
   return {
     account_ids: [...form.querySelectorAll("[data-publisher-account]:checked")].map((input) => input.value),
     official_store_ids: Object.fromEntries(
@@ -5231,11 +5250,12 @@ function collectAssistedPublication() {
         .map((input) => [input.dataset.publisherOfficialStore, input.value])
     ),
     variants,
+    publication_modes: publicationModes,
     draft: {
       source_url: state.productDraft?.source_url || "",
       title: values.get("title"), brand: values.get("brand"), model: values.get("model"), mpn: values.get("mpn"), gtin: values.get("gtin"),
       description: values.get("description"), category_id: values.get("category_id"), domain_id: categoryOption?.dataset.domainId || "",
-      catalog_product_id: values.get("catalog_product_id"), catalog_listing: Boolean(values.get("catalog_listing")),
+      catalog_product_id: values.get("catalog_product_id"),
       sku: values.get("sku"), stock: values.get("stock"), manufacturing_time: values.get("manufacturing_time"), condition: values.get("condition"),
       package_weight: values.get("package_weight"), package_height: values.get("package_height"),
       package_width: values.get("package_width"), package_length: values.get("package_length"),
@@ -5252,8 +5272,8 @@ function renderPublisherResults(result) {
   applyPublisherPendingFields(result?.results || []);
   root.innerHTML = `<div class="publisher-result-summary"><strong>${Number(result.created || 0)} anúncio(s) criado(s)</strong><span>${Number(result.failed || 0)} falha(s)</span></div>
     <div class="publisher-result-grid">${(result.results || []).map((row) => row.status === "created" ? `
-      <a href="${escapeAttr(row.permalink || "#")}" target="_blank" rel="noreferrer"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"}</small><strong>${escapeText(row.item_id || "Criado")}</strong><span>${escapeText(row.title || "")}</span></a>
-    ` : `<article class="${row.pending_fields?.length ? "review" : "error"}"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"}</small><strong>${row.pending_fields?.length ? "Seleção necessária" : "Não publicado"}</strong><span>${escapeText(row.error || "Erro não identificado")}</span>${row.pending_fields?.length ? `<em>Selecione a Loja Oficial na conta acima e publique novamente.</em>` : ""}</article>`).join("")}</div>`;
+      <a href="${escapeAttr(row.permalink || "#")}" target="_blank" rel="noreferrer"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${escapeText(row.item_id || "Criado")}</strong><span>${escapeText(row.title || "")}</span></a>
+    ` : `<article class="${row.pending_fields?.length ? "review" : "error"}"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${row.pending_fields?.length ? "Seleção necessária" : "Não publicado"}</strong><span>${escapeText(row.error || "Erro não identificado")}</span>${row.pending_fields?.length ? `<em>Selecione a Loja Oficial na conta acima e publique novamente.</em>` : ""}</article>`).join("")}</div>`;
 }
 
 function applyPublisherPendingFields(rows) {
@@ -7735,8 +7755,9 @@ document.querySelector("#product-publish-form")?.addEventListener("submit", asyn
   const request = collectAssistedPublication();
   if (!request.account_ids.length) return showToast("Selecione ao menos uma conta.", "error");
   if (!request.variants.length) return showToast("Selecione Clássico, Premium ou ambos.", "error");
+  if (!request.publication_modes.length) return showToast("Selecione anúncio tradicional, anúncio de catálogo ou ambos.", "error");
   if (!request.draft.pictures.length) return showToast("Selecione ao menos uma foto.", "error");
-  const total = request.account_ids.length * request.variants.length;
+  const total = request.account_ids.length * request.variants.length * request.publication_modes.length;
   if (!window.confirm(`Publicar ${total} anúncio(s) oficialmente no Mercado Livre?`)) return;
   const button = event.currentTarget.querySelector('button[type="submit"]');
   state.productPublishing = true;
