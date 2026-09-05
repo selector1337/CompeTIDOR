@@ -213,6 +213,9 @@ BACKGROUND_MELI_MAX_IN_FLIGHT = configured_int(
 INTERACTIVE_MELI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(INTERACTIVE_MELI_MAX_IN_FLIGHT)
 BACKGROUND_MELI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(BACKGROUND_MELI_MAX_IN_FLIGHT)
 MELI_WORK_CONTEXT = threading.local()
+ASSISTED_PUBLICATION_MAX_COMBINATIONS = max(
+    1, min(32, int(os.getenv("MELI_ASSISTED_PUBLICATION_MAX_COMBINATIONS", "16")))
+)
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -2754,6 +2757,19 @@ def extract_meli_catalog_product_id(value):
     return match.group(1).upper() if match else ""
 
 
+def extract_meli_user_product_id(value):
+    """Return the MLBU entity carried by a Mercado Livre /up/ URL."""
+    raw = str(value or "").strip()
+    try:
+        path = unquote(urlparse(raw).path or "")
+    except Exception:
+        path = raw
+    match = re.search(r"/up/(MLBU\d{5,})(?:/|$)", path, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"\b(MLBU\d{5,})\b", raw, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
 def resolve_competitor_seller(payload, reference):
     raw = str(reference or "").strip()
     if not raw:
@@ -4026,30 +4042,50 @@ def imported_meli_public_page(source_url):
 
 
 def imported_meli_product(payload, item_id, source_url):
-    # /up/MLBU... is a User Product page, not an Items API id. Its public
-    # rendering state is the authoritative source and also exposes the concrete
-    # MLB offer even when the URL does not carry a `wid` fragment.
-    if str(item_id or "").upper().startswith("MLBU"):
-        try:
-            return imported_meli_public_page(source_url)
-        except Exception:
-            pass
+    # /up/MLBU... is a User Product page, while `wid` identifies its commercial
+    # offer. Both identities are resolved independently below.
     catalog_product = {}
+    user_product = {}
     try:
         item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
     except Exception as exc:
         error_text = str(exc)
         public_page_error = None
-        try:
-            return imported_meli_public_page(source_url)
-        except Exception as page_exc:
-            public_page_error = page_exc
+        # /up/ URLs identify the seller's structured User Product separately
+        # from the concrete commercial offer carried in `wid`. This official
+        # endpoint supplies the content even when /items/{wid} is policy-hidden.
+        user_product_id = extract_meli_user_product_id(source_url)
+        if user_product_id:
+            try:
+                user_product = try_meli_sources(payload, [f"/user-products/{user_product_id}"])
+                if not isinstance(user_product, dict) or not (
+                    user_product.get("name") or user_product.get("title") or user_product.get("family_name")
+                ):
+                    raise RuntimeError("User Product sem título.")
+                item = {
+                    "id": str(item_id or "").upper(),
+                    "title": (
+                        user_product.get("name") or user_product.get("title")
+                        or user_product.get("family_name") or ""
+                    ),
+                    "price": first_present(user_product, ["price", "sale_price"], 0) or 0,
+                    "currency_id": user_product.get("currency_id") or "BRL",
+                    "pictures": user_product.get("pictures") or [],
+                    "attributes": user_product.get("attributes") or [],
+                    "category_id": user_product.get("category_id") or "",
+                    "domain_id": user_product.get("domain_id") or "",
+                    "catalog_product_id": user_product.get("catalog_product_id") or "",
+                    "user_product_id": user_product_id,
+                    "permalink": source_url,
+                }
+            except Exception:
+                user_product = {}
         # Search/catalog URLs now commonly carry the product id in /p/MLB...
         # and the concrete offer in pdp_filters=item_id:MLB.... Even when the
         # Items policy hides that seller's offer, /products/{id} remains the
         # official source for title, pictures and technical attributes.
         catalog_product_id = extract_meli_catalog_product_id(source_url)
-        if catalog_product_id:
+        if not user_product and catalog_product_id:
             try:
                 catalog_product = try_meli_sources(payload, [f"/products/{catalog_product_id}"])
                 if not isinstance(catalog_product, dict) or not (
@@ -4081,7 +4117,12 @@ def imported_meli_product(payload, item_id, source_url):
         # A concrete listing id extracted from `wid` must be read through the
         # Items API. Treating its 403 as an unknown catalog id caused a second
         # Scan request and replaced the useful diagnosis with a generic error.
-        if not catalog_product and re.fullmatch(r"MLB\d{6,}", str(item_id or "").upper()) and (
+        if not user_product and not catalog_product:
+            try:
+                return imported_meli_public_page(source_url)
+            except Exception as page_exc:
+                public_page_error = page_exc
+        if not user_product and not catalog_product and re.fullmatch(r"MLB\d{6,}", str(item_id or "").upper()) and (
             "HTTP 403" in error_text
             or "PA_UNAUTHORIZED_RESULT_FROM_POLICIES" in error_text
             or "PolicyAgent" in error_text
@@ -4098,7 +4139,7 @@ def imported_meli_product(payload, item_id, source_url):
                 f"O navegador público de contingência também falhou. Diagnóstico: "
                 f"{page_reason or 'motivo não informado'}."
             ) from public_page_error
-        if not catalog_product:
+        if not user_product and not catalog_product:
             item = resolve_scan_target(payload, item_id)
     description = ""
     owner = next(
@@ -4131,7 +4172,7 @@ def imported_meli_product(payload, item_id, source_url):
     except Exception:
         pass
     attributes_by_id = {}
-    for container in (catalog_product, item):
+    for container in (catalog_product, user_product, item):
         for row in container.get("attributes") or []:
             if row.get("id"):
                 attributes_by_id[str(row.get("id")).upper()] = row
@@ -4157,6 +4198,7 @@ def imported_meli_product(payload, item_id, source_url):
         "source_currency": item.get("currency_id") or "BRL",
         "pictures": product_image_urls([
             *(item.get("pictures") or []),
+            *(user_product.get("pictures") or []),
             *(catalog_product.get("pictures") or []),
             item.get("secure_thumbnail") or item.get("thumbnail"),
         ], source_url),
@@ -4164,6 +4206,7 @@ def imported_meli_product(payload, item_id, source_url):
         "category_id": item.get("category_id") or "",
         "domain_id": item.get("domain_id") or "",
         "catalog_product_id": item.get("catalog_product_id") or "",
+        "user_product_id": item.get("user_product_id") or extract_meli_user_product_id(source_url),
         "raw_attributes": attributes,
     }
 
@@ -12293,6 +12336,43 @@ def hydrate_clone_package_attributes(create_payload, source_item):
     return copied
 
 
+SELLER_PACKAGE_ATTRIBUTE_FIELDS = {
+    "SELLER_PACKAGE_HEIGHT": "package_height",
+    "SELLER_PACKAGE_LENGTH": "package_length",
+    "SELLER_PACKAGE_WIDTH": "package_width",
+    "SELLER_PACKAGE_WEIGHT": "package_weight",
+}
+
+
+def clone_package_error_kind(exc):
+    """Classify the explicit package-dimension validation errors from /items."""
+    text = meli_error_text(exc).lower()
+    if "seller.package.dimensions" not in text and "seller_package_" not in text:
+        return ""
+    if "missing.seller.package.dimensions" in text or "all required" in text:
+        return "missing"
+    if "invalid.format.seller.package.dimensions" in text or "wrong format" in text:
+        return "format"
+    return "invalid" if "invalid.seller.package.dimensions" in text else ""
+
+
+def restore_clone_package_set(create_payload, source_item, numeric_only=False):
+    """Restore all four package values together, optionally using the numeric-only API form."""
+    values = package_values_from_item(source_item)
+    fields = SELLER_PACKAGE_ATTRIBUTE_FIELDS.values()
+    if not all(clean_attribute_value(values.get(field)) for field in fields):
+        return []
+    remove_clone_attributes(create_payload, SELLER_PACKAGE_ATTRIBUTE_FIELDS)
+    restored = []
+    for attr_id, field in SELLER_PACKAGE_ATTRIBUTE_FIELDS.items():
+        api_value = seller_package_api_value(field, values[field])
+        if numeric_only:
+            api_value = str(max(1, math.ceil(parse_decimal_number(api_value))))
+        create_payload.setdefault("attributes", []).append({"id": attr_id, "value_name": api_value})
+        restored.append(attr_id)
+    return restored
+
+
 def restore_clone_attribute_from_source(create_payload, source_item, category_attributes, attr_id):
     canonical_id = canonical_clone_attribute_id(attr_id)
     if not canonical_id or clone_required_attribute_satisfied(create_payload, canonical_id):
@@ -13427,6 +13507,21 @@ def clone_retry_adjustments_from_error(
     adjustments = []
     error_text = meli_error_text(exc)
     lowered_error = error_text.lower()
+    package_error = clone_package_error_kind(exc)
+    if package_error in {"missing", "format"}:
+        restored_package = restore_clone_package_set(
+            create_payload,
+            source_item,
+            numeric_only=package_error == "format",
+        )
+        if restored_package:
+            changed = True
+            adjustments.append({
+                "tipo": "medidas_embalagem_reaplicadas"
+                if package_error == "missing"
+                else "formato_medidas_embalagem_ajustado",
+                "campos": restored_package,
+            })
     immutable_terms = [
         match.group(1).upper()
         for match in re.finditer(r"(?:not allowed to modify sale term|não é permitido alterar o termo de venda)\s+([A-Z0-9_]+)", error_text, flags=re.I)
@@ -14278,8 +14373,11 @@ def publish_assisted_product_operation(payload, request, actor=None):
         raise RuntimeError("Selecione ao menos uma conta conectada.")
     variants = assisted_publication_variants(request)
     publication_modes = assisted_publication_modes(request)
-    if len(accounts) * len(variants) * len(publication_modes) > 12:
-        raise RuntimeError("Publique no máximo 12 combinações de conta e tipo por operação.")
+    if len(accounts) * len(variants) * len(publication_modes) > ASSISTED_PUBLICATION_MAX_COMBINATIONS:
+        raise RuntimeError(
+            f"Publique no máximo {ASSISTED_PUBLICATION_MAX_COMBINATIONS} combinações "
+            "de conta, tipo e modalidade por operação."
+        )
     draft = request.get("draft") or {}
     requested_stores = request.get("official_store_ids") if isinstance(request.get("official_store_ids"), dict) else {}
     description = str(draft.get("description") or "").strip()[:50000]
