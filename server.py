@@ -4041,12 +4041,37 @@ def imported_meli_public_page(source_url):
     return product
 
 
+def imported_meli_up_public_fallback(source_url, item_id=""):
+    """Try the UPP and the concrete offer identified by its wid, never another product."""
+    candidates = [source_url]
+    if extract_meli_user_product_id(source_url) and re.fullmatch(r"MLB\d{5,}", str(item_id or "")):
+        candidates.append(f"https://produto.mercadolivre.com.br/MLB-{item_id[3:]}-_JM")
+    errors = []
+    for candidate in candidates:
+        try:
+            product = imported_meli_public_page(candidate)
+            resolved_id = product.get("source_item_id")
+            if candidate != source_url and resolved_id and resolved_id != item_id:
+                raise RuntimeError("A página redirecionou para outro anúncio.")
+            product["source_url"] = source_url
+            product["user_product_id"] = extract_meli_user_product_id(source_url)
+            if re.fullmatch(r"MLB\d{5,}", str(item_id or "")):
+                product.setdefault("source_item_id", item_id)
+                product["source_item_id"] = product.get("source_item_id") or item_id
+            return product
+        except Exception as exc:
+            errors.append(str(exc))
+    raise RuntimeError("; ".join(dict.fromkeys(errors)))
+
+
 def imported_meli_product(payload, item_id, source_url):
     # /up/MLBU... is a User Product page, while `wid` identifies its commercial
     # offer. Both identities are resolved independently below.
     catalog_product = {}
     user_product = {}
     try:
+        if not re.fullmatch(r"MLB\d{5,}", str(item_id or "")):
+            raise RuntimeError("O link identifica um User Product, sem ID de oferta.")
         item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
     except Exception as exc:
         error_text = str(exc)
@@ -4119,7 +4144,7 @@ def imported_meli_product(payload, item_id, source_url):
         # Scan request and replaced the useful diagnosis with a generic error.
         if not user_product and not catalog_product:
             try:
-                return imported_meli_public_page(source_url)
+                return imported_meli_up_public_fallback(source_url, item_id)
             except Exception as page_exc:
                 public_page_error = page_exc
         if not user_product and not catalog_product and re.fullmatch(r"MLB\d{6,}", str(item_id or "").upper()) and (
@@ -4140,6 +4165,11 @@ def imported_meli_product(payload, item_id, source_url):
                 f"{page_reason or 'motivo não informado'}."
             ) from public_page_error
         if not user_product and not catalog_product:
+            if extract_meli_user_product_id(source_url):
+                raise RuntimeError(
+                    "Não foi possível ler este User Product na API nem na página pública. "
+                    f"Diagnóstico: {public_page_error}"
+                ) from public_page_error
             item = resolve_scan_target(payload, item_id)
     description = ""
     owner = next(
@@ -4368,7 +4398,9 @@ def import_product_operation(payload, request):
     source_url = str(request.get("url") or "").strip()
     host = product_import_host(source_url)
     update_async_operation_progress("Lendo os dados públicos do produto.", 1, 4)
-    item_id = extract_meli_item_id(source_url) if "mercado" in host else ""
+    item_id = (
+        extract_meli_item_id(source_url) or extract_meli_user_product_id(source_url)
+    ) if "mercado" in host else ""
     if item_id:
         product = imported_meli_product(payload, item_id, source_url)
     else:
