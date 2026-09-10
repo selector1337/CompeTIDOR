@@ -1916,11 +1916,17 @@ class MercadoLivreClient:
 
     def items_bulk(self, item_ids):
         ids = ",".join(item_ids)
-        rows = self.get(f"/items?ids={ids}&include_attributes=all")
+        try:
+            rows = self.get(f"/items/bulk?ids={ids}")
+        except Exception:
+            # Mercado Livre keeps the former endpoint during the migration
+            # window; retain it for accounts not enabled on /items/bulk yet.
+            rows = self.get(f"/items?ids={ids}&include_attributes=all")
         items = []
         for row in rows if isinstance(rows, list) else []:
             body = row.get("body") if isinstance(row, dict) else None
-            if body:
+            status = row.get("status_code", row.get("code")) if isinstance(row, dict) else None
+            if body and status in (None, 200):
                 items.append(body)
         return items
 
@@ -2679,6 +2685,176 @@ def catalog_safe_package_draft(client, draft):
     return adjusted
 
 
+def catalog_too_small_package_fields(exc):
+    text = meli_error_text(exc).lower()
+    if "too small for the product dimensions" not in text:
+        return []
+    fields = []
+    by_attribute = {key.lower(): value for key, value in SELLER_PACKAGE_ATTRIBUTE_FIELDS.items()}
+    for attr_id, field in by_attribute.items():
+        if attr_id in text:
+            fields.append(field)
+    return fields
+
+
+def package_payload_numbers(create_payload):
+    values = {}
+    for row in (create_payload or {}).get("attributes") or []:
+        field = SELLER_PACKAGE_ATTRIBUTE_FIELDS.get(str(row.get("id") or "").upper())
+        if not field:
+            continue
+        value = catalog_measurement_value(row, field)
+        if value is not None:
+            values[field] = max(1, math.ceil(value))
+    return values
+
+
+def set_package_payload_numbers(create_payload, values):
+    units = {
+        "package_height": "cm", "package_width": "cm", "package_length": "cm",
+        "package_weight": "g",
+    }
+    by_field = {value: key for key, value in SELLER_PACKAGE_ATTRIBUTE_FIELDS.items()}
+    for field, value in values.items():
+        attr_id = by_field.get(field)
+        if attr_id:
+            add_or_update_clone_attribute(create_payload, attr_id, f"{max(1, math.ceil(value))} {units[field]}")
+    return create_payload
+
+
+def catalog_package_validated_payload(client, create_payload, source_item, initial_error=None):
+    """Find the smallest whole package accepted by the PDP's hidden validator.
+
+    Mercado Livre does not always return the dimensions used by its catalog
+    validator in /products.  In that case /items/validate is the authoritative,
+    side-effect-free source: its error explicitly names only the dimensions that
+    are below the PDP minimum.  Exponential growth finds an accepted bound and a
+    short binary refinement avoids sending an unnecessarily inflated package.
+    """
+    method = getattr(client, "validate_item", None)
+    if not callable(method):
+        return create_payload, source_item, []
+    payload = json.loads(json.dumps(create_payload or {}, ensure_ascii=False))
+    source = json.loads(json.dumps(source_item or {}, ensure_ascii=False))
+    current = package_payload_numbers(payload)
+    if len(current) < 4:
+        return create_payload, source_item, []
+    error = initial_error
+    if error is None:
+        try:
+            run_interactive_meli_call(method, payload)
+            return payload, source, []
+        except Exception as exc:
+            error = exc
+    fields = catalog_too_small_package_fields(error)
+    if not fields:
+        raise error
+    original = dict(current)
+    lower = {field: current[field] for field in fields}
+    changed = set(fields)
+    last_valid = None
+    limits = {
+        "package_height": 500, "package_width": 500, "package_length": 500,
+        "package_weight": 500_000,
+    }
+    for _attempt in range(10):
+        for field in fields:
+            lower[field] = current[field]
+            current[field] = min(limits[field], max(current[field] + 1, current[field] * 2))
+        set_package_payload_numbers(payload, current)
+        try:
+            run_interactive_meli_call(method, payload)
+            last_valid = json.loads(json.dumps(payload, ensure_ascii=False))
+            break
+        except Exception as exc:
+            fields = catalog_too_small_package_fields(exc)
+            if not fields:
+                raise exc
+            changed.update(fields)
+            if all(current[field] >= limits[field] for field in fields):
+                raise exc
+    if last_valid is None:
+        raise error
+
+    high = package_payload_numbers(last_valid)
+    # Refine all dimensions together. On a failed midpoint the API tells us
+    # exactly which fields remain low; fields omitted from the error already pass.
+    for _attempt in range(4):
+        probe_fields = [field for field in changed if high[field] - lower.get(field, original[field]) > 1]
+        if not probe_fields:
+            break
+        probe_values = dict(high)
+        for field in probe_fields:
+            probe_values[field] = (lower.get(field, original[field]) + high[field]) // 2
+        probe = json.loads(json.dumps(last_valid, ensure_ascii=False))
+        set_package_payload_numbers(probe, probe_values)
+        try:
+            run_interactive_meli_call(method, probe)
+            last_valid = probe
+            high = package_payload_numbers(last_valid)
+        except Exception as exc:
+            rejected = set(catalog_too_small_package_fields(exc))
+            if not rejected:
+                break
+            for field in probe_fields:
+                if field in rejected:
+                    lower[field] = probe_values[field]
+                else:
+                    high[field] = probe_values[field]
+
+    final_values = package_payload_numbers(last_valid)
+    set_package_payload_numbers(source, final_values)
+    adjustments = [
+        {
+            "tipo": "medidas_minimas_do_catalogo_validadas",
+            "campo": field,
+            "de": original[field],
+            "para": final_values[field],
+        }
+        for field in sorted(changed)
+        if final_values.get(field, original[field]) != original[field]
+    ]
+    return last_valid, source, adjustments
+
+
+def catalog_inherited_or_seller_package_payload(client, create_payload, source_item):
+    """Prefer the PDP's inherited logistics and send seller measures only when required."""
+    inherited = json.loads(json.dumps(create_payload or {}, ensure_ascii=False))
+    removed = remove_clone_attributes(inherited, SELLER_PACKAGE_ATTRIBUTE_FIELDS)
+    method = getattr(client, "validate_item", None)
+    if not removed or not callable(method):
+        return inherited, source_item, []
+    try:
+        run_interactive_meli_call(method, inherited)
+        return inherited, source_item, [{
+            "tipo": "medidas_herdadas_do_catalogo",
+            "campos": removed,
+        }]
+    except Exception as exc:
+        package_error = clone_package_error_kind(exc)
+        required = {str(value).lower() for value in required_fields_from_error(exc)}
+        package_required = package_error in {"missing", "format"} or bool(
+            required.intersection({key.lower() for key in SELLER_PACKAGE_ATTRIBUTE_FIELDS})
+        )
+        if not package_required:
+            # Keep the inherited form. The regular creation pipeline will deal
+            # with any unrelated validation error without reintroducing package
+            # data that this PDP owns.
+            return inherited, source_item, [{
+                "tipo": "medidas_herdadas_do_catalogo",
+                "campos": removed,
+            }]
+    # This PDP explicitly delegates packaging to the seller. Restore the four
+    # real values and let the hidden-dimension validator refine them if needed.
+    restored = json.loads(json.dumps(create_payload or {}, ensure_ascii=False))
+    try:
+        return catalog_package_validated_payload(client, restored, source_item)
+    except Exception as exc:
+        if catalog_too_small_package_fields(exc):
+            raise
+        return restored, source_item, []
+
+
 def item_manufacturing_time(item):
     """Return the official MANUFACTURING_TIME sale term as whole days."""
     candidates = [
@@ -3316,6 +3492,20 @@ def reset_product_browser_worker():
         pass
 
 
+def meli_up_search_url(value):
+    """Build a public search URL from an UPP slug without tracking data."""
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except Exception:
+        return ""
+    if not extract_meli_user_product_id(value):
+        return ""
+    before_up = (parsed.path or "").split("/up/", 1)[0].strip("/")
+    slug = before_up.rsplit("/", 1)[-1]
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", unquote(slug)).strip("-")
+    return f"https://lista.mercadolivre.com.br/{slug}" if slug else ""
+
+
 def product_browser_worker_download(url, maximum):
     if sync_playwright is None:
         raise RuntimeError("O leitor Chromium não está instalado.")
@@ -3355,7 +3545,38 @@ def product_browser_worker_download(url, maximum):
     try:
         context = PRODUCT_BROWSER_STATE["context"]
         page = context.new_page()
-        navigation_response = page.goto(str(url).strip(), wait_until="domcontentloaded", timeout=35_000)
+        requested_url = str(url).strip()
+        navigation_url = requested_url
+        user_product_id = extract_meli_user_product_id(requested_url)
+        concrete_item_id = extract_meli_item_id(requested_url)
+        search_url = meli_up_search_url(requested_url)
+        if user_product_id and search_url:
+            # UPP routes are often challenged when opened as the browser's
+            # first navigation. Warm the first-party context and resolve only
+            # an anchor carrying the same MLBU or the exact commercial item.
+            try:
+                page.goto("https://www.mercadolivre.com.br/", wait_until="domcontentloaded", timeout=20_000)
+                page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+                resolved = page.evaluate(
+                    """({ itemId, userProductId }) => {
+                        const wanted = [itemId, userProductId]
+                            .filter(Boolean).map(value => value.toUpperCase());
+                        for (const anchor of document.querySelectorAll('a[href]')) {
+                            const href = String(anchor.href || '');
+                            const upper = href.toUpperCase();
+                            if (wanted.some(value => upper.includes(value))) return href;
+                        }
+                        return '';
+                    }""",
+                    {"itemId": concrete_item_id, "userProductId": user_product_id},
+                )
+                if resolved:
+                    navigation_url = resolved
+            except Exception:
+                # Search warm-up is a contingency, never a reason to reject an
+                # otherwise readable exact PDP.
+                navigation_url = requested_url
+        navigation_response = page.goto(navigation_url, wait_until="domcontentloaded", timeout=35_000)
         try:
             page.wait_for_function(
                 "() => !!document.querySelector('#__NORDIC_RENDERING_CTX__, script[type=\"application/ld+json\"]')",
@@ -4286,6 +4507,10 @@ def imported_up_offer(payload, item_id, source_url=""):
             "permalink", "secure_thumbnail", "thumbnail",
         ))
         for multiget_path in (
+            f"/items/bulk?ids={item_id}",
+            f"/items/bulk?ids={item_id}&attributes=" + ",".join(
+                f"body.{field}" for field in limited_fields.split(",")
+            ),
             f"/items?ids={item_id}&include_attributes=all",
             f"/items?ids={item_id}&attributes={limited_fields}",
         ):
@@ -4293,7 +4518,8 @@ def imported_up_offer(payload, item_id, source_url=""):
                 rows = try_meli_sources(payload, [multiget_path])
                 for row in rows if isinstance(rows, list) else []:
                     body = row.get("body") if isinstance(row, dict) else None
-                    if isinstance(row, dict) and row.get("code") == 200 and isinstance(body, dict) and body.get("id") == item_id:
+                    status = row.get("status_code", row.get("code")) if isinstance(row, dict) else None
+                    if isinstance(row, dict) and status == 200 and isinstance(body, dict) and body.get("id") == item_id:
                         return body
             except Exception:
                 pass
@@ -14709,6 +14935,11 @@ def validate_assisted_product_operation(payload, request):
         raise RuntimeError("A Loja Oficial selecionada não pertence à conta escolhida.")
     destination_store_id = requested_store_id or target_official_store_id(client, account, source_item, stores)
     prepare_cross_account_official_store_payload(create_payload, destination_store_id)
+    package_adjustments = []
+    if publication_mode == "catalog":
+        create_payload, source_item, package_adjustments = catalog_inherited_or_seller_package_payload(
+            client, create_payload, source_item,
+        )
     try:
         response = run_interactive_meli_call(client.validate_item, create_payload)
         return {
@@ -14718,8 +14949,25 @@ def validate_assisted_product_operation(payload, request):
             "publication_mode": publication_mode,
             "message": "O Mercado Livre aceitou a estrutura deste anúncio.",
             "official": response or {},
+            "adjustments": package_adjustments,
         }
     except Exception as exc:
+        if publication_mode == "catalog" and catalog_too_small_package_fields(exc):
+            try:
+                create_payload, source_item, package_adjustments = catalog_package_validated_payload(
+                    client, create_payload, source_item, initial_error=exc,
+                )
+                return {
+                    "valid": True,
+                    "account": account.get("nickname"),
+                    "listing_type_id": variant.get("listing_type_id"),
+                    "publication_mode": publication_mode,
+                    "message": "O Mercado Livre aceitou a estrutura após ajustar as medidas mínimas ocultas do catálogo.",
+                    "official": {},
+                    "adjustments": package_adjustments,
+                }
+            except Exception as package_exc:
+                exc = package_exc
         if official_store_error_kind(exc) == "required":
             stores = merge_official_stores(stores, official_stores_from_error(exc))
             retry_store_id = official_store_retry_id(exc, source_item, destination_store_id)
@@ -14813,6 +15061,18 @@ def publish_assisted_product_operation(payload, request, actor=None):
                 destination_store_id = requested_store_id or target_official_store_id(
                     client, account, source_item, destination_stores,
                 )
+                package_adjustments = []
+                if publication_mode == "catalog":
+                    prepare_cross_account_official_store_payload(create_payload, destination_store_id)
+                    try:
+                        create_payload, source_item, package_adjustments = catalog_inherited_or_seller_package_payload(
+                            client, create_payload, source_item,
+                        )
+                    except Exception as probe_exc:
+                        if catalog_too_small_package_fields(probe_exc):
+                            raise probe_exc
+                        # Other validation rules remain handled by the existing
+                        # creation retry pipeline, which can request user fields.
                 created = create_item_with_clone_retries(
                     client, create_payload, source_item,
                     category_attributes=definitions,
@@ -14821,8 +15081,10 @@ def publish_assisted_product_operation(payload, request, actor=None):
                     destination_stores=destination_stores,
                     publication_name=draft.get("title") or "",
                 )
+                if package_adjustments:
+                    created.setdefault("_clone_adjustments", []).extend(package_adjustments)
                 item_id = created.get("id")
-                if description and item_id:
+                if description and item_id and publication_mode != "catalog":
                     client.create_item_description(item_id, description)
                 try:
                     verified = client.item_for_clone(item_id) if item_id else {}
