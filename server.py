@@ -2508,6 +2508,89 @@ def package_values_from_item(item):
     }
 
 
+CATALOG_PRODUCT_PACKAGE_MINIMUM_IDS = {
+    "package_height": {"HEIGHT", "PRODUCT_HEIGHT", "PACKAGE_HEIGHT"},
+    "package_width": {"WIDTH", "PRODUCT_WIDTH", "PACKAGE_WIDTH"},
+    "package_length": {"LENGTH", "DEPTH", "PRODUCT_LENGTH", "PRODUCT_DEPTH", "PACKAGE_LENGTH"},
+    "package_weight": {"WEIGHT", "PRODUCT_WEIGHT", "PACKAGE_WEIGHT"},
+}
+
+
+def catalog_measurement_value(attribute, field):
+    structs = []
+    if isinstance(attribute.get("value_struct"), dict):
+        structs.append(attribute.get("value_struct"))
+    for value in attribute.get("values") or []:
+        if isinstance(value, dict) and isinstance(value.get("struct"), dict):
+            structs.append(value.get("struct"))
+    raw_number = None
+    unit = ""
+    for struct in structs:
+        if struct.get("number") not in (None, ""):
+            raw_number = struct.get("number")
+            unit = clean_attribute_value(struct.get("unit")).lower()
+            break
+    if raw_number is None:
+        raw = clean_attribute_value(attribute.get("value_name"))
+        if not raw and attribute.get("values"):
+            raw = clean_attribute_value((attribute.get("values") or [{}])[0].get("name"))
+        match = re.search(r"([-+]?\d[\d.,]*)\s*([a-zA-Z]+)", raw)
+        if not match:
+            return None
+        raw_number, unit = match.group(1), match.group(2).lower()
+    try:
+        number = parse_decimal_number(raw_number)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    if field == "package_weight":
+        factors = {
+            "mg": 0.001, "g": 1, "gr": 1, "grama": 1, "gramas": 1,
+            "kg": 1000, "kgs": 1000, "lb": 453.59237, "lbs": 453.59237,
+            "oz": 28.349523125,
+        }
+    else:
+        factors = {"mm": 0.1, "cm": 1, "m": 100, "in": 2.54, "inch": 2.54, "inches": 2.54}
+    factor = factors.get(unit)
+    return number * factor if factor else None
+
+
+def catalog_product_package_minimums(product):
+    minimums = {}
+    for attribute in (product or {}).get("attributes") or []:
+        attr_id = str(attribute.get("id") or "").upper()
+        for field, ids in CATALOG_PRODUCT_PACKAGE_MINIMUM_IDS.items():
+            if attr_id not in ids:
+                continue
+            value = catalog_measurement_value(attribute, field)
+            if value is not None:
+                minimums[field] = max(minimums.get(field, 0), value)
+    return minimums
+
+
+def catalog_safe_package_draft(client, draft):
+    """Raise catalog package values only when the official product establishes a larger minimum."""
+    catalog_product_id = clean_attribute_value((draft or {}).get("catalog_product_id"))
+    method = getattr(client, "product", None)
+    if not catalog_product_id or not callable(method):
+        return dict(draft or {})
+    try:
+        product = call_interactive_client_method(method, catalog_product_id) or {}
+    except Exception:
+        return dict(draft or {})
+    minimums = catalog_product_package_minimums(product)
+    adjusted = dict(draft or {})
+    for field, minimum in minimums.items():
+        try:
+            current = parse_decimal_number(adjusted.get(field))
+        except (TypeError, ValueError):
+            current = 0
+        if current + 1e-9 < minimum:
+            adjusted[field] = str(max(1, math.ceil(minimum)))
+    return adjusted
+
+
 def item_manufacturing_time(item):
     """Return the official MANUFACTURING_TIME sale term as whole days."""
     candidates = [
@@ -3184,20 +3267,20 @@ def product_browser_worker_download(url, maximum):
     try:
         context = PRODUCT_BROWSER_STATE["context"]
         page = context.new_page()
-        page.goto(str(url).strip(), wait_until="domcontentloaded", timeout=35_000)
+        navigation_response = page.goto(str(url).strip(), wait_until="domcontentloaded", timeout=35_000)
         try:
             page.wait_for_function(
-                "() => document.documentElement.innerHTML.includes('__NORDIC_RENDERING_CTX__')",
+                "() => !!document.querySelector('#__NORDIC_RENDERING_CTX__, script[type=\"application/ld+json\"]')",
                 timeout=12_000,
             )
         except Exception:
             # A first navigation can set edge cookies and still return a
             # challenge shell. Reload once in the same browser session before
             # falling back to JSON-LD/full-page parsing.
-            page.reload(wait_until="domcontentloaded", timeout=25_000)
+            navigation_response = page.reload(wait_until="domcontentloaded", timeout=25_000)
             try:
                 page.wait_for_function(
-                    "() => document.documentElement.innerHTML.includes('__NORDIC_RENDERING_CTX__')",
+                    "() => !!document.querySelector('#__NORDIC_RENDERING_CTX__, script[type=\"application/ld+json\"]')",
                     timeout=8_000,
                 )
             except Exception:
@@ -3219,8 +3302,15 @@ def product_browser_worker_download(url, maximum):
             }"""
         )
         decoded = str(structured or "")
-        if not mercado_livre_public_page(decoded, final_url).get("name"):
+        if not meli_page_has_product_data(decoded, final_url):
             decoded = page.content()
+        if not meli_page_has_product_data(decoded, final_url):
+            status = navigation_response.status if navigation_response else "desconhecido"
+            final_path = urlparse(final_url).path
+            raise RuntimeError(
+                f"Chromium: HTTP {status}, caminho {final_path}; "
+                "a resposta não contém ficha de produto Nordic nem JSON-LD Product."
+            )
         if len(decoded.encode("utf-8", errors="ignore")) > maximum:
             raise RuntimeError("A página do produto é maior do que o limite de importação.")
         blocked = normalized_attribute_label(decoded[:16000])
@@ -3262,7 +3352,7 @@ def product_browser_download(url, maximum=None):
         future.cancel()
         raise RuntimeError("O navegador excedeu o tempo de leitura do produto.") from exc
     # Never retain a challenge/generic shell as a valid product response.
-    if not mercado_livre_public_page(decoded, final_url).get("name"):
+    if not meli_page_has_product_data(decoded, final_url):
         raise RuntimeError("O navegador abriu a página, mas ela não devolveu os dados do produto.")
     with PRODUCT_BROWSER_PAGE_CACHE_LOCK:
         PRODUCT_BROWSER_PAGE_CACHE[cache_key] = (now, decoded, final_url)
@@ -3303,7 +3393,7 @@ def product_page_download(url):
                 "automated access", "captcha required", "just a moment", "checking your browser",
             )):
                 raise RuntimeError("O Mercado Livre devolveu uma página de bloqueio.")
-            if mercado_livre_public_page(decoded, final_url).get("name"):
+            if meli_page_has_product_data(decoded, final_url):
                 return decoded, final_url
         except Exception:
             # Keep the existing direct and public-reader fallbacks for temporary
@@ -3868,7 +3958,9 @@ def mercado_livre_public_page(page_html, page_url):
         r"<script[^>]+id=[\"']__NORDIC_RENDERING_CTX__[\"'][^>]*>(.*?)</script>",
         page_html or "", flags=re.IGNORECASE | re.DOTALL,
     )
-    rendering = json_object_after_marker(script_match.group(1), "_n.ctx.r=") if script_match else {}
+    script = script_match.group(1) if script_match else ""
+    assignment = re.search(r"_n\.ctx\.r\s*=\s*", script)
+    rendering = json_object_after_marker(script, assignment.group(0)) if assignment else {}
     state = first_present(rendering, ["appProps.pageProps.initialState"], {}) or {}
     components = state.get("components") if isinstance(state, dict) else {}
     components = components if isinstance(components, dict) else {}
@@ -3952,6 +4044,18 @@ def mercado_livre_public_page(page_html, page_url):
     }
 
 
+def meli_page_has_product_data(page_html, page_url):
+    """Accept either supported product format, but never site metadata alone."""
+    if mercado_livre_public_page(page_html, page_url).get("name"):
+        return True
+    parser = ProductPageParser()
+    parser.feed(page_html)
+    node = first_product_json_ld(parser)
+    types = node.get("@type") or []
+    types = types if isinstance(types, list) else [types]
+    return bool(node.get("name") and any(str(value).lower() == "product" for value in types))
+
+
 def parse_external_product_page(page_html, page_url):
     parser = ProductPageParser()
     parser.feed(page_html)
@@ -3972,14 +4076,14 @@ def parse_external_product_page(page_html, page_url):
     name = specific.get("name") or node.get("name") or parser.meta.get("og:title") or "".join(parser.title_parts)
     description = specific.get("description") or node.get("description") or parser.meta.get("og:description") or parser.meta.get("description") or ""
     image_candidates = [*(specific.get("images") or [])]
-    if not meli_page:
+    if not meli_page or not specific.get("images"):
         image_candidates.extend([
             *(retailer.get("images") or []),
             *(node.get("image") if isinstance(node.get("image"), list) else [node.get("image")]),
             parser.meta.get("og:image"),
         ])
     images = product_image_urls(image_candidates, page_url)
-    if not images and "amazon." not in host:
+    if not images and "amazon." not in host and "mercado" not in host:
         images = product_image_urls(parser.images[:24], page_url)
     specifications = [*(specific.get("specifications") or []), *(retailer.get("specifications") or [])]
     properties = node.get("additionalProperty") or []
@@ -4034,6 +4138,11 @@ def parse_external_product_page(page_html, page_url):
 
 def imported_meli_public_page(source_url):
     page_html, final_url = product_page_download(source_url)
+    if not meli_page_has_product_data(page_html, final_url):
+        raise RuntimeError(
+            "A página pública não devolveu ficha Nordic nem JSON-LD Product; "
+            "metadados genéricos do site não identificam um produto."
+        )
     product = parse_external_product_page(page_html, final_url)
     title = normalized_attribute_label(product.get("title") or product.get("source_title"))
     if not title or title in {"mercado livre", "mercado libre"}:
@@ -4064,6 +4173,57 @@ def imported_meli_up_public_fallback(source_url, item_id=""):
     raise RuntimeError("; ".join(dict.fromkeys(errors)))
 
 
+def meli_up_slug_query(source_url):
+    try:
+        path = unquote(urlparse(str(source_url or "")).path or "")
+    except Exception:
+        return ""
+    slug = path.split("/up/", 1)[0].strip("/").rsplit("/", 1)[-1]
+    return clean_product_text(re.sub(r"[-_]+", " ", slug), 180)
+
+
+def imported_up_offer(payload, item_id, source_url=""):
+    """Resolve the exact commercial item; multiget responses require unwrapping."""
+    if not re.fullmatch(r"MLB\d{5,}", str(item_id or "")):
+        raise RuntimeError("ID de oferta inválido para User Product.")
+    try:
+        item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
+        if isinstance(item, dict) and item.get("id") == item_id and (item.get("title") or item.get("family_name")):
+            return item
+        raise RuntimeError("A API não retornou a oferta solicitada.")
+    except Exception as original_error:
+        try:
+            rows = try_meli_sources(payload, [f"/items?ids={item_id}&include_attributes=all"])
+            for row in rows if isinstance(rows, list) else []:
+                body = row.get("body") if isinstance(row, dict) else None
+                if isinstance(row, dict) and row.get("code") == 200 and isinstance(body, dict) and body.get("id") == item_id:
+                    return body
+        except Exception:
+            pass
+        query = meli_up_slug_query(source_url)
+        if query:
+            try:
+                response = try_meli_sources(payload, [
+                    f"/sites/MLB/search?{urlencode({'q': query, 'limit': 50})}"
+                ])
+                exact = next(
+                    (
+                        row for row in response.get("results") or []
+                        if isinstance(row, dict) and str(row.get("id") or "").upper() == item_id
+                    ),
+                    None,
+                )
+                if exact and (exact.get("title") or exact.get("family_name")):
+                    pictures = exact.get("pictures") or []
+                    thumbnail = exact.get("secure_thumbnail") or exact.get("thumbnail")
+                    if not pictures and thumbnail:
+                        exact = {**exact, "pictures": [{"url": thumbnail}]}
+                    return exact
+            except Exception:
+                pass
+        raise original_error
+
+
 def imported_meli_product(payload, item_id, source_url):
     # /up/MLBU... is a User Product page, while `wid` identifies its commercial
     # offer. Both identities are resolved independently below.
@@ -4072,7 +4232,10 @@ def imported_meli_product(payload, item_id, source_url):
     try:
         if not re.fullmatch(r"MLB\d{5,}", str(item_id or "")):
             raise RuntimeError("O link identifica um User Product, sem ID de oferta.")
-        item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
+        if extract_meli_user_product_id(source_url):
+            item = imported_up_offer(payload, item_id, source_url)
+        else:
+            item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
     except Exception as exc:
         error_text = str(exc)
         public_page_error = None
@@ -4088,7 +4251,7 @@ def imported_meli_product(payload, item_id, source_url):
                 ):
                     raise RuntimeError("User Product sem título.")
                 item = {
-                    "id": str(item_id or "").upper(),
+                    "id": item_id if re.fullmatch(r"MLB\d{5,}", str(item_id or "")) else "",
                     "title": (
                         user_product.get("name") or user_product.get("title")
                         or user_product.get("family_name") or ""
@@ -4101,8 +4264,25 @@ def imported_meli_product(payload, item_id, source_url):
                     "domain_id": user_product.get("domain_id") or "",
                     "catalog_product_id": user_product.get("catalog_product_id") or "",
                     "user_product_id": user_product_id,
+                    "seller_id": user_product.get("user_id"),
                     "permalink": source_url,
                 }
+                if not item["id"] and user_product.get("user_id"):
+                    try:
+                        linked = try_meli_sources(payload, [
+                            f"/users/{user_product['user_id']}/items/search?" + urlencode({"user_product_id": user_product_id, "limit": 50})
+                        ])
+                    except Exception:
+                        linked = {}
+                    for offer_id in (linked.get("results") or [])[:5]:
+                        try:
+                            offer = imported_up_offer(payload, str(offer_id))
+                            if offer.get("user_product_id") != user_product_id:
+                                continue
+                            item = {**item, **offer}
+                            break
+                        except Exception:
+                            continue
             except Exception:
                 user_product = {}
         # Search/catalog URLs now commonly carry the product id in /p/MLB...
@@ -4171,7 +4351,9 @@ def imported_meli_product(payload, item_id, source_url):
                     f"Diagnóstico: {public_page_error}"
                 ) from public_page_error
             item = resolve_scan_target(payload, item_id)
-    description = ""
+    description = user_product.get("description") or ""
+    if isinstance(description, dict):
+        description = description.get("plain_text") or description.get("text") or ""
     owner = next(
         (
             account for account in payload.get("accounts") or []
@@ -4196,7 +4378,7 @@ def imported_meli_product(payload, item_id, source_url):
             except Exception:
                 catalog_product = {}
     try:
-        if not description:
+        if not description and re.fullmatch(r"MLB\d{5,}", str(item.get("id") or "")):
             detail = try_meli_sources(payload, [f"/items/{item.get('id') or item_id}/description"])
             description = detail.get("plain_text") or detail.get("text") or ""
     except Exception:
@@ -4216,7 +4398,7 @@ def imported_meli_product(payload, item_id, source_url):
     return {
         "source_url": source_url,
         "source_host": "mercadolivre.com.br",
-        "source_item_id": item.get("id") or item_id,
+        "source_item_id": item.get("id") or (item_id if re.fullmatch(r"MLB\d{5,}", str(item_id or "")) else ""),
         "source_title": item.get("title") or "",
         "title": optimized_product_title(item.get("title") or "", source_attribute_value(item, ["BRAND"]), source_attribute_value(item, ["MODEL"])),
         "brand": source_attribute_value(item, ["BRAND"]),
@@ -13777,6 +13959,16 @@ def clone_retry_adjustments_from_error(
 
 
 def friendly_clone_error(exc):
+    error_text = meli_error_text(exc)
+    if "too small for the product dimensions" in error_text.lower():
+        ids = list(dict.fromkeys(re.findall(r"seller_package_(?:width|height|length|weight)", error_text.lower())))
+        labels = ", ".join(clone_attribute_label(value.upper()) for value in ids)
+        return (
+            f"O Mercado Livre recebeu a embalagem, mas considera {labels or 'as medidas informadas'} "
+            "inferiores às dimensões do produto. Confira se o produto de catálogo selecionado é exatamente "
+            "o mesmo e informe as medidas da embalagem real: centímetros e peso em gramas. "
+            "Se a embalagem já está correta, a ficha de dimensões do catálogo precisa ser revisada no Mercado Livre."
+        )
     if meli_rate_limited_error(exc):
         return "O Mercado Livre limitou temporariamente as criações. A aplicação tentou novamente com espera progressiva; aguarde alguns instantes e repita se necessário."
     store_error = official_store_error_kind(exc)
@@ -14140,6 +14332,11 @@ def assisted_publication_attributes(draft):
     condition = clean_attribute_value(draft.get("condition")).lower() or "new"
     for attribute in draft.get("attributes") or []:
         attr_id = canonical_clone_attribute_id(attribute.get("id"))
+        package_field = SELLER_PACKAGE_ATTRIBUTE_FIELDS.get(attr_id)
+        if package_field and clean_attribute_value(draft.get(package_field)):
+            # Explicit package inputs win over stale imported/category values,
+            # including PACKAGE_* aliases and old dropdown value IDs.
+            continue
         if condition == "new" and clone_attribute_describes_refurbished_status(attr_id, attribute.get("name") or ""):
             continue
         value = clean_attribute_value(attribute.get("value"))
@@ -14337,11 +14534,13 @@ def validate_assisted_product_operation(payload, request):
     draft = request.get("draft") or {}
     variant = assisted_publication_variants(request)[0]
     publication_mode = assisted_publication_modes(request)[0]
+    client = account_client(account)
     mode_draft = {**draft, "catalog_listing": publication_mode == "catalog"}
     if publication_mode == "traditional":
         mode_draft["catalog_product_id"] = ""
+    else:
+        mode_draft = catalog_safe_package_draft(client, mode_draft)
     create_payload, source_item = build_assisted_publication_payload(mode_draft, variant)
-    client = account_client(account)
     stores = target_official_stores(client, account, payload.get("catalog") or [])
     requested_stores = request.get("official_store_ids") if isinstance(request.get("official_store_ids"), dict) else {}
     requested_store_id = clean_attribute_value(requested_stores.get(str(account.get("id"))))
@@ -14420,6 +14619,7 @@ def publish_assisted_product_operation(payload, request, actor=None):
         client = account_client(account)
         category_id = clean_attribute_value(draft.get("category_id"))
         definitions = cached_category_attributes(client, category_id) if category_id else []
+        catalog_draft = catalog_safe_package_draft(client, draft) if "catalog" in publication_modes else draft
         for variant, publication_mode in (
             (variant, publication_mode)
             for variant in variants
@@ -14433,7 +14633,10 @@ def publish_assisted_product_operation(payload, request, actor=None):
                 f"Publicando {label} · {mode_label} na conta {account.get('nickname')}.", progress - 1, total
             )
             try:
-                mode_draft = {**draft, "catalog_listing": publication_mode == "catalog"}
+                mode_draft = {
+                    **(catalog_draft if publication_mode == "catalog" else draft),
+                    "catalog_listing": publication_mode == "catalog",
+                }
                 if publication_mode == "traditional":
                     mode_draft["catalog_product_id"] = ""
                 create_payload, source_item = build_assisted_publication_payload(mode_draft, variant)
