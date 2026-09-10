@@ -5313,6 +5313,15 @@ function collectAssistedPublication() {
   };
 }
 
+function publisherPendingGuidance(row) {
+  const ids = new Set((row?.pending_fields || []).map((field) => String(field.id || "").toLowerCase()));
+  if (ids.has("official_store_id")) return "Selecione a Loja Oficial na conta acima e publique novamente.";
+  if ([...ids].some((id) => id.includes("seller_package") || id.includes("package_"))) {
+    return "Confira peso e medidas da embalagem e publique novamente.";
+  }
+  return "Revise os campos indicados e publique novamente.";
+}
+
 function renderPublisherResults(result) {
   const root = document.querySelector("#publisher-results");
   if (!root) return;
@@ -5320,7 +5329,7 @@ function renderPublisherResults(result) {
   root.innerHTML = `<div class="publisher-result-summary"><strong>${Number(result.created || 0)} anúncio(s) criado(s)</strong><span>${Number(result.failed || 0)} falha(s)</span></div>
     <div class="publisher-result-grid">${(result.results || []).map((row) => row.status === "created" ? `
       <a href="${escapeAttr(row.permalink || "#")}" target="_blank" rel="noreferrer"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${escapeText(row.item_id || "Criado")}</strong><span>${escapeText(row.title || "")}</span></a>
-    ` : `<article class="${row.pending_fields?.length ? "review" : "error"}"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${row.pending_fields?.length ? "Seleção necessária" : "Não publicado"}</strong><span>${escapeText(row.error || "Erro não identificado")}</span>${row.pending_fields?.length ? `<em>Selecione a Loja Oficial na conta acima e publique novamente.</em>` : ""}</article>`).join("")}</div>`;
+    ` : `<article class="${row.pending_fields?.length ? "review" : "error"}"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${row.pending_fields?.length ? "Ajuste necessário" : "Não publicado"}</strong><span>${escapeText(row.error || "Erro não identificado")}</span>${row.pending_fields?.length ? `<em>${escapeText(publisherPendingGuidance(row))}</em>` : ""}</article>`).join("")}</div>`;
 }
 
 function applyPublisherPendingFields(rows) {
@@ -7815,9 +7824,10 @@ document.querySelector("#product-publish-form")?.addEventListener("submit", asyn
     const queued = await api("/api/products/publish", { method: "POST", body: JSON.stringify(request) });
     const result = await waitForAsyncOperation(queued, (message) => { button.textContent = message || "Publicando..."; });
     renderPublisherResults(result);
+    const pendingRow = (result.results || []).find((row) => row.pending_fields?.length);
     showToast(
       result.requires_review
-        ? "Selecione a Loja Oficial indicada e publique novamente."
+        ? publisherPendingGuidance(pendingRow)
         : `${result.created || 0} anúncio(s) criado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`,
       result.failed ? "error" : "success",
     );

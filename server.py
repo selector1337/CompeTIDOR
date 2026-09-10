@@ -14163,6 +14163,12 @@ def clone_retry_adjustments_from_error(
         attr_id = str(field.get("id") or "").replace("attribute:", "")
         if kit_gtin_fallback_applied and canonical_clone_attribute_id(attr_id) in GTIN_IDENTIFIER_ATTRS:
             continue
+        # An earlier adjustment in this same pass may already have restored the
+        # complete SELLER_PACKAGE_* set (or another required attribute). Do not
+        # turn an already satisfied field into a pending user question: retry
+        # the request with the corrected payload instead.
+        if clone_required_attribute_satisfied(create_payload, attr_id):
+            continue
         if restore_clone_attribute_from_source(create_payload, source_item, category_attributes or [], attr_id):
             changed = True
             adjustments.append({"tipo": "atributo_recuperado_do_anuncio_original", "campos": [canonical_clone_attribute_id(attr_id)]})
@@ -14216,6 +14222,8 @@ def clone_retry_adjustments_from_error(
             if not canonical_id:
                 continue
             if kit_gtin_fallback_applied and canonical_id in GTIN_IDENTIFIER_ATTRS:
+                continue
+            if clone_required_attribute_satisfied(create_payload, canonical_id):
                 continue
             if restore_clone_attribute_from_source(create_payload, source_item, category_attributes or [], canonical_id):
                 changed = True
