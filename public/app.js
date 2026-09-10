@@ -326,34 +326,81 @@ function finishManualAction(id, status, message) {
   }, status === "success" ? 5000 : 9000);
 }
 
+function waitFor502Retry(message) {
+  const stack = document.querySelector("#toast-stack");
+  if (!stack) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const toast = document.createElement("div");
+    toast.className = "toast error retry-toast";
+    toast.innerHTML = `
+      <strong>Servidor temporariamente indisponível (502)</strong>
+      <span>${escapeText(message || "A requisição não chegou a uma resposta válida.")}</span>
+      <div class="toast-actions">
+        <button class="primary" type="button" data-retry>Tentar novamente</button>
+        <button class="ghost" type="button" data-cancel>Cancelar</button>
+      </div>`;
+    const finish = (retry) => {
+      toast.classList.remove("visible");
+      window.setTimeout(() => toast.remove(), 220);
+      resolve(retry);
+    };
+    toast.querySelector("[data-retry]").addEventListener("click", () => finish(true), { once: true });
+    toast.querySelector("[data-cancel]").addEventListener("click", () => finish(false), { once: true });
+    stack.appendChild(toast);
+    window.setTimeout(() => toast.classList.add("visible"), 20);
+  });
+}
+
 async function api(path, options = {}) {
   const actionId = shouldTrackManualRequest(path, options)
     ? beginManualAction(options.progressLabel || manualActionLabel(path)) : "";
   const fetchOptions = { ...options };
   delete fetchOptions.manualProgress;
   delete fetchOptions.progressLabel;
+  const method = String(fetchOptions.method || "GET").toUpperCase();
+  const requestHeaders = { "Content-Type": "application/json", ...(fetchOptions.headers || {}) };
+  if (method !== "GET" && method !== "HEAD") {
+    requestHeaders["X-Idempotency-Key"] = requestHeaders["X-Idempotency-Key"]
+      || (window.crypto?.randomUUID?.() || `retry-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  }
+  fetchOptions.headers = requestHeaders;
   try {
-    const response = await fetch(path, {
-      headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",
-      ...fetchOptions,
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      if (response.status === 401 && !["/api/auth/me", "/api/auth/login", "/api/auth/setup-master"].includes(path)) {
-        showLogin();
+    while (true) {
+      const response = await fetch(path, {
+        credentials: "same-origin",
+        ...fetchOptions,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (response.status === 401 && !["/api/auth/me", "/api/auth/login", "/api/auth/setup-master"].includes(path)) {
+          showLogin();
+        }
+        const error = new Error(payload.error || payload.message || `Erro ${response.status}`);
+        Object.assign(error, payload, { status: response.status });
+        if (response.status === 502) {
+          updateManualAction(actionId, {
+            status: "error",
+            message: "Erro 502. Aguardando sua confirmação para repetir a mesma requisição.",
+          });
+          if (await waitFor502Retry(error.message)) {
+            updateManualAction(actionId, {
+              status: "running",
+              message: "Tentando novamente a mesma requisição...",
+              progress: null,
+            });
+            continue;
+          }
+        }
+        throw error;
       }
-      const error = new Error(payload.error || payload.message || `Erro ${response.status}`);
-      Object.assign(error, payload);
-      throw error;
+      if (actionId && payload?.job_id) {
+        payload._manualActionId = actionId;
+        updateManualAction(actionId, { message: payload.message || "Ação adicionada à fila do servidor." });
+      } else if (actionId) {
+        finishManualAction(actionId, "success", payload.message || "Ação concluída com sucesso.");
+      }
+      return payload;
     }
-    if (actionId && payload?.job_id) {
-      payload._manualActionId = actionId;
-      updateManualAction(actionId, { message: payload.message || "Ação adicionada à fila do servidor." });
-    } else if (actionId) {
-      finishManualAction(actionId, "success", payload.message || "Ação concluída com sucesso.");
-    }
-    return payload;
   } catch (error) {
     if (actionId) finishManualAction(actionId, "error", error.message || "Não foi possível concluir a ação.");
     throw error;

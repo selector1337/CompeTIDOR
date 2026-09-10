@@ -3001,6 +3001,23 @@ main {
   overflow-wrap: anywhere;
 }
 
+.toast.retry-toast {
+  max-height: none;
+  pointer-events: auto;
+}
+
+.toast-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.toast-actions button {
+  min-height: 36px;
+  padding: 7px 12px;
+}
+
 .ad-main {
   display: grid;
   gap: 10px;

@@ -184,6 +184,8 @@ RESPONSE_CACHE_LOCK = threading.RLock()
 RESPONSE_CACHE = {}
 ASYNC_OPERATION_JOBS_LOCK = threading.RLock()
 ASYNC_OPERATION_JOBS = {}
+ASYNC_OPERATION_IDEMPOTENCY = {}
+HTTP_REQUEST_CONTEXT = threading.local()
 SKU_COMMERCIAL_DATA_LOCK = threading.RLock()
 ACTIVE_CLONE_OPERATIONS = set()
 DASHBOARD_THUMBNAIL_REFRESH_LOCK = threading.Lock()
@@ -2509,10 +2511,16 @@ def package_values_from_item(item):
 
 
 CATALOG_PRODUCT_PACKAGE_MINIMUM_IDS = {
-    "package_height": {"HEIGHT", "PRODUCT_HEIGHT", "PACKAGE_HEIGHT"},
-    "package_width": {"WIDTH", "PRODUCT_WIDTH", "PACKAGE_WIDTH"},
-    "package_length": {"LENGTH", "DEPTH", "PRODUCT_LENGTH", "PRODUCT_DEPTH", "PACKAGE_LENGTH"},
-    "package_weight": {"WEIGHT", "PRODUCT_WEIGHT", "PACKAGE_WEIGHT"},
+    "package_height": {"HEIGHT", "PRODUCT_HEIGHT", "PACKAGE_HEIGHT", "SELLER_PACKAGE_HEIGHT"},
+    "package_width": {"WIDTH", "PRODUCT_WIDTH", "PACKAGE_WIDTH", "SELLER_PACKAGE_WIDTH"},
+    "package_length": {
+        "LENGTH", "DEPTH", "PRODUCT_LENGTH", "PRODUCT_DEPTH", "PACKAGE_LENGTH",
+        "PACKAGE_DEPTH", "SELLER_PACKAGE_LENGTH",
+    },
+    "package_weight": {
+        "WEIGHT", "NET_WEIGHT", "UNIT_WEIGHT", "PRODUCT_WEIGHT", "PRODUCT_NET_WEIGHT",
+        "PACKAGE_WEIGHT", "PACKAGE_NET_WEIGHT", "SELLER_PACKAGE_WEIGHT",
+    },
 }
 
 
@@ -2557,8 +2565,20 @@ def catalog_measurement_value(attribute, field):
 
 
 def catalog_product_package_minimums(product):
+    """Read physical/package measurements from every attribute block in a PDP response."""
     minimums = {}
-    for attribute in (product or {}).get("attributes") or []:
+    stack = [product or {}]
+    attributes = []
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            attr_id = str(node.get("id") or "").upper()
+            if any(attr_id in ids for ids in CATALOG_PRODUCT_PACKAGE_MINIMUM_IDS.values()):
+                attributes.append(node)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    for attribute in attributes:
         attr_id = str(attribute.get("id") or "").upper()
         for field, ids in CATALOG_PRODUCT_PACKAGE_MINIMUM_IDS.items():
             if attr_id not in ids:
@@ -2567,6 +2587,71 @@ def catalog_product_package_minimums(product):
             if value is not None:
                 minimums[field] = max(minimums.get(field, 0), value)
     return minimums
+
+
+def catalog_offer_package_minimums(client, catalog_product_id, product=None):
+    """Use an already accepted offer of the exact PDP as the packaging reference.
+
+    Product attributes are preferred.  Some PDPs omit one or more physical
+    dimensions from /products, while /products/{id}/items points to offers whose
+    complete SELLER_PACKAGE_* set has already passed Mercado Livre validation.
+    """
+    candidates = []
+    winner = (product or {}).get("buy_box_winner") or {}
+    winner_id = clean_attribute_value(winner.get("item_id") or winner.get("id"))
+    if winner_id:
+        candidates.append(winner_id)
+    method = getattr(client, "product_winners", None)
+    if callable(method):
+        try:
+            response = method(catalog_product_id) or {}
+            rows = response.get("results") if isinstance(response, dict) else response
+            if isinstance(rows, dict):
+                rows = rows.get("results") or rows.get("items") or []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                item_id = clean_attribute_value(row.get("item_id") or row.get("id"))
+                if item_id:
+                    candidates.append(item_id)
+        except Exception:
+            pass
+    candidates = list(dict.fromkeys(candidates))[:12]
+    if not candidates:
+        return {}
+    method = getattr(client, "items_bulk", None)
+    if not callable(method):
+        return {}
+    try:
+        items = method(candidates) or []
+    except Exception:
+        return {}
+    complete = []
+    partial = {}
+    for item in items:
+        values = package_values_from_item(item)
+        measured = {}
+        for field, value in values.items():
+            if not clean_attribute_value(value):
+                continue
+            measured_value = catalog_measurement_value({"value_name": value}, field)
+            if measured_value is None:
+                continue
+            measured[field] = measured_value
+            partial[field] = max(partial.get(field, 0), measured_value)
+        if len(measured) == 4:
+            complete.append(measured)
+    if not complete:
+        return partial
+    # A single complete, previously accepted package keeps all four dimensions
+    # coherent. Choose the least inflated package among equivalent PDP offers.
+    return min(
+        complete,
+        key=lambda row: (
+            row["package_height"] * row["package_width"] * row["package_length"],
+            row["package_weight"],
+        ),
+    )
 
 
 def catalog_safe_package_draft(client, draft):
@@ -2578,8 +2663,11 @@ def catalog_safe_package_draft(client, draft):
     try:
         product = call_interactive_client_method(method, catalog_product_id) or {}
     except Exception:
-        return dict(draft or {})
+        product = {}
     minimums = catalog_product_package_minimums(product)
+    offer_minimums = catalog_offer_package_minimums(client, catalog_product_id, product)
+    for field, minimum in offer_minimums.items():
+        minimums[field] = max(minimums.get(field, 0), minimum)
     adjusted = dict(draft or {})
     for field, minimum in minimums.items():
         try:
@@ -4192,20 +4280,30 @@ def imported_up_offer(payload, item_id, source_url=""):
             return item
         raise RuntimeError("A API não retornou a oferta solicitada.")
     except Exception as original_error:
-        try:
-            rows = try_meli_sources(payload, [f"/items?ids={item_id}&include_attributes=all"])
-            for row in rows if isinstance(rows, list) else []:
-                body = row.get("body") if isinstance(row, dict) else None
-                if isinstance(row, dict) and row.get("code") == 200 and isinstance(body, dict) and body.get("id") == item_id:
-                    return body
-        except Exception:
-            pass
+        limited_fields = ",".join((
+            "id", "title", "family_name", "price", "currency_id", "pictures", "attributes",
+            "category_id", "domain_id", "catalog_product_id", "user_product_id", "seller_id",
+            "permalink", "secure_thumbnail", "thumbnail",
+        ))
+        for multiget_path in (
+            f"/items?ids={item_id}&include_attributes=all",
+            f"/items?ids={item_id}&attributes={limited_fields}",
+        ):
+            try:
+                rows = try_meli_sources(payload, [multiget_path])
+                for row in rows if isinstance(rows, list) else []:
+                    body = row.get("body") if isinstance(row, dict) else None
+                    if isinstance(row, dict) and row.get("code") == 200 and isinstance(body, dict) and body.get("id") == item_id:
+                        return body
+            except Exception:
+                pass
         query = meli_up_slug_query(source_url)
         if query:
             try:
                 response = try_meli_sources(payload, [
                     f"/sites/MLB/search?{urlencode({'q': query, 'limit': 50})}"
                 ])
+                user_product_id = extract_meli_user_product_id(source_url)
                 exact = next(
                     (
                         row for row in response.get("results") or []
@@ -4219,6 +4317,44 @@ def imported_up_offer(payload, item_id, source_url=""):
                     if not pictures and thumbnail:
                         exact = {**exact, "pictures": [{"url": thumbnail}]}
                     return exact
+                # An UPP can expose several commercial conditions for the same
+                # physical User Product.  The `wid` offer may be policy-hidden,
+                # while another result for the very same MLBU remains readable.
+                # Matching by user_product_id is exact and avoids importing a
+                # merely similar result from the textual search.
+                same_up = next(
+                    (
+                        row for row in response.get("results") or []
+                        if isinstance(row, dict)
+                        and user_product_id
+                        and str(row.get("user_product_id") or "").upper() == user_product_id
+                        and (row.get("title") or row.get("family_name"))
+                    ),
+                    None,
+                )
+                if not same_up and user_product_id:
+                    result_ids = [
+                        str(row.get("id") or "").upper()
+                        for row in response.get("results") or []
+                        if isinstance(row, dict) and re.fullmatch(r"MLB\d{5,}", str(row.get("id") or "").upper())
+                    ][:20]
+                    if result_ids:
+                        bulk = try_meli_sources(payload, [
+                            f"/items?ids={','.join(result_ids)}&include_attributes=all"
+                        ])
+                        for row in bulk if isinstance(bulk, list) else []:
+                            body = row.get("body") if isinstance(row, dict) else None
+                            if not isinstance(body, dict):
+                                continue
+                            if str(body.get("user_product_id") or "").upper() == user_product_id:
+                                same_up = body
+                                break
+                if same_up:
+                    pictures = same_up.get("pictures") or []
+                    thumbnail = same_up.get("secure_thumbnail") or same_up.get("thumbnail")
+                    if not pictures and thumbnail:
+                        same_up = {**same_up, "pictures": [{"url": thumbnail}]}
+                    return same_up
             except Exception:
                 pass
         raise original_error
@@ -10553,6 +10689,10 @@ def cleanup_async_operation_jobs():
         ]
         for job_id in expired:
             ASYNC_OPERATION_JOBS.pop(job_id, None)
+        live_ids = set(ASYNC_OPERATION_JOBS)
+        for key, job_id in list(ASYNC_OPERATION_IDEMPOTENCY.items()):
+            if job_id not in live_ids:
+                ASYNC_OPERATION_IDEMPOTENCY.pop(key, None)
 
 
 def async_operation_result(job_id):
@@ -10586,8 +10726,26 @@ def update_async_operation_progress(message="", completed=None, total=None, deta
         job.update(updates)
 
 
-def start_async_operation(kind, work, message="Processamento adicionado à fila.", heavy=False, priority="interactive"):
+def start_async_operation(
+    kind, work, message="Processamento adicionado à fila.", heavy=False,
+    priority="interactive", idempotency_key="",
+):
     cleanup_async_operation_jobs()
+    idempotency_key = clean_attribute_value(
+        idempotency_key or getattr(HTTP_REQUEST_CONTEXT, "idempotency_key", "")
+    )[:240]
+    if idempotency_key:
+        with ASYNC_OPERATION_JOBS_LOCK:
+            existing_id = ASYNC_OPERATION_IDEMPOTENCY.get(idempotency_key)
+            existing = ASYNC_OPERATION_JOBS.get(existing_id)
+            if existing:
+                return {
+                    "job_id": existing_id,
+                    "status": existing.get("status") or "queued",
+                    "message": existing.get("message") or message,
+                    "poll_url": f"/api/async/jobs/{existing_id}",
+                    "reused": True,
+                }
     job_id = f"op-{uuid.uuid4().hex[:12]}"
     now = time.time()
     job = {
@@ -10601,6 +10759,8 @@ def start_async_operation(kind, work, message="Processamento adicionado à fila.
     }
     with ASYNC_OPERATION_JOBS_LOCK:
         ASYNC_OPERATION_JOBS[job_id] = job
+        if idempotency_key:
+            ASYNC_OPERATION_IDEMPOTENCY[idempotency_key] = job_id
 
     def worker():
         interactive = not heavy and priority in {"interactive", "manual"}
@@ -21608,6 +21768,10 @@ class App(BaseHTTPRequestHandler):
 
     def _do_POST(self):
         parsed = urlparse(self.path)
+        request_idempotency_key = clean_attribute_value(self.headers.get("X-Idempotency-Key"))
+        HTTP_REQUEST_CONTEXT.idempotency_key = (
+            f"{parsed.path}:{request_idempotency_key}" if request_idempotency_key else ""
+        )
         if parsed.path == "/api/notifications/meli":
             try:
                 event = self.read_json_request(maximum_body=1024 * 1024)
@@ -21995,6 +22159,10 @@ class App(BaseHTTPRequestHandler):
                     lambda: import_product_operation(payload, request_copy),
                     "Importação e tradução do produto adicionadas à fila.",
                     priority="manual",
+                    idempotency_key=(
+                        f"{parsed.path}:{self.headers.get('X-Idempotency-Key')}"
+                        if self.headers.get("X-Idempotency-Key") else ""
+                    ),
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -22008,6 +22176,10 @@ class App(BaseHTTPRequestHandler):
                     "product_validate",
                     lambda: validate_assisted_product_operation(payload, request_copy),
                     "Validação oficial do anúncio adicionada à fila.",
+                    idempotency_key=(
+                        f"{parsed.path}:{self.headers.get('X-Idempotency-Key')}"
+                        if self.headers.get("X-Idempotency-Key") else ""
+                    ),
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -22030,6 +22202,10 @@ class App(BaseHTTPRequestHandler):
                     lambda: publish_assisted_product_operation(payload, request_copy, actor),
                     "Publicação dos novos anúncios adicionada à fila.",
                     priority="manual",
+                    idempotency_key=(
+                        f"{parsed.path}:{self.headers.get('X-Idempotency-Key')}"
+                        if self.headers.get("X-Idempotency-Key") else ""
+                    ),
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
