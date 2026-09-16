@@ -3906,6 +3906,9 @@ function updateStatisticsReportFields() {
   if (flexField) flexField.hidden = noSales;
   const brandField = form.querySelector("[data-statistics-brand]");
   if (brandField) brandField.hidden = !noSales;
+  const availabilityField = form.querySelector("[data-statistics-availability]");
+  if (availabilityField) availabilityField.hidden = !noSales;
+  if (form.elements.min_available_days) form.elements.min_available_days.disabled = !noSales;
   if (form.elements.brand) {
     form.elements.brand.disabled = !noSales;
     if (!noSales) form.elements.brand.value = "";
@@ -4048,10 +4051,10 @@ function renderStatistics() {
       ? `<div class="notice danger-notice">A consulta atingiu o limite configurado de pedidos. Reduza o período para garantir a conferência completa.</div>`
       : "";
     const messages = (data.warnings || []).map((message) => `<div class="notice warning-notice">${escapeText(message)}</div>`).join("");
-    results.innerHTML = `${warning}${messages}${paginationHtml("statisticsPage", pageInfo)}${pageInfo.items.length ? `
+    results.innerHTML = `${warning}${messages}<div class="notice">Disponibilidade: dias completos até esta consulta, considerando o anúncio ativo com estoque acompanhado há mais tempo no SKU. Datas antigas de reativação ou reposição não registradas permanecem desconhecidas. Preços são os valores atuais sincronizados.</div>${paginationHtml("statisticsPage", pageInfo)}${pageInfo.items.length ? `
       <div class="statistics-table no-sales-statistics-table" role="table" aria-label="SKUs ativos sem venda">
         <div class="statistics-table-head" role="row">
-          <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Anúncios ativos</span><span>Estoque</span><span>Tipos</span><span>Anúncios ML</span><span>Última venda</span>
+          <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Anúncios ativos</span><span>Estoque</span><span>Tipos</span><span>Anúncios ML</span><span>Última venda</span><span>Preço de venda atual</span><span>Histórico dos anúncios ativos</span><span>Disponibilidade com estoque</span>
         </div>
         ${pageInfo.items.map((row, index) => `
           <article class="statistics-row" role="row">
@@ -4066,10 +4069,21 @@ function renderStatistics() {
             <span>${escapeText((row.listing_types || []).join(" e ") || "-")}</span>
             <span class="statistics-item-ids">${(row.item_ids || []).map((id) => `<em>${escapeText(id)}</em>`).join("")}</span>
             <span>${row.last_sale_at ? formatDateBR(row.last_sale_at) : "Sem venda sincronizada"}</span>
+            <span title="${escapeAttr(row.listing_prices_label || '')}">${row.min_sale_price == null ? "Não informado" : `${money.format(row.min_sale_price)}${row.max_sale_price !== row.min_sale_price ? ` a ${money.format(row.max_sale_price)}` : ""}`}</span>
+            <div class="no-sales-history">
+              <span>Primeira identificação: ${row.first_seen_at ? formatDateBR(row.first_seen_at) : "Não registrada"}</span>
+              <span>Reativação: ${row.last_reactivated_at ? formatDateBR(row.last_reactivated_at) : "Não registrada"}</span>
+              <span>Retorno de estoque: ${row.last_restocked_at ? formatDateBR(row.last_restocked_at) : "Não registrado"}</span>
+            </div>
+            <div class="no-sales-history">
+              <strong>${row.available_days == null ? "—" : `${Number(row.available_days).toLocaleString("pt-BR")} dia(s)`}</strong>
+              <span>${row.available_since ? `Desde ${formatDateBR(row.available_since)}` : ""}</span>
+              <small>${escapeText(row.availability_note || "Histórico não registrado")}</small>
+            </div>
           </article>
         `).join("")}
       </div>
-    ` : `<div class="notice">Todos os SKUs ativos correspondentes aos filtros tiveram venda no período.</div>`}${paginationHtml("statisticsPage", pageInfo)}`;
+    ` : `<div class="notice">Nenhum SKU ativo sem venda corresponde aos filtros de período e disponibilidade.</div>`}${paginationHtml("statisticsPage", pageInfo)}`;
     return;
   }
   summary.innerHTML = `
@@ -4348,6 +4362,7 @@ async function loadStatistics() {
         account: form.elements.account.value,
         sku: form.elements.sku.value,
         brand: form.elements.brand?.value || "",
+        min_available_days: form.elements.report_type?.value === "no_sales" ? Number(form.elements.min_available_days?.value || 0) : 0,
         flex: form.elements.flex.value,
         ...range,
       }),
@@ -4705,6 +4720,8 @@ function currentReportFilters(reportType) {
       account: form.elements.account.value,
       kind: form.elements.report_type?.value || "sku_sales",
       sku: form.elements.sku.value,
+      brand: form.elements.brand?.value || "",
+      min_available_days: form.elements.report_type?.value === "no_sales" ? Number(form.elements.min_available_days?.value || 0) : 0,
       flex: form.elements.flex.value,
       ...statisticsDateRange(form),
     };
@@ -5202,6 +5219,7 @@ document.querySelector('#product-publish-form [name="gtin"]')?.addEventListener(
 
 function applyAssistedProduct(product) {
   state.productDraft = product;
+  state.productPublicationId = window.crypto?.randomUUID?.() || `publish-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   state.productUploadedPictures = [];
   const form = document.querySelector("#product-publish-form");
   if (!form) return;
@@ -5230,7 +5248,7 @@ function applyAssistedProduct(product) {
   sourceThumb.src = product.pictures?.[0] || "";
   sourceThumb.hidden = !product.pictures?.[0];
   sourceThumb.onerror = () => { sourceThumb.hidden = true; };
-  document.querySelector("#publisher-source-badge").textContent = product.translated ? "Traduzido e adaptado" : "Dados importados";
+  document.querySelector("#publisher-source-badge").textContent = product.import_method === "saved_page" ? "Importado da página salva" : product.translated ? "Traduzido e adaptado" : "Dados importados";
   const categories = product.category_suggestions || [];
   form.elements.category_id.innerHTML = categories.length
     ? categories.map((row, index) => `<option value="${escapeAttr(row.category_id)}" data-domain-id="${escapeAttr(row.domain_id || "")}" ${row.category_id === product.category_id || (!product.category_id && index === 0) ? "selected" : ""}>${escapeText(row.category_name || row.category_id)} · ${escapeText(row.category_id)}</option>`).join("")
@@ -5298,6 +5316,7 @@ function collectAssistedPublication() {
     ),
     variants,
     publication_modes: publicationModes,
+    publication_id: state.productPublicationId || (state.productPublicationId = window.crypto?.randomUUID?.() || `publish-${Date.now()}-${Math.random().toString(16).slice(2)}`),
     draft: {
       source_url: state.productDraft?.source_url || "",
       title: values.get("title"), brand: values.get("brand"), model: values.get("model"), mpn: values.get("mpn"), gtin: values.get("gtin"),
@@ -5326,9 +5345,9 @@ function renderPublisherResults(result) {
   const root = document.querySelector("#publisher-results");
   if (!root) return;
   applyPublisherPendingFields(result?.results || []);
-  root.innerHTML = `<div class="publisher-result-summary"><strong>${Number(result.created || 0)} anúncio(s) criado(s)</strong><span>${Number(result.failed || 0)} falha(s)</span></div>
+  root.innerHTML = `<div class="publisher-result-summary"><strong>${Number(result.created || 0)} anúncio(s) criado(s)</strong><span>${Number(result.reused || 0)} já existente(s) · ${Number(result.failed || 0)} falha(s)</span></div>
     <div class="publisher-result-grid">${(result.results || []).map((row) => row.status === "created" ? `
-      <a href="${escapeAttr(row.permalink || "#")}" target="_blank" rel="noreferrer"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${escapeText(row.item_id || "Criado")}</strong><span>${escapeText(row.title || "")}</span></a>
+      <a href="${escapeAttr(row.permalink || "#")}" target="_blank" rel="noreferrer"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${escapeText(row.item_id || "Criado")}</strong><span>${escapeText(row.title || "")}</span>${row.catalog_link_status ? `<em>${row.catalog_link_status === "linked" ? `Vinculado ao tradicional ${escapeText(row.traditional_item_id)}` : "Vínculo aguardando confirmação"}</em>` : ""}${row.warning ? `<span class="publisher-result-warning">${escapeText(row.warning)}</span>` : ""}${row.reused ? "<small>Anúncio existente reutilizado</small>" : ""}</a>
     ` : `<article class="${row.pending_fields?.length ? "review" : "error"}"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${row.pending_fields?.length ? "Ajuste necessário" : "Não publicado"}</strong><span>${escapeText(row.error || "Erro não identificado")}</span>${row.pending_fields?.length ? `<em>${escapeText(publisherPendingGuidance(row))}</em>` : ""}</article>`).join("")}</div>`;
 }
 
@@ -6068,7 +6087,7 @@ document.querySelector("#spreadsheet-preview")?.addEventListener("click", (event
 
 document.querySelector("#statistics-form")?.addEventListener("change", (event) => {
   if (event.target.name === "period") updateStatisticsPeriodFields();
-  if (["account", "sku", "brand", "period", "flex", "specific_date", "specific_month", "date_from", "date_to"].includes(event.target.name)) {
+  if (["account", "sku", "brand", "min_available_days", "period", "flex", "specific_date", "specific_month", "date_from", "date_to"].includes(event.target.name)) {
     state.statistics = null;
     state.statisticsJobId = "";
     state.statisticsAttempted = false;
@@ -7585,6 +7604,7 @@ document.querySelector('#product-publish-form [name="title"]')?.addEventListener
 function resetAssistedPublisher() {
   state.productImportRequestToken += 1;
   state.productDraft = null;
+  state.productPublicationId = "";
   state.productUploadedPictures = [];
   state.productImportLoading = false;
   state.productPublishing = false;
@@ -7713,9 +7733,12 @@ document.querySelector("#product-import-form")?.addEventListener("submit", async
   if (progressBar) progressBar.style.width = "12%";
   if (button) { button.disabled = true; button.textContent = "Lendo produto..."; }
   try {
+    const savedPage = values.get("page_html_file");
+    if (savedPage?.size > 8000000) throw new Error("A página salva deve ter até 8 MB.");
+    const pageHtml = savedPage?.size ? await savedPage.text() : "";
     const queued = await api("/api/products/import", {
       method: "POST",
-      body: JSON.stringify({ url: values.get("url") }),
+      body: JSON.stringify({ url: values.get("url"), ...(pageHtml ? { page_html: pageHtml } : {}) }),
     });
     const result = await waitForAsyncOperation(queued, (message) => {
       if (requestToken !== state.productImportRequestToken) return;
@@ -7827,7 +7850,7 @@ document.querySelector("#product-publish-form")?.addEventListener("submit", asyn
     const pendingRow = (result.results || []).find((row) => row.pending_fields?.length);
     showToast(
       result.requires_review
-        ? publisherPendingGuidance(pendingRow)
+        ? (pendingRow ? publisherPendingGuidance(pendingRow) : "Confira os avisos e o estado do vínculo nos resultados da publicação.")
         : `${result.created || 0} anúncio(s) criado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`,
       result.failed ? "error" : "success",
     );

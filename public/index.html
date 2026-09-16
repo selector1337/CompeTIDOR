@@ -308,6 +308,10 @@
               <input name="brand" type="search" list="statistics-brand-options" placeholder="Todas as marcas" autocomplete="off" />
               <datalist id="statistics-brand-options"></datalist>
             </label>
+            <label data-statistics-availability hidden>Disponível há pelo menos (dias)
+              <input name="min_available_days" type="number" min="0" max="36500" step="1" value="0" disabled />
+              <small>0 inclui todos. Acima de 0, exige histórico de disponibilidade com estoque.</small>
+            </label>
             <label>Período
               <select name="period">
                 <option value="today">Hoje</option>
@@ -973,6 +977,11 @@
             </div>
           </form>
           <div id="product-import-progress" class="manual-progress publisher-progress" hidden><strong>Preparando produto</strong><div><span></span></div><small></small></div>
+          <details class="publisher-saved-page">
+            <summary>O Mercado Livre exige verificação para abrir o link?</summary>
+            <p>Abra o anúncio no navegador, conclua a verificação e salve a página como HTML (Ctrl+S). Selecione o arquivo abaixo e clique em “Importar e preparar” usando o mesmo link. Até 8 MB.</p>
+            <label>Página salva do anúncio (opcional)<input name="page_html_file" form="product-import-form" type="file" accept=".html,.htm,text/html" /></label>
+          </details>
           <div id="product-draft-empty" class="publisher-empty"><span>＋</span><strong>Comece colando o link de um produto</strong><small>A aplicação aproveitará título, especificações e fotos e consultará categoria, atributos e catálogo no Mercado Livre.</small></div>
           <form id="product-publish-form" hidden>
             <div class="publisher-source-card">
@@ -1002,8 +1011,8 @@
                   </label>
                   <div class="publisher-publication-modes span-2">
                     <strong>Modalidade da publicação</strong>
-                    <label class="publisher-check"><input name="publication_traditional" type="checkbox" checked /><span><strong>Anúncio tradicional</strong><small>Cria uma publicação independente, sem competir no catálogo.</small></span></label>
-                    <label class="publisher-check"><input name="publication_catalog" type="checkbox" /><span><strong>Anúncio de catálogo</strong><small>Disponível quando o produto oficial correspondente estiver selecionado.</small></span></label>
+                    <label class="publisher-check"><input name="publication_traditional" type="checkbox" checked /><span><strong>Anúncio tradicional</strong><small>Ao selecionar as duas opções, será a origem do anúncio de Catálogo vinculado.</small></span></label>
+                    <label class="publisher-check"><input name="publication_catalog" type="checkbox" /><span><strong>Anúncio de catálogo</strong><small>Com o tradicional selecionado, cria o vínculo quando o Mercado Livre permitir. Requer o produto oficial correspondente.</small></span></label>
                   </div>
                   <label class="span-2">Descrição adaptada <textarea name="description" rows="12" maxlength="50000"></textarea></label>
                 </div>
@@ -1414,7 +1423,7 @@
                 <legend>Enviar pelo bot quando ocorrer:</legend>
                 <label class="check-row">
                   <input type="checkbox" name="alert_types" value="stock" />
-                  Produto sem estoque ou pausado
+                  Reposição por SKU (até 5 unidades), estoque zerado ou pausado
                 </label>
                 <label class="check-row">
                   <input type="checkbox" name="alert_types" value="catalog" />

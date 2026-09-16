@@ -121,6 +121,11 @@ APP_DATA_FILE = "app.json"
 CATALOG_DATA_FILE = "catalog.json"
 SKU_COSTS_FILE = "sku_costs.json"
 SKU_LAST_SALES_FILE = "sku_last_sales.json"
+REPLENISHMENT_ALERTS_FILE = "replenishment_alerts.json"
+REPLENISHMENT_ALERT_LOCK = threading.Lock()
+ASSISTED_PUBLICATION_LOCK = threading.RLock()
+REPLENISHMENT_STOCK_THRESHOLD = 5
+REPLENISHMENT_SALES_DAYS = 60
 SYNC_PROGRESS_FILE = "sync_progress.json"
 RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
@@ -253,6 +258,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/items/[^/]+/description(\?|$)"),
     re.compile(r"^/items/[^/]+/price_to_win(\?|$)"),
     re.compile(r"^/items/[^/]+/sale_price(\?|$)"),
+    re.compile(r"^/items/[^/]+/catalog_listing_eligibility(\?|$)"),
     re.compile(r"^/item/[A-Z]{3}[0-9]+/performance(\?|$)"),
     re.compile(r"^/user-product/[^/]+/performance(\?|$)"),
     re.compile(r"^/categories/[^/]+/attributes(\?|$)"),
@@ -568,6 +574,8 @@ CATALOG_ITEM_FIELDS = {
     "package_weight", "package_height", "package_width", "package_length", "package_mode",
     "manufacturing_time", "price", "list_price", "stock", "sold_quantity", "family_name",
     "meli_status", "permalink", "picture_count", "picture_count_status", "item_data_checked_at",
+    "first_seen_at", "last_reactivated_at", "last_restocked_at", "available_since",
+    "availability_checked_at", "availability_basis",
 }
 CATALOG_SHIPPING_FIELDS = {
     "shipping_cost", "shipping_cost_currency", "shipping_billable_weight", "shipping_cost_source",
@@ -600,7 +608,13 @@ def merge_catalog_records(incoming, latest):
             continue
         merged = {**saved, **current}
         competition_source = current if str(current.get("competition_checked_at") or "") >= str(saved.get("competition_checked_at") or "") else saved
-        item_source = current if str(current.get("item_data_checked_at") or "") >= str(saved.get("item_data_checked_at") or "") else saved
+        item_source = current if (
+            parse_meli_datetime(current.get("item_data_checked_at")) or datetime.min.replace(tzinfo=APP_TZ),
+            parse_meli_datetime(current.get("availability_checked_at")) or datetime.min.replace(tzinfo=APP_TZ),
+        ) >= (
+            parse_meli_datetime(saved.get("item_data_checked_at")) or datetime.min.replace(tzinfo=APP_TZ),
+            parse_meli_datetime(saved.get("availability_checked_at")) or datetime.min.replace(tzinfo=APP_TZ),
+        ) else saved
         shipping_source = current if str(current.get("shipping_cost_updated_at") or "") >= str(saved.get("shipping_cost_updated_at") or "") else saved
         sale_fee_source = current if str(current.get("sale_fee_updated_at") or "") >= str(saved.get("sale_fee_updated_at") or "") else saved
         identifier_source = current if str(current.get("gtin_updated_at") or "") >= str(saved.get("gtin_updated_at") or "") else saved
@@ -630,6 +644,10 @@ def write_payload(payload, replace_collections=None):
         path = DATA / APP_DATA_FILE
         latest = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         latest.pop("catalog", None)
+        payload["assisted_catalog_opt_ins"] = {
+            **(latest.get("assisted_catalog_opt_ins") or {}),
+            **(payload.get("assisted_catalog_opt_ins") or {}),
+        }
         incoming_revision = int(payload.get("_revision") or 0)
         latest_revision = int(latest.get("_revision") or 0)
         payload["item_logs"] = merge_item_logs(
@@ -2041,6 +2059,15 @@ class MercadoLivreClient:
     def validate_item(self, payload):
         return self.post("/items/validate", payload)
 
+    def catalog_listing_eligibility(self, item_id):
+        return self.get(f"/items/{item_id}/catalog_listing_eligibility", **interactive_request_options())
+
+    def opt_in_catalog_listing(self, item_id, catalog_product_id):
+        # A single POST: retry only after reconciling the traditional item's relations.
+        return self.post("/items/catalog_listings", {
+            "item_id": item_id, "catalog_product_id": catalog_product_id,
+        })
+
     def upload_item_picture(self, content, filename="kit.jpg", content_type="image/jpeg"):
         path = "/pictures/items/upload"
         validate_meli_path(path)
@@ -3117,6 +3144,18 @@ def extract_meli_user_product_id(value):
     return match.group(1).upper() if match else ""
 
 
+def canonical_meli_import_url(value):
+    """Fragments never reach the server; preserve the selected offer as a query."""
+    raw = html.unescape(str(value or "").strip())
+    if not extract_meli_user_product_id(raw) and not extract_meli_catalog_product_id(raw):
+        return raw
+    parsed = urlparse(raw)
+    item_id = extract_meli_item_id(raw)
+    catalog_id = extract_meli_catalog_product_id(raw)
+    query = urlencode({"wid": item_id}) if item_id and item_id != catalog_id else ""
+    return parsed._replace(query=query, fragment="").geturl()
+
+
 def resolve_competitor_seller(payload, reference):
     raw = str(reference or "").strip()
     if not raw:
@@ -3673,6 +3712,8 @@ def product_browser_download(url, maximum=None):
 
 def product_page_download(url):
     host = product_import_host(url)
+    if "mercado" in host:
+        url = canonical_meli_import_url(url)
     maximum = max(512_000, min(8_000_000, int(os.getenv("COMPETIDOR_PRODUCT_IMPORT_MAX_BYTES", "4000000"))))
     # Mercado Livre's UPP pages may reject urllib/datacenter TLS signatures even
     # though the same public URL works in Chrome. Reproduce the browser's TLS,
@@ -4263,15 +4304,30 @@ def mercado_livre_public_page(page_html, page_url):
     valid publication grant.  The product page still publishes title, gallery,
     description and technical specifications in its Nordic rendering state.
     """
-    script_match = re.search(
-        r"<script[^>]+id=[\"']__NORDIC_RENDERING_CTX__[\"'][^>]*>(.*?)</script>",
-        page_html or "", flags=re.IGNORECASE | re.DOTALL,
-    )
-    script = script_match.group(1) if script_match else ""
-    assignment = re.search(r"_n\.ctx\.r\s*=\s*", script)
-    rendering = json_object_after_marker(script, assignment.group(0)) if assignment else {}
-    state = first_present(rendering, ["appProps.pageProps.initialState"], {}) or {}
+    state = {}
+    for script in re.findall(r"<script\b[^>]*>(.*?)</script>", page_html or "", flags=re.I | re.S):
+        rendering = {}
+        for assignment in re.finditer(r"(?:_n\.ctx\.r|(?:window\.)?__(?:PRELOADED|INITIAL)_STATE__)\s*=\s*", script):
+            rendering = json_object_after_marker(script, assignment.group(0))
+            if rendering:
+                break
+        if not rendering and script.lstrip().startswith("{"):
+            try:
+                rendering = json.loads(script)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(rendering, dict):
+            continue
+        for path in ("appProps.pageProps.initialState", "props.pageProps.initialState", "pageProps.initialState", "initialState", ""):
+            candidate = first_present(rendering, [path], {}) if path else rendering
+            if isinstance(candidate, dict) and candidate.get("components"):
+                state = candidate
+                break
+        if state:
+            break
     components = state.get("components") if isinstance(state, dict) else {}
+    if isinstance(components, list):
+        components = {str(row.get("id") or row.get("type") or ""): row for row in components if isinstance(row, dict)}
     components = components if isinstance(components, dict) else {}
     header = components.get("header") if isinstance(components.get("header"), dict) else {}
     gallery = components.get("gallery") if isinstance(components.get("gallery"), dict) else {}
@@ -4280,7 +4336,7 @@ def mercado_livre_public_page(page_html, page_url):
     metadata = components.get("metadata") if isinstance(components.get("metadata"), dict) else {}
 
     specifications = []
-    highlighted = components.get("highlighted_specs_attrs") or {}
+    highlighted = [components.get(key) or {} for key in ("highlighted_specs_attrs", "technical_specifications", "specs", "specifications")]
     for node in product_json_nodes(highlighted):
         attributes = node.get("attributes") if isinstance(node, dict) else None
         if not isinstance(attributes, list):
@@ -4288,8 +4344,8 @@ def mercado_livre_public_page(page_html, page_url):
         for attribute in attributes:
             if not isinstance(attribute, dict):
                 continue
-            label = clean_product_text(attribute.get("id") or attribute.get("name"), 120)
-            value = clean_product_text(attribute.get("text") or attribute.get("value"), 500)
+            label = clean_product_text(attribute.get("name") or attribute.get("id"), 120)
+            value = clean_product_text(attribute.get("text") or attribute.get("value_name") or attribute.get("value"), 500)
             if label and value and not any(
                 normalized_attribute_label(row.get("name")) == normalized_attribute_label(label)
                 and normalized_attribute_label(row.get("value")) == normalized_attribute_label(value)
@@ -4314,6 +4370,10 @@ def mercado_livre_public_page(page_html, page_url):
     pictures = []
     for picture in gallery.get("pictures") or []:
         if not isinstance(picture, dict):
+            continue
+        direct_url = picture.get("secure_url") or picture.get("url") or picture.get("source")
+        if direct_url:
+            pictures.append(direct_url)
             continue
         picture_id = str(picture.get("id") or "").strip()
         if not picture_id:
@@ -4348,6 +4408,7 @@ def mercado_livre_public_page(page_html, page_url):
         "price": price,
         "currency": currency,
         "source_item_id": item_id,
+        "user_product_id": event_data.get("user_product_id") or state.get("user_product_id") or "",
         "category_id": event_data.get("category_id") or "",
         "domain_id": event_data.get("domain_id") or "",
     }
@@ -4440,6 +4501,7 @@ def parse_external_product_page(page_html, page_url):
         "pictures": images,
         "specifications": specifications[:80],
         "source_item_id": specific.get("source_item_id") or "",
+        "user_product_id": specific.get("user_product_id") or "",
         "category_id": specific.get("category_id") or "",
         "domain_id": specific.get("domain_id") or "",
     }
@@ -4480,6 +4542,39 @@ def imported_meli_up_public_fallback(source_url, item_id=""):
         except Exception as exc:
             errors.append(str(exc))
     raise RuntimeError("; ".join(dict.fromkeys(errors)))
+
+
+def imported_meli_saved_page(source_url, page_html):
+    """Extract a page supplied by the user without executing any of its scripts."""
+    if not isinstance(page_html, str) or len(page_html.encode("utf-8")) > 8_000_000:
+        raise RuntimeError("A página salva deve ser um arquivo HTML de até 8 MB.")
+    if not meli_page_has_product_data(page_html, source_url):
+        raise RuntimeError("O arquivo não contém a ficha do produto. Abra o anúncio no navegador e salve a página após concluir a verificação de acesso.")
+    product = parse_external_product_page(page_html, source_url)
+    parser = ProductPageParser()
+    parser.feed(page_html)
+    node = first_product_json_ld(parser)
+    source_item_id = product.get("source_item_id") or ""
+    for key in ("sku", "productID"):
+        value = str(node.get(key) or "").strip().upper()
+        if not source_item_id and re.fullmatch(r"MLB\d{5,}", value):
+            source_item_id = value
+    declared_url = parser.meta.get("og:url") or node.get("url") or ""
+    wanted_item = extract_meli_item_id(source_url)
+    wanted_up = extract_meli_user_product_id(source_url)
+    actual_up = product.get("user_product_id") or extract_meli_user_product_id(declared_url)
+    declared_item = extract_meli_item_id(declared_url)
+    if source_item_id and wanted_item and source_item_id != wanted_item:
+        raise RuntimeError("A página salva pertence a outro anúncio. Salve o anúncio do link informado.")
+    if actual_up and wanted_up and actual_up != wanted_up:
+        raise RuntimeError("A página salva pertence a outro produto. Confira o link e o arquivo.")
+    if not (source_item_id and source_item_id == wanted_item or actual_up and actual_up == wanted_up
+            or declared_item and declared_item == wanted_item):
+        raise RuntimeError("Não foi possível confirmar que o arquivo pertence ao produto do link informado.")
+    product["source_item_id"] = source_item_id or wanted_item
+    product["user_product_id"] = actual_up or wanted_up
+    product["import_method"] = "saved_page"
+    return product
 
 
 def meli_up_slug_query(source_url):
@@ -4594,7 +4689,7 @@ def imported_meli_product(payload, item_id, source_url):
     try:
         if not re.fullmatch(r"MLB\d{5,}", str(item_id or "")):
             raise RuntimeError("O link identifica um User Product, sem ID de oferta.")
-        if extract_meli_user_product_id(source_url):
+        if extract_meli_user_product_id(source_url) or not extract_meli_catalog_product_id(source_url):
             item = imported_up_offer(payload, item_id, source_url)
         else:
             item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
@@ -4761,8 +4856,8 @@ def imported_meli_product(payload, item_id, source_url):
         "source_url": source_url,
         "source_host": "mercadolivre.com.br",
         "source_item_id": item.get("id") or (item_id if re.fullmatch(r"MLB\d{5,}", str(item_id or "")) else ""),
-        "source_title": item.get("title") or "",
-        "title": optimized_product_title(item.get("title") or "", source_attribute_value(item, ["BRAND"]), source_attribute_value(item, ["MODEL"])),
+        "source_title": item.get("title") or item.get("family_name") or "",
+        "title": optimized_product_title(item.get("title") or item.get("family_name") or "", source_attribute_value(item, ["BRAND"]), source_attribute_value(item, ["MODEL"])),
         "brand": source_attribute_value(item, ["BRAND"]),
         "model": source_attribute_value(item, ["MODEL"]),
         "mpn": source_attribute_value(item, ["MPN", "PART_NUMBER"]),
@@ -4945,7 +5040,11 @@ def import_product_operation(payload, request):
     item_id = (
         extract_meli_item_id(source_url) or extract_meli_user_product_id(source_url)
     ) if "mercado" in host else ""
-    if item_id:
+    if request.get("page_html"):
+        if "mercado" not in host or not item_id:
+            raise RuntimeError("A página salva deve corresponder a um link de anúncio do Mercado Livre.")
+        product = imported_meli_saved_page(source_url, request["page_html"])
+    elif item_id:
         product = imported_meli_product(payload, item_id, source_url)
     else:
         page_html, final_url = product_page_download(source_url)
@@ -5478,8 +5577,7 @@ def process_meli_notification(event, payload=None, persist=True):
     before = dict(existing) if existing else None
     is_catalog = is_catalog_listing(official)
     competition = normalize_competition(client, account, official) if is_catalog else {}
-    updated = synced_catalog_item(account, official, competition)
-    updated["first_seen_at"] = (before or {}).get("first_seen_at") or now_label()
+    updated = synced_catalog_item(account, official, competition, previous=before)
     updated["updated_at"] = now_label()
     updated["last_webhook_at"] = now_label()
     if existing is None:
@@ -6371,7 +6469,42 @@ def sale_price_values(response, fallback=0):
     }
 
 
-def synced_catalog_item(account, item, competition=None):
+def item_is_available(item):
+    try:
+        return normalized_meli_status(item.get("meli_status")) == "active" and float(item.get("stock") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def track_item_availability(item, previous=None, observed_at=None):
+    """Record observed transitions, never infer past availability from import dates."""
+    previous = previous or {}
+    observed_at = observed_at or datetime.now(APP_TZ).isoformat()
+    for field in ("first_seen_at", "last_reactivated_at", "last_restocked_at", "available_since", "availability_basis"):
+        item[field] = previous.get(field) or ""
+    item["first_seen_at"] = previous.get("first_seen_at") or observed_at
+    previous_status = normalized_meli_status(previous.get("meli_status"))
+    current_status = normalized_meli_status(item.get("meli_status"))
+    if previous_status == "paused" and current_status == "active":
+        item["last_reactivated_at"] = observed_at
+    if previous.get("stock") is not None:
+        try:
+            if float(previous["stock"]) <= 0 and float(item.get("stock") or 0) > 0:
+                item["last_restocked_at"] = observed_at
+        except (TypeError, ValueError):
+            pass
+    if not item_is_available(item):
+        item["available_since"] = ""
+        item["availability_basis"] = ""
+    elif not item_is_available(previous) or not previous.get("available_since"):
+        item["available_since"] = observed_at
+        item["availability_basis"] = "transition" if previous and not item_is_available(previous) else "observed"
+    item["availability_checked_at"] = observed_at
+    item["item_data_checked_at"] = parse_meli_datetime(observed_at).strftime("%Y-%m-%d %H:%M")
+    return item
+
+
+def synced_catalog_item(account, item, competition=None, previous=None):
     stock = item_available_quantity(item)
     catalog_product_id = item.get("catalog_product_id") or "-"
     listing_type_id = item.get("listing_type_id") or first_present(item, ["listing_type.id", "listing_type"], "")
@@ -6386,7 +6519,7 @@ def synced_catalog_item(account, item, competition=None):
     pictures = item.get("pictures") if isinstance(item.get("pictures"), list) else None
     price_values = sale_price_values(item.get("sale_price"), item.get("price"))
     list_price = item_list_price(item, price_values.get("regular_amount"))
-    return {
+    row = {
         "id": item.get("id"),
         "title": item.get("title") or item.get("id"),
         "account": account.get("nickname"),
@@ -6431,6 +6564,10 @@ def synced_catalog_item(account, item, competition=None):
         "permalink": item.get("permalink", ""),
         **competition,
     }
+    for field in ("assisted_publication_id", "assisted_publication_mode", "assisted_traditional_item_id"):
+        if (previous or {}).get(field):
+            row[field] = previous[field]
+    return track_item_availability(row, previous)
 
 
 def shipping_quote_values(response):
@@ -7467,8 +7604,7 @@ def refresh_item_prices_operation(item_ids):
                     f"Conferido {completed} de {total} anúncios.", completed, total, detail
                 )
                 continue
-            first_seen_at = current.get("first_seen_at")
-            refreshed = synced_catalog_item(account, official, competition_snapshot(current))
+            refreshed = synced_catalog_item(account, official, competition_snapshot(current), previous=current)
             preserve_shipping_cost_snapshot(refreshed, current)
             preserve_identifier_snapshot(refreshed, current)
             sale_price = sale_prices_by_id.get(item_id)
@@ -7490,7 +7626,6 @@ def refresh_item_prices_operation(item_ids):
                 refreshed["price_source"] = "items_fallback"
                 refreshed["sale_price_checked_at"] = now_label()
             preserve_sale_fee_snapshot(refreshed, current)
-            refreshed["first_seen_at"] = first_seen_at or now_label()
             refreshed["updated_at"] = now_label()
             current.update(refreshed)
             apply_item_net_values(current)
@@ -7846,6 +7981,229 @@ def send_telegram_message_to_users(payload, alert_type, text):
         except Exception as exc:
             results[user_id] = {"ok": False, "error": str(exc)}
     return results
+
+
+def replenishment_stock_by_sku(payload):
+    """Use the same shared-SKU stock reference as Compras, never sum mirrored ads."""
+    accounts = [account for account in payload.get("accounts") or [] if
+                account.get("official") and account.get("access_token") and account.get("status") == "connected"]
+    account_ids = {str(account.get("id") or "") for account in accounts}
+    account_names = {str(account.get("nickname") or "") for account in accounts}
+    grouped = {}
+    for item in payload.get("catalog") or []:
+        if str(item.get("account_id") or "") not in account_ids and str(item.get("account") or "") not in account_names:
+            continue
+        if normalized_meli_status(item.get("meli_status")) not in {"active", "paused"}:
+            continue
+        sku = normalized_sku_key(item.get("sku"))
+        if not sku or sku == "-":
+            continue
+        row = grouped.setdefault(sku, {"sku": sku, "product": item.get("title") or sku, "stock": 0, "known_stock": True})
+        stock = optional_money(item.get("stock"))
+        if stock is None or not math.isfinite(stock) or stock < 0 or stock != int(stock):
+            row["known_stock"] = False
+        else:
+            row["stock"] = max(row["stock"], int(stock))
+    return {sku: row for sku, row in grouped.items() if row["known_stock"]}
+
+
+def replenishment_telegram_targets(payload):
+    targets = {}
+    for _, config in notification_targets(payload):
+        telegram = config.get("telegram") or {}
+        chat_id = str(telegram.get("chat_id") or "").strip()
+        if not telegram.get("enabled") or not telegram.get("bot_token") or not chat_id:
+            continue
+        if not telegram_type_enabled(config, "stock"):
+            continue
+        # Several users/bots may point to the same group. Deliver once to that chat.
+        key = hashlib.sha256(chat_id.encode("utf-8")).hexdigest()
+        targets.setdefault(key, config)
+    return targets
+
+
+def replenishment_period_metrics(report, skus):
+    grouped = {sku: [] for sku in skus}
+    for row in report.get("rows") or []:
+        sku = normalized_sku_key(row.get("sku"))
+        if sku in grouped:
+            grouped[sku].append(row)
+    complete = report.get("orders_complete", not report.get("warnings")) and not report.get("truncated")
+    result = {}
+    for sku, rows in grouped.items():
+        units = sum(int(row.get("quantity") or 0) for row in rows) if complete else None
+        known_financials = complete and not report.get("warnings") and all(
+            optional_money(row.get("profit_amount")) is not None
+            and optional_money(row.get("net_amount")) is not None for row in rows
+        )
+        profit = sum(float(row["profit_amount"]) for row in rows) if known_financials and units else None
+        net = sum(float(row["net_amount"]) for row in rows) if known_financials and units else None
+        result[sku] = {
+            "units": units,
+            "margin": round(profit / net * 100, 2) if profit is not None and net and net > 0 else None,
+            "unit_profit": round(profit / units, 2) if profit is not None and units else None,
+            "external_flex_cost_unknown": any(row.get("flex") is True for row in rows) and report.get("flex_carrier_cost") is None,
+        }
+    return result
+
+
+def replenishment_alert_text(item, metrics, date_from, date_to):
+    units = metrics.get("units")
+    coverage = item["stock"] * REPLENISHMENT_SALES_DAYS / units if units else None
+    coverage_label = (
+        ("< 0,1 dia" if 0 < coverage < 0.1 else f"{coverage:.1f} dia(s)".replace(".", ","))
+        if coverage is not None else "Sem giro no período" if units == 0 else "Indisponível: vendas incompletas"
+    )
+    no_profit = "Sem vendas no período" if units == 0 else "Indisponível: custo ou dados incompletos"
+    margin = f"{metrics['margin']:.2f}%".replace(".", ",") if metrics.get("margin") is not None else no_profit
+    unit_profit = brl_label(metrics["unit_profit"]) if metrics.get("unit_profit") is not None else no_profit
+    lines = [
+        "CompeTIDOR | Reposição de estoque",
+        f"SKU: {item['sku'][:200]}",
+        f"Produto: {str(item['product'])[:240]}",
+        f"Estoque de referência: {item['stock']} unidade(s)",
+        f"Alerta: {REPLENISHMENT_STOCK_THRESHOLD} unidades ou menos",
+        "",
+        f"Últimos {REPLENISHMENT_SALES_DAYS} dias ({date_from} a {date_to}):",
+        f"Quantidade vendida: {units} unidade(s)" if units is not None else "Quantidade vendida: indisponível (consulta incompleta)",
+        f"Margem sobre receita líquida: {margin}",
+        f"Lucro médio por unidade: {unit_profit}",
+        f"Duração estimada do estoque: {coverage_label}",
+        "",
+        "Estoque: maior saldo entre anúncios do SKU, sem somar anúncios espelhados.",
+        "Rentabilidade calculada com o custo atual cadastrado. Cobertura baseada no giro médio de 60 dias.",
+    ]
+    if metrics.get("external_flex_cost_unknown"):
+        lines.append("Transportadora externa Flex não informada; esse custo não está incluído na rentabilidade.")
+    return "\n".join(lines)
+
+
+def replenishment_failed_delivery(response):
+    parameters = response.get("parameters") or {}
+    try:
+        retry_seconds = max(900, int(parameters.get("retry_after") or 0))
+    except (TypeError, ValueError):
+        retry_seconds = 900
+    return {"status": "failed", "retry_after": time.time() + retry_seconds}
+
+
+def process_replenishment_alerts():
+    """One persisted delivery per SKU/chat while stock remains at or below five."""
+    if not REPLENISHMENT_ALERT_LOCK.acquire(blocking=False):
+        return {"status": "busy", "sent": 0}
+    try:
+        payload = read_payload()
+        stocks = replenishment_stock_by_sku(payload)
+        targets = replenishment_telegram_targets(payload)
+        store = read_json(REPLENISHMENT_ALERTS_FILE, {"version": 1, "skus": {}})
+        if not isinstance(store, dict) or store.get("version") != 1 or not isinstance(store.get("skus"), dict):
+            raise RuntimeError("Estado dos alertas de reposição inválido; envios suspensos para evitar duplicidade.")
+
+        def update_cycles(current_stocks):
+            changed = False
+            for sku, item in current_stocks.items():
+                if item["stock"] > REPLENISHMENT_STOCK_THRESHOLD:
+                    if sku in store["skus"]:
+                        del store["skus"][sku]
+                        changed = True
+                elif sku not in store["skus"]:
+                    store["skus"][sku] = {"started_at": now_label(), "deliveries": {}}
+                    changed = True
+            if changed:
+                write_json(REPLENISHMENT_ALERTS_FILE, store)
+
+        def pending_destinations(sku):
+            deliveries = store["skus"][sku]["deliveries"]
+            return [key for key in targets if key not in deliveries or (
+                deliveries[key].get("status") == "failed" and float(deliveries[key].get("retry_after") or 0) <= time.time()
+            )]
+
+        update_cycles(stocks)
+        pending = [sku for sku, item in stocks.items() if item["stock"] <= REPLENISHMENT_STOCK_THRESHOLD and pending_destinations(sku)]
+        pending = pending[:50]
+        if not pending or float(store.get("query_retry_after") or 0) > time.time():
+            return {"status": "idle", "sent": 0}
+        today = datetime.now(APP_TZ).date()
+        date_from = (today - timedelta(days=REPLENISHMENT_SALES_DAYS - 1)).isoformat()
+        date_to = today.isoformat()
+        try:
+            report = HEAVY_JOB_EXECUTOR.submit(
+                run_meli_work, "background", query_sales_report,
+                payload, {"account": "all", "date_from": date_from, "date_to": date_to},
+                target_skus=set(pending), paid_only=True,
+            ).result()
+            metrics = replenishment_period_metrics(report, pending)
+        except Exception:
+            store["query_retry_after"] = time.time() + 900
+            store["last_error"] = "Não foi possível consultar as vendas dos últimos 60 dias. Nova tentativa em 15 minutos."
+            write_json(REPLENISHMENT_ALERTS_FILE, store)
+            return {"status": "sales_error", "sent": 0}
+
+        # Stock or notification preferences can change while the sales query runs.
+        fresh_payload = read_payload()
+        stocks = replenishment_stock_by_sku(fresh_payload)
+        targets = replenishment_telegram_targets(fresh_payload)
+        update_cycles(stocks)
+        store.pop("query_retry_after", None)
+        store.pop("last_error", None)
+        sent = 0
+        failed = 0
+        next_send_at = {}
+        for sku in pending:
+            item = stocks.get(sku)
+            if not item or item["stock"] > REPLENISHMENT_STOCK_THRESHOLD:
+                continue
+            text = replenishment_alert_text(item, metrics[sku], date_from, date_to)
+            deliveries = store["skus"][sku]["deliveries"]
+            for key in pending_destinations(sku):
+                delay = next_send_at.get(key, 0) - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                # Persist the claim BEFORE the side effect. A crash/timeout must not
+                # automatically replay a message whose delivery is uncertain.
+                deliveries[key] = {"status": "sending", "attempted_at": now_label()}
+                write_json(REPLENISHMENT_ALERTS_FILE, store)
+                try:
+                    response = Notifier(targets[key]).send_telegram(text)
+                except Exception as exc:
+                    # request_json raises on HTTP rejection; those are safe to retry.
+                    rejection = re.match(r"^HTTP (4\d\d): (.*)$", str(exc), flags=re.S)
+                    if rejection:
+                        try:
+                            response = json.loads(rejection.group(2))
+                        except (TypeError, ValueError):
+                            response = {}
+                        deliveries[key].update(replenishment_failed_delivery(response if isinstance(response, dict) else {}))
+                    else:
+                        deliveries[key]["status"] = "uncertain"
+                    failed += 1
+                else:
+                    if response.get("ok") is True:
+                        deliveries[key].update({"status": "sent", "sent_at": now_label(), "stock": item["stock"]})
+                        sent += 1
+                    else:
+                        deliveries[key].update(replenishment_failed_delivery(response))
+                        failed += 1
+                next_send_at[key] = time.monotonic() + 3.1
+                write_json(REPLENISHMENT_ALERTS_FILE, store)
+        write_json(REPLENISHMENT_ALERTS_FILE, store)
+        return {"status": "completed", "sent": sent, "failed": failed}
+    finally:
+        REPLENISHMENT_ALERT_LOCK.release()
+
+
+def replenishment_alert_loop():
+    interval = max(60, int(os.getenv("REPLENISHMENT_ALERT_INTERVAL_SECONDS", "300")))
+    time.sleep(max(30, int(os.getenv("REPLENISHMENT_ALERT_STARTUP_DELAY_SECONDS", "90"))))
+    while True:
+        try:
+            if not any(meli_background_work_busy()):
+                # Only the sales calculation uses the heavy queue; Telegram pacing
+                # must not block the user's report exports.
+                run_meli_work("background", process_replenishment_alerts)
+        except Exception:
+            print("Não foi possível verificar os alertas de reposição nesta rodada.")
+        time.sleep(interval)
 
 
 def add_stock_alerts(payload, account, items):
@@ -10406,15 +10764,14 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
                     competition = normalize_competition(client, account, item)
                 else:
                     competition = competition_snapshot(existing_by_id.get(item_id, {}))
-                row = synced_catalog_item(account, item, competition)
                 previous = existing_by_id.get(item_id, {})
+                row = synced_catalog_item(account, item, competition, previous=previous)
                 preserve_sale_price_snapshot(row, previous)
                 preserve_shipping_cost_snapshot(row, previous)
                 preserve_sale_fee_snapshot(row, previous)
                 preserve_identifier_snapshot(row, previous)
                 preserve_clips_snapshot(row, previous)
                 preserve_description_snapshot(row, previous)
-                row["first_seen_at"] = previous.get("first_seen_at") or now_label()
                 imported.append(row)
             fetched_count += planned_count
             update_progress(
@@ -10549,7 +10906,6 @@ def discover_recent_official_items(payload, account, client, per_status=None):
         if not official:
             continue
         row = synced_catalog_item(account, official, {})
-        row["first_seen_at"] = now_label()
         row["updated_at"] = now_label()
         imported.append(row)
     payload.setdefault("catalog", []).extend(imported)
@@ -10590,7 +10946,7 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
             if not official:
                 raise RuntimeError("Anúncio não retornado pelo lote oficial nesta rodada.")
             competition = competition_snapshot(current)
-            updated = synced_catalog_item(account, official, competition)
+            updated = synced_catalog_item(account, official, competition, previous=current)
             preserve_sale_price_snapshot(updated, current)
             preserve_identifier_snapshot(updated, current)
             preserve_shipping_cost_snapshot(updated, current)
@@ -11408,6 +11764,7 @@ def update_item_operation(request, actor=None):
             account_id and item.get("account_id") not in {account_id, account.get("id")}
         ):
             continue
+        availability_before = dict(item)
         changes = {}
         if "price" in update:
             changes["price"] = {"from": item.get("price"), "to": update["price"]}
@@ -11458,7 +11815,7 @@ def update_item_operation(request, actor=None):
             changes["status"] = {"from": item.get("meli_status"), "to": "active"}
             item["status"] = "sharing" if is_catalog_listing(item) else "winning"
             item["meli_status"] = "active"
-        item["item_data_checked_at"] = now_label()
+        track_item_availability(item, availability_before)
         item["updated_at"] = now_label()
         apply_item_net_values(item)
         append_item_log(payload, item, actor or {}, "Atualização manual", changes)
@@ -14914,7 +15271,7 @@ def assisted_publication_modes(request):
         raise RuntimeError("Selecione anúncio tradicional, anúncio de catálogo ou ambos.")
     if "catalog" in modes and not clean_attribute_value(draft.get("catalog_product_id")):
         raise RuntimeError("Selecione o produto oficial correspondente antes de criar o anúncio de catálogo.")
-    return modes
+    return ["traditional", "catalog"] if len(modes) == 2 else modes
 
 
 def validate_assisted_product_operation(payload, request):
@@ -14935,6 +15292,8 @@ def validate_assisted_product_operation(payload, request):
     else:
         mode_draft = catalog_safe_package_draft(client, mode_draft)
     create_payload, source_item = build_assisted_publication_payload(mode_draft, variant)
+    if len(assisted_publication_modes(request)) == 2:
+        create_payload["catalog_product_id"] = clean_attribute_value(draft.get("catalog_product_id"))
     stores = target_official_stores(client, account, payload.get("catalog") or [])
     requested_stores = request.get("official_store_ids") if isinstance(request.get("official_store_ids"), dict) else {}
     requested_store_id = clean_attribute_value(requested_stores.get(str(account.get("id"))))
@@ -15008,7 +15367,161 @@ def validate_assisted_product_operation(payload, request):
         }
 
 
-def publish_assisted_product_operation(payload, request, actor=None):
+def linked_catalog_from_relations(client, traditional, catalog_product_id):
+    for relation in traditional.get("item_relations") or []:
+        related_id = str(relation.get("id") or "")
+        if not related_id:
+            continue
+        related = client.item_for_clone(related_id)
+        if str(related.get("id") or "") == related_id and related.get("catalog_listing") is True and str(related.get("catalog_product_id") or "") == catalog_product_id:
+            if str(related.get("seller_id") or "") != str(traditional.get("seller_id") or ""):
+                raise RuntimeError("A relação retornada pertence a outro vendedor.")
+            return related
+    return None
+
+
+def create_linked_catalog_listing(client, traditional_id, catalog_product_id, seller_id, before_opt_in=None, verify_only=False):
+    traditional = client.item_for_clone(traditional_id)
+    if str(traditional.get("id") or "") != traditional_id or str(traditional.get("seller_id") or "") != str(seller_id):
+        raise RuntimeError("Não foi possível confirmar o anúncio tradicional na conta selecionada.")
+    if traditional.get("catalog_listing") is True:
+        raise RuntimeError("O anúncio de origem já é de Catálogo; não será criado outro anúncio independente.")
+    related = linked_catalog_from_relations(client, traditional, catalog_product_id)
+    if related:
+        return related, True, True
+    if verify_only:
+        raise RuntimeError(f"A associação ao tradicional {traditional_id} já foi solicitada, mas o vínculo ainda não foi confirmado. Confira o anúncio no Mercado Livre; a solicitação não será repetida para evitar duplicação.")
+    if traditional.get("item_relations"):
+        raise RuntimeError("O tradicional já possui outra relação. Confira o produto de Catálogo selecionado.")
+    if traditional.get("variations"):
+        raise RuntimeError("Este anúncio possui variações. É necessário selecionar o produto de Catálogo correspondente a cada variação.")
+    eligibility = client.catalog_listing_eligibility(traditional_id)
+    if eligibility.get("status") == "ALREADY_OPTED_IN":
+        related = linked_catalog_from_relations(client, client.item_for_clone(traditional_id), catalog_product_id)
+        if related:
+            return related, True, True
+        raise RuntimeError("O Mercado Livre informou um vínculo existente, ainda não disponível para conferência. Tente verificar novamente; nenhum anúncio adicional foi criado.")
+    if eligibility.get("status") != "READY_FOR_OPTIN" or eligibility.get("buy_box_eligible") is not True:
+        status = str(eligibility.get("status") or "não informado")
+        raise RuntimeError(f"O tradicional {traditional_id} ainda não está elegível para este Catálogo ({status}). Ele foi preservado; nenhum catálogo independente foi criado.")
+    if before_opt_in:
+        before_opt_in()
+    try:
+        created = normalize_created_item_response(client.opt_in_catalog_listing(traditional_id, catalog_product_id))
+    except Exception as exc:
+        # Never replay a POST after an ambiguous response. Read back the relationship.
+        try:
+            related = linked_catalog_from_relations(client, client.item_for_clone(traditional_id), catalog_product_id)
+        except Exception:
+            related = None
+        if related:
+            return related, True, True
+        raise RuntimeError(f"Não foi possível confirmar a associação ao tradicional {traditional_id}. Confira o vínculo antes de tentar novamente. {friendly_clone_error(exc)}") from exc
+    if not isinstance(created, dict) or not created.get("id"):
+        raise RuntimeError(f"O Mercado Livre não confirmou o ID do Catálogo associado a {traditional_id}. Confira a conta antes de tentar novamente.")
+    official = dict(created)
+    try:
+        official.update(client.item_for_clone(created["id"]))
+    except Exception:
+        pass
+    relation_confirmed = any(str(row.get("id") or "") == traditional_id for row in official.get("item_relations") or [])
+    if not relation_confirmed:
+        try:
+            latest = client.item_for_clone(traditional_id)
+            relation_confirmed = any(str(row.get("id") or "") == str(created["id"]) for row in latest.get("item_relations") or [])
+        except Exception:
+            pass
+    confirmed = (str(official.get("id") or "") == str(created["id"]) and relation_confirmed and official.get("catalog_listing") is True
+                 and str(official.get("catalog_product_id") or "") == catalog_product_id
+                 and str(official.get("seller_id") or "") == str(seller_id))
+    return official, confirmed, False
+
+
+def publish_linked_assisted_product(payload, request, actor, accounts, variants):
+    results = []
+    publication_id = str(request.get("publication_id") or uuid.uuid4().hex)[:100]
+    product_id = clean_attribute_value((request.get("draft") or {}).get("catalog_product_id"))
+    with ASSISTED_PUBLICATION_LOCK:
+        for account in accounts:
+            client = account_client(account)
+            for variant in variants:
+                base = {"account": account.get("nickname"), "account_id": account.get("id"), "listing_type_id": variant["listing_type_id"]}
+                traditional_id = ""
+                try:
+                    existing = next((row for row in payload.get("catalog") or [] if
+                                     row.get("account_id") == account.get("id")
+                                     and row.get("listing_type_id") == variant["listing_type_id"]
+                                     and row.get("assisted_publication_id") == publication_id
+                                     and row.get("assisted_publication_mode") == "traditional"), None)
+                    if existing:
+                        traditional_id = existing["id"]
+                        results.append({**base, "status": "created", "publication_mode": "traditional", "item_id": traditional_id,
+                                        "title": existing.get("title"), "permalink": existing.get("permalink"), "reused": True})
+                    else:
+                        single = {**request, "publication_id": publication_id, "account_ids": [account["id"]],
+                                  "variants": [variant], "publication_modes": ["traditional"]}
+                        published = publish_assisted_product_operation(payload, single, actor, linked_catalog_product_id=product_id)
+                        results.extend(published["results"])
+                        traditional_id = next((row["item_id"] for row in published["results"] if row.get("status") == "created"), "")
+                    if not traditional_id:
+                        results.append({**base, "status": "error", "publication_mode": "catalog",
+                                        "error": "A publicação de Catálogo aguarda a criação do tradicional."})
+                        continue
+                    prior_catalog = next((row for row in payload.get("catalog") or [] if
+                                          row.get("account_id") == account.get("id")
+                                          and row.get("assisted_traditional_item_id") == traditional_id), None)
+                    if prior_catalog:
+                        # A known opt-in must only be checked again, never posted twice.
+                        official = client.item_for_clone(prior_catalog["id"])
+                        latest = client.item_for_clone(traditional_id)
+                        confirmed = (str(official.get("id") or "") == str(prior_catalog["id"])
+                                     and str(latest.get("id") or "") == traditional_id
+                                     and str(latest.get("seller_id") or "") == str(account.get("seller_id"))
+                                     and official.get("catalog_listing") is True and str(official.get("catalog_product_id") or "") == product_id
+                                     and str(official.get("seller_id") or "") == str(account.get("seller_id"))
+                                     and (any(str(r.get("id")) == traditional_id for r in official.get("item_relations") or [])
+                                          or any(str(r.get("id")) == str(official.get("id")) for r in latest.get("item_relations") or [])))
+                        reused = True
+                    else:
+                        attempts = payload.setdefault("assisted_catalog_opt_ins", {})
+                        attempt_key = f"{account['id']}:{traditional_id}:{product_id}"
+                        def record_attempt():
+                            attempts[attempt_key] = {"traditional_item_id": traditional_id, "catalog_product_id": product_id}
+                            write_payload(payload)
+                        official, confirmed, reused = create_linked_catalog_listing(
+                            client, traditional_id, product_id, account.get("seller_id"),
+                            before_opt_in=record_attempt, verify_only=attempt_key in attempts,
+                        )
+                    prior_catalog = prior_catalog or next((row for row in payload.get("catalog") or [] if
+                                                          row.get("account_id") == account.get("id")
+                                                          and row.get("id") == official["id"]), None)
+                    normalized = synced_catalog_item(account, official, previous=prior_catalog)
+                    normalized.update({"assisted_publication_id": publication_id, "assisted_publication_mode": "catalog",
+                                       "assisted_traditional_item_id": traditional_id})
+                    if prior_catalog:
+                        prior_catalog.update(normalized)
+                    else:
+                        payload.setdefault("catalog", []).append(normalized)
+                    result = {**base, "status": "created", "publication_mode": "catalog", "item_id": official["id"],
+                              "title": official.get("title"), "permalink": official.get("permalink"), "reused": reused,
+                              "traditional_item_id": traditional_id, "catalog_link_status": "linked" if confirmed else "pending"}
+                    if not confirmed:
+                        result["warning"] = "Catálogo criado pelo fluxo de associação, mas o vínculo ainda não foi confirmado. Ao repetir, apenas verificaremos esse anúncio."
+                    results.append(result)
+                    append_item_log(payload, normalized, actor or {}, "Catálogo associado ao tradicional", {"traditional_item_id": traditional_id, "confirmed": confirmed})
+                    write_payload(payload)
+                except Exception as exc:
+                    results.append({**base, "status": "error", "publication_mode": "catalog" if traditional_id else "traditional",
+                                    "traditional_item_id": traditional_id, "error": friendly_clone_error(exc)})
+                update_async_operation_progress("Conferindo publicações vinculadas.", len(results), len(accounts) * len(variants) * 2, results[-1])
+    return {"created": sum(row.get("status") == "created" and not row.get("reused") for row in results),
+            "reused": sum(bool(row.get("reused")) for row in results),
+            "failed": sum(row.get("status") == "error" for row in results), "results": results,
+            "requires_review": any(row.get("pending_fields") or row.get("warning") for row in results),
+            "publication_id": publication_id}
+
+
+def publish_assisted_product_operation(payload, request, actor=None, *, linked_catalog_product_id=""):
     if (actor or {}).get("role") == "viewer":
         raise RuntimeError("Usuários com acesso somente para leitura não podem publicar anúncios.")
     account_ids = list(dict.fromkeys(str(value) for value in request.get("account_ids") or [] if value))
@@ -15025,6 +15538,8 @@ def publish_assisted_product_operation(payload, request, actor=None):
             f"Publique no máximo {ASSISTED_PUBLICATION_MAX_COMBINATIONS} combinações "
             "de conta, tipo e modalidade por operação."
         )
+    if len(publication_modes) == 2:
+        return publish_linked_assisted_product(payload, request, actor, accounts, variants)
     draft = request.get("draft") or {}
     requested_stores = request.get("official_store_ids") if isinstance(request.get("official_store_ids"), dict) else {}
     description = str(draft.get("description") or "").strip()[:50000]
@@ -15056,6 +15571,9 @@ def publish_assisted_product_operation(payload, request, actor=None):
                 if publication_mode == "traditional":
                     mode_draft["catalog_product_id"] = ""
                 create_payload, source_item = build_assisted_publication_payload(mode_draft, variant)
+                if publication_mode == "traditional" and linked_catalog_product_id:
+                    create_payload["catalog_product_id"] = linked_catalog_product_id
+                    source_item["catalog_product_id"] = linked_catalog_product_id
                 destination_stores = target_official_stores(
                     client, account, payload.get("catalog") or [],
                 )
@@ -15092,14 +15610,20 @@ def publish_assisted_product_operation(payload, request, actor=None):
                 if package_adjustments:
                     created.setdefault("_clone_adjustments", []).extend(package_adjustments)
                 item_id = created.get("id")
+                description_warning = ""
                 if description and item_id and publication_mode != "catalog":
-                    client.create_item_description(item_id, description)
+                    try:
+                        client.create_item_description(item_id, description)
+                    except Exception:
+                        description_warning = "Anúncio criado, mas a descrição não foi salva. Revise a descrição no anúncio existente."
                 try:
                     verified = client.item_for_clone(item_id) if item_id else {}
                 except Exception:
                     verified = {}
                 official = {**source_item, **created, **verified}
                 normalized = synced_catalog_item(account, official)
+                normalized["assisted_publication_id"] = str(request.get("publication_id") or "")[:100]
+                normalized["assisted_publication_mode"] = publication_mode
                 normalized["description_override"] = description
                 payload.setdefault("catalog", []).append(normalized)
                 append_item_log(payload, normalized, actor or {}, "Cadastro assistido por link", {
@@ -15112,6 +15636,7 @@ def publish_assisted_product_operation(payload, request, actor=None):
                     "publication_mode": publication_mode,
                     "title": official.get("title") or draft.get("title"),
                     "permalink": official.get("permalink") or created.get("permalink") or "",
+                    "warning": description_warning,
                 })
             except Exception as exc:
                 pending_fields = list(getattr(exc, "pending_fields", []) or [])
@@ -15145,8 +15670,13 @@ def publish_assisted_product_operation(payload, request, actor=None):
         "created": created_count,
         "failed": sum(row.get("status") == "error" for row in results),
         "results": results,
-        "requires_review": has_pending_fields,
+        "requires_review": has_pending_fields or any(row.get("warning") for row in results),
     }
+
+
+def publish_assisted_product_request(request, actor):
+    with ASSISTED_PUBLICATION_LOCK:
+        return publish_assisted_product_operation(read_payload(), request, actor)
 
 
 def statistics_date_window(date_from, date_to):
@@ -15650,7 +16180,50 @@ def query_sku_statistics(payload, request):
     }
 
 
+def no_sales_min_available_days(request):
+    value = (request or {}).get("min_available_days")
+    try:
+        days = int(value or 0)
+        if isinstance(value, float) and value != days:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise ValueError("Informe um número inteiro de dias de disponibilidade.")
+    if not 0 <= days <= 36500:
+        raise ValueError("Os dias de disponibilidade devem estar entre 0 e 36500.")
+    return days
+
+
+def no_sales_availability_summary(items, reference=None):
+    reference = reference or datetime.now(APP_TZ)
+
+    def known_dates(field, candidates):
+        return [parsed for item in candidates if (parsed := parse_meli_datetime(item.get(field)))]
+
+    available = [item for item in items if item_is_available(item)]
+    starts = known_dates("available_since", available)
+    since = min(starts) if starts else None
+    first_seen = known_dates("first_seen_at", items)
+    reactivated = known_dates("last_reactivated_at", items)
+    restocked = known_dates("last_restocked_at", items)
+    return {
+        "first_seen_at": min(first_seen).isoformat() if first_seen else "",
+        "last_reactivated_at": max(reactivated).isoformat() if reactivated else "",
+        "last_restocked_at": max(restocked).isoformat() if restocked else "",
+        "available_since": since.isoformat() if since else "",
+        "available_days": max(0, (reference - since).days) if since else None,
+        "availability_note": (
+            "Disponibilidade acompanhada; histórico anterior desconhecido"
+            if since and any(parse_meli_datetime(item.get("available_since")) == since and item.get("availability_basis") == "observed" for item in available)
+            else "Desde retorno observado" if since
+            else "Histórico não registrado" if available
+            else "Sem estoque disponível"
+        ),
+    }
+
+
 def active_skus_without_sales_rows(payload, request, sold_rows):
+    min_available_days = no_sales_min_available_days(request)
+    reference = datetime.now(APP_TZ)
     account_filter = str((request or {}).get("account") or "all")
     sku_filter = normalized_attribute_label((request or {}).get("sku") or "")
     brand_filter = normalized_attribute_label((request or {}).get("brand") or "")
@@ -15707,6 +16280,7 @@ def active_skus_without_sales_rows(payload, request, sold_rows):
                 "listing_types": set(),
                 "active_listings": 0,
                 "current_stock": 0,
+                "listings": [],
             },
         )
         if not row["thumbnail"] and item.get("thumbnail"):
@@ -15722,6 +16296,16 @@ def active_skus_without_sales_rows(payload, request, sold_rows):
             else listing_type or "Não informado"
         )
         row["active_listings"] += 1
+        raw_price = optional_money(item.get("price"))
+        row["listings"].append({
+            "item_id": item.get("id") or "",
+            "account": item_account_name,
+            "price": round(raw_price, 2) if raw_price is not None and math.isfinite(raw_price) and raw_price >= 0 else None,
+            **{field: item.get(field) for field in (
+                "meli_status", "stock", "first_seen_at", "last_reactivated_at", "last_restocked_at",
+                "available_since", "availability_basis",
+            )},
+        })
         try:
             row["current_stock"] += max(0, int(float(item.get("stock") or 0)))
         except (TypeError, ValueError):
@@ -15730,9 +16314,21 @@ def active_skus_without_sales_rows(payload, request, sold_rows):
     rows = []
     for sku, row in grouped.items():
         last_sale = last_sales.get(sku) if isinstance(last_sales, dict) else None
+        availability = no_sales_availability_summary(row["listings"], reference)
+        if min_available_days and (availability["available_days"] is None or availability["available_days"] < min_available_days):
+            continue
+        prices = [listing["price"] for listing in row["listings"] if listing["price"] is not None]
+        row["listings"].sort(key=lambda listing: (listing["account"], listing["item_id"]))
         rows.append(
             {
                 **row,
+                **availability,
+                "min_sale_price": min(prices) if prices else None,
+                "max_sale_price": max(prices) if prices else None,
+                "listing_prices_label": "; ".join(
+                    f"{listing['account']} / {listing['item_id']}: {brl_label(listing['price']) if listing['price'] is not None else 'Não informado'}"
+                    for listing in row["listings"]
+                ),
                 "accounts": sorted(row["accounts"]),
                 "item_ids": sorted(row["item_ids"]),
                 "listing_types": sorted(row["listing_types"]),
@@ -15744,6 +16340,7 @@ def active_skus_without_sales_rows(payload, request, sold_rows):
 
 
 def query_active_skus_without_sales(payload, request):
+    min_available_days = no_sales_min_available_days(request)
     sales_request = {**(request or {}), "flex": "all"}
     sales = query_sku_statistics(payload, sales_request)
     rows = active_skus_without_sales_rows(payload, request, sales.get("rows") or [])
@@ -15756,6 +16353,7 @@ def query_active_skus_without_sales(payload, request):
         "filters": {
             "sku": normalized_attribute_label((request or {}).get("sku") or ""),
             "brand": normalized_attribute_label((request or {}).get("brand") or ""),
+            "min_available_days": min_available_days,
         },
         "rows": rows,
         "summary": {
@@ -16489,7 +17087,7 @@ def shipment_financials(client, order, seller_id, is_flex, catalog_item, local_c
     return result
 
 
-def query_sales_report(payload, request):
+def query_sales_report(payload, request, *, target_skus=None, paid_only=False):
     start, end, _, _ = statistics_date_window(request.get("date_from"), request.get("date_to"))
     account_filter = str(request.get("account") or "all")
     shipping_method_filter = str(request.get("shipping_method") or "all").lower()
@@ -16527,6 +17125,7 @@ def query_sales_report(payload, request):
     rows = []
     warnings = []
     truncated = False
+    orders_complete = True
     ignored_statuses = {"cancelled", "canceled", "invalid"}
     for account in accounts:
         client = account_client(account)
@@ -16541,7 +17140,20 @@ def query_sales_report(payload, request):
             truncated = truncated or account_truncated
         except Exception as exc:
             warnings.append(f"{account.get('nickname')}: {policy_error_message(exc, 'a leitura das vendas do período')}")
+            orders_complete = False
             continue
+        if paid_only:
+            orders = [order for order in orders if str(order.get("status") or "").lower() == "paid"]
+        if target_skus is not None:
+            # Keep every line of a matching cart for correct fee/shipping allocations.
+            orders = [order for order in orders if any(
+                normalized_sku_key(order_item_sku(line, (
+                    catalog_by_account_item.get((str(account.get("id") or ""), str((line.get("item") or {}).get("id") or "")))
+                    or catalog_by_name_item.get((str(account.get("nickname") or ""), str((line.get("item") or {}).get("id") or "")))
+                    or {}
+                ))) in target_skus
+                for line in order.get("order_items") or []
+            )]
         flex_by_order = {}
         billing_period_by_order = {}
         for order in orders:
@@ -16675,6 +17287,8 @@ def query_sales_report(payload, request):
                     continue
                 external_flex_carrier = carrier_allocations[line_index]
                 sku = order_item_sku(order_item, catalog_item) or "-"
+                if target_skus is not None and normalized_sku_key(sku) not in target_skus:
+                    continue
                 if sku_filter and normalized_sku_key(sku) != sku_filter:
                     continue
                 item_brand = catalog_item.get("brand") or ""
@@ -16755,6 +17369,7 @@ def query_sales_report(payload, request):
         "warnings": warnings,
         "truncated": truncated,
         "flex_carrier_cost": flex_carrier_cost,
+        "orders_complete": orders_complete and not truncated,
         "generated_at": now_label(),
     }
 
@@ -19759,6 +20374,15 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
                 ("listing_types_label", "Tipos", "text"),
                 ("item_ids_label", "Anúncios ML", "text"),
                 ("last_sale_at", "Última venda sincronizada", "text"),
+                ("min_sale_price", "Menor preço de venda atual", "currency"),
+                ("max_sale_price", "Maior preço de venda atual", "currency"),
+                ("listing_prices_label", "Preços atuais por conta / anúncio", "text"),
+                ("first_seen_at", "Primeira identificação no Competidor", "datetime"),
+                ("last_reactivated_at", "Última reativação observada", "datetime"),
+                ("last_restocked_at", "Último retorno de estoque observado", "datetime"),
+                ("available_since", "Disponibilidade acompanhada desde", "datetime"),
+                ("available_days", "Dias disponíveis acompanhados", "integer"),
+                ("availability_note", "Histórico de disponibilidade", "text"),
             ]
             rows = [
                 {
@@ -19778,6 +20402,10 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
                     "Conta": filters.get("account") or "Todas",
                     "SKU": filters.get("sku") or "Todos",
                     "Somente anúncios": "Ativos",
+                    "Disponível há pelo menos (dias)": (result.get("filters") or {}).get("min_available_days", no_sales_min_available_days(filters)),
+                    "Disponibilidade": "Dias completos até a consulta, do anúncio ativo com estoque e início conhecido mais antigo do SKU. Histórico anterior ao acompanhamento é desconhecido.",
+                    "Datas": "Referem-se aos anúncios ativos selecionados. Reativação e retorno de estoque são datas de detecção; campos vazios indicam histórico não registrado.",
+                    "Preços": "Preços atuais sincronizados por anúncio, não faturamento do período.",
                 },
             )
         columns = [
@@ -20672,6 +21300,7 @@ def apply_spreadsheet_change(payload, row, actor):
     verified = verify_package_update(client, item_id, expected_package) if expected_package else {}
     if expected_gtin:
         verified = verify_gtin_update(client, item_id, expected_gtin)
+    availability_before = dict(item)
     local_changes = {}
     for key, local_key in (("price", "price"), ("available_quantity", "stock"), ("title", "title")):
         if key in update:
@@ -20698,6 +21327,7 @@ def apply_spreadsheet_change(payload, row, actor):
         local_changes["shipping_logistic_type"] = {"from": item.get("shipping_logistic_type"), "to": update["shipping"]["logistic_type"]}
         item["shipping_logistic_type"] = update["shipping"]["logistic_type"]
     item["updated_at"] = now_label()
+    track_item_availability(item, availability_before)
     append_item_log(payload, item, actor, "Atualização por planilha", local_changes)
     return {"item_id": item_id, "status": "updated", "changes": list(local_changes)}
 
@@ -22469,7 +23099,7 @@ class App(BaseHTTPRequestHandler):
                 actor = self.current_user(payload)
                 operation = start_async_operation(
                     "product_publish",
-                    lambda: publish_assisted_product_operation(payload, request_copy, actor),
+                    lambda: publish_assisted_product_request(request_copy, actor),
                     "Publicação dos novos anúncios adicionada à fila.",
                     priority="manual",
                     idempotency_key=(
@@ -23000,6 +23630,7 @@ class App(BaseHTTPRequestHandler):
                 stock_transition = None
                 for item in payload.get("catalog", []):
                     if item.get("id") == item_id:
+                        availability_before = dict(item)
                         changes = {}
                         if "price" in update:
                             changes["price"] = {"from": item.get("price"), "to": update["price"]}
@@ -23039,6 +23670,7 @@ class App(BaseHTTPRequestHandler):
                             item["meli_status"] = "active"
                         item["updated_at"] = now_label()
                         apply_item_net_values(item)
+                        track_item_availability(item, availability_before)
                         append_item_log(payload, item, user, "Atualização manual", changes)
                 if stock_transition and stock_transition[0] > 0 and stock_transition[1] == 0:
                     old_stock, new_stock, changed_item = stock_transition
@@ -23380,6 +24012,7 @@ if __name__ == "__main__":
     threading.Thread(target=resume_pending_official_syncs, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
     threading.Thread(target=auto_official_sync_loop, daemon=True).start()
+    threading.Thread(target=replenishment_alert_loop, name="replenishment-alerts", daemon=True).start()
     threading.Thread(target=auto_sale_fee_loop, daemon=True).start()
     threading.Thread(target=auto_catalog_competition_loop, daemon=True).start()
     threading.Thread(target=price_schedule_loop, name="price-schedules", daemon=True).start()
