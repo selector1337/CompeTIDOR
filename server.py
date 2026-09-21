@@ -27,6 +27,8 @@ import unicodedata
 import urllib.error
 import urllib.request
 import uuid
+import sys
+import official_store_report
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 
 try:
@@ -655,6 +657,8 @@ def write_payload(payload, replace_collections=None):
             latest.get("item_logs", []),
         )
         if incoming_revision < latest_revision:
+            for field in ("official_store_rules", "official_store_batches"):
+                payload[field] = {**(payload.get(field) or {}), **(latest.get(field) or {})}
             for collection in ("users", "accounts"):
                 if collection not in replace_collections:
                     payload[collection] = merge_critical_records(
@@ -1026,6 +1030,7 @@ def public_payload(payload, actor=None, include_catalog=True):
     clean.pop("_revision", None)
     clean.pop("operations_snapshot", None)
     clean.pop("catalog_counts_snapshot", None)
+    clean.pop("official_store_batches", None)
     return clean
 
 
@@ -22714,6 +22719,10 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/item/activate_pickup",
             "/api/meli/item/delete",
             "/api/clone/preview",
+            "/api/reports/official-stores/query",
+            "/api/reports/official-stores/rules",
+            "/api/reports/official-stores/preview",
+            "/api/reports/official-stores/execute",
             "/api/clone/execute",
             "/api/clone/execute-batch",
             "/api/products/import",
@@ -23825,6 +23834,28 @@ class App(BaseHTTPRequestHandler):
                 )
                 write_payload(payload)
                 self.send_json({"ok": True, "official": official, "item": item})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path.startswith("/api/reports/official-stores/"):
+            action = parsed.path.rsplit("/", 1)[-1]
+            actor = self.current_user(payload)
+            if action != "query" and (actor or {}).get("role") == "viewer":
+                self.send_json({"error": "Usuário somente leitura não pode alterar regras ou publicar."}, status=403)
+                return
+            handlers = {
+                "query": lambda: official_store_report.report(sys.modules[__name__]),
+                "rules": lambda: official_store_report.save_rules(sys.modules[__name__], request),
+                "preview": lambda: official_store_report.preview(sys.modules[__name__], request),
+                "execute": lambda: official_store_report.execute(sys.modules[__name__], request),
+            }
+            if action not in handlers:
+                self.send_json({"error": "Operação desconhecida."}, status=404)
+                return
+            try:
+                operation = start_async_operation("official_stores_" + action, handlers[action], "Processando lojas oficiais.")
+                self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
             return

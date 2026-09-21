@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260904-meli-wid-catalog-v4" />
+  <link rel="stylesheet" href="/styles.css?v=20260921-official-stores" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -675,10 +675,27 @@
               <option value="sales">Vendas por período</option>
               <option value="brand">Vendas e reposição por marca</option>
               <option value="equalization">Cobertura e consistência por SKU</option>
+              <option value="official-stores">Anúncios por loja oficial</option>
             </select>
           </label>
         </div>
         <div id="reports-statistics-host" data-report-section="statistics" hidden></div>
+        <div class="panel" id="official-stores-report" data-report-section="official-stores" hidden>
+          <div class="panel-heading"><div><p class="eyebrow">Cobertura por conta, loja e SKU</p><h2>Anúncios por loja oficial</h2></div><button type="button" class="primary" id="stores-load">Consultar / atualizar relatório</button></div>
+          <p>Selecione os produtos e destinos para criar somente os anúncios que faltam. Clássico e Premium usam os mesmos preços em todas as contas. A cobertura exibida usa a base sincronizada; antes de publicar, os anúncios serão conferidos novamente no Mercado Livre.</p>
+          <p id="stores-progress" role="status" aria-live="polite"></p>
+          <p id="stores-errors" role="alert" hidden></p>
+          <div id="stores-content" hidden>
+            <details><summary>Regras de marca por loja oficial</summary><p>Deixe em branco para permitir todas as marcas. Separe marcas por vírgula. A regra vale para a loja em todas as contas; produtos com marca ausente ou divergente não entram em lojas restritas.</p><div id="stores-rules" class="store-rule-grid"></div><button type="button" id="stores-save-rules">Salvar regras</button></details>
+            <h3>Contas e lojas de destino</h3><button type="button" id="stores-all-targets">Selecionar todos os destinos</button><button type="button" id="stores-no-targets">Limpar destinos</button><div id="stores-targets" class="store-rule-grid"></div>
+            <div class="filter-bar"><label>SKU ou produto<input id="stores-search" type="search" /></label><label>Marca<select id="stores-brand"><option value="">Todas</option></select></label><label>Loja de referência<select id="stores-reference"><option value="">Todas</option></select></label><label><input id="stores-missing" type="checkbox" checked /> Apenas com anúncios faltantes nos destinos</label></div>
+            <div class="report-actions"><button type="button" id="stores-select-filtered">Selecionar todos os produtos filtrados</button><button type="button" id="stores-clear-selected">Limpar produtos</button><button type="button" class="primary" id="stores-preview">Preparar publicação dos selecionados</button></div>
+            <p id="stores-selection"></p><div class="store-matrix-scroll"><table class="store-matrix"><thead id="stores-head"></thead><tbody id="stores-rows"></tbody></table></div>
+            <div class="report-actions"><button type="button" id="stores-prev">Anterior</button><span id="stores-page"></span><button type="button" id="stores-next">Próxima</button></div>
+            <h3>Lotes de publicação</h3><label>Consultar ou retomar lote<select id="stores-batches"><option value="">Selecione</option></select></label>
+            <div id="stores-batch"></div>
+          </div>
+        </div>
         <div class="panel catalog-panel sales-report-panel" data-report-section="sales" hidden>
           <div class="panel-heading">
             <div>
@@ -1469,6 +1486,7 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260904-meli-wid-catalog-v4"></script>
+  <script src="/app.js?v=20260921-official-stores"></script>
+  <script src="/official-stores.js?v=20260921"></script>
   </body>
 </html>
