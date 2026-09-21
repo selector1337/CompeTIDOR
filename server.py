@@ -67,9 +67,11 @@ def _build_official_store_report_service():
                         continue
                     name = store.get("name") or store.get("fantasy_name") or store_id
                     default = [name] if key(app, name) in ("MXL", "WIN HOME") else []
+                    dylan_only = key(app, " ".join(name.split())) == "DYLAN CELEBRATE"
                     rows.append({"id": f"{account['id']}:{store_id}", "account_id": account["id"],
                                  "account": account.get("nickname"), "store_id": store_id, "name": name,
-                                 "brands": payload.get("official_store_rules", {}).get(store_id, default)})
+                                 "fixed_brands": dylan_only,
+                                 "brands": ["Dylan Celebrate"] if dylan_only else payload.get("official_store_rules", {}).get(store_id, default)})
             except Exception as exc:
                 errors.append({"account": account.get("nickname"), "error": str(exc)})
         return rows, errors
@@ -117,7 +119,7 @@ def _build_official_store_report_service():
         for row in rows:
             row["sources"] = [{"id": i["id"], "account_id": i.get("account_id"), "account": i.get("account"),
                                "official_store_id": i.get("official_store_id"), "listing_type_id": i.get("listing_type_id"),
-                               "price": i.get("price")} for i in row["sources"]]
+                               "price": i.get("price"), "status": app.normalized_meli_status(i.get("meli_status"))} for i in row["sources"]]
         return {"destinations": targets, "rows": rows, "errors": errors,
                 "batches": list(payload.get("official_store_batches", {}).values())[-20:]}
 
@@ -131,6 +133,8 @@ def _build_official_store_report_service():
             for store_id, brands in incoming.items():
                 if store_id not in valid or not isinstance(brands, list) or any(not isinstance(b, str) for b in brands):
                     raise RuntimeError("Regra de loja inválida.")
+                if any(t["store_id"] == store_id and t.get("fixed_brands") for t in targets) and {key(app, b) for b in brands} != {"DYLAN CELEBRATE"}:
+                    raise RuntimeError("A loja Dylan Celebrate permite somente produtos da marca Dylan Celebrate.")
             with app.DATA_LOCK:
                 payload = app.read_payload()
                 payload.setdefault("official_store_rules", {}).update({s: list(dict.fromkeys(b.strip() for b in brands if b.strip()))

@@ -23,9 +23,11 @@
     const text = $('stores-search').value.toLocaleLowerCase();
     const brand = $('stores-brand').value;
     const ref = $('stores-reference').value;
+    const status = $('stores-status').value;
     return data.rows.filter(r => (!text || `${r.sku} ${r.title}`.toLocaleLowerCase().includes(text))
       && (!brand || r.brands.includes(brand))
       && (!ref || kinds.some(k => r.cells[ref]?.[k]?.status === 'existing'))
+      && (!status || (r.sources || []).some(s => s.status === status && (!ref || `${s.account_id}:${s.official_store_id}` === ref)))
       && (!$('stores-missing').checked || [...targets].some(t => kinds.some(k => r.cells[t]?.[k]?.status === 'missing'))));
   }
   function renderRows() {
@@ -65,7 +67,7 @@
     $('stores-content').hidden = false;
     $('stores-targets').innerHTML = data.destinations.map(t => `<label><input type="checkbox" data-store-target="${attr(t.id)}" ${targets.has(t.id) ? 'checked' : ''}>${esc(t.account)} — ${esc(t.name)}</label>`).join('') || 'Nenhuma loja autorizada encontrada nas contas conectadas.';
     const stores = [...new Map(data.destinations.map(t => [t.store_id, t])).values()];
-    $('stores-rules').innerHTML = stores.map(t => `<label>${esc(t.name)}<input data-store-rule="${attr(t.store_id)}" value="${attr(t.brands.join(', '))}" placeholder="Todas as marcas"></label>`).join('');
+    $('stores-rules').innerHTML = stores.map(t => `<label>${esc(t.name)}${t.fixed_brands ? ' (marca obrigatória)' : ''}<input data-store-rule="${attr(t.store_id)}" value="${attr(t.brands.join(', '))}" placeholder="Todas as marcas" ${t.fixed_brands ? 'disabled' : ''}></label>`).join('');
     $('stores-brand').innerHTML = '<option value="">Todas</option>' + [...new Set(data.rows.flatMap(r => r.brands))].sort().map(b => `<option>${esc(b)}</option>`).join('');
     $('stores-reference').innerHTML = '<option value="">Todas</option>' + data.destinations.map(t => `<option value="${attr(t.id)}">${esc(t.account)} / ${esc(t.name)}</option>`).join('');
     $('stores-errors').hidden = !data.errors.length;
@@ -75,14 +77,19 @@
   $('stores-load').onclick = () => run(load);
   $('stores-save-rules').onclick = () => run(async () => {
     const rules = {};
-    document.querySelectorAll('[data-store-rule]').forEach(i => rules[i.dataset.storeRule] = i.value.split(',').map(v => v.trim()).filter(Boolean));
+    document.querySelectorAll('[data-store-rule]:not(:disabled)').forEach(i => rules[i.dataset.storeRule] = i.value.split(',').map(v => v.trim()).filter(Boolean));
     await operation('rules', {rules}); await load(); batch = null; renderBatch();
   });
   function setTargets(all) { if (busy || !data) return; targets = new Set(all ? data.destinations.map(t => t.id) : []); document.querySelectorAll('[data-store-target]').forEach(i => i.checked = all); page = 0; renderRows(); }
   $('stores-all-targets').onclick = () => setTargets(true);
   $('stores-no-targets').onclick = () => setTargets(false);
   $('stores-targets').onchange = e => { const id = e.target.dataset.storeTarget; if (!id || busy) return; e.target.checked ? targets.add(id) : targets.delete(id); page = 0; renderRows(); };
-  ['stores-search', 'stores-brand', 'stores-reference', 'stores-missing'].forEach(id => $(id).addEventListener('input', () => {page = 0; renderRows();}));
+  ['stores-search', 'stores-status', 'stores-brand', 'stores-reference', 'stores-missing'].forEach(id => $(id).addEventListener('input', () => {
+    page = 0;
+    const visible = new Set(filtered().map(r => r.sku));
+    selected = new Set([...selected].filter(sku => visible.has(sku)));
+    renderRows();
+  }));
   $('stores-select-filtered').onclick = () => { filtered().forEach(r => selected.add(r.sku)); renderRows(); };
   $('stores-clear-selected').onclick = () => { selected.clear(); renderRows(); };
   $('stores-rows').onchange = e => {

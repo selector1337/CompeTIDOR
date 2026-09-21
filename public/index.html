@@ -688,7 +688,7 @@
           <div id="stores-content" hidden>
             <details><summary>Regras de marca por loja oficial</summary><p>Deixe em branco para permitir todas as marcas. Separe marcas por vírgula. A regra vale para a loja em todas as contas; produtos com marca ausente ou divergente não entram em lojas restritas.</p><div id="stores-rules" class="store-rule-grid"></div><button type="button" id="stores-save-rules">Salvar regras</button></details>
             <h3>Contas e lojas de destino</h3><button type="button" id="stores-all-targets">Selecionar todos os destinos</button><button type="button" id="stores-no-targets">Limpar destinos</button><div id="stores-targets" class="store-rule-grid"></div>
-            <div class="filter-bar"><label>SKU ou produto<input id="stores-search" type="search" /></label><label>Marca<select id="stores-brand"><option value="">Todas</option></select></label><label>Loja de referência<select id="stores-reference"><option value="">Todas</option></select></label><label><input id="stores-missing" type="checkbox" checked /> Apenas com anúncios faltantes nos destinos</label></div>
+            <div class="filter-bar"><label>SKU ou produto<input id="stores-search" type="search" /></label><label>Status dos anúncios de origem<select id="stores-status"><option value="">Todos</option><option value="active">Ativos</option><option value="paused">Pausados</option></select></label><label>Marca<select id="stores-brand"><option value="">Todas</option></select></label><label>Loja de referência<select id="stores-reference"><option value="">Todas</option></select></label><label><input id="stores-missing" type="checkbox" checked /> Apenas com anúncios faltantes nos destinos</label></div>
             <div class="report-actions"><button type="button" id="stores-select-filtered">Selecionar todos os produtos filtrados</button><button type="button" id="stores-clear-selected">Limpar produtos</button><button type="button" class="primary" id="stores-preview">Preparar publicação dos selecionados</button></div>
             <p id="stores-selection"></p><div class="store-matrix-scroll"><table class="store-matrix"><thead id="stores-head"></thead><tbody id="stores-rows"></tbody></table></div>
             <div class="report-actions"><button type="button" id="stores-prev">Anterior</button><span id="stores-page"></span><button type="button" id="stores-next">Próxima</button></div>
@@ -1487,6 +1487,6 @@
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
   <script src="/app.js?v=20260921-official-stores"></script>
-  <script src="/official-stores.js?v=20260921"></script>
+  <script src="/official-stores.js?v=20260921-status-dylan"></script>
   </body>
 </html>
