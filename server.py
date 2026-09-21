@@ -28,8 +28,330 @@ import urllib.error
 import urllib.request
 import uuid
 import sys
-import official_store_report
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+
+def _build_official_store_report_service():
+    """Keep report startup self-contained for installations deploying server.py alone."""
+    from types import SimpleNamespace
+    """Official store coverage and durable, explicitly targeted publication batches."""
+    import copy
+    import math
+    import re
+    import threading
+    import uuid
+    from collections import Counter
+
+    LOCK = threading.RLock()
+    KINDS = ("gold_special", "gold_pro")
+
+
+    def key(app, value):
+        return app.normalized_sku_key(value)
+
+
+    def destinations(app, payload):
+        rows, errors = [], []
+        for account in payload.get("accounts", []):
+            if not account.get("official") or account.get("status") != "connected":
+                continue
+            try:
+                response = app.account_client(account).user_brands(account["seller_id"], interactive=True)
+                if isinstance(response, dict) and response.get("status") and str(response["status"]).upper() not in ("LINKED", "ACTIVE"):
+                    raise RuntimeError("O Mercado Livre não confirmou o credenciamento desta conta às lojas oficiais.")
+                brands = response.get("brands", []) if isinstance(response, dict) else response
+                if isinstance(brands, dict):
+                    brands = [brands]
+                for store in brands or []:
+                    store_id = str(store.get("official_store_id") or "")
+                    if not store_id or str(store.get("status", "active")).lower() not in ("active", "online"):
+                        continue
+                    name = store.get("name") or store.get("fantasy_name") or store_id
+                    default = [name] if key(app, name) in ("MXL", "WIN HOME") else []
+                    rows.append({"id": f"{account['id']}:{store_id}", "account_id": account["id"],
+                                 "account": account.get("nickname"), "store_id": store_id, "name": name,
+                                 "brands": payload.get("official_store_rules", {}).get(store_id, default)})
+            except Exception as exc:
+                errors.append({"account": account.get("nickname"), "error": str(exc)})
+        return rows, errors
+
+
+    def allowed(app, product, destination):
+        brands = destination.get("brands") or []
+        return not brands or (len(product["brands"]) == 1 and
+                              key(app, product["brands"][0]) in {key(app, b) for b in brands})
+
+
+    def coverage(app, payload, targets):
+        products = {}
+        for item in payload.get("catalog", []):
+            sku = key(app, item.get("sku"))
+            if not sku or sku in ("-", "SEM-SKU"):
+                continue
+            row = products.setdefault(sku, {"sku": sku, "title": item.get("title", ""), "brands": [], "sources": [], "cells": {}})
+            brand = str(item.get("brand") or "").strip()
+            if brand and key(app, brand) not in {key(app, b) for b in row["brands"]}:
+                row["brands"].append(brand)
+            row["sources"].append(item)
+        for row in products.values():
+            row["sources"].sort(key=lambda item: (item.get("meli_status") != "active", bool(item.get("catalog_listing")), str(item.get("id"))))
+            row["prices"] = {}
+            for kind in KINDS:
+                candidates = [i for i in row["sources"] if i.get("listing_type_id") == kind and float(i.get("price") or 0) > 0]
+                row["prices"][kind] = float(candidates[0]["price"]) if candidates else None
+            for target in targets:
+                cells = {}
+                for kind in KINDS:
+                    items = [i for i in row["sources"] if str(i.get("account_id")) == str(target["account_id"])
+                             and str(i.get("official_store_id")) == target["store_id"] and i.get("listing_type_id") == kind]
+                    cells[kind] = {"status": "existing" if items else "missing" if allowed(app, row, target) else "excluded",
+                                   "items": [{"id": i["id"], "status": i.get("meli_status"), "stock": i.get("stock"),
+                                              "permalink": i.get("permalink")} for i in items]}
+                row["cells"][target["id"]] = cells
+        return sorted(products.values(), key=lambda p: p["sku"])
+
+
+    def report(app):
+        payload = app.read_payload()
+        targets, errors = destinations(app, payload)
+        rows = coverage(app, payload, targets)
+        for row in rows:
+            row["sources"] = [{"id": i["id"], "account_id": i.get("account_id"), "account": i.get("account"),
+                               "official_store_id": i.get("official_store_id"), "listing_type_id": i.get("listing_type_id"),
+                               "price": i.get("price")} for i in row["sources"]]
+        return {"destinations": targets, "rows": rows, "errors": errors,
+                "batches": list(payload.get("official_store_batches", {}).values())[-20:]}
+
+
+    def save_rules(app, request):
+        with LOCK:
+            payload = app.read_payload()
+            targets, _ = destinations(app, payload)
+            valid = {t["store_id"] for t in targets}
+            incoming = request.get("rules") or {}
+            for store_id, brands in incoming.items():
+                if store_id not in valid or not isinstance(brands, list) or any(not isinstance(b, str) for b in brands):
+                    raise RuntimeError("Regra de loja inválida.")
+            with app.DATA_LOCK:
+                payload = app.read_payload()
+                payload.setdefault("official_store_rules", {}).update({s: list(dict.fromkeys(b.strip() for b in brands if b.strip()))
+                                                                       for s, brands in incoming.items()})
+                app.write_payload(payload)
+        return {"ok": True}
+
+
+    def preview(app, request):
+        with LOCK:
+            payload = app.read_payload()
+            targets, _ = destinations(app, payload)
+            selected = set(request.get("destinations") or [])
+            if not selected or not selected.issubset({t["id"] for t in targets}):
+                raise RuntimeError("Selecione destinos autorizados.")
+            targets = [t for t in targets if t["id"] in selected]
+            skus = {key(app, s) for s in request.get("skus", [])}
+            rows = [r for r in coverage(app, payload, targets) if r["sku"] in skus]
+            if not rows or {r["sku"] for r in rows} != skus:
+                raise RuntimeError("Selecione SKUs presentes no relatório.")
+            tasks = []
+            for row in rows:
+                prices = (request.get("prices") or {}).get(row["sku"], row["prices"])
+                for target in targets:
+                    for kind in KINDS:
+                        cell = row["cells"][target["id"]][kind]
+                        status = cell["status"]
+                        price = float(prices.get(kind) or 0)
+                        if not math.isfinite(price):
+                            raise RuntimeError(f"Preço inválido para o SKU {row['sku']}.")
+                        source = next((i for i in row["sources"] if i.get("listing_type_id") == kind), row["sources"][0])
+                        if status == "missing" and (not math.isfinite(price) or price <= 0):
+                            raise RuntimeError(f"Informe o preço {kind} do SKU {row['sku']}.")
+                        tasks.append({"sku": row["sku"], "target": target, "kind": kind, "price": price,
+                                      "source_id": source["id"], "source_account_id": source["account_id"],
+                                      "status": "pending" if status == "missing" else status})
+            batch = {"id": uuid.uuid4().hex, "created_at": app.now_label(), "tasks": tasks, "status": "preview"}
+            persist(app, batch)
+            return batch
+
+
+    def live_inventory(app, account):
+        """Require a complete scan; never infer absence from a truncated/failed read."""
+        client = app.account_client(account)
+        ids = set()
+        for status in ("active", "paused", "under_review", "closed"):
+            scroll, seen = "", set()
+            while True:
+                response = client.seller_items_scan(account["seller_id"], limit=100, scroll_id=scroll, status=status)
+                page = response.get("results")
+                if not isinstance(page, list):
+                    raise RuntimeError("Não foi possível conferir todos os anúncios da conta.")
+                new = set(page) - seen
+                ids.update(page)
+                seen.update(page)
+                total = (response.get("paging") or {}).get("total")
+                if not page and total is not None and len(seen) < int(total):
+                    raise RuntimeError("A consulta de anúncios terminou antes do total informado.")
+                if not page or (total is not None and len(seen) >= int(total)):
+                    break
+                scroll = response.get("scroll_id")
+                if not scroll or not new:
+                    raise RuntimeError("A consulta de anúncios ficou incompleta; publicação interrompida nesta conta.")
+        items = []
+        ids = sorted(ids)
+        for offset in range(0, len(ids), 20):
+            part = ids[offset:offset + 20]
+            result = client.items_bulk(part)
+            if {r.get("id") for r in result} != set(part):
+                raise RuntimeError("A API não retornou todos os anúncios para conferir duplicações.")
+            items.extend(result)
+        return items
+
+
+    def persist(app, batch):
+        # Read fresh metadata on every step so other long-running jobs are preserved.
+        with app.DATA_LOCK:
+            payload = app.read_payload(include_catalog=False)
+            payload.setdefault("official_store_batches", {})[batch["id"]] = copy.deepcopy(batch)
+            app.write_payload(payload)
+
+
+    def execute(app, request):
+        with LOCK:
+            payload = app.read_payload()
+            batch = copy.deepcopy(payload.get("official_store_batches", {}).get(request.get("batch_id")))
+            if not batch:
+                raise RuntimeError("Lote não encontrado. Gere a prévia primeiro.")
+            targets, _ = destinations(app, payload)
+            targets = {t["id"]: t for t in targets}
+            accounts = {a["id"]: a for a in payload.get("accounts", [])}
+            inventories, failures, sources = {}, {}, {}
+            products = {r["sku"]: r for r in coverage(app, payload, list(targets.values()))}
+            batch["status"] = "running"
+            persist(app, batch)
+            for index, task in enumerate(batch["tasks"]):
+                if task["status"] in ("created", "existing", "excluded"):
+                    continue
+                target = targets.get(task["target"]["id"])
+                try:
+                    if not target:
+                        raise RuntimeError("A conta não está mais autorizada nesta loja.")
+                    product = products.get(task["sku"])
+                    if not product or not allowed(app, product, target):
+                        task["status"] = "excluded"
+                        continue
+                    account = accounts[target["account_id"]]
+                    account_id = account["id"]
+                    if account_id not in inventories and account_id not in failures:
+                        try:
+                            inventories[account_id] = live_inventory(app, account)
+                        except Exception as exc:
+                            failures[account_id] = str(exc)
+                    if account_id in failures:
+                        raise RuntimeError(failures[account_id])
+                    inventory = inventories[account_id]
+                    existing = next((i for i in inventory if str(i.get("official_store_id")) == target["store_id"]
+                                     and i.get("listing_type_id") == task["kind"]
+                                     and task["sku"] in {key(app, app.item_sku(i)), *[key(app, app.item_sku(v)) for v in i.get("variations", [])]}), None)
+                    if existing:
+                        task.update(status="existing", item_id=existing["id"], error="")
+                        continue
+                    previous_attempt = any(
+                        old.get("submitted") and old["sku"] == task["sku"] and old["kind"] == task["kind"]
+                        and old["target"]["id"] == target["id"]
+                        for prior in payload.get("official_store_batches", {}).values() for old in prior.get("tasks", [])
+                    )
+                    if task.get("submitted") or previous_attempt:
+                        task.update(status="uncertain", error="Solicitação já enviada; confira o Mercado Livre. Não será repetida enquanto o resultado for incerto.")
+                        continue
+                    source_key = (task["source_account_id"], task["source_id"])
+                    if source_key not in sources:
+                        sources[source_key] = app.clone_source_bundle(
+                            payload, *source_key, include_description=True, force=True,
+                        )
+                    bundle = sources[source_key]
+                    source = copy.deepcopy(bundle["source_item"])
+                    if source.get("variations"):
+                        variants = [v for v in source["variations"] if key(app, app.item_sku(v)) == task["sku"]]
+                        if not variants:
+                            raise RuntimeError("O SKU da variação precisa ser conferido no anúncio origem.")
+                        source["variations"] = variants
+                    elif key(app, app.item_sku(source)) != task["sku"]:
+                        raise RuntimeError("O SKU da origem mudou. Atualize o relatório.")
+                    live_brand = app.source_attribute_value(source, ["BRAND"])
+                    if not allowed(app, {"brands": [live_brand] if live_brand else []}, target):
+                        task.update(status="excluded", error="Marca da origem incompatível com a loja.")
+                        continue
+                    client = app.account_client(account)
+                    body = app.build_clone_item_payload(source, {"sku": task["sku"], "listing_type_id": task["kind"], "price": task["price"]})
+                    body = app.apply_target_account_clone_rules(body, source, accounts[task["source_account_id"]], account)
+                    body["official_store_id"] = int(target["store_id"])
+                    app.hydrate_clone_package_attributes(body, source)
+                    definitions = app.cached_category_attributes(client, body.get("category_id"))
+                    app.hydrate_required_clone_attributes(body, source, definitions, bundle.get("catalog_product") or {})
+                    client.validate_item(body)
+                    task.update(status="submitting", submitted=True, error="")
+                    persist(app, batch)
+                    try:
+                        created = app.normalize_created_item_response(client.create_item(body))
+                    except Exception as exc:
+                        if re.match(r"HTTP (400|401|403|404|422|429):", str(exc)):
+                            task["submitted"] = False
+                        raise
+                    if not created.get("id"):
+                        raise RuntimeError("A API não confirmou o código criado.")
+                    task.update(status="created", item_id=created["id"], permalink=created.get("permalink", ""))
+                    persist(app, batch)
+                    official = {**body, **created}
+                    inventory.append(official)
+                    try:
+                        verified = client.item(created["id"])
+                        if (str(verified.get("official_store_id")) != target["store_id"]
+                                or verified.get("listing_type_id") != task["kind"]
+                                or str(verified.get("seller_id")) != str(account["seller_id"])):
+                            task["warning"] = "Anúncio criado, mas o destino/tipo retornado diverge da solicitação. Confira o anúncio existente."
+                        official.update(verified)
+                    except Exception:
+                        task["warning"] = "Anúncio criado; aguarda confirmação dos dados pela API."
+                    with app.DATA_LOCK:
+                        latest = app.read_payload()
+                        normalized = app.synced_catalog_item(account, official)
+                        latest.setdefault("catalog", []).append(normalized)
+                        app.append_item_log(latest, normalized, {}, "Replicação por loja oficial", {"source_id": task["source_id"], "batch_id": batch["id"]})
+                        app.write_payload(latest)
+                    if bundle.get("description") and not body.get("catalog_listing"):
+                        try:
+                            client.create_item_description(created["id"], bundle["description"])
+                        except Exception:
+                            task["warning"] = "Anúncio criado; confira a descrição, que não foi salva."
+                except Exception as exc:
+                    task["status"] = "created" if task.get("item_id") else "uncertain" if task.get("submitted") else "error"
+                    task["error"] = app.friendly_clone_error(exc)
+                finally:
+                    persist(app, batch)
+                    app.update_async_operation_progress(
+                        f"{index + 1}/{len(batch['tasks'])} · {task['sku']} · {task['target']['account']} / {task['target']['name']}",
+                        index + 1, len(batch["tasks"]),
+                    )
+            batch["status"] = "finished"
+            batch["counts"] = dict(Counter(t["status"] for t in batch["tasks"]))
+            persist(app, batch)
+            return batch
+
+    return SimpleNamespace(
+        LOCK=LOCK,
+        KINDS=KINDS,
+        key=key,
+        destinations=destinations,
+        allowed=allowed,
+        coverage=coverage,
+        report=report,
+        save_rules=save_rules,
+        preview=preview,
+        live_inventory=live_inventory,
+        persist=persist,
+        execute=execute,
+    )
+
+
+official_store_report = _build_official_store_report_service()
 
 try:
     from curl_cffi import requests as browser_http_requests
