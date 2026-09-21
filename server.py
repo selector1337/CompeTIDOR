@@ -109,11 +109,7 @@ def _build_official_store_report_service():
                     items = [i for i in row["sources"] if str(i.get("account_id")) == str(target["account_id"])
                              and str(i.get("official_store_id")) == target["store_id"] and i.get("listing_type_id") == kind]
                     traditional = [i for i in items if not i.get("catalog_listing")]
-                    linked = any(c.get("catalog_listing") and (
-                        any(str(r.get("id")) == str(t["id"]) for r in c.get("item_relations", []))
-                        or any(str(r.get("id")) == str(c["id"]) for r in t.get("item_relations", []))
-                    ) for c in items for t in traditional)
-                    complete = bool(traditional) and (not row["catalog_product_id"] or linked)
+                    complete = bool(traditional)
                     cells[kind] = {"status": "existing" if complete else "missing" if allowed(app, row, target) else "excluded",
                                    "traditional_exists": bool(traditional), "catalog_expected": bool(row["catalog_product_id"]),
                                    "items": [{"id": i["id"], "status": i.get("meli_status"), "stock": i.get("stock"),
@@ -212,12 +208,17 @@ def _build_official_store_report_service():
                     raise RuntimeError("A consulta de anúncios ficou incompleta; publicação interrompida nesta conta.")
         items = []
         ids = sorted(ids)
-        for offset in range(0, len(ids), 20):
-            part = ids[offset:offset + 20]
+        def read_chunk(part):
             result = client.items_bulk(part)
             if {r.get("id") for r in result} != set(part):
                 raise RuntimeError("A API não retornou todos os anúncios para conferir duplicações.")
-            items.extend(result)
+            return result
+        chunks = [ids[offset:offset + 20] for offset in range(0, len(ids), 20)]
+        # Bound both concurrency and queued work; all IDs must still be verified.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="store-inventory") as executor:
+            for offset in range(0, len(chunks), 3):
+                for result in executor.map(read_chunk, chunks[offset:offset + 3]):
+                    items.extend(result)
         return items
 
 
@@ -273,6 +274,26 @@ def _build_official_store_report_service():
         if task["catalog_status"] != "linked":
             raise RuntimeError("Catálogo criado; vínculo, loja ou modalidade ainda aguardam confirmação. Retome para conferir, sem repetir a criação.")
 
+    def adjust_publication_error(app, body, name, exc):
+        before = copy.deepcopy(body)
+        model = app.publication_model_required_by_error(exc)
+        if model:
+            app.apply_publication_name(body, name, model)
+        text = app.meli_error_text(exc).lower()
+        if "user has not mode me1" in text:
+            body.setdefault("shipping", {})["mode"] = "me2"
+        if "mandatory free shipping" in text or "mandatory_free_shipping" in text:
+            body.setdefault("shipping", {})["free_shipping"] = True
+        return body != before
+
+    def validate_publication(app, client, body, name):
+        for attempt in range(3):
+            try:
+                return client.validate_item(body)
+            except Exception as exc:
+                if attempt == 2 or not adjust_publication_error(app, body, name, exc):
+                    raise
+
     def execute(app, request):
         with LOCK:
             payload = app.read_payload()
@@ -317,6 +338,7 @@ def _build_official_store_report_service():
                                      and task["sku"] in {key(app, app.item_sku(i)), *[key(app, app.item_sku(v)) for v in i.get("variations", [])]}), None)
                     if existing:
                         task.update(status="existing", item_id=existing["id"], error="")
+                        task["catalog_product_id"] = task.get("catalog_product_id") or existing.get("catalog_product_id") or ""
                         finish_catalog(app, payload, batch, task, account, inventory)
                         continue
                     previous_attempt = any(
@@ -358,6 +380,19 @@ def _build_official_store_report_service():
                         source["variations"] = variants
                     elif key(app, app.item_sku(source)) != task["sku"]:
                         raise RuntimeError("O SKU da origem mudou. Atualize o relatório.")
+                    if not task.get("catalog_product_id"):
+                        if "_store_catalog_product_id" not in bundle:
+                            related_products = set()
+                            source_client = app.account_client(accounts[task["source_account_id"]])
+                            for relation in source.get("item_relations", []):
+                                related = source_client.item_for_clone(relation["id"])
+                                if (app.is_catalog_listing(related) and related.get("catalog_product_id")
+                                        and str(related.get("seller_id")) == str(accounts[task["source_account_id"]]["seller_id"])):
+                                    related_products.add(str(related["catalog_product_id"]))
+                            if len(related_products) > 1:
+                                raise RuntimeError("A origem possui mais de um produto de Catálogo relacionado. Confira a correspondência antes de publicar.")
+                            bundle["_store_catalog_product_id"] = next(iter(related_products), "")
+                        task["catalog_product_id"] = bundle["_store_catalog_product_id"]
                     live_brand = app.source_attribute_value(source, ["BRAND"])
                     if not allowed(app, {"brands": [live_brand] if live_brand else []}, target):
                         task.update(status="excluded", error="Marca da origem incompatível com a loja.")
@@ -367,6 +402,8 @@ def _build_official_store_report_service():
                     body = app.apply_target_account_clone_rules(body, source, accounts[task["source_account_id"]], account)
                     body["official_store_id"] = int(target["store_id"])
                     body.pop("catalog_listing", None)
+                    if (source.get("shipping") or {}).get("mode") == "me2":
+                        body.setdefault("shipping", {})["mode"] = "me2"
                     if task.get("catalog_product_id"):
                         body["catalog_product_id"] = task["catalog_product_id"]
                     model = app.target_publication_model(client, account, source)
@@ -375,14 +412,7 @@ def _build_official_store_report_service():
                     app.hydrate_clone_package_attributes(body, source)
                     definitions = app.cached_category_attributes(client, body.get("category_id"))
                     app.hydrate_required_clone_attributes(body, source, definitions, bundle.get("catalog_product") or {})
-                    try:
-                        client.validate_item(body)
-                    except Exception as exc:
-                        required_model = app.publication_model_required_by_error(exc, model)
-                        if required_model == model:
-                            raise
-                        app.apply_publication_name(body, name, required_model)
-                        client.validate_item(body)
+                    validate_publication(app, client, body, name)
                     task.update(status="submitting", submitted=True, error="")
                     persist(app, batch)
                     try:
@@ -390,11 +420,9 @@ def _build_official_store_report_service():
                     except Exception as exc:
                         if re.match(r"HTTP (400|401|403|404|422|429):", str(exc)):
                             task["submitted"] = False
-                        required_model = app.publication_model_required_by_error(exc)
-                        if not str(exc).startswith("HTTP 400:") or not required_model:
+                        if not str(exc).startswith("HTTP 400:") or not adjust_publication_error(app, body, name, exc):
                             raise
-                        app.apply_publication_name(body, name, required_model)
-                        client.validate_item(body)
+                        validate_publication(app, client, body, name)
                         task["submitted"] = True
                         persist(app, batch)
                         try:
@@ -429,6 +457,7 @@ def _build_official_store_report_service():
                             client.create_item_description(created["id"], bundle["description"])
                         except Exception:
                             task["warning"] = "Anúncio criado; confira a descrição, que não foi salva."
+                    task["catalog_product_id"] = task.get("catalog_product_id") or official.get("catalog_product_id") or ""
                     finish_catalog(app, payload, batch, task, account, inventory)
                 except Exception as exc:
                     task["status"] = "partial" if task.get("item_id") else "uncertain" if task.get("submitted") else "error"
