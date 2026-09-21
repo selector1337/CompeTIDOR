@@ -291,6 +291,16 @@ def _build_official_store_report_service():
             try:
                 return client.validate_item(body)
             except Exception as exc:
+                causes = app.meli_error_causes(exc)
+                detail = app.meli_error_detail(exc)
+                # /items/validate can reject a request containing only warnings.
+                # The actual creation remains authoritative and is never bypassed.
+                if (app.meli_error_status(exc) == 400 and causes
+                        and all(str(c.get("type") or "").lower() == "warning" for c in causes)
+                        and str(detail.get("error") or "") in ("", "validation_error")
+                        and str(detail.get("message") or "").lower() in ("", "validation error", "validation_error")):
+                    adjust_publication_error(app, body, name, exc)
+                    return {"warnings": causes}
                 if attempt == 2 or not adjust_publication_error(app, body, name, exc):
                     raise
 
@@ -306,11 +316,18 @@ def _build_official_store_report_service():
             inventories, failures, sources = {}, {}, {}
             products = {r["sku"]: r for r in coverage(app, payload, list(targets.values()))}
             batch["status"] = "running"
+            batch["last_attempt_at"] = app.now_label()
+            batch["execution_revision"] = "store-validation-warnings-v1"
             persist(app, batch)
             for index, task in enumerate(batch["tasks"]):
                 if task["status"] == "excluded" or (task["status"] in ("created", "existing") and task.get("catalog_status") in ("linked", "not_available")):
                     continue
                 target = targets.get(task["target"]["id"])
+                task["last_attempt_at"] = app.now_label()
+                task["attempt_count"] = int(task.get("attempt_count") or 0) + 1
+                task["phase"] = "preparation"
+                body = None
+                task.pop("error_detail", None)
                 try:
                     if not target:
                         raise RuntimeError("A conta não está mais autorizada nesta loja.")
@@ -339,6 +356,7 @@ def _build_official_store_report_service():
                     if existing:
                         task.update(status="existing", item_id=existing["id"], error="")
                         task["catalog_product_id"] = task.get("catalog_product_id") or existing.get("catalog_product_id") or ""
+                        task["phase"] = "catalog"
                         finish_catalog(app, payload, batch, task, account, inventory)
                         continue
                     previous_attempt = any(
@@ -412,7 +430,10 @@ def _build_official_store_report_service():
                     app.hydrate_clone_package_attributes(body, source)
                     definitions = app.cached_category_attributes(client, body.get("category_id"))
                     app.hydrate_required_clone_attributes(body, source, definitions, bundle.get("catalog_product") or {})
-                    validate_publication(app, client, body, name)
+                    task["phase"] = "validation"
+                    validation = validate_publication(app, client, body, name)
+                    task["validation_warnings"] = (validation or {}).get("warnings", [])
+                    task["phase"] = "creation"
                     task.update(status="submitting", submitted=True, error="")
                     persist(app, batch)
                     try:
@@ -458,10 +479,14 @@ def _build_official_store_report_service():
                         except Exception:
                             task["warning"] = "Anúncio criado; confira a descrição, que não foi salva."
                     task["catalog_product_id"] = task.get("catalog_product_id") or official.get("catalog_product_id") or ""
+                    task["phase"] = "catalog"
                     finish_catalog(app, payload, batch, task, account, inventory)
                 except Exception as exc:
                     task["status"] = "partial" if task.get("item_id") else "uncertain" if task.get("submitted") else "error"
                     task["error"] = app.friendly_clone_error(exc)
+                    task["error_detail"] = {"phase": task.get("phase"), "http_status": app.meli_error_status(exc),
+                                            "response": app.meli_error_detail(exc), "message": str(exc),
+                                            "shipping_sent": copy.deepcopy((body or {}).get("shipping"))}
                 finally:
                     persist(app, batch)
                     app.update_async_operation_progress(
