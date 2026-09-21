@@ -9796,6 +9796,18 @@ textarea:focus {
 .publisher-validation.error { color: var(--red); border: 1px solid rgba(220,38,38,.42); background: var(--red-soft); }
 .publisher-results { margin-top: 14px; }
 .store-rule-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 16px 0; }
+#stores-targets { grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); align-items: start; gap: 18px; }
+.store-account-group { min-width: 0; padding: 16px; border: 1px solid var(--line, #64748b); border-radius: 14px; }
+.store-account-group legend { padding: 0 8px; }
+.store-account-group legend small { display: block; color: var(--muted); font-size: 10px; letter-spacing: .08em; }
+.store-account-group legend strong { display: block; margin-top: 5px; overflow-wrap: anywhere; }
+.store-account-options { display: grid; gap: 10px; }
+#stores-targets .store-destination-card { display: flex; flex-wrap: nowrap; align-items: flex-start; gap: 12px; padding: 12px; border: 1px solid transparent; border-radius: 10px; cursor: pointer; background: var(--panel-2); }
+#stores-targets .store-destination-card:has(input:checked) { border-color: #d5b800; background: rgba(229,195,0,.09); }
+#stores-targets input[type=checkbox] { width: 18px; height: 18px; flex: 0 0 18px; margin-top: 3px; }
+.store-destination-card span { min-width: 0; display: grid; gap: 4px; }
+.store-destination-card strong { overflow-wrap: anywhere; }
+.store-destination-card small, .store-destination-card em { color: var(--muted); font-size: 11px; font-style: normal; }
 .store-rule-grid label { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .store-rule-grid input:not([type=checkbox]) { width: 100%; }
 .store-matrix-scroll { overflow: auto; max-height: 65vh; margin: 16px 0; }

@@ -95,7 +95,10 @@ def _build_official_store_report_service():
                 row["brands"].append(brand)
             row["sources"].append(item)
         for row in products.values():
-            row["sources"].sort(key=lambda item: (item.get("meli_status") != "active", bool(item.get("catalog_listing")), str(item.get("id"))))
+            row["sources"].sort(key=lambda item: (bool(item.get("catalog_listing")), item.get("meli_status") != "active", str(item.get("id"))))
+            row["title"] = row["sources"][0].get("title") or row["title"]
+            product_ids = {str(i["catalog_product_id"]) for i in row["sources"] if i.get("catalog_product_id")}
+            row["catalog_product_id"] = next(iter(product_ids)) if len(product_ids) == 1 else ""
             row["prices"] = {}
             for kind in KINDS:
                 candidates = [i for i in row["sources"] if i.get("listing_type_id") == kind and float(i.get("price") or 0) > 0]
@@ -105,9 +108,16 @@ def _build_official_store_report_service():
                 for kind in KINDS:
                     items = [i for i in row["sources"] if str(i.get("account_id")) == str(target["account_id"])
                              and str(i.get("official_store_id")) == target["store_id"] and i.get("listing_type_id") == kind]
-                    cells[kind] = {"status": "existing" if items else "missing" if allowed(app, row, target) else "excluded",
+                    traditional = [i for i in items if not i.get("catalog_listing")]
+                    linked = any(c.get("catalog_listing") and (
+                        any(str(r.get("id")) == str(t["id"]) for r in c.get("item_relations", []))
+                        or any(str(r.get("id")) == str(c["id"]) for r in t.get("item_relations", []))
+                    ) for c in items for t in traditional)
+                    complete = bool(traditional) and (not row["catalog_product_id"] or linked)
+                    cells[kind] = {"status": "existing" if complete else "missing" if allowed(app, row, target) else "excluded",
+                                   "traditional_exists": bool(traditional), "catalog_expected": bool(row["catalog_product_id"]),
                                    "items": [{"id": i["id"], "status": i.get("meli_status"), "stock": i.get("stock"),
-                                              "permalink": i.get("permalink")} for i in items]}
+                                              "catalog_listing": bool(i.get("catalog_listing")), "permalink": i.get("permalink")} for i in items]}
                 row["cells"][target["id"]] = cells
         return sorted(products.values(), key=lambda p: p["sku"])
 
@@ -165,13 +175,15 @@ def _build_official_store_report_service():
                         price = float(prices.get(kind) or 0)
                         if not math.isfinite(price):
                             raise RuntimeError(f"Preço inválido para o SKU {row['sku']}.")
-                        source = next((i for i in row["sources"] if i.get("listing_type_id") == kind), row["sources"][0])
+                        traditional_sources = [i for i in row["sources"] if not i.get("catalog_listing")]
+                        source = next((i for i in traditional_sources if i.get("listing_type_id") == kind), (traditional_sources or row["sources"])[0])
                         if status == "missing" and (not math.isfinite(price) or price <= 0):
                             raise RuntimeError(f"Informe o preço {kind} do SKU {row['sku']}.")
                         tasks.append({"sku": row["sku"], "target": target, "kind": kind, "price": price,
                                       "source_id": source["id"], "source_account_id": source["account_id"],
+                                      "catalog_product_id": row["catalog_product_id"],
                                       "status": "pending" if status == "missing" else status})
-            batch = {"id": uuid.uuid4().hex, "created_at": app.now_label(), "tasks": tasks, "status": "preview"}
+            batch = {"id": uuid.uuid4().hex, "created_at": app.now_label(), "tasks": tasks, "status": "preview", "version": 2}
             persist(app, batch)
             return batch
 
@@ -217,6 +229,50 @@ def _build_official_store_report_service():
             app.write_payload(payload)
 
 
+    def finish_catalog(app, payload, batch, task, account, inventory):
+        product_id = task.get("catalog_product_id") or ""
+        if not product_id:
+            task["catalog_status"] = "not_available"
+            return
+        client = app.account_client(account)
+        traditional_id = task["item_id"]
+        traditional = client.item_for_clone(traditional_id)
+        if (str(traditional.get("official_store_id")) != task["target"]["store_id"]
+                or traditional.get("listing_type_id") != task["kind"]):
+            raise RuntimeError("Confira a loja e a modalidade do tradicional antes de associar o Catálogo.")
+        unrelated = [i for i in inventory if i.get("catalog_listing") and str(i.get("catalog_product_id")) == product_id
+                     and str(i.get("official_store_id")) == task["target"]["store_id"] and i.get("listing_type_id") == task["kind"]
+                     and not any(str(r.get("id")) == traditional_id for r in i.get("item_relations", []))
+                     and not any(str(r.get("id")) == str(i.get("id")) for r in traditional.get("item_relations", []))]
+        if unrelated:
+            raise RuntimeError("Já existe Catálogo nesta loja sem vínculo confirmado com este tradicional. Confira os anúncios existentes antes de criar outro.")
+        attempted = task.get("catalog_submitted") or any(old.get("catalog_submitted") and old.get("item_id") == traditional_id
+                    for b in payload.get("official_store_batches", {}).values() for old in b.get("tasks", []))
+        def before():
+            task["catalog_submitted"] = True
+            task["catalog_status"] = "submitting"
+            persist(app, batch)
+        official, confirmed, reused = app.create_linked_catalog_listing(
+            client, traditional_id, product_id, account["seller_id"], before_opt_in=before, verify_only=bool(attempted))
+        task["catalog_item_id"] = official["id"]
+        task["catalog_status"] = "linked" if confirmed else "pending"
+        if str(official.get("official_store_id")) != task["target"]["store_id"] or official.get("listing_type_id") != task["kind"]:
+            task["catalog_status"] = "pending"
+        persist(app, batch)
+        with app.DATA_LOCK:
+            latest = app.read_payload()
+            existing = next((i for i in latest.get("catalog", []) if i.get("id") == official["id"] and i.get("account_id") == account["id"]), None)
+            normalized = app.synced_catalog_item(account, official, previous=existing)
+            if existing is not None:
+                existing.update(normalized)
+            else:
+                latest.setdefault("catalog", []).append(normalized)
+            app.write_payload(latest)
+        if not any(i.get("id") == official["id"] for i in inventory):
+            inventory.append(official)
+        if task["catalog_status"] != "linked":
+            raise RuntimeError("Catálogo criado; vínculo, loja ou modalidade ainda aguardam confirmação. Retome para conferir, sem repetir a criação.")
+
     def execute(app, request):
         with LOCK:
             payload = app.read_payload()
@@ -231,7 +287,7 @@ def _build_official_store_report_service():
             batch["status"] = "running"
             persist(app, batch)
             for index, task in enumerate(batch["tasks"]):
-                if task["status"] in ("created", "existing", "excluded"):
+                if task["status"] == "excluded" or (task["status"] in ("created", "existing") and task.get("catalog_status") in ("linked", "not_available")):
                     continue
                 target = targets.get(task["target"]["id"])
                 try:
@@ -241,6 +297,11 @@ def _build_official_store_report_service():
                     if not product or not allowed(app, product, target):
                         task["status"] = "excluded"
                         continue
+                    task["catalog_product_id"] = task.get("catalog_product_id") or product["catalog_product_id"]
+                    candidates = [i for i in product["sources"] if not i.get("catalog_listing")]
+                    if candidates:
+                        chosen = next((i for i in candidates if i.get("listing_type_id") == task["kind"]), candidates[0])
+                        task.update(source_id=chosen["id"], source_account_id=chosen["account_id"])
                     account = accounts[target["account_id"]]
                     account_id = account["id"]
                     if account_id not in inventories and account_id not in failures:
@@ -251,11 +312,12 @@ def _build_official_store_report_service():
                     if account_id in failures:
                         raise RuntimeError(failures[account_id])
                     inventory = inventories[account_id]
-                    existing = next((i for i in inventory if str(i.get("official_store_id")) == target["store_id"]
+                    existing = next((i for i in inventory if not i.get("catalog_listing") and str(i.get("official_store_id")) == target["store_id"]
                                      and i.get("listing_type_id") == task["kind"]
                                      and task["sku"] in {key(app, app.item_sku(i)), *[key(app, app.item_sku(v)) for v in i.get("variations", [])]}), None)
                     if existing:
                         task.update(status="existing", item_id=existing["id"], error="")
+                        finish_catalog(app, payload, batch, task, account, inventory)
                         continue
                     previous_attempt = any(
                         old.get("submitted") and old["sku"] == task["sku"] and old["kind"] == task["kind"]
@@ -272,6 +334,23 @@ def _build_official_store_report_service():
                         )
                     bundle = sources[source_key]
                     source = copy.deepcopy(bundle["source_item"])
+                    if app.is_catalog_listing(source):
+                        source_client = app.account_client(accounts[task["source_account_id"]])
+                        traditional_source = None
+                        for relation in source.get("item_relations", []):
+                            related = source_client.item_for_clone(relation["id"])
+                            if (not app.is_catalog_listing(related) and key(app, app.item_sku(related)) == task["sku"]
+                                    and str(related.get("seller_id")) == str(accounts[task["source_account_id"]]["seller_id"])):
+                                traditional_source = related
+                                break
+                        if traditional_source is None:
+                            raise RuntimeError("Não foi encontrado anúncio tradicional para este SKU. Sincronize a conta de origem; o Catálogo não será usado como modelo.")
+                        task["source_id"] = traditional_source["id"]
+                        bundle = app.clone_source_bundle(payload, task["source_account_id"], task["source_id"], include_description=True, force=True)
+                        source = copy.deepcopy(bundle["source_item"])
+                        if app.is_catalog_listing(source):
+                            raise RuntimeError("A origem precisa ser um anúncio tradicional.")
+                    task["catalog_product_id"] = source.get("catalog_product_id") or task.get("catalog_product_id") or ""
                     if source.get("variations"):
                         variants = [v for v in source["variations"] if key(app, app.item_sku(v)) == task["sku"]]
                         if not variants:
@@ -287,10 +366,23 @@ def _build_official_store_report_service():
                     body = app.build_clone_item_payload(source, {"sku": task["sku"], "listing_type_id": task["kind"], "price": task["price"]})
                     body = app.apply_target_account_clone_rules(body, source, accounts[task["source_account_id"]], account)
                     body["official_store_id"] = int(target["store_id"])
+                    body.pop("catalog_listing", None)
+                    if task.get("catalog_product_id"):
+                        body["catalog_product_id"] = task["catalog_product_id"]
+                    model = app.target_publication_model(client, account, source)
+                    name = source.get("title") or source.get("family_name") or ""
+                    app.apply_publication_name(body, name, model)
                     app.hydrate_clone_package_attributes(body, source)
                     definitions = app.cached_category_attributes(client, body.get("category_id"))
                     app.hydrate_required_clone_attributes(body, source, definitions, bundle.get("catalog_product") or {})
-                    client.validate_item(body)
+                    try:
+                        client.validate_item(body)
+                    except Exception as exc:
+                        required_model = app.publication_model_required_by_error(exc, model)
+                        if required_model == model:
+                            raise
+                        app.apply_publication_name(body, name, required_model)
+                        client.validate_item(body)
                     task.update(status="submitting", submitted=True, error="")
                     persist(app, batch)
                     try:
@@ -298,7 +390,19 @@ def _build_official_store_report_service():
                     except Exception as exc:
                         if re.match(r"HTTP (400|401|403|404|422|429):", str(exc)):
                             task["submitted"] = False
-                        raise
+                        required_model = app.publication_model_required_by_error(exc)
+                        if not str(exc).startswith("HTTP 400:") or not required_model:
+                            raise
+                        app.apply_publication_name(body, name, required_model)
+                        client.validate_item(body)
+                        task["submitted"] = True
+                        persist(app, batch)
+                        try:
+                            created = app.normalize_created_item_response(client.create_item(body))
+                        except Exception as retry_exc:
+                            if re.match(r"HTTP (400|401|403|404|422|429):", str(retry_exc)):
+                                task["submitted"] = False
+                            raise
                     if not created.get("id"):
                         raise RuntimeError("A API não confirmou o código criado.")
                     task.update(status="created", item_id=created["id"], permalink=created.get("permalink", ""))
@@ -325,8 +429,9 @@ def _build_official_store_report_service():
                             client.create_item_description(created["id"], bundle["description"])
                         except Exception:
                             task["warning"] = "Anúncio criado; confira a descrição, que não foi salva."
+                    finish_catalog(app, payload, batch, task, account, inventory)
                 except Exception as exc:
-                    task["status"] = "created" if task.get("item_id") else "uncertain" if task.get("submitted") else "error"
+                    task["status"] = "partial" if task.get("item_id") else "uncertain" if task.get("submitted") else "error"
                     task["error"] = app.friendly_clone_error(exc)
                 finally:
                     persist(app, batch)
@@ -6874,6 +6979,7 @@ def synced_catalog_item(account, item, competition=None, previous=None):
         "variation_count": len(item.get("variations") or []),
         "catalog_product_id": catalog_product_id,
         "catalog_listing": is_catalog,
+        "item_relations": item.get("item_relations") or [],
         "listing_type_id": listing_type_id,
         "category_id": item.get("category_id") or "",
         "currency_id": item.get("currency_id") or "BRL",
