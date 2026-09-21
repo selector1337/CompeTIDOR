@@ -574,6 +574,7 @@ SAFE_LEGACY_ORDER_BILLING_INFO_PATH = re.compile(r"^/orders/[0-9]+/billing_info$
 SAFE_SHIPMENT_BILLING_INFO_PATH = re.compile(r"^/shipments/[^/?]+/billing_info$")
 ALLOWED_MELI_PATHS = (
     re.compile(r"^/users/me$"),
+    re.compile(r"^/users/[0-9]+/brands$"),
     re.compile(r"^/users/[^/]+$"),
     re.compile(r"^/users/[^/]+/shipping_options/free(\?|$)"),
     re.compile(r"^/users/[^/]+/items/search(\?|$)"),
