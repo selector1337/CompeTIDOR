@@ -317,7 +317,7 @@ def _build_official_store_report_service():
             products = {r["sku"]: r for r in coverage(app, payload, list(targets.values()))}
             batch["status"] = "running"
             batch["last_attempt_at"] = app.now_label()
-            batch["execution_revision"] = "store-validation-warnings-v1"
+            batch["execution_revision"] = "store-catalog-association-v2"
             persist(app, batch)
             for index, task in enumerate(batch["tasks"]):
                 if task["status"] == "excluded" or (task["status"] in ("created", "existing") and task.get("catalog_status") in ("linked", "not_available")):
@@ -15888,6 +15888,39 @@ def create_linked_catalog_listing(client, traditional_id, catalog_product_id, se
     if traditional.get("variations"):
         raise RuntimeError("Este anúncio possui variações. É necessário selecionar o produto de Catálogo correspondente a cada variação.")
     eligibility = client.catalog_listing_eligibility(traditional_id)
+    # Creation can leave the marketplace item unassociated even when the
+    # source's catalog ID was sent. Repair that association before opt-in.
+    missing_product = (eligibility.get("status") == "CATALOG_PRODUCT_ID_NULL"
+                       or eligibility.get("reason") == "CATALOG_PRODUCT_ID_NULL"
+                       or (eligibility.get("status") == "PRODUCT_INACTIVE"
+                           and not traditional.get("catalog_product_id")))
+    if missing_product:
+        current_product = str(traditional.get("catalog_product_id") or "")
+        if current_product and current_product != catalog_product_id:
+            raise RuntimeError("O tradicional está associado a outro produto de Catálogo. Confira a ficha técnica antes de alterar a associação.")
+        client.update_item(traditional_id, {"catalog_product_id": catalog_product_id})
+        # Association/eligibility propagation can be asynchronous. Only reads
+        # are repeated; never replay the catalog creation request here.
+        for attempt in range(3):
+            if attempt:
+                time.sleep(1)
+            latest = client.item_for_clone(traditional_id)
+            if (str(latest.get("id") or "") != traditional_id
+                    or str(latest.get("seller_id") or "") != str(seller_id)):
+                raise RuntimeError("Não foi possível confirmar o anúncio tradicional após associar o produto de Catálogo.")
+            related = linked_catalog_from_relations(client, latest, catalog_product_id)
+            if related:
+                return related, True, True
+            if latest.get("item_relations") or latest.get("catalog_listing") is True:
+                raise RuntimeError("O vínculo do tradicional mudou durante a associação. Confira o anúncio no Mercado Livre.")
+            associated_product = str(latest.get("catalog_product_id") or "")
+            if associated_product and associated_product != catalog_product_id:
+                raise RuntimeError("O Mercado Livre associou outro produto de Catálogo ao tradicional. Confira a ficha técnica.")
+            eligibility = client.catalog_listing_eligibility(traditional_id)
+            if associated_product == catalog_product_id and eligibility.get("status") in ("READY_FOR_OPTIN", "ALREADY_OPTED_IN"):
+                break
+        else:
+            raise RuntimeError(f"O tradicional {traditional_id} foi preservado, mas o Mercado Livre ainda não confirmou a associação/elegibilidade do produto {catalog_product_id} ({eligibility.get('status')}). Retome o lote para conferir novamente.")
     if eligibility.get("status") == "ALREADY_OPTED_IN":
         related = linked_catalog_from_relations(client, client.item_for_clone(traditional_id), catalog_product_id)
         if related:
