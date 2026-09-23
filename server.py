@@ -333,7 +333,7 @@ def _build_official_store_report_service():
             products = {r["sku"]: r for r in coverage(app, payload, list(targets.values()))}
             batch["status"] = "running"
             batch["last_attempt_at"] = app.now_label()
-            batch["execution_revision"] = "store-editable-validation-v3"
+            batch["execution_revision"] = "store-clear-pending-v4"
             persist(app, batch)
             for index, task in enumerate(batch["tasks"]):
                 if task["status"] == "excluded" or (task["status"] in ("created", "existing") and task.get("catalog_status") in ("linked", "not_available")):
@@ -13711,6 +13711,18 @@ def remove_clone_product_identifiers(attributes):
     ]
 
 
+def clone_variation_attribute_row(attribute):
+    if attribute.get("id"):
+        return clone_attribute_row(attribute)
+    if not clean_attribute_value(attribute.get("name")):
+        return {}
+    row = clone_attribute_row({**attribute, "id": "CUSTOM_VARIATION"})
+    if row:
+        row.pop("id")
+        row["name"] = attribute["name"]
+    return row
+
+
 def clone_variations_payload(item, sku_override="", price_override="", stock_override=""):
     source_variations = item.get("variations") or []
     if not source_variations:
@@ -13722,7 +13734,7 @@ def clone_variations_payload(item, sku_override="", price_override="", stock_ove
         combinations = [
             clean
             for attribute in variation.get("attribute_combinations") or []
-            if (clean := clone_attribute_row(attribute))
+            if (clean := clone_variation_attribute_row(attribute))
         ]
         attributes = [
             clean
@@ -13860,6 +13872,14 @@ def clone_package_error_kind(exc):
 def restore_clone_package_set(create_payload, source_item, numeric_only=False):
     """Restore all four package values together, optionally using the numeric-only API form."""
     values = package_values_from_item(source_item)
+    # User corrections in the outgoing payload take precedence over old data.
+    for attribute in create_payload.get("attributes") or []:
+        field = SELLER_PACKAGE_ATTRIBUTE_FIELDS.get(attribute.get("id"))
+        value = clean_attribute_value(attribute.get("value_name"))
+        if field and value:
+            if re.fullmatch(r"[\d.,]+", value):
+                value += " g" if field == "package_weight" else " cm"
+            values[field] = value
     fields = SELLER_PACKAGE_ATTRIBUTE_FIELDS.values()
     if not all(clean_attribute_value(values.get(field)) for field in fields):
         return []
@@ -13869,6 +13889,9 @@ def restore_clone_package_set(create_payload, source_item, numeric_only=False):
         api_value = seller_package_api_value(field, values[field])
         if numeric_only:
             api_value = str(max(1, math.ceil(parse_decimal_number(api_value))))
+        else:
+            unit = "g" if field == "package_weight" else "cm"
+            api_value = f"{max(1, math.ceil(parse_decimal_number(api_value)))} {unit}"
         create_payload.setdefault("attributes", []).append({"id": attr_id, "value_name": api_value})
         restored.append(attr_id)
     return restored
@@ -14711,6 +14734,8 @@ def category_attribute_ids(category_attributes):
 
 def canonical_clone_attribute_id(attr_id):
     normalized = str(attr_id or "").replace("attribute:", "").upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", normalized):
+        return ""
     if normalized in CLONE_INTERNAL_READ_ONLY_ATTRIBUTES:
         return ""
     return CLONE_ATTRIBUTE_ALIASES.get(normalized, normalized)
@@ -14797,10 +14822,14 @@ def sanitize_clone_payload_attributes(create_payload, category_attributes, sourc
     allowed = category_attribute_ids(category_attributes)
     removed = []
 
-    def sanitize_section(section):
+    def sanitize_section(section, combinations=False):
         kept = []
         seen = set()
         for attribute in section or []:
+            # Custom variation dimensions may have a name instead of an ID.
+            if combinations and not attribute.get("id") and attribute.get("name") and clone_attribute_display_value(attribute):
+                kept.append(attribute)
+                continue
             original_id = str(attribute.get("id") or "").upper()
             attr_id = canonical_clone_attribute_id(original_id)
             clean = attribute
@@ -14826,7 +14855,7 @@ def sanitize_clone_payload_attributes(create_payload, category_attributes, sourc
     create_payload["attributes"] = sanitize_section(create_payload.get("attributes") or [])
     for variation in create_payload.get("variations") or []:
         variation["attributes"] = sanitize_section(variation.get("attributes") or [])
-        variation["attribute_combinations"] = sanitize_section(variation.get("attribute_combinations") or [])
+        variation["attribute_combinations"] = sanitize_section(variation.get("attribute_combinations") or [], combinations=True)
     return list(dict.fromkeys(removed))
 
 
@@ -14977,9 +15006,26 @@ def clone_payload_from_answers(create_payload, answers):
     for key, value in answers.items():
         if not clean_attribute_value(value):
             continue
-        if key.startswith("attribute:"):
+        variation_match = re.fullmatch(r"variation:(\d+):attribute:([A-Z][A-Z0-9_]*)", key)
+        if variation_match:
+            index, attr_id = int(variation_match[1]), variation_match[2]
+            variations = create_payload.get("variations") or []
+            if index < len(variations):
+                combinations = variations[index].setdefault("attribute_combinations", [])
+                combinations[:] = [a for a in combinations if a.get("id") != attr_id]
+                combinations.append({"id": attr_id, "value_name": str(value).strip()})
+        elif key.startswith("attribute:"):
             attr_id = canonical_clone_attribute_id(key.split(":", 1)[1])
-            if attr_id == "GTIN":
+            if not attr_id:
+                continue
+            if attr_id in SELLER_PACKAGE_ATTRIBUTE_FIELDS:
+                unit = "g" if attr_id == "SELLER_PACKAGE_WEIGHT" else "cm"
+                text = str(value).strip()
+                if re.fullmatch(r"[\d.,]+", text):
+                    text += f" {unit}"
+                normalized = seller_package_api_value(SELLER_PACKAGE_ATTRIBUTE_FIELDS[attr_id], text)
+                add_or_update_clone_attribute(create_payload, attr_id, f"{max(1, math.ceil(parse_decimal_number(normalized)))} {unit}")
+            elif attr_id == "GTIN":
                 apply_clone_gtin_override(create_payload, value)
             elif attr_id == "EMPTY_GTIN_REASON":
                 remove_clone_attributes(create_payload, GTIN_IDENTIFIER_ATTRS)
@@ -15008,14 +15054,36 @@ def clone_retry_adjustments_from_error(
     adjustments = []
     error_text = meli_error_text(exc)
     lowered_error = error_text.lower()
+    if "attribute_combinations" in lowered_error and ("required" in lowered_error or "missing" in lowered_error):
+        source_variations = source_item.get("variations") or []
+        for index, variation in enumerate(create_payload.get("variations") or []):
+            if variation.get("attribute_combinations"):
+                continue
+            original = source_variations[index] if index < len(source_variations) else {}
+            combinations = [row for a in original.get("attribute_combinations") or [] if (row := clone_variation_attribute_row(a))]
+            if combinations:
+                variation["attribute_combinations"] = combinations
+                changed = True
+            else:
+                for definition in category_attributes or []:
+                    if not (definition.get("tags") or {}).get("allow_variations"):
+                        continue
+                    field = pending_clone_attribute(definition.get("id"), original, category_attributes, item_id)
+                    if field:
+                        field["id"] = f"variation:{index}:attribute:{definition['id']}"
+                        field["label"] += f" — variação {index + 1}"
+                        pending_fields.append(field)
     package_error = clone_package_error_kind(exc)
+    repaired_package = []
     if package_error in {"missing", "format"}:
+        requires_units = ("unit" in lowered_error and ("'cm'" in lowered_error or "'g'" in lowered_error))
         restored_package = restore_clone_package_set(
             create_payload,
             source_item,
-            numeric_only=package_error == "format",
+            numeric_only=package_error == "format" and not requires_units,
         )
         if restored_package:
+            repaired_package = [copy.deepcopy(a) for a in create_payload.get("attributes", []) if a.get("id") in SELLER_PACKAGE_ATTRIBUTE_FIELDS]
             changed = True
             adjustments.append({
                 "tipo": "medidas_embalagem_reaplicadas"
@@ -15175,7 +15243,7 @@ def clone_retry_adjustments_from_error(
                     continue
                 pending = pending_clone_attribute("GTIN", source_item, category_attributes or [], item_id)
                 if pending:
-                    pending["message"] = "Informe um novo GTIN/EAN/UPC que ainda não esteja vinculado a outro produto do Mercado Livre."
+                    pending["message"] = "Confira o código de barras da embalagem e a categoria do anúncio. Produtos idênticos podem usar o mesmo GTIN; não invente um código diferente."
                     pending["default_value"] = ""
                     pending_fields.append(pending)
                 if not source_identifiers:
@@ -15250,11 +15318,17 @@ def clone_retry_adjustments_from_error(
         changed = True
         adjustments.append({"tipo": "family_name_ajustado", "campos": ["family_name"]})
 
+    if repaired_package:
+        remove_clone_attributes(create_payload, SELLER_PACKAGE_ATTRIBUTE_FIELDS)
+        create_payload.setdefault("attributes", []).extend(repaired_package)
+        pending_fields[:] = [f for f in pending_fields if str(f.get("id", "")).removeprefix("attribute:") not in SELLER_PACKAGE_ATTRIBUTE_FIELDS]
     return create_payload, changed, adjustments
 
 
 def friendly_clone_error(exc):
     error_text = meli_error_text(exc)
+    if "attribute_combinations" in error_text.lower():
+        return "Faltam características que identificam a variação, como cor ou tamanho. Confira os campos da variação; se não houver campos abaixo, complete essas características no anúncio de origem e retome o lote."
     if "too small for the product dimensions" in error_text.lower():
         ids = list(dict.fromkeys(re.findall(r"seller_package_(?:width|height|length|weight)", error_text.lower())))
         labels = ", ".join(clone_attribute_label(value.upper()) for value in ids)
@@ -15286,7 +15360,7 @@ def friendly_clone_error(exc):
         if code == "item.family_name.length_invalid":
             messages.append("Nome de família do catálogo passou de 60 caracteres; ajuste o campo solicitado e tente novamente.")
         elif code == "item.attribute.invalid_product_identifier":
-            messages.append("Código universal do produto não pode ser reutilizado nessa categoria. O clone remove esse código; se a categoria exigir, informe um novo.")
+            messages.append("O Mercado Livre recusou o código de barras para este produto ou categoria. Confira o GTIN/EAN da embalagem e se a categoria corresponde ao produto.")
         elif code == "invalid.item.attribute.values":
             attrs = ", ".join(attribute_ids_from_error_text(message)) or "atributo"
             messages.append(f"Atributo com valor inválido: {attrs}. Informe um valor válido ou deixe o clone remover quando não for obrigatório.")

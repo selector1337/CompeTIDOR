@@ -50,24 +50,49 @@
     $('stores-batches').innerHTML = '<option value="">Selecione</option>' + [...data.batches].reverse().map(b => `<option value="${attr(b.id)}">${esc(b.created_at)} · ${esc(b.status)} · ${b.tasks.length} combinações</option>`).join('');
     if (batch) $('stores-batches').value = batch.id;
   }
+  function visibleFields(task) {
+    return (task.pending_fields || []).filter(f => /^(attribute:[A-Z][A-Z0-9_]*|variation:\d+:attribute:[A-Z][A-Z0-9_]*|title|family_name|price|available_quantity|condition)$/.test(f.id));
+  }
   function pendingInputs(task, index) {
-    return (task.pending_fields || []).map(field => {
-      const common = `data-store-answer="${index}" data-field="${attr(field.id)}"`;
-      const value = task.field_answers?.[field.id] ?? field.default_value ?? '';
+    return visibleFields(task).map(field => {
+      const packageField = /^attribute:SELLER_PACKAGE_(HEIGHT|WIDTH|LENGTH|WEIGHT)$/.test(field.id);
+      const unit = packageField ? (field.id.endsWith('WEIGHT') ? 'g' : 'cm') : '';
+      const common = `data-store-answer="${index}" data-field="${attr(field.id)}" data-unit="${unit}"`;
+      let value = task.field_answers?.[field.id] ?? field.default_value ?? '';
+      if (unit) value = String(value).replace(new RegExp('\\s*' + unit + '$', 'i'), '');
       const input = field.options?.length
         ? `<select ${common}><option value="">Selecione</option>${field.options.map(o => { const v = typeof o === 'object' ? o.value : o; return `<option value="${attr(v)}" ${String(v) === String(value) ? 'selected' : ''}>${esc(typeof o === 'object' ? o.label : o)}</option>`; }).join('')}</select>`
-        : `<input ${common} value="${attr(value)}" placeholder="${attr(field.units?.length ? 'Valor com unidade: ' + field.units.join(', ') : field.label || field.id)}">`;
-      return `<label class="store-pending-field" style="display:grid;gap:6px;margin:12px 0;max-width:420px">${esc(field.label || field.id)}${input}<small>${esc(field.message || '')}</small></label>`;
+        : `<span class="store-field-value"><input ${common} value="${attr(value)}" ${unit ? 'inputmode="decimal"' : ''} placeholder="${attr(unit ? 'Ex.: ' + (unit === 'g' ? '200' : '15') : field.label || '')}">${unit ? `<span>${unit}</span>` : ''}</span>`;
+      const guidance = unit ? `Informe ${unit === 'g' ? 'o peso real da embalagem em gramas' : 'a medida real da embalagem em centímetros'}. A unidade será enviada automaticamente.` : field.id === 'attribute:GTIN' ? 'Use o código de barras real do produto. O mesmo produto pode ter o mesmo código em vários anúncios.' : (field.message || '');
+      return `<label class="store-pending-field"><strong>${esc(field.label || field.id)}</strong>${input}<small>${esc(guidance)}</small></label>`;
     }).join('');
+  }
+  function resultMessage(task) {
+    const text = [task.error, task.error_detail?.message].filter(Boolean).join(' ');
+    const messages = [];
+    if (/seller_package_|seller.package|embalagem/i.test(text)) messages.push('Confira as medidas da embalagem em centímetros e o peso em gramas. Os dados existentes serão reaproveitados e enviados com as unidades corretas.');
+    if (/invalid_product_identifier|GTIN|código universal|código de barras/i.test(text)) messages.push('O Mercado Livre recusou o código de barras para este produto ou categoria. Confira o código impresso na embalagem e a categoria do anúncio de origem.');
+    if (/attribute.?combinations|características que identificam a variação/i.test(text)) messages.push('A variação precisa de características como cor ou tamanho. Vamos recuperar esses dados da origem. Se a pendência continuar e não houver campo abaixo, complete a variação no anúncio original.');
+    if (!messages.length && visibleFields(task).length) messages.push('O Mercado Livre solicitou uma correção na ficha do produto. Confira os campos abaixo e retome a publicação.');
+    if (!messages.length && (task.error || task.warning)) messages.push(String(task.error || task.warning).length > 450 ? 'O Mercado Livre não aceitou esta publicação. Os detalhes completos estão disponíveis para suporte.' : task.error || task.warning);
+    return messages.length ? `<ul class="store-result-messages">${messages.map(m => `<li>${esc(m)}</li>`).join('')}</ul>` : '';
+  }
+  function resultHtml(task, index) {
+    return `<section class="store-result-card"><strong class="store-result-status">${labels[task.status] || esc(task.status)}</strong>
+      ${task.item_id ? `<div>Tradicional: <strong>${esc(task.item_id)}</strong></div>` : ''}
+      ${task.catalog_item_id ? `<div>Catálogo: ${esc(task.catalog_item_id)} · ${task.catalog_status === 'linked' ? 'Vínculo confirmado' : 'A conferir'}</div>` : ''}
+      ${task.catalog_status === 'not_available' ? '<small>Sem produto de Catálogo correspondente identificado</small>' : ''}
+      ${resultMessage(task)}<div class="store-pending-fields">${pendingInputs(task, index)}</div>
+      ${task.error_detail ? `<button type="button" class="mini-button ghost" data-store-support="${index}">Baixar detalhes para suporte</button>` : ''}</section>`;
   }
   function renderBatch() {
     if (!batch) { $('stores-batch').innerHTML = ''; return; }
     const counts = {};
     batch.tasks.forEach(t => counts[t.status] = (counts[t.status] || 0) + 1);
-    $('stores-batch').innerHTML = `<p>${batch.last_attempt_at ? `Última tentativa: ${esc(batch.last_attempt_at)} · Versão: ${esc(batch.execution_revision || 'anterior')}` : 'Prévia / resultado salvo; clique em publicar ou retomar para executar.'}</p><p>${Object.entries(counts).map(([s, n]) => `${n} ${labels[s] || s}`).join(' · ')}</p>
+    $('stores-batch').innerHTML = `<p>${batch.last_attempt_at ? `Última tentativa: ${esc(batch.last_attempt_at)}` : 'Prévia / resultado salvo; clique em publicar ou retomar para executar.'}</p><p>${Object.entries(counts).map(([s, n]) => `${n} ${labels[s] || s}`).join(' · ')}</p>
       <p>Cada linha representa uma modalidade. Quando houver produto de Catálogo correspondente, serão criados o tradicional e seu Catálogo vinculado: até quatro anúncios por SKU e destino (dois Clássicos e dois Premium). Revise os destinos e preços abaixo. A publicação preserva os anúncios existentes. Solicitações com resposta incerta serão conferidas, sem repetição automática.</p>
       <button type="button" class="primary" data-store-execute> ${batch.status === 'preview' ? 'Publicar anúncios faltantes' : 'Retomar / conferir pendências'}</button>
-      <div class="store-matrix-scroll"><table class="store-matrix"><thead><tr><th>SKU</th><th>Conta / loja</th><th>Tipo / preço</th><th>Resultado</th></tr></thead><tbody>${batch.tasks.slice(batchPage * 100, batchPage * 100 + 100).map((t, i) => `<tr><td>${esc(t.sku)}</td><td><small>Conta</small><br><strong>${esc(t.target.account)}</strong><br><small>Loja oficial</small><br>${esc(t.target.name)}</td><td>${labels[t.kind]} · ${Number(t.price || 0).toLocaleString('pt-BR', {style:'currency',currency:'BRL'})}<br><small>Tradicional + Catálogo vinculado, quando disponível</small></td><td>${labels[t.status] || esc(t.status)} ${t.item_id ? `<br>Tradicional: ${esc(t.item_id)}` : ''}${t.catalog_item_id ? `<br>Catálogo: ${esc(t.catalog_item_id)} · ${t.catalog_status === 'linked' ? 'Vínculo confirmado' : 'A conferir'}` : ''}${t.catalog_status === 'not_available' ? '<br>Sem produto de Catálogo correspondente identificado' : ''}<br>${esc(t.error || t.warning || '')}${pendingInputs(t, batchPage * 100 + i)}${t.error_detail ? `<details><summary>Diagnóstico da tentativa ${Number(t.attempt_count || 1)}</summary><pre>${esc(JSON.stringify(t.error_detail, null, 2))}</pre></details>` : ''}${t.validation_warnings?.length ? `<small>Avisos da validação: ${esc(t.validation_warnings.map(w => w.message || w.code).join(' · '))}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>
+      <div class="store-matrix-scroll"><table class="store-matrix"><thead><tr><th>SKU</th><th>Conta / loja</th><th>Tipo / preço</th><th>Resultado</th></tr></thead><tbody>${batch.tasks.slice(batchPage * 100, batchPage * 100 + 100).map((t, i) => `<tr><td>${esc(t.sku)}</td><td><small>Conta</small><br><strong>${esc(t.target.account)}</strong><br><small>Loja oficial</small><br>${esc(t.target.name)}</td><td>${labels[t.kind]} · ${Number(t.price || 0).toLocaleString('pt-BR', {style:'currency',currency:'BRL'})}<br><small>Tradicional + Catálogo vinculado, quando disponível</small></td><td>${resultHtml(t, batchPage * 100 + i)}</td></tr>`).join('')}</tbody></table></div>
       <button type="button" data-store-batch-prev>Anterior</button> ${batchPage + 1} / ${Math.max(1, Math.ceil(batch.tasks.length / 100))} <button type="button" data-store-batch-next>Próxima</button>`;
   }
   async function load() {
@@ -120,9 +145,17 @@
   $('stores-batch').onchange = e => {
     if (e.target.dataset.storeAnswer == null || busy) return;
     const task = batch.tasks[Number(e.target.dataset.storeAnswer)];
-    (task.field_answers ||= {})[e.target.dataset.field] = e.target.value.trim();
+    let value = e.target.value.trim();
+    if (e.target.dataset.unit && /^[0-9.,]+$/.test(value)) value += ' ' + e.target.dataset.unit;
+    (task.field_answers ||= {})[e.target.dataset.field] = value;
   };
   $('stores-batch').onclick = e => {
+    if (e.target.dataset.storeSupport != null) {
+      const task = batch.tasks[Number(e.target.dataset.storeSupport)];
+      const url = URL.createObjectURL(new Blob([JSON.stringify({batch_id:batch.id, revision:batch.execution_revision, task}, null, 2)], {type:'application/json'}));
+      const link = document.createElement('a'); link.href = url; link.download = 'detalhes-publicacao.json'; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
     if (e.target.hasAttribute('data-store-execute')) run(async () => {
       batch = await operation('execute', {batch_id: batch.id, field_answers: Object.fromEntries(batch.tasks.map((t, i) => [String(i), t.field_answers || {}]))});
       await load(); renderBatch();
