@@ -1822,38 +1822,26 @@ function purchaseReferenceForSku(rawSku) {
   const sku = normalizedSkuKey(rawSku);
   if (!sku || sku === "-") return null;
   const analyzed = (state.purchaseAnalysis?.rows || []).find((row) => normalizedSkuKey(row.sku) === sku);
-  if (analyzed) {
-    return {
-      sku,
-      product: analyzed.product || "",
-      salePrice: analyzed.average_unit_price,
-      feePercentage: analyzed.average_fee_percentage,
-      fixedFee: analyzed.average_fixed_fee_per_sale,
-      shipping: analyzed.average_shipping_per_sale,
-      reimbursement: analyzed.average_shipping_reimbursement_per_sale,
-      monthlyDemand: Number(analyzed.average_daily_units || 0) * 30,
-      cost: state.data?.sku_costs?.[sku]?.cost,
-      source: `Histórico oficial de ${Number(state.purchaseAnalysis?.period_days || 0).toLocaleString("pt-BR")} dia(s)`,
-      confidence: analyzed.confidence || "-",
-    };
-  }
-  const listings = (state.data.catalog || []).filter((item) => normalizedSkuKey(item.sku) === sku);
-  const listing = listings.sort((a, b) => Number(normalizedMlStatus(b.meli_status) === "active") - Number(normalizedMlStatus(a.meli_status) === "active"))[0];
-  if (!listing) return null;
-  const price = Number(listing.price || 0);
-  const totalFee = listing.sale_fee_status === "ok" ? Number(listing.sale_fee_amount || 0) : null;
+  const skuListings = (state.data?.catalog || []).filter(item => normalizedSkuKey(item.sku) === sku);
+  const listings = skuListings.filter(item => item.listing_type_id === "gold_special");
+  const listing = listings.sort((a, b) =>
+    Number(b.sale_fee_status === "ok") - Number(a.sale_fee_status === "ok") ||
+    Number(normalizedMlStatus(b.meli_status) === "active") - Number(normalizedMlStatus(a.meli_status) === "active"))[0];
+  if (!skuListings.length && !analyzed) return null;
+  const price = Number(listing?.price || 0);
+  const totalFee = listing?.sale_fee_status === "ok" ? Number(listing.sale_fee_amount || 0) : null;
   return {
     sku,
-    product: listing.title || "",
-    salePrice: price || null,
+    product: listing?.title || analyzed?.product || skuListings[0]?.title || "",
+    salePrice: price || analyzed?.average_unit_price || null,
     feePercentage: totalFee != null && price > 0 ? totalFee / price * 100 : null,
-    fixedFee: 0,
-    shipping: listing.shipping_cost_status === "ok" ? Number(listing.shipping_cost || 0) : null,
-    reimbursement: 0,
-    monthlyDemand: null,
+    fixedFee: totalFee != null ? 0 : null,
+    shipping: listing?.shipping_cost_status === "ok" ? Number(listing.shipping_cost || 0) : analyzed?.average_shipping_per_sale,
+    reimbursement: analyzed?.average_shipping_reimbursement_per_sale || 0,
+    monthlyDemand: analyzed ? Number(analyzed.average_daily_units || 0) * 30 : null,
     cost: state.data?.sku_costs?.[sku]?.cost,
-    source: "Anúncio sincronizado; tarifa exibida como taxa efetiva no preço atual",
-    confidence: "Referência inicial",
+    source: totalFee != null ? "Anúncio Clássico; tarifa efetiva no preço atual (inclui a parcela fixa)" : "Tarifa Clássico indisponível; informe a tarifa manualmente",
+    confidence: analyzed?.confidence || "Referência inicial",
   };
 }
 
@@ -1874,6 +1862,8 @@ function applyPurchaseReference(rawSku) {
   }
   form.elements.product.value = reference.product || "";
   setPurchaseCalculatorValue(form, "sale_price", reference.salePrice);
+  form.elements.fee_percentage.value = "";
+  form.elements.fixed_fee.value = "";
   setPurchaseCalculatorValue(form, "fee_percentage", reference.feePercentage);
   setPurchaseCalculatorValue(form, "fixed_fee", reference.fixedFee);
   setPurchaseCalculatorValue(form, "ml_shipping", reference.shipping);

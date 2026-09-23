@@ -232,6 +232,9 @@ def _build_official_store_report_service():
 
     def finish_catalog(app, payload, batch, task, account, inventory):
         product_id = task.get("catalog_product_id") or ""
+        if not str(product_id).startswith("MLB"):
+            product_id = ""
+            task["catalog_product_id"] = ""
         if not product_id:
             task["catalog_status"] = "not_available"
             return
@@ -286,8 +289,20 @@ def _build_official_store_report_service():
             body.setdefault("shipping", {})["free_shipping"] = True
         return body != before
 
-    def validate_publication(app, client, body, name):
-        for attempt in range(3):
+    def repair_publication(app, body, name, exc, source, definitions, pending):
+        before = copy.deepcopy(body)
+        # Reuse attribute repairs, but never let the generic clone fallback
+        # change the store, modality or price explicitly selected in this report.
+        fixed = {k: body[k] for k in ("official_store_id", "listing_type_id", "price") if k in body}
+        app.clone_retry_adjustments_from_error(exc, body, source, pending,
+                                               category_attributes=definitions)
+        body.update(fixed)
+        adjust_publication_error(app, body, name, exc)
+        return body != before
+
+    def validate_publication(app, client, body, name, source=None, definitions=None, pending=None):
+        pending = pending if pending is not None else []
+        for attempt in range(5):
             try:
                 return client.validate_item(body)
             except Exception as exc:
@@ -301,7 +316,8 @@ def _build_official_store_report_service():
                         and str(detail.get("message") or "").lower() in ("", "validation error", "validation_error")):
                     adjust_publication_error(app, body, name, exc)
                     return {"warnings": causes}
-                if attempt == 2 or not adjust_publication_error(app, body, name, exc):
+                changed = repair_publication(app, body, name, exc, source or {}, definitions or [], pending)
+                if attempt == 4 or not changed:
                     raise
 
     def execute(app, request):
@@ -317,7 +333,7 @@ def _build_official_store_report_service():
             products = {r["sku"]: r for r in coverage(app, payload, list(targets.values()))}
             batch["status"] = "running"
             batch["last_attempt_at"] = app.now_label()
-            batch["execution_revision"] = "store-catalog-association-v2"
+            batch["execution_revision"] = "store-editable-validation-v3"
             persist(app, batch)
             for index, task in enumerate(batch["tasks"]):
                 if task["status"] == "excluded" or (task["status"] in ("created", "existing") and task.get("catalog_status") in ("linked", "not_available")):
@@ -326,6 +342,10 @@ def _build_official_store_report_service():
                 task["last_attempt_at"] = app.now_label()
                 task["attempt_count"] = int(task.get("attempt_count") or 0) + 1
                 task["phase"] = "preparation"
+                answers = (request.get("field_answers") or {}).get(str(index), {})
+                permitted = {f["id"] for f in task.get("pending_fields", [])}
+                task.setdefault("field_answers", {}).update({k: v for k, v in answers.items() if k in permitted})
+                task["pending_fields"] = []
                 body = None
                 task.pop("error_detail", None)
                 try:
@@ -390,7 +410,11 @@ def _build_official_store_report_service():
                         source = copy.deepcopy(bundle["source_item"])
                         if app.is_catalog_listing(source):
                             raise RuntimeError("A origem precisa ser um anúncio tradicional.")
-                    task["catalog_product_id"] = source.get("catalog_product_id") or task.get("catalog_product_id") or ""
+                    task["catalog_product_id"] = next((str(value) for value in
+                        (source.get("catalog_product_id"), task.get("catalog_product_id"))
+                        if str(value or "").startswith("MLB")), "")
+                    if not str(source.get("catalog_product_id") or "").startswith("MLB"):
+                        source.pop("catalog_product_id", None)
                     if source.get("variations"):
                         variants = [v for v in source["variations"] if key(app, app.item_sku(v)) == task["sku"]]
                         if not variants:
@@ -404,7 +428,7 @@ def _build_official_store_report_service():
                             source_client = app.account_client(accounts[task["source_account_id"]])
                             for relation in source.get("item_relations", []):
                                 related = source_client.item_for_clone(relation["id"])
-                                if (app.is_catalog_listing(related) and related.get("catalog_product_id")
+                                if (app.is_catalog_listing(related) and str(related.get("catalog_product_id") or "").startswith("MLB")
                                         and str(related.get("seller_id")) == str(accounts[task["source_account_id"]]["seller_id"])):
                                     related_products.add(str(related["catalog_product_id"]))
                             if len(related_products) > 1:
@@ -430,8 +454,11 @@ def _build_official_store_report_service():
                     app.hydrate_clone_package_attributes(body, source)
                     definitions = app.cached_category_attributes(client, body.get("category_id"))
                     app.hydrate_required_clone_attributes(body, source, definitions, bundle.get("catalog_product") or {})
+                    app.sanitize_clone_payload_attributes(body, definitions, source)
+                    body = app.clone_payload_from_answers(body, app.sanitize_clone_answers(task["field_answers"], definitions))
                     task["phase"] = "validation"
-                    validation = validate_publication(app, client, body, name)
+                    validation = validate_publication(app, client, body, name, source, definitions, task["pending_fields"])
+                    task["pending_fields"] = []
                     task["validation_warnings"] = (validation or {}).get("warnings", [])
                     task["phase"] = "creation"
                     task.update(status="submitting", submitted=True, error="")
@@ -441,9 +468,9 @@ def _build_official_store_report_service():
                     except Exception as exc:
                         if re.match(r"HTTP (400|401|403|404|422|429):", str(exc)):
                             task["submitted"] = False
-                        if not str(exc).startswith("HTTP 400:") or not adjust_publication_error(app, body, name, exc):
+                        if not str(exc).startswith("HTTP 400:") or not repair_publication(app, body, name, exc, source, definitions, task["pending_fields"]):
                             raise
-                        validate_publication(app, client, body, name)
+                        validate_publication(app, client, body, name, source, definitions, task["pending_fields"])
                         task["submitted"] = True
                         persist(app, batch)
                         try:
@@ -451,10 +478,13 @@ def _build_official_store_report_service():
                         except Exception as retry_exc:
                             if re.match(r"HTTP (400|401|403|404|422|429):", str(retry_exc)):
                                 task["submitted"] = False
+                            if str(retry_exc).startswith("HTTP 400:"):
+                                repair_publication(app, body, name, retry_exc, source, definitions, task["pending_fields"])
                             raise
                     if not created.get("id"):
                         raise RuntimeError("A API não confirmou o código criado.")
                     task.update(status="created", item_id=created["id"], permalink=created.get("permalink", ""))
+                    task["pending_fields"] = []
                     persist(app, batch)
                     official = {**body, **created}
                     inventory.append(official)
@@ -482,6 +512,7 @@ def _build_official_store_report_service():
                     task["phase"] = "catalog"
                     finish_catalog(app, payload, batch, task, account, inventory)
                 except Exception as exc:
+                    task["pending_fields"] = app.dedupe_pending_fields(task.get("pending_fields", []))
                     task["status"] = "partial" if task.get("item_id") else "uncertain" if task.get("submitted") else "error"
                     task["error"] = app.friendly_clone_error(exc)
                     task["error_detail"] = {"phase": task.get("phase"), "http_status": app.meli_error_status(exc),
@@ -932,6 +963,19 @@ def sync_progress_snapshot():
         return json.loads(json.dumps(SYNC_PROGRESS, ensure_ascii=False))
 
 
+def read_poll_authorization():
+    """Read current users without copying batch histories on every progress poll."""
+    path = DATA / APP_DATA_FILE
+    signature = file_signature(path)
+    with JSON_CACHE_LOCK:
+        cached = JSON_CACHE.get(str(path.resolve()))
+        value = cached.get("value") if cached and cached.get("signature") == signature else None
+        users = value.get("users", []) if isinstance(value, dict) else None
+    if users is None:
+        users = read_json(APP_DATA_FILE, {}).get("users", [])
+    return {"users": copy.deepcopy(users)}
+
+
 def read_payload(include_catalog=True):
     # JSON files are committed with os.replace(), so readers never observe a
     # partially written document. Keeping reads outside DATA_LOCK prevents a
@@ -983,7 +1027,7 @@ def merge_clone_jobs(incoming, latest):
     """Keep previews created while an older background writer was running."""
     incoming_by_id = {str(row.get("id")): row for row in incoming or [] if row.get("id")}
     latest_by_id = {str(row.get("id")): row for row in latest or [] if row.get("id")}
-    ordered_ids = [*latest_by_id, *[key for key in incoming_by_id if key not in latest_by_id]]
+    ordered_ids = [*[key for key in incoming_by_id if key not in latest_by_id], *latest_by_id]
     merged = []
     status_rank = {
         "preview_ready": 1,
@@ -1000,9 +1044,14 @@ def merge_clone_jobs(incoming, latest):
             continue
         current_rank = status_rank.get(current.get("status"), 0)
         saved_rank = status_rank.get(saved.get("status"), 0)
-        winner = current if current_rank > saved_rank else saved
+        current_time, saved_time = int(current.get("updated_at_ns") or 0), int(saved.get("updated_at_ns") or 0)
+        winner = (current if current_time > saved_time else saved) if current_time != saved_time else (current if current_rank > saved_rank else saved)
         merged.append({**current, **saved, **winner})
-    return merged[:500]
+    # Pending previews must not be discarded when a stale writer merges a
+    # history of 500 jobs. Keep only the completed history bounded.
+    pending = [row for row in merged if row.get("status") != "copied"]
+    completed = [row for row in merged if row.get("status") == "copied"]
+    return pending + completed[:500]
 
 
 def merge_critical_records(collection, incoming, latest):
@@ -11773,7 +11822,10 @@ def async_operation_result(job_id):
     cleanup_async_operation_jobs()
     with ASYNC_OPERATION_JOBS_LOCK:
         job = ASYNC_OPERATION_JOBS.get(str(job_id or ""))
-        return json.loads(json.dumps(job, ensure_ascii=False)) if job else None
+        snapshot = dict(job) if job else None
+    # Completed results can be large. Never serialize them while holding the
+    # lock used by health checks and all workers to publish their progress.
+    return copy.deepcopy(snapshot) if snapshot else None
 
 
 def update_async_operation_progress(message="", completed=None, total=None, detail=None):
@@ -20266,7 +20318,7 @@ def statistics_job_result(job_id, include_result=True):
         public = {key: value for key, value in job.items() if key not in {"signature", "created_epoch"}}
         if not include_result:
             public.pop("result", None)
-        return json.loads(json.dumps(public, ensure_ascii=False))
+    return copy.deepcopy(public)
 
 
 def cleanup_report_jobs(now=None):
@@ -22422,6 +22474,7 @@ def prepare_clone_preview(request):
                     "id": f"clone-{uuid.uuid4().hex[:8]}",
                     "batch_id": batch_id,
                     "validation_version": 3,
+                    "updated_at_ns": time.time_ns(),
                     "source": source_account.get("nickname"),
                     "target": target_account.get("nickname"),
                     "source_account_id": source_account.get("id"),
@@ -22451,6 +22504,7 @@ def execute_clone_request(request):
     if not job:
         raise RuntimeError("Preview não encontrado.")
     copied = execute_clone_job(payload, job, request.get("field_answers") or {})
+    job["updated_at_ns"] = time.time_ns()
     write_payload(payload)
     return {"ok": True, "job": job, "copied": copied}
 
@@ -22475,6 +22529,7 @@ def execute_clone_batch_request(request):
         if job.get("status") == "copied":
             continue
         copied.extend(execute_clone_job(payload, job, (request.get("field_answers") or {}).get(job.get("id"), {})))
+        job["updated_at_ns"] = time.time_ns()
     write_payload(payload)
     return {"ok": True, "jobs": selected, "copied": copied}
 
@@ -22846,7 +22901,10 @@ class App(BaseHTTPRequestHandler):
             "/api/reports/jobs/",
             "/api/spreadsheet/jobs/",
         )
-        fast_paths = {"/api/health", "/api/meta", "/api/dashboard", "/api/auth/me", "/api/returns", "/api/customers"}
+        if parsed_path == "/api/health":
+            self._do_GET()
+            return
+        fast_paths = {"/api/meta", "/api/dashboard", "/api/auth/me", "/api/returns", "/api/customers"}
         semaphore = HTTP_FAST_REQUEST_SEMAPHORE if (
             parsed_path in fast_paths or parsed_path.startswith(fast_prefixes)
         ) else HTTP_REQUEST_SEMAPHORE
@@ -22875,7 +22933,8 @@ class App(BaseHTTPRequestHandler):
                 saturated_pools.append("manual")
             self.send_json(
                 {
-                    "ok": not saturated_pools,
+                    "ok": True,
+                    "ready": not saturated_pools,
                     "service": "CompeTIDOR",
                     "profile": PERFORMANCE_PROFILE,
                     "uptime_seconds": int(time.time() - RUNTIME_STARTED_AT),
@@ -22922,7 +22981,8 @@ class App(BaseHTTPRequestHandler):
             else:
                 self.send_json_body(body, headers=headers)
             return
-        payload = read_payload(include_catalog=False)
+        polling = parsed.path.startswith(("/api/async/jobs/", "/api/statistics/jobs/", "/api/reports/jobs/", "/api/spreadsheet/jobs/"))
+        payload = read_poll_authorization() if polling else read_payload(include_catalog=False)
 
         if parsed.path == "/api/auth/me":
             user = self.current_user(payload)

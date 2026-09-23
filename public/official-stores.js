@@ -50,6 +50,16 @@
     $('stores-batches').innerHTML = '<option value="">Selecione</option>' + [...data.batches].reverse().map(b => `<option value="${attr(b.id)}">${esc(b.created_at)} · ${esc(b.status)} · ${b.tasks.length} combinações</option>`).join('');
     if (batch) $('stores-batches').value = batch.id;
   }
+  function pendingInputs(task, index) {
+    return (task.pending_fields || []).map(field => {
+      const common = `data-store-answer="${index}" data-field="${attr(field.id)}"`;
+      const value = task.field_answers?.[field.id] ?? field.default_value ?? '';
+      const input = field.options?.length
+        ? `<select ${common}><option value="">Selecione</option>${field.options.map(o => { const v = typeof o === 'object' ? o.value : o; return `<option value="${attr(v)}" ${String(v) === String(value) ? 'selected' : ''}>${esc(typeof o === 'object' ? o.label : o)}</option>`; }).join('')}</select>`
+        : `<input ${common} value="${attr(value)}" placeholder="${attr(field.units?.length ? 'Valor com unidade: ' + field.units.join(', ') : field.label || field.id)}">`;
+      return `<label class="store-pending-field" style="display:grid;gap:6px;margin:12px 0;max-width:420px">${esc(field.label || field.id)}${input}<small>${esc(field.message || '')}</small></label>`;
+    }).join('');
+  }
   function renderBatch() {
     if (!batch) { $('stores-batch').innerHTML = ''; return; }
     const counts = {};
@@ -57,7 +67,7 @@
     $('stores-batch').innerHTML = `<p>${batch.last_attempt_at ? `Última tentativa: ${esc(batch.last_attempt_at)} · Versão: ${esc(batch.execution_revision || 'anterior')}` : 'Prévia / resultado salvo; clique em publicar ou retomar para executar.'}</p><p>${Object.entries(counts).map(([s, n]) => `${n} ${labels[s] || s}`).join(' · ')}</p>
       <p>Cada linha representa uma modalidade. Quando houver produto de Catálogo correspondente, serão criados o tradicional e seu Catálogo vinculado: até quatro anúncios por SKU e destino (dois Clássicos e dois Premium). Revise os destinos e preços abaixo. A publicação preserva os anúncios existentes. Solicitações com resposta incerta serão conferidas, sem repetição automática.</p>
       <button type="button" class="primary" data-store-execute> ${batch.status === 'preview' ? 'Publicar anúncios faltantes' : 'Retomar / conferir pendências'}</button>
-      <div class="store-matrix-scroll"><table class="store-matrix"><thead><tr><th>SKU</th><th>Conta / loja</th><th>Tipo / preço</th><th>Resultado</th></tr></thead><tbody>${batch.tasks.slice(batchPage * 100, batchPage * 100 + 100).map(t => `<tr><td>${esc(t.sku)}</td><td><small>Conta</small><br><strong>${esc(t.target.account)}</strong><br><small>Loja oficial</small><br>${esc(t.target.name)}</td><td>${labels[t.kind]} · ${Number(t.price || 0).toLocaleString('pt-BR', {style:'currency',currency:'BRL'})}<br><small>Tradicional + Catálogo vinculado, quando disponível</small></td><td>${labels[t.status] || esc(t.status)} ${t.item_id ? `<br>Tradicional: ${esc(t.item_id)}` : ''}${t.catalog_item_id ? `<br>Catálogo: ${esc(t.catalog_item_id)} · ${t.catalog_status === 'linked' ? 'Vínculo confirmado' : 'A conferir'}` : ''}${t.catalog_status === 'not_available' ? '<br>Sem produto de Catálogo correspondente identificado' : ''}<br>${esc(t.error || t.warning || '')}${t.error_detail ? `<details><summary>Diagnóstico da tentativa ${Number(t.attempt_count || 1)}</summary><pre>${esc(JSON.stringify(t.error_detail, null, 2))}</pre></details>` : ''}${t.validation_warnings?.length ? `<small>Avisos da validação: ${esc(t.validation_warnings.map(w => w.message || w.code).join(' · '))}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>
+      <div class="store-matrix-scroll"><table class="store-matrix"><thead><tr><th>SKU</th><th>Conta / loja</th><th>Tipo / preço</th><th>Resultado</th></tr></thead><tbody>${batch.tasks.slice(batchPage * 100, batchPage * 100 + 100).map((t, i) => `<tr><td>${esc(t.sku)}</td><td><small>Conta</small><br><strong>${esc(t.target.account)}</strong><br><small>Loja oficial</small><br>${esc(t.target.name)}</td><td>${labels[t.kind]} · ${Number(t.price || 0).toLocaleString('pt-BR', {style:'currency',currency:'BRL'})}<br><small>Tradicional + Catálogo vinculado, quando disponível</small></td><td>${labels[t.status] || esc(t.status)} ${t.item_id ? `<br>Tradicional: ${esc(t.item_id)}` : ''}${t.catalog_item_id ? `<br>Catálogo: ${esc(t.catalog_item_id)} · ${t.catalog_status === 'linked' ? 'Vínculo confirmado' : 'A conferir'}` : ''}${t.catalog_status === 'not_available' ? '<br>Sem produto de Catálogo correspondente identificado' : ''}<br>${esc(t.error || t.warning || '')}${pendingInputs(t, batchPage * 100 + i)}${t.error_detail ? `<details><summary>Diagnóstico da tentativa ${Number(t.attempt_count || 1)}</summary><pre>${esc(JSON.stringify(t.error_detail, null, 2))}</pre></details>` : ''}${t.validation_warnings?.length ? `<small>Avisos da validação: ${esc(t.validation_warnings.map(w => w.message || w.code).join(' · '))}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>
       <button type="button" data-store-batch-prev>Anterior</button> ${batchPage + 1} / ${Math.max(1, Math.ceil(batch.tasks.length / 100))} <button type="button" data-store-batch-next>Próxima</button>`;
   }
   async function load() {
@@ -107,9 +117,14 @@
     data.batches.push(batch); batchPage = 0; renderBatches(); renderBatch(); $('stores-batch').scrollIntoView({behavior:'smooth',block:'start'});
   });
   $('stores-batches').onchange = () => { batch = data.batches.find(b => b.id === $('stores-batches').value); batchPage = 0; renderBatch(); };
+  $('stores-batch').onchange = e => {
+    if (e.target.dataset.storeAnswer == null || busy) return;
+    const task = batch.tasks[Number(e.target.dataset.storeAnswer)];
+    (task.field_answers ||= {})[e.target.dataset.field] = e.target.value.trim();
+  };
   $('stores-batch').onclick = e => {
     if (e.target.hasAttribute('data-store-execute')) run(async () => {
-      batch = await operation('execute', {batch_id: batch.id});
+      batch = await operation('execute', {batch_id: batch.id, field_answers: Object.fromEntries(batch.tasks.map((t, i) => [String(i), t.field_answers || {}]))});
       await load(); renderBatch();
     });
     if (e.target.hasAttribute('data-store-batch-prev')) { batchPage = Math.max(0, batchPage - 1); renderBatch(); }
