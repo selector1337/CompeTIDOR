@@ -189,6 +189,7 @@ const pageTitles = {
   clientes: ["Histórico transacional", "Clientes"],
   estatisticas: ["Vendas oficiais", "Estatísticas por SKU"],
   custos: ["Rentabilidade", "Custos por SKU"],
+  metas: ["Planejamento comercial", "Metas de Venda"],
   compras: ["Inteligência de abastecimento", "Compras"],
   relatorios: ["Vendas e equalização", "Relatórios"],
   contas: ["OAuth oficial", "Contas Mercado Livre"],
@@ -700,6 +701,7 @@ function renderRoute() {
     clientes: renderCustomers,
     estatisticas: renderStatistics,
     custos: renderCosts,
+    metas: () => window.salesGoalsPage?.open(),
     compras: renderPurchases,
     relatorios: renderReportsHub,
     contas: () => {
@@ -3007,7 +3009,23 @@ function resetBulkPriceControls(root) {
   if (value) value.value = "";
 }
 
+let bulkSuccessTimer = null;
+let bulkSuccessSnapshot = null;
+function bulkPriceLabel(value) {
+  if (value == null || value === "") return "Preço confirmado; consulte o anúncio";
+  const parsed = typeof value === "number" ? value : Number(String(value).replace(/R\$|\s/g, "").replace(/\.(?=\d{3}(?:\D|$))/g, "").replace(",", "."));
+  return Number.isFinite(parsed) ? money.format(parsed) : "Preço confirmado; consulte o anúncio";
+}
 function renderBulkPriceProgress() {
+  const candidate = state.bulkPriceProgress;
+  if (candidate?.status === "completed" && !candidate.failed && bulkSuccessSnapshot !== candidate) {
+    clearTimeout(bulkSuccessTimer);
+    bulkSuccessSnapshot = candidate;
+    bulkSuccessTimer = setTimeout(() => {
+      if (state.bulkPriceProgress === candidate) { state.bulkPriceProgress = null; renderBulkPriceProgress(); }
+    }, 5000);
+  }
+
   const root = document.querySelector("[data-bulk-price-progress]");
   if (!root) return;
   const progress = state.bulkPriceProgress;
@@ -3040,7 +3058,7 @@ function renderBulkPriceProgress() {
           ? progress.operation === "availability" ? ` · ${Number(item.manufacturing_time || 0) ? `${Number(item.manufacturing_time)} dias` : "Disponibilidade imediata"}`
             : progress.operation === "flex_activate" ? " · Flex ativado"
             : ["flex", "flex_remove"].includes(progress.operation) ? " · Flex removido"
-              : ` · ${money.format(item.price)}`
+              : progress.operation === "delete" ? " · Excluído" : progress.operation === "pickup_activate" ? " · Retirada ativada" : progress.operation === "pickup_remove" ? " · Retirada desativada" : ` · ${bulkPriceLabel(item.price ?? item.new_price ?? item.updated_price)}`
           : item.status === "ignored" ? ` · ${escapeText(item.message || "Sem alteração")}` : ` · ${escapeText(item.error || "Falhou")}`}
       </span>`).join("");
   }
@@ -4680,6 +4698,7 @@ async function loadBrandSalesReport() {
 }
 
 function currentReportFilters(reportType) {
+  if (reportType === "sales_goals") return window.salesGoalsPage.filters();
   if (reportType === "dashboard_stock") {
     return {
       period: state.stockPeriod,
@@ -6934,7 +6953,7 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
       };
       renderBulkPriceProgress();
     });
-    const updates = new Map((result.results || []).filter((row) => row.status === "updated").map((row) => [row.item_id, row.price]));
+    const updates = new Map((result.results || []).filter((row) => row.status === "updated" && row.price != null && Number.isFinite(Number(row.price))).map((row) => [row.item_id, Number(row.price)]));
     state.data.catalog = state.data.catalog.map((item) => updates.has(item.id)
       ? { ...item, price: updates.get(item.id), price_source: "manual_update", sale_price_checked_at: "", sale_fee_status: "pending", sale_fee_updated_at: "", sale_fee_basis: "", item_data_checked_at: new Date().toISOString() }
       : item);

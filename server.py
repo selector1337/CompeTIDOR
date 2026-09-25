@@ -704,6 +704,7 @@ JSON_CACHE = {}
 STATIC_FILE_CACHE_LOCK = threading.RLock()
 STATIC_FILE_CACHE = {}
 RESPONSE_CACHE_LOCK = threading.RLock()
+CATALOG_RESPONSE_BUILD_LOCK = threading.Lock()
 RESPONSE_CACHE = {}
 ASYNC_OPERATION_JOBS_LOCK = threading.RLock()
 ASYNC_OPERATION_JOBS = {}
@@ -1192,6 +1193,7 @@ def write_payload(payload, replace_collections=None):
             latest.get("item_logs", []),
         )
         if incoming_revision < latest_revision:
+            payload["monthly_revenue"] = merge_monthly_revenue(payload.get("monthly_revenue") or {}, latest.get("monthly_revenue") or {})
             for field in ("official_store_rules", "official_store_batches"):
                 payload[field] = {**(payload.get(field) or {}), **(latest.get(field) or {})}
             for collection in ("users", "accounts"):
@@ -8983,6 +8985,10 @@ def sync_recent_sales(payload, account, client):
     account["sales_sync_status"] = f"{revenue_orders} pedidos reais sincronizados no mês"
     upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"])
     try:
+        cache_sales_goal_orders(payload, account, period, orders)
+    except Exception as exc:
+        account["sales_goals_sync_status"] = f"Não foi possível atualizar as metas: {exc}"
+    try:
         today = datetime.now(APP_TZ).date()
         cache_official_orders_for_analytics(payload, account, today.replace(day=1), today, orders)
     except Exception:
@@ -9017,17 +9023,32 @@ def fetch_seller_orders_window(client, seller_id, date_from, date_to, max_orders
     orders = []
     offset = 0
     page_size = 50
+    # Freeze the upper bound so new orders cannot shift date_desc pages mid-read.
+    upper = parse_meli_datetime(date_to)
+    if upper and upper > datetime.now(APP_TZ):
+        date_to = datetime.now(APP_TZ).isoformat(timespec="milliseconds")
     # Dashboard totals must not inherit the old recent-sales cap. The dedicated
     # limit remains configurable as an emergency guard for exceptionally large accounts.
     limit = int(max_orders or os.getenv("MELI_DASHBOARD_MONTHLY_ORDERS_LIMIT", "50000"))
+    seen = set()
     while len(orders) < limit:
         data = client.seller_orders(seller_id, limit=page_size, offset=offset, date_from=date_from, date_to=date_to)
         batch = data.get("results", []) or []
-        orders.extend(batch)
-        total = int((data.get("paging") or {}).get("total") or len(orders))
-        if not batch or len(orders) >= total:
+        total = int((data.get("paging") or {}).get("total") or 0)
+        for order in batch:
+            identity = str(order.get("id") or json.dumps(order, sort_keys=True))
+            if identity not in seen:
+                seen.add(identity)
+                orders.append(order)
+        if (not batch and offset < total) or (offset + len(batch) >= total and total and len(orders) < total):
+            raise RuntimeError(f"Importação incompleta de pedidos: {len(orders)} únicos recebidos de {total}. Os totais anteriores foram preservados; atualize novamente.")
+        if not batch or (total and offset + len(batch) >= total) or (not total and len(batch) < page_size):
             break
         offset += len(batch)
+        if offset >= limit and len(orders) < offset:
+            raise RuntimeError("A API repetiu páginas de pedidos. Atualize novamente para conferir os totais.")
+    if not max_orders and total > len(orders):
+        raise RuntimeError(f"Consulta incompleta: {len(orders)} de {total} pedidos. Amplie o limite de importação antes de usar os totais.")
     return orders[:limit]
 
 
@@ -11129,6 +11150,190 @@ def competition_snapshot(item):
     return snapshot
 
 
+SALES_GOALS_FILE = "sales_goals.json"
+
+
+def sales_goal_month(value=None):
+    period = str(value or current_month_period())
+    if not re.fullmatch(r"\d{4}-\d{2}", period):
+        raise RuntimeError("Informe um mês válido.")
+    start = datetime.strptime(period, "%Y-%m").replace(tzinfo=APP_TZ)
+    end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return period, start, end
+
+
+def sales_goal_period(store, period):
+    months = store.setdefault("months", {})
+    if period not in months:
+        previous = sorted(p for p in months if p < period)
+        targets = copy.deepcopy(months[previous[-1]].get("targets", {})) if previous else {}
+        months[period] = {"targets": targets, "accounts": {}}
+    return months[period]
+
+
+def cache_sales_goal_orders(payload, account, period, orders):
+    period, start, end = sales_goal_month(period)
+    catalog = {str(i.get("id")): i for i in payload.get("catalog", [])
+               if str(i.get("account_id")) == str(account.get("id"))}
+    units, products, seen, unknown = {}, {}, set(), 0
+    revenue, count = 0.0, 0
+    for order in orders:
+        identity = str(order.get("id") or "")
+        if identity and identity in seen:
+            continue
+        seen.add(identity)
+        sold_at = parse_meli_datetime(order.get("date_created"))
+        if sold_at and not start <= sold_at < end:
+            continue
+        if not official_order_is_revenue(order):
+            continue
+        revenue += official_order_revenue_amount(order)
+        count += 1
+        for line in order.get("order_items") or []:
+            item = line.get("item") or {}
+            sku = normalized_sku_key(order_item_sku(line, catalog.get(str(item.get("id")), {})))
+            quantity = max(0, int(line.get("quantity") or 0))
+            if not sku or sku == "-":
+                unknown += quantity
+                continue
+            units[sku] = units.get(sku, 0) + quantity
+            products[sku] = item.get("title") or sku
+    record = {"account": account.get("nickname"), "units": units, "products": products,
+              "orders_count": count, "amount": round(revenue, 2), "unknown_units": unknown,
+              "updated_at": now_label(), "updated_at_ns": time.time_ns()}
+    with DATA_LOCK:
+        store = read_json(SALES_GOALS_FILE, {"months": {}})
+        month = sales_goal_period(store, period)
+        month["accounts"][str(account.get("seller_id") or account["id"])] = record
+        write_json(SALES_GOALS_FILE, store)
+    return record
+
+
+def query_sales_goals(payload, request):
+    period, _, _ = sales_goal_month(request.get("month"))
+    with DATA_LOCK:
+        store = read_json(SALES_GOALS_FILE, {"months": {}})
+        if period == current_month_period() and period not in store["months"]:
+            sales_goal_period(store, period)
+            write_json(SALES_GOALS_FILE, store)
+    month = store.get("months", {}).get(period, {"targets": {}, "accounts": {}})
+    rows = {}
+    for item in payload.get("catalog", []):
+        sku = normalized_sku_key(item.get("sku"))
+        if not sku or sku == "-":
+            continue
+        row = rows.setdefault(sku, {"sku": sku, "product": item.get("title") or sku, "statuses": [], "sold": 0})
+        status = normalized_meli_status(item.get("meli_status") or item.get("status") or "")
+        if status not in row["statuses"]:
+            row["statuses"].append(status)
+    for account in month.get("accounts", {}).values():
+        for sku, units in account.get("units", {}).items():
+            row = rows.setdefault(sku, {"sku": sku, "product": account.get("products", {}).get(sku, sku), "statuses": [], "sold": 0})
+            row["sold"] += units
+    for sku in month.get("targets", {}):
+        rows.setdefault(sku, {"sku": sku, "product": sku, "statuses": [], "sold": 0})
+    selected = []
+    for sku, row in sorted(rows.items()):
+        target = month.get("targets", {}).get(sku)
+        row.update(target=target, remaining=max(0, (target or 0) - row["sold"]),
+                   progress=round(row["sold"] / target * 100, 1) if target else 0)
+        if request.get("status") and request["status"] not in row["statuses"]:
+            continue
+        if request.get("registered") == "yes" and not target or request.get("registered") == "no" and target:
+            continue
+        if str(request.get("search") or "").casefold() not in f"{sku} {row['product']}".casefold():
+            continue
+        selected.append(row)
+    accounts = list(month.get("accounts", {}).values())
+    expected = {str(a.get("seller_id") or a["id"]) for a in payload.get("accounts", []) if a.get("official") and a.get("status") == "connected"}
+    missing = expected - set(month.get("accounts", {}))
+    return {"month": period, "months": sorted(set(store.get("months", {})) | {period}, reverse=True),
+            "rows": selected, "editable": period == current_month_period(),
+            "accounts": [{k: v for k, v in a.items() if k not in {"units", "products"}} for a in accounts],
+            "warnings": ([f"{len(missing)} conta(s) ainda sem vendas sincronizadas neste mês. Clique em Atualizar vendas."] if missing else [])
+                        + (["Há vendas sem SKU identificado; confira os cadastros de origem."] if any(a.get("unknown_units") for a in accounts) else [])}
+
+
+def save_sales_goals(request):
+    period, _, _ = sales_goal_month(request.get("month"))
+    if period != current_month_period():
+        raise RuntimeError("O histórico é somente para consulta. Edite as metas do mês atual.")
+    edits = request.get("targets") or {}
+    if not isinstance(edits, dict) or len(edits) > 50000:
+        raise RuntimeError("Lista de metas inválida.")
+    validated = {}
+    for raw, value in edits.items():
+        sku = normalized_sku_key(raw)
+        if not sku or sku == "-":
+            raise RuntimeError("SKU inválido.")
+        if value in (None, ""):
+            validated[sku] = None
+        else:
+            number = float(str(value).replace(",", "."))
+            if not math.isfinite(number) or not number.is_integer() or number < 1 or number > 100000000:
+                raise RuntimeError(f"Informe uma meta inteira positiva para {sku}.")
+            validated[sku] = int(number)
+    with DATA_LOCK:
+        store = read_json(SALES_GOALS_FILE, {"months": {}})
+        month = sales_goal_period(store, period)
+        for sku, value in validated.items():
+            if value is None:
+                month["targets"].pop(sku, None)
+            else:
+                month["targets"][sku] = value
+        write_json(SALES_GOALS_FILE, store)
+    return {"ok": True, "saved": len(validated)}
+
+
+def reconcile_month_sales(request):
+    period, start, end = sales_goal_month(request.get("month"))
+    if start > datetime.now(APP_TZ):
+        raise RuntimeError("Selecione o mês atual ou anterior.")
+    payload = read_payload()
+    results, seen = [], set()
+    for account in payload.get("accounts", []):
+        seller = str(account.get("seller_id") or "")
+        if not account.get("official") or account.get("status") != "connected" or seller in seen:
+            continue
+        seen.add(seller)
+        try:
+            orders = fetch_seller_orders_window(account_client(account), seller,
+                start.isoformat(timespec="milliseconds"), (min(end, datetime.now(APP_TZ)) - timedelta(milliseconds=1)).isoformat(timespec="milliseconds"))
+            record = cache_sales_goal_orders(payload, account, period, orders)
+            cache_official_orders_for_analytics(payload, account, start.date(),
+                min(end - timedelta(days=1), datetime.now(APP_TZ)).date(), orders)
+            with DATA_LOCK:
+                fresh = read_payload(include_catalog=False)
+                upsert_monthly_revenue(fresh, account, record["amount"], record["orders_count"], period, "Pedidos conferidos com a API oficial")
+                write_payload(fresh)
+            results.append({"account": account.get("nickname"), "orders": record["orders_count"], "amount": record["amount"], "status": "ok"})
+        except Exception as exc:
+            results.append({"account": account.get("nickname"), "status": "error", "error": str(exc)})
+        update_async_operation_progress("Conferindo pedidos por conta", len(results), None)
+    return {"results": results, "month": period}
+
+
+def merge_monthly_revenue(incoming, latest):
+    merged = {**latest, **incoming, "history": {}}
+    periods = set((incoming.get("history") or {})) | set((latest.get("history") or {}))
+    periods.update(p for p in (incoming.get("period"), latest.get("period")) if p)
+    for period in periods:
+        accounts = {}
+        for source in (latest, incoming):
+            records = dict(((source.get("history") or {}).get(period) or {}).get("accounts") or {})
+            if source.get("period") == period:
+                records.update(source.get("accounts") or {})
+            for key, record in records.items():
+                saved = accounts.get(key, {})
+                rank = lambda r: (int(r.get("updated_at_ns") or 0), str(r.get("updated_at") or ""))
+                if key not in accounts or rank(record) > rank(saved):
+                    accounts[key] = record
+        merged["history"][period] = {"accounts": accounts}
+    merged["period"] = current_month_period()
+    merged["accounts"] = (merged["history"].get(merged["period"]) or {}).get("accounts", {})
+    return merged
+
+
 def upsert_monthly_revenue(payload, account, amount, orders_count, period, status):
     monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}, "history": {}})
     record = {
@@ -11138,6 +11343,7 @@ def upsert_monthly_revenue(payload, account, amount, orders_count, period, statu
         "source": "Pedidos oficiais Mercado Livre",
         "sync_status": status,
         "updated_at": now_label(),
+        "updated_at_ns": time.time_ns(),
     }
     key = str(account.get("id") or account.get("seller_id") or account.get("nickname") or "")
     monthly.setdefault("history", {}).setdefault(period, {"accounts": {}}).setdefault("accounts", {})[key] = record
@@ -16364,6 +16570,10 @@ def fetch_statistics_orders(client, seller_id, start, end):
     truncated = False
     for window_from, window_to in statistics_order_windows(start, end):
         offset = 0
+        window_seen = set()
+        upper = parse_meli_datetime(window_to)
+        if upper and upper > datetime.now(APP_TZ):
+            window_to = datetime.now(APP_TZ).isoformat(timespec="milliseconds")
         while len(orders) < maximum:
             data = client.seller_orders(
                 seller_id,
@@ -16376,6 +16586,7 @@ def fetch_statistics_orders(client, seller_id, start, end):
             for order in batch:
                 order_id = str(order.get("id") or "")
                 signature = order_id or json.dumps(order, sort_keys=True, ensure_ascii=False)
+                window_seen.add(signature)
                 if signature in seen:
                     continue
                 seen.add(signature)
@@ -16386,6 +16597,8 @@ def fetch_statistics_orders(client, seller_id, start, end):
             total = int((data.get("paging") or {}).get("total") or len(batch))
             offset += len(batch)
             if not batch or offset >= total or len(orders) >= maximum:
+                if total > len(window_seen):
+                    truncated = True
                 break
         if len(orders) >= maximum:
             truncated = True
@@ -20432,7 +20645,7 @@ def start_report_job(request):
     output_format = str((request or {}).get("format") or "xlsx").lower()
     if report_type not in {
         "statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization",
-        "dashboard_stock", "customers",
+        "dashboard_stock", "customers", "sales_goals",
     }:
         raise RuntimeError("Selecione um relatório disponível para exportar.")
     if output_format not in {"xlsx", "pdf"}:
@@ -20470,7 +20683,7 @@ def start_report_job(request):
             title, columns, rows, metadata = report_dataset(
                 read_payload(include_catalog=report_type in {
                     "statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization",
-                    "dashboard_stock",
+                    "dashboard_stock", "sales_goals",
                 }),
                 report_type,
                 filters,
@@ -20722,6 +20935,12 @@ def media_consistency_report_rows(payload, filters, report_mode):
 
 
 def report_dataset(payload, report_type, filters, statistics_result=None):
+    if report_type == "sales_goals":
+        result = query_sales_goals(payload, filters)
+        columns = [("sku", "SKU", "text"), ("product", "Produto", "text"), ("target", "Meta mensal (un.)", "integer"), ("sold", "Vendidas", "integer"), ("remaining", "Faltam", "integer"), ("progress", "Progresso", "percent")]
+        rows = [{**r, "target": r["target"] or "", "remaining": r["remaining"] if r["target"] else ""} for r in result["rows"]]
+        return "Metas de Venda", columns, rows, {"Mês": result["month"], "Critério": "Todas as contas; pedidos não cancelados", "Avisos": " ".join(result["warnings"])}
+
     if report_type == "dashboard_stock":
         period = str(filters.get("period") or "week").lower()
         custom_from = str(filters.get("date_from") or "")[:10]
@@ -22609,6 +22828,11 @@ def execute_clone_batch_request(request):
 
 
 def catalog_api_response(payload=None):
+    with CATALOG_RESPONSE_BUILD_LOCK:
+        return build_catalog_api_response(payload)
+
+
+def build_catalog_api_response(payload=None):
     signatures = (
         file_signature(DATA / CATALOG_DATA_FILE),
         file_signature(DATA / SKU_COSTS_FILE),
@@ -22966,6 +23190,9 @@ class App(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed_path = urlparse(self.path).path
+        if parsed_path == "/api/live":
+            self.send_json({"ok": True, "service": "CompeTIDOR", "uptime_seconds": int(time.time() - RUNTIME_STARTED_AT)}, headers={"Cache-Control": "no-store"})
+            return
         if not parsed_path.startswith("/api/"):
             self._do_GET()
             return
@@ -23372,6 +23599,9 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/item/remove_pickup",
             "/api/meli/item/activate_pickup",
             "/api/meli/item/delete",
+            "/api/sales-goals/query",
+            "/api/sales-goals/save",
+            "/api/sales-goals/refresh",
             "/api/clone/preview",
             "/api/reports/official-stores/query",
             "/api/reports/official-stores/rules",
@@ -24490,6 +24720,17 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "official": official, "item": item})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path in {"/api/sales-goals/query", "/api/sales-goals/save", "/api/sales-goals/refresh"}:
+            action = parsed.path.rsplit("/", 1)[-1]
+            if action == "save" and (self.current_user(payload) or {}).get("role") == "viewer":
+                self.send_json({"error": "Perfil sem permissão para editar metas."}, status=403)
+                return
+            work = {"query": lambda: query_sales_goals(read_payload(), request),
+                    "save": lambda: save_sales_goals(request),
+                    "refresh": lambda: reconcile_month_sales(request)}[action]
+            self.send_json({"ok": True, **start_async_operation("sales_goals_" + action, work, priority="manual")}, status=202)
             return
 
         if parsed.path.startswith("/api/reports/official-stores/"):

@@ -10877,3 +10877,15 @@ textarea:focus {
 .store-field-value input { min-width: 0; width: 100%; }
 .store-pending-field input, .store-pending-field select { padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); min-height: 38px; }
 .store-field-value > span { color: var(--muted); font-weight: 600; }
+
+.goals-hero { display:flex;justify-content:space-between;align-items:center;gap:20px;padding:24px;border-radius:16px;background:var(--panel-2);border:1px solid var(--line);margin-bottom:20px; }
+.goals-hero h2 { margin:8px 0; }.goals-hero p,.goals-toolbar p { color:var(--muted);line-height:1.6; }
+.goals-filters { display:grid;grid-template-columns:180px 2fr 1fr 1fr;gap:16px; }.goals-filters label { display:grid;gap:8px; }
+.goals-filters input,.goals-filters select,.goals-table input { padding:10px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink); }
+.goals-summary { display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:20px 0; }.goals-summary article { display:grid;gap:12px;background:var(--panel);border:1px solid var(--line);padding:20px;border-radius:12px; }.goals-summary strong { font-size:28px; }
+.goals-toolbar { display:flex;align-items:center;gap:12px;margin:16px 0; }.goals-toolbar p { flex:1; }.goals-table-wrap { overflow:auto; }.goals-table { width:100%;border-collapse:collapse; }.goals-table td,.goals-table th { padding:16px;text-align:left;border-bottom:1px solid var(--line); }.goals-table small { display:block;color:var(--muted);margin-top:6px; }.goals-table input { width:110px; }.goal-progress { width:180px;height:10px;border-radius:8px;background:var(--line);overflow:hidden; }.goal-progress span { display:block;height:100%;background:var(--green);border-radius:8px; }
+@media(max-width:780px) { .goals-filters,.goals-summary { grid-template-columns:1fr 1fr; }.goals-hero,.goals-toolbar { flex-wrap:wrap; }.goals-toolbar p { flex-basis:100%; } }
+.goals-table-wrap { max-height:65vh; border:1px solid var(--line); border-radius:12px; }
+.goals-table th { position:sticky;top:0;background:var(--panel);z-index:1; }
+.goals-filters > label { min-width:0; }.goals-filters input,.goals-filters select { width:100%;min-width:0;box-sizing:border-box; }
+#page-metas button:disabled { opacity:.5;cursor:not-allowed; }
