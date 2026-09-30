@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20260925-goals" />
+  <link rel="stylesheet" href="/styles.css?v=20260930-dedicated" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -80,6 +80,18 @@
             </div>
           </div>
           <div id="dashboard-revenue" class="revenue-grid"></div>
+          <details class="revenue-reconcile">
+            <summary>Conferir / importar vendas de outros meses</summary>
+            <p>Consulte novamente os pedidos oficiais de todas as contas. Os totais só são substituídos quando a consulta do mês está completa.</p>
+            <p>A API permite consultar pedidos de até 12 meses. Meses anteriores permanecem no histórico salvo; uma busca indisponível não apaga esses valores.</p>
+            <form id="sales-reconcile-form" class="goals-toolbar">
+              <label>Do mês <input type="month" name="month_from" required></label>
+              <label>Até o mês <input type="month" name="month_to" required></label>
+              <button class="primary" type="submit">Conferir e importar vendas</button>
+            </form>
+            <p id="sales-reconcile-status" role="status" aria-live="polite"></p>
+            <div id="sales-reconcile-results"></div>
+          </details>
         </div>
         <div class="summary-grid">
           <article class="summary-card success">
@@ -1496,7 +1508,7 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20260925-goals"></script>
+  <script src="/app.js?v=20260930-dedicated"></script>
   <script src="/sales-goals.js?v=20260925"></script>
   <script src="/official-stores.js?v=20260923-clear-pending"></script>
   </body>

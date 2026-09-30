@@ -560,6 +560,19 @@ except ImportError:  # The application still starts while the optional browser i
 
 PERFORMANCE_PROFILE = (os.getenv("COMPETIDOR_PERFORMANCE_PROFILE", "shared-8gb") or "shared-8gb").strip().lower()
 PERFORMANCE_DEFAULTS = {
+    "dedicated-16gb": {
+        "http_max_concurrent_requests": 96,
+        "http_request_queue": 256,
+        "interactive_meli_max_in_flight": 8,
+        "background_meli_max_in_flight": 6,
+        "sync_concurrent_accounts": 2,
+        "sync_batch_workers": 6,
+        "manual_concurrent_jobs": 4,
+        "clone_concurrent_jobs": 4,
+        "background_concurrent_jobs": 2,
+        "competition_workers": 10,
+        "gzip_threshold_bytes": 2048,
+    },
     "shared-8gb": {
         "http_max_concurrent_requests": 64,
         "http_request_queue": 128,
@@ -592,7 +605,7 @@ GC_GENERATION0_THRESHOLD = max(
     700,
     min(
         200000,
-        int(os.getenv("COMPETIDOR_GC_GENERATION0_THRESHOLD", "50000" if PERFORMANCE_PROFILE == "shared-8gb" else "10000")),
+        int(os.getenv("COMPETIDOR_GC_GENERATION0_THRESHOLD", "50000" if PERFORMANCE_PROFILE in {"shared-8gb", "dedicated-16gb"} else "10000")),
     ),
 )
 gc.set_threshold(GC_GENERATION0_THRESHOLD, 10, 10)
@@ -653,6 +666,9 @@ PURCHASE_OPPORTUNITIES_CACHE_VERSION = 9
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
+ACCOUNT_REFRESH_LOCK = threading.RLock()
+ACCOUNT_REFRESHED_TOKENS = {}
+ACCOUNT_TOKEN_FIELDS = ("access_token", "refresh_token", "expires_in", "token_created_at", "token_created_at_ns")
 RETURNS_DATA_LOCK = threading.RLock()
 RETURNS_SYNC_LOCK = threading.RLock()
 ACTIVE_RETURN_SYNCS = set()
@@ -868,11 +884,12 @@ def read_json(name, fallback):
     # previous complete snapshot while a large catalog is being serialized.
     for attempt in range(3):
         try:
+            read_signature = file_signature(path)
             value = json.loads(path.read_text(encoding="utf-8"))
             cached_value = copy.deepcopy(value)
             with JSON_CACHE_LOCK:
                 JSON_CACHE[cache_key] = {
-                    "signature": file_signature(path),
+                    "signature": read_signature,
                     "value": cached_value,
                     "loaded_at": time.monotonic(),
                 }
@@ -904,6 +921,7 @@ def write_json(name, payload):
                 ensure_ascii=False,
             )
         os.replace(temporary, path)
+        cached_copy = None if compact else copy.deepcopy(payload)
         with JSON_CACHE_LOCK:
             cache_key = str(path.resolve())
             if compact:
@@ -913,7 +931,7 @@ def write_json(name, payload):
             else:
                 JSON_CACHE[cache_key] = {
                     "signature": file_signature(path),
-                    "value": copy.deepcopy(payload),
+                    "value": cached_copy,
                     "loaded_at": time.monotonic(),
                 }
         invalidate_response_cache(name)
@@ -1072,8 +1090,8 @@ def merge_critical_records(collection, incoming, latest):
             current_sync = str(current.get("last_sync") or current.get("sync_finished_at") or "")
             saved_sync = str(saved.get("last_sync") or saved.get("sync_finished_at") or "")
             row = {**current, **saved} if saved_sync >= current_sync else {**saved, **current}
-            token_source = current if int(current.get("token_created_at") or 0) > int(saved.get("token_created_at") or 0) else saved
-            for field in ("access_token", "refresh_token", "expires_in", "token_created_at", "status", "official"):
+            token_source = current if account_token_revision(current) > account_token_revision(saved) else saved
+            for field in (*ACCOUNT_TOKEN_FIELDS, "status", "official"):
                 if field in token_source:
                     row[field] = token_source[field]
             merged.append(row)
@@ -2908,16 +2926,65 @@ def add_or_update_account(payload, account):
     return account
 
 
+def account_token_revision(account):
+    return int(account.get("token_created_at_ns") or int(account.get("token_created_at") or 0) * 1000000000)
+
+
+def account_token_expiring(account):
+    expires_at = int(account.get("token_created_at") or 0) + int(account.get("expires_in") or 0)
+    return bool(account.get("refresh_token") and expires_at and expires_at - 300 <= int(time.time()))
+
+
+def same_oauth_account(saved, account):
+    if saved.get("seller_id") and account.get("seller_id"):
+        return str(saved["seller_id"]) == str(account["seller_id"])
+    return bool(account.get("id") and str(saved.get("id")) == str(account["id"]))
+
+
 def account_client(account):
     if not account.get("access_token"):
         raise RuntimeError("Conta oficial sem access token salvo. Refaça o login OAuth.")
-    expires_at = int(account.get("token_created_at") or 0) + int(account.get("expires_in") or 0)
-    if account.get("refresh_token") and expires_at and expires_at - 300 <= int(time.time()):
-        token = MercadoLivreClient().refresh(account["refresh_token"])
-        account["access_token"] = token.get("access_token", account.get("access_token"))
-        account["refresh_token"] = token.get("refresh_token", account.get("refresh_token"))
-        account["expires_in"] = token.get("expires_in", account.get("expires_in"))
-        account["token_created_at"] = int(time.time())
+    key = (str(DATA), str(account.get("seller_id") or account.get("id") or hashlib.sha256(str(account["access_token"]).encode()).hexdigest()))
+    applied = False
+    with ACCOUNT_REFRESH_LOCK:
+        cached = ACCOUNT_REFRESHED_TOKENS.get(key, {})
+        if account_token_revision(cached) > account_token_revision(account):
+            account.update(cached)
+            applied = True
+    if account_token_expiring(account):
+        # Recover a newer durable token before refreshing a stale task snapshot.
+        # Do not acquire DATA_LOCK while holding ACCOUNT_REFRESH_LOCK: some callers
+        # already own DATA_LOCK, and inverse ordering would deadlock those callers.
+        latest = read_payload(include_catalog=False)
+        saved = next((a for a in latest.get("accounts", []) if same_oauth_account(a, account)), {})
+        if account_token_revision(saved) > account_token_revision(account):
+            account.update({k: saved[k] for k in ACCOUNT_TOKEN_FIELDS if k in saved})
+        with ACCOUNT_REFRESH_LOCK:
+            cached = ACCOUNT_REFRESHED_TOKENS.get(key, {})
+            if account_token_revision(cached) > account_token_revision(account):
+                account.update(cached)
+                applied = True
+            if account_token_expiring(account):
+                token = MercadoLivreClient().refresh(account["refresh_token"])
+                if not token.get("access_token"):
+                    raise RuntimeError("Renovação OAuth não retornou um token válido.")
+                account.update({
+                    "access_token": token["access_token"],
+                    "refresh_token": token.get("refresh_token") or account["refresh_token"],
+                    "expires_in": token.get("expires_in") or account.get("expires_in"),
+                    "token_created_at": int(time.time()),
+                    "token_created_at_ns": time.time_ns(),
+                })
+                ACCOUNT_REFRESHED_TOKENS[key] = {k: account[k] for k in ACCOUNT_TOKEN_FIELDS if k in account}
+                applied = True
+    if applied:
+        # Persist before returning a client, even if the subsequent operation fails.
+        with DATA_LOCK:
+            latest = read_payload(include_catalog=False)
+            saved = next((a for a in latest.get("accounts", []) if same_oauth_account(a, account)), None)
+            if saved is not None and account_token_revision(account) > account_token_revision(saved):
+                saved.update({k: account[k] for k in ACCOUNT_TOKEN_FIELDS if k in account})
+                write_payload(latest)
     return MercadoLivreClient(account["access_token"])
 
 
@@ -6313,24 +6380,14 @@ def auto_official_sync_loop():
             if changed:
                 write_payload(payload)
 
-            # Fill one immutable previous-month account before the expensive item pass.
-            # Completed accounts are cached forever, so each cycle only advances missing data.
+            # Closed months are not immutable: delayed orders and later cancellations
+            # must be reconciled again rather than frozen on the first successful read.
             previous_period = month_window(-1)[0]
-            previous_accounts = (
-                (((payload.get("monthly_revenue") or {}).get("history") or {}).get(previous_period) or {}).get("accounts")
-                or {}
-            )
-            history_account = next(
-                (
-                    account
-                    for account in official_accounts
-                    if account_record(previous_accounts, account).get("source") != "Pedidos oficiais Mercado Livre"
-                ),
-                None,
-            )
-            if history_account and not meli_background_work_busy()[1]:
+            history_work = next_historical_reconciliation(payload, official_accounts)
+            if history_work and not meli_background_work_busy()[1]:
                 try:
-                    sync_previous_month_revenue(payload, history_account, account_client(history_account))
+                    history_period, history_account = history_work
+                    sync_previous_month_revenue(payload, history_account, account_client(history_account), period=history_period)
                     write_payload(payload)
                 except Exception:
                     pass
@@ -8910,6 +8967,7 @@ def sync_recent_sales(payload, account, client):
     period, date_from, date_to = current_month_window()
     try:
         orders = fetch_seller_orders_window(client, account.get("seller_id"), date_from, date_to)
+        orders = reconcile_known_order_ids(payload, account, client, period, orders)
     except Exception as exc:
         account["sales_sync_status"] = policy_error_message(exc, "a leitura das vendas reais do mês")
         mark_monthly_revenue_error(payload, account, period, account["sales_sync_status"])
@@ -8983,7 +9041,7 @@ def sync_recent_sales(payload, account, client):
     daily.extend(by_sku.values())
     payload["daily_sku_sales"] = daily
     account["sales_sync_status"] = f"{revenue_orders} pedidos reais sincronizados no mês"
-    upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"])
+    upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"], orders=orders)
     try:
         cache_sales_goal_orders(payload, account, period, orders)
     except Exception as exc:
@@ -9019,7 +9077,38 @@ def sync_recent_sales(payload, account, client):
     return rows
 
 
+class IncompleteOrderWindow(RuntimeError):
+    pass
+
+
 def fetch_seller_orders_window(client, seller_id, date_from, date_to, max_orders=None):
+    """Recover incomplete search windows by subdividing time, never publishing partial totals."""
+    start, end = parse_meli_datetime(date_from), parse_meli_datetime(date_to)
+    if start and end:
+        end = min(end, datetime.now(APP_TZ))
+        date_from, date_to = start.isoformat(timespec="milliseconds"), end.isoformat(timespec="milliseconds")
+    maximum = max(1, int(max_orders or os.getenv("MELI_DASHBOARD_MONTHLY_ORDERS_LIMIT", "50000")))
+
+    def fetch(lower, upper, depth=0):
+        try:
+            return fetch_seller_orders_page_window(client, seller_id, lower, upper, max_orders=max_orders)
+        except IncompleteOrderWindow:
+            left, right = parse_meli_datetime(lower), parse_meli_datetime(upper)
+            if max_orders or not left or not right or depth >= 20 or right-left <= timedelta(milliseconds=1):
+                raise
+            # Keep inclusive API bounds disjoint at millisecond precision.
+            width_ms = int((right-left).total_seconds()*1000)
+            middle = left + timedelta(milliseconds=width_ms//2)
+            first = fetch(lower, middle.isoformat(timespec="milliseconds"), depth+1)
+            second = fetch((middle+timedelta(milliseconds=1)).isoformat(timespec="milliseconds"), upper, depth+1)
+            result = {str(row.get("id") or json.dumps(row,sort_keys=True)):row for row in [*first,*second]}
+            if len(result) > maximum:
+                raise RuntimeError(f"O período excede o limite de {maximum} pedidos. Nenhum total parcial foi salvo; aumente MELI_DASHBOARD_MONTHLY_ORDERS_LIMIT.")
+            return sorted(result.values(), key=lambda row: str(row.get("date_created") or ""), reverse=True)
+    return fetch(date_from,date_to)
+
+
+def fetch_seller_orders_page_window(client, seller_id, date_from, date_to, max_orders=None):
     orders = []
     offset = 0
     page_size = 50
@@ -9035,20 +9124,23 @@ def fetch_seller_orders_window(client, seller_id, date_from, date_to, max_orders
         data = client.seller_orders(seller_id, limit=page_size, offset=offset, date_from=date_from, date_to=date_to)
         batch = data.get("results", []) or []
         total = int((data.get("paging") or {}).get("total") or 0)
+        split_threshold = max(100, int(os.getenv("MELI_ORDERS_SPLIT_THRESHOLD", "5000")))
+        if not max_orders and total >= split_threshold and parse_meli_datetime(date_from) and parse_meli_datetime(date_to):
+            raise IncompleteOrderWindow("Consulta volumosa: subdividindo o período para conferir todos os pedidos.")
         for order in batch:
             identity = str(order.get("id") or json.dumps(order, sort_keys=True))
             if identity not in seen:
                 seen.add(identity)
                 orders.append(order)
         if (not batch and offset < total) or (offset + len(batch) >= total and total and len(orders) < total):
-            raise RuntimeError(f"Importação incompleta de pedidos: {len(orders)} únicos recebidos de {total}. Os totais anteriores foram preservados; atualize novamente.")
+            raise IncompleteOrderWindow(f"Importação incompleta de pedidos: {len(orders)} únicos recebidos de {total}. Os totais anteriores foram preservados; atualize novamente.")
         if not batch or (total and offset + len(batch) >= total) or (not total and len(batch) < page_size):
             break
         offset += len(batch)
         if offset >= limit and len(orders) < offset:
-            raise RuntimeError("A API repetiu páginas de pedidos. Atualize novamente para conferir os totais.")
+            raise IncompleteOrderWindow("A API repetiu páginas de pedidos. Atualize novamente para conferir os totais.")
     if not max_orders and total > len(orders):
-        raise RuntimeError(f"Consulta incompleta: {len(orders)} de {total} pedidos. Amplie o limite de importação antes de usar os totais.")
+        raise IncompleteOrderWindow(f"Consulta incompleta: {len(orders)} de {total} pedidos. Amplie o limite de importação antes de usar os totais.")
     return orders[:limit]
 
 
@@ -11285,11 +11377,59 @@ def save_sales_goals(request):
     return {"ok": True, "saved": len(validated)}
 
 
+def month_within_order_retention(period, now=None):
+    now = now or datetime.now(APP_TZ)
+    try:
+        cutoff = now.replace(year=now.year-1)
+    except ValueError:
+        cutoff = now.replace(year=now.year-1, day=28)
+    _, start, _ = sales_goal_month(period)
+    return start >= cutoff
+
+
+def reconcile_known_order_ids(payload, account, client, period, orders):
+    monthly = payload.get("monthly_revenue") or {}
+    previous = account_record(((monthly.get("history") or {}).get(period) or {}).get("accounts"), account)
+    if not previous and monthly.get("period") == period:
+        previous = account_record(monthly.get("accounts"), account)
+    found = {str(order.get("id")): order for order in orders if order.get("id")}
+    missing = set(previous.get("order_ids") or []) - set(found)
+    _, start, end = sales_goal_month(period)
+    for identity in sorted(missing):
+        recovered = client.order(identity)
+        when = parse_meli_datetime(recovered.get("date_created"))
+        seller = (recovered.get("seller") or {}).get("id")
+        if str(recovered.get("id")) != identity or not when or not start <= when < end or (seller and str(seller) != str(account.get("seller_id"))):
+            raise RuntimeError(f"Não foi possível confirmar o pedido {identity}; os totais anteriores foram preservados.")
+        found[identity] = recovered
+    # Retain id-less legacy fixtures; the official API supplies IDs for all orders.
+    return list(found.values()) + [order for order in orders if not order.get("id")]
+
+
+def reconcile_sales_history(request):
+    first, start, _ = sales_goal_month(request.get("month_from"))
+    last, finish, _ = sales_goal_month(request.get("month_to"))
+    if finish < start or finish > datetime.now(APP_TZ):
+        raise RuntimeError("Selecione meses em ordem, até o mês atual.")
+    results = []
+    current = start
+    while current <= finish:
+        period = current.strftime("%Y-%m")
+        result = reconcile_month_sales({"month": period})
+        results.extend({**row, "month": period} for row in result["results"])
+        update_async_operation_progress(f"Conferido {period}", len(results), None)
+        current = (current.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return {"month_from": first, "month_to": last, "results": results,
+            "failed": sum(row["status"] == "error" for row in results)}
+
+
 def reconcile_month_sales(request):
     period, start, end = sales_goal_month(request.get("month"))
     if start > datetime.now(APP_TZ):
         raise RuntimeError("Selecione o mês atual ou anterior.")
     payload = read_payload()
+    if not any(a.get("official") and a.get("status") == "connected" for a in payload.get("accounts", [])):
+        raise RuntimeError("Nenhuma conta oficial conectada para conferir as vendas.")
     results, seen = [], set()
     for account in payload.get("accounts", []):
         seller = str(account.get("seller_id") or "")
@@ -11297,16 +11437,23 @@ def reconcile_month_sales(request):
             continue
         seen.add(seller)
         try:
-            orders = fetch_seller_orders_window(account_client(account), seller,
+            old = account_record((((payload.get("monthly_revenue") or {}).get("history") or {}).get(period) or {}).get("accounts"), account)
+            if not month_within_order_retention(period):
+                raise RuntimeError("Mês fora da janela integral de 12 meses da API. Histórico salvo preservado; não é possível confirmar novas vendas deste mês pela busca.")
+            client = account_client(account)
+            orders = fetch_seller_orders_window(client, seller,
                 start.isoformat(timespec="milliseconds"), (min(end, datetime.now(APP_TZ)) - timedelta(milliseconds=1)).isoformat(timespec="milliseconds"))
+            orders = reconcile_known_order_ids(payload, account, client, period, orders)
             record = cache_sales_goal_orders(payload, account, period, orders)
             cache_official_orders_for_analytics(payload, account, start.date(),
                 min(end - timedelta(days=1), datetime.now(APP_TZ)).date(), orders)
             with DATA_LOCK:
                 fresh = read_payload(include_catalog=False)
-                upsert_monthly_revenue(fresh, account, record["amount"], record["orders_count"], period, "Pedidos conferidos com a API oficial")
+                fresh["accounts"] = merge_critical_records("accounts", [account], fresh.get("accounts", []))
+                upsert_monthly_revenue(fresh, account, record["amount"], record["orders_count"], period, "Pedidos conferidos com a API oficial", orders=orders)
                 write_payload(fresh)
-            results.append({"account": account.get("nickname"), "orders": record["orders_count"], "amount": record["amount"], "status": "ok"})
+            results.append({"account": account.get("nickname"), "orders": record["orders_count"], "amount": record["amount"], "status": "ok",
+                            "previous_orders": old.get("orders_count"), "previous_amount": old.get("amount")})
         except Exception as exc:
             results.append({"account": account.get("nickname"), "status": "error", "error": str(exc)})
         update_async_operation_progress("Conferindo pedidos por conta", len(results), None)
@@ -11334,7 +11481,7 @@ def merge_monthly_revenue(incoming, latest):
     return merged
 
 
-def upsert_monthly_revenue(payload, account, amount, orders_count, period, status):
+def upsert_monthly_revenue(payload, account, amount, orders_count, period, status, orders=None):
     monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}, "history": {}})
     record = {
         "account": account.get("nickname"),
@@ -11346,6 +11493,8 @@ def upsert_monthly_revenue(payload, account, amount, orders_count, period, statu
         "updated_at_ns": time.time_ns(),
     }
     key = str(account.get("id") or account.get("seller_id") or account.get("nickname") or "")
+    if orders is not None:
+        record["order_ids"] = sorted({str(order["id"]) for order in orders if order.get("id")})
     monthly.setdefault("history", {}).setdefault(period, {"accounts": {}}).setdefault("accounts", {})[key] = record
     if period == current_month_period():
         monthly["period"] = period
@@ -11353,8 +11502,36 @@ def upsert_monthly_revenue(payload, account, amount, orders_count, period, statu
     return record
 
 
-def sync_previous_month_revenue(payload, account, client):
-    period, date_from, date_to = month_window(-1)
+def monthly_revenue_needs_refresh(record):
+    failed = parse_meli_datetime(record.get("last_error_at"))
+    if failed and (datetime.now(APP_TZ)-failed).total_seconds() < 900:
+        return False
+    updated = parse_meli_datetime(record.get("updated_at"))
+    ttl = max(3600, int(os.getenv("MELI_CLOSED_MONTH_REVENUE_CACHE_SECONDS", "86400")))
+    return (record.get("source") != "Pedidos oficiais Mercado Livre" or not updated
+            or (datetime.now(APP_TZ) - updated).total_seconds() >= ttl)
+
+
+def next_historical_reconciliation(payload, accounts):
+    history = (payload.get("monthly_revenue") or {}).get("history") or {}
+    periods = {p for p in history if re.fullmatch(r"\d{4}-\d{2}", p) and p < current_month_period() and month_within_order_retention(p)}
+    periods.add(month_window(-1)[0])
+    candidates = []
+    for period in sorted(periods, reverse=True):
+        for account in accounts:
+            record = account_record((history.get(period) or {}).get("accounts"), account)
+            if monthly_revenue_needs_refresh(record):
+                updated = parse_meli_datetime(record.get("updated_at"))
+                candidates.append((updated.timestamp() if updated else 0, period, account))
+    if not candidates:
+        return None
+    _, period, account = min(candidates, key=lambda entry: entry[0])
+    return period, account
+
+
+def sync_previous_month_revenue(payload, account, client, period=None):
+    period, start_at, end_at = sales_goal_month(period or month_window(-1)[0])
+    date_from, date_to = start_at.isoformat(timespec="milliseconds"), (end_at-timedelta(milliseconds=1)).isoformat(timespec="milliseconds")
     monthly = payload.setdefault("monthly_revenue", {"period": current_month_period(), "accounts": {}, "history": {}})
     key = str(account.get("id") or account.get("seller_id") or account.get("nickname"))
     period_accounts = monthly.setdefault("history", {}).setdefault(period, {"accounts": {}}).setdefault("accounts", {})
@@ -11378,30 +11555,29 @@ def sync_previous_month_revenue(payload, account, client):
     ):
         return cached
     try:
+        if not month_within_order_retention(period):
+            raise RuntimeError("Mês fora da janela integral de 12 meses da API; histórico salvo preservado.")
         orders = fetch_seller_orders_window(client, account.get("seller_id"), date_from, date_to)
+        orders = reconcile_known_order_ids(payload, account, client, period, orders)
         amount, count = summarize_monthly_orders(orders)
-        previous_end = datetime.now(APP_TZ).date().replace(day=1) - timedelta(days=1)
-        previous_start = previous_end.replace(day=1)
-        try:
-            cache_official_orders_for_analytics(
-                payload, account, previous_start, previous_end, orders,
-            )
-        except Exception:
-            pass
+        previous_end = end_at.date() - timedelta(days=1)
+        previous_start = start_at.date()
+        cache_official_orders_for_analytics(payload, account, previous_start, previous_end, orders)
+        cache_sales_goal_orders(payload, account, period, orders)
         return upsert_monthly_revenue(
             payload, account, amount, count, period,
-            f"{count} pedidos reais sincronizados no mês anterior",
+            f"{count} pedidos reais sincronizados em {period}",
+            orders=orders,
         )
     except Exception as exc:
         status = policy_error_message(exc, "a leitura das vendas reais do mês anterior")
-        record = {
+        record = {**cached} if cached.get("source") == "Pedidos oficiais Mercado Livre" else {
             "account": account.get("nickname"),
             "amount": 0,
             "orders_count": 0,
             "source": "Erro temporário",
-            "sync_status": status,
-            "updated_at": now_label(),
         }
+        record.update(sync_status=status, last_error_at=now_label())
         period_accounts[key] = record
         return record
 
@@ -16567,43 +16743,22 @@ def fetch_statistics_orders(client, seller_id, start, end):
     maximum = max(1, int(os.getenv("MELI_STATISTICS_ORDERS_LIMIT", "50000")))
     orders = []
     seen = set()
-    truncated = False
     for window_from, window_to in statistics_order_windows(start, end):
-        offset = 0
-        window_seen = set()
-        upper = parse_meli_datetime(window_to)
-        if upper and upper > datetime.now(APP_TZ):
-            window_to = datetime.now(APP_TZ).isoformat(timespec="milliseconds")
-        while len(orders) < maximum:
-            data = client.seller_orders(
-                seller_id,
-                limit=50,
-                offset=offset,
-                date_from=window_from,
-                date_to=window_to,
-            )
-            batch = data.get("results") or []
-            for order in batch:
-                order_id = str(order.get("id") or "")
-                signature = order_id or json.dumps(order, sort_keys=True, ensure_ascii=False)
-                window_seen.add(signature)
-                if signature in seen:
-                    continue
-                seen.add(signature)
-                orders.append(order)
-                if len(orders) >= maximum:
-                    truncated = True
-                    break
-            total = int((data.get("paging") or {}).get("total") or len(batch))
-            offset += len(batch)
-            if not batch or offset >= total or len(orders) >= maximum:
-                if total > len(window_seen):
-                    truncated = True
-                break
-        if len(orders) >= maximum:
-            truncated = True
-            break
-    return orders, truncated
+        # Share the dashboard importer: retry incomplete pages in smaller time
+        # windows instead of returning partial sales to analytics and SKU reports.
+        batch = fetch_seller_orders_window(client, seller_id, window_from, window_to)
+        for order in batch:
+            signature = str(order.get("id") or json.dumps(order, sort_keys=True, ensure_ascii=False))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            orders.append(order)
+            if len(orders) > maximum:
+                raise RuntimeError(
+                    f"O período excede {maximum} pedidos. Selecione um período menor "
+                    "ou ajuste MELI_STATISTICS_ORDERS_LIMIT. Nenhum total parcial foi confirmado."
+                )
+    return orders, False
 
 
 def fetch_customer_orders_without_date_filter(client, seller_id, start, end):
@@ -20180,9 +20335,20 @@ def fetch_analytics_account_snapshot(
             store = {"version": ANALYTICS_CACHE_VERSION, "accounts": {}}
         cached_days = dict((((store.get("accounts") or {}).get(account_key) or {}).get("days") or {}))
 
+    try:
+        retention_cutoff = today.replace(year=today.year - 1)
+    except ValueError:
+        retention_cutoff = today.replace(year=today.year - 1, day=28)
+    # An empty response outside the API retention window is not evidence of zero sales.
+    unavailable_days = [day for day in requested_days if day <= retention_cutoff and day.isoformat() not in cached_days]
+    if unavailable_days:
+        raise RuntimeError(
+            "Há dias sem histórico local fora da retenção de 12 meses da API de pedidos. "
+            "Selecione um período mais recente ou recupere o histórico de um backup."
+        )
     refresh_days = [
         day for day in requested_days
-        if not analytics_cache_fresh(cached_days.get(day.isoformat()), day, today, now_epoch)
+        if day > retention_cutoff and not analytics_cache_fresh(cached_days.get(day.isoformat()), day, today, now_epoch)
     ]
     refreshed_entries = {}
     fetched_snapshots = []
@@ -22856,10 +23022,12 @@ def build_catalog_api_response(payload=None):
     body = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     signature_text = repr(signatures).encode("utf-8")
     etag = f'"catalog-{hashlib.sha256(signature_text).hexdigest()[:20]}"'
+    compressed_body = gzip.compress(body, compresslevel=1)
     with RESPONSE_CACHE_LOCK:
         RESPONSE_CACHE["catalog-api"] = {
             "signatures": signatures,
             "body": body,
+            "gzip_body": compressed_body,
             "etag": etag,
         }
     return body, etag
@@ -22945,6 +23113,12 @@ class App(BaseHTTPRequestHandler):
         threshold = configured_int("COMPETIDOR_GZIP_THRESHOLD_BYTES", "gzip_threshold_bytes")
         compressible = content_type.startswith(("application/json", "application/javascript", "text/"))
         if accepts_gzip and compressible and len(body) >= threshold:
+            if content_type.startswith("application/json"):
+                with RESPONSE_CACHE_LOCK:
+                    catalog = RESPONSE_CACHE.get("catalog-api") or {}
+                    compressed = catalog.get("gzip_body") if catalog.get("body") is body else None
+                if compressed is not None:
+                    return compressed, "gzip"
             return gzip.compress(body, compresslevel=1), "gzip"
         return body, ""
 
@@ -23512,6 +23686,7 @@ class App(BaseHTTPRequestHandler):
                     "refresh_token": token.get("refresh_token"),
                     "expires_in": token.get("expires_in"),
                     "token_created_at": int(time.time()),
+                    "token_created_at_ns": time.time_ns(),
                     "permalink": me.get("permalink", ""),
                 }
                 add_or_update_account(payload, account)
@@ -23600,6 +23775,7 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/item/activate_pickup",
             "/api/meli/item/delete",
             "/api/sales-goals/query",
+            "/api/sales/reconcile",
             "/api/sales-goals/save",
             "/api/sales-goals/refresh",
             "/api/clone/preview",
@@ -24720,6 +24896,10 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "official": official, "item": item})
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/sales/reconcile":
+            self.send_json({"ok": True, **start_async_operation("sales_reconcile", lambda: reconcile_sales_history(request), priority="manual", heavy=True)}, status=202)
             return
 
         if parsed.path in {"/api/sales-goals/query", "/api/sales-goals/save", "/api/sales-goals/refresh"}:

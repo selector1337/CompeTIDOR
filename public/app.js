@@ -4268,7 +4268,7 @@ function openProfitCalculator(item, context = "ads") {
         }
       }
     } else {
-      const parsed = parseLocalizedNumber(priceInput.value);
+      const parsed = parseBrazilianMoney(priceInput.value);
       if (!Number.isFinite(parsed) || parsed <= 0) {
         message = "Informe um preço de venda maior que zero.";
       } else {
@@ -4279,6 +4279,7 @@ function openProfitCalculator(item, context = "ads") {
     const tone = values.profitStatus === "profit" ? "profit-positive"
       : values.profitStatus === "loss" ? "profit-negative" : "profit-missing";
     useButton.disabled = !feeReady || Boolean(message);
+    useButton.textContent = message ? "Corrija o valor informado" : `Usar ${money.format(simulatedPrice)} ${context === "catalog" ? "no catálogo" : "no ajuste em lote"}`;
     resultNode.innerHTML = `
       ${message ? `<p class="profit-calculator-validation">${escapeText(message)}</p>` : ""}
       <div class="profit-calculator-result-grid">
@@ -4302,6 +4303,10 @@ function openProfitCalculator(item, context = "ads") {
   });
 
   priceInput?.addEventListener("input", () => renderSimulation("price"));
+  priceInput?.addEventListener("blur", () => {
+    const price = parseBrazilianMoney(priceInput.value);
+    if (Number.isFinite(price) && price > 0) priceInput.value = price.toLocaleString("pt-BR", {minimumFractionDigits:2, maximumFractionDigits:2});
+  });
   marginInput?.addEventListener("input", () => {
     if (!marginInput.value.trim()) {
       renderSimulation("price");
@@ -6534,11 +6539,40 @@ document.addEventListener("click", (event) => {
   });
 });
 
+function parseBrazilianMoney(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+  const text = String(value ?? "").trim().replace(/^R\$\s*/, "");
+  if (!text) return NaN;
+  // A period followed by groups of three digits is a Brazilian thousands separator.
+  // Never reinterpret 2.250 (after deleting ,00) as 2.25.
+  if (/^-?\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?$/.test(text)) return Number(text.replace(/\./g, "").replace(",", "."));
+  if (/^-?\d+(?:,\d{1,2})?$/.test(text)) return Number(text.replace(",", "."));
+  if (/^-?\d+\.\d{1,2}$/.test(text)) return Number(text);
+  return NaN;
+}
+
 function parseLocalizedNumber(value) {
   const text = String(value ?? "").trim();
   if (!text) return NaN;
   return Number(text.includes(",") ? text.replace(/\./g, "").replace(",", ".") : text);
 }
+
+document.querySelector('#sales-reconcile-form')?.addEventListener('submit', async event => {
+  event.preventDefault();
+  const form = event.currentTarget, button = form.querySelector('button'), status = document.querySelector('#sales-reconcile-status');
+  button.disabled = true;
+  form.querySelectorAll('input').forEach(input => input.disabled = true);
+  document.querySelector('#sales-reconcile-results').textContent = '';
+  try {
+    status.textContent = 'Conferindo os pedidos oficiais por mês e conta…';
+    const queued = await api('/api/sales/reconcile', {method:'POST', body:JSON.stringify({month_from:form.elements.month_from.value, month_to:form.elements.month_to.value})});
+    const result = await waitForAsyncOperation(queued, message => status.textContent = message);
+    document.querySelector('#sales-reconcile-results').innerHTML = result.results.map(row => `<p><strong>${escapeText(row.month)} · ${escapeText(row.account)}</strong> — ${row.status === 'ok' ? `${row.orders} pedidos · ${money.format(row.amount)}${row.previous_orders != null ? ` (antes: ${row.previous_orders} pedidos · ${money.format(row.previous_amount)})` : ''}` : `Não atualizado: ${escapeText(row.error)}`}</p>`).join('');
+    status.textContent = result.failed ? 'Há contas pendentes. Confira os motivos abaixo e tente novamente.' : 'Conferência concluída. Totais atualizados por mês e conta.';
+    await load();
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; form.querySelectorAll('input').forEach(input => input.disabled = false); }
+});
 
 async function persistSkuCost(sku, cost, remove = false) {
   const result = await api("/api/costs/save", {

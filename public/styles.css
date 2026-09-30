@@ -10889,3 +10889,7 @@ textarea:focus {
 .goals-table th { position:sticky;top:0;background:var(--panel);z-index:1; }
 .goals-filters > label { min-width:0; }.goals-filters input,.goals-filters select { width:100%;min-width:0;box-sizing:border-box; }
 #page-metas button:disabled { opacity:.5;cursor:not-allowed; }
+.revenue-reconcile { margin-top:20px;padding:16px;border:1px solid var(--line);border-radius:12px; }
+.revenue-reconcile p { line-height:1.6; }.revenue-reconcile label { display:grid;gap:8px; }
+.revenue-reconcile input { padding:10px;border:1px solid var(--line);border-radius:8px;color:var(--ink);background:var(--panel); }
+#sales-reconcile-results { max-height:420px;overflow:auto; }
