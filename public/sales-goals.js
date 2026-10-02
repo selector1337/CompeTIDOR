@@ -8,7 +8,7 @@
   let lastCurrentMonth = currentMonth();
   $('goals-month').value = lastCurrentMonth;
   function editable() { return data?.editable && document.body.dataset.role !== 'viewer'; }
-  function filters() { return {month:$('goals-month').value, search:$('goals-search').value, status:$('goals-status').value, registered:$('goals-registered').value}; }
+  function filters() { return {month:$('goals-month').value, search:$('goals-search').value, status:$('goals-status').value, registered:$('goals-registered').value, achievement:$('goals-achievement').value}; }
   async function operation(action, body) {
     const queued = await api('/api/sales-goals/' + action, {method:'POST', body:JSON.stringify(body), manualProgress:action !== 'query'});
     return waitForAsyncOperation(queued, message => $('goals-feedback').textContent = message || 'Processando…');
@@ -25,7 +25,8 @@
     const f = filters();
     return data.rows.map(r=>({...r, target:Object.hasOwn(edits,r.sku) ? Number(edits[r.sku]) || null : r.target})).filter(r =>
       (!f.status || r.statuses.includes(f.status)) && (!f.search || `${r.sku} ${r.product}`.toLocaleLowerCase().includes(f.search.toLocaleLowerCase())) &&
-      (f.registered !== 'yes' || r.target) && (f.registered !== 'no' || !r.target));
+      (f.registered !== 'yes' || r.target) && (f.registered !== 'no' || !r.target) &&
+      (!f.achievement || (r.target && (f.achievement === 'reached' ? r.sold >= r.target : f.achievement === 'not_reached' ? r.sold < r.target : r.sold === 0))));
   }
   function render() {
     if (!data) {
@@ -53,7 +54,7 @@
     if (data && data.month !== $('goals-month').value) { data=null; render(); }
     data = await operation('query', {month:$('goals-month').value});
     loadedAt = Date.now();
-    $('goals-feedback').textContent = data.warnings.join(' ') || (data.editable ? 'Vendas atualizadas automaticamente pela sincronização das contas.' : 'Histórico: metas preservadas. Edição disponível apenas no mês atual.');
+    $('goals-feedback').textContent = data.warnings.join(' ') || 'Metas válidas para todos os meses. Vendas atualizadas automaticamente pela sincronização das contas.';
   }
   $('goals-refresh').onclick = () => run(async()=> {
     const result = await operation('refresh', {month:$('goals-month').value});
@@ -62,7 +63,7 @@
     if (errors.length) $('goals-feedback').textContent = errors.map(r=>`${r.account}: ${r.error}`).join(' · ');
   });
   $('goals-save').onclick = () => run(async()=> {
-    await operation('save', {month:$('goals-month').value, targets:edits}); edits={}; await load(); $('goals-feedback').textContent='Metas salvas.';
+    await operation('save', {month:$('goals-month').value, targets:edits}); edits={}; await load(); $('goals-feedback').textContent='Metas salvas para todos os meses.';
   });
   $('goals-rows').onchange = e => {
     if (!e.target.dataset.goalSku) return;
@@ -71,7 +72,7 @@
     // Wait until blur finishes before replacing the focused input's table row.
     setTimeout(()=>{if(!busy)render();},0);
   };
-  ['goals-search','goals-status','goals-registered'].forEach(id=>$(id).oninput=()=>{page=0;render();});
+  ['goals-search','goals-status','goals-registered','goals-achievement'].forEach(id=>$(id).oninput=()=>{page=0;render();});
   $('goals-month').onchange = () => {
     if (Object.keys(edits).length && !confirm('Trocar de mês e descartar as metas ainda não salvas?')) { $('goals-month').value=data.month; return; }
     edits={};page=0;run(load);

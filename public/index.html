@@ -506,9 +506,9 @@
 
       <section class="page" id="page-metas">
         <div class="goals-hero"><div><small>PLANEJE, ACOMPANHE, VENDA</small><h2>Metas de Venda</h2><p>Uma meta por SKU. Todas as contas trabalhando para o mesmo resultado.</p></div><button class="primary" id="goals-refresh">Atualizar vendas</button></div>
-        <div class="goals-filters"><label>Mês / histórico<input type="month" id="goals-month"></label><label>SKU ou produto<input id="goals-search" placeholder="Buscar produto"></label><label>Anúncios<select id="goals-status"><option value="">Todos os status</option><option value="active">Ativos</option><option value="paused">Pausados</option></select></label><label>Meta<select id="goals-registered"><option value="">Todas</option><option value="yes">Meta cadastrada</option><option value="no">Meta não cadastrada</option></select></label></div>
+        <div class="goals-filters"><label>Mês / histórico<input type="month" id="goals-month"></label><label>SKU ou produto<input id="goals-search" placeholder="Buscar produto"></label><label>Anúncios<select id="goals-status"><option value="">Todos os status</option><option value="active">Ativos</option><option value="paused">Pausados</option></select></label><label>Meta<select id="goals-registered"><option value="">Todas</option><option value="yes">Meta cadastrada</option><option value="no">Meta não cadastrada</option></select></label><label>Resultado da meta<select id="goals-achievement"><option value="">Todos os resultados</option><option value="reached">Meta atingida</option><option value="not_reached">Meta não atingida</option><option value="zero">0% da meta atingida</option></select></label></div>
         <p id="goals-feedback" role="status" aria-live="polite"></p><div id="goals-summary" class="goals-summary"></div>
-        <div class="goals-toolbar"><p>Metas em unidades. No dia 1, o progresso inicia um novo mês; as metas são mantidas até você alterá-las. O histórico fica preservado.</p><button id="goals-save" class="primary">Salvar metas</button><button data-export-report="sales_goals" data-export-format="xlsx">Excel</button><button data-export-report="sales_goals" data-export-format="pdf">PDF</button></div>
+        <div class="goals-toolbar"><p>A meta de cada SKU vale para todos os meses, inclusive os anteriores. Alterar ou remover uma meta atualiza todas as comparações; as vendas continuam separadas por mês.</p><button id="goals-save" class="primary">Salvar metas</button><button data-export-report="sales_goals" data-export-format="xlsx">Excel</button><button data-export-report="sales_goals" data-export-format="pdf">PDF</button></div>
         <div class="goals-table-wrap"><table class="goals-table"><thead><tr><th>SKU / produto</th><th>Meta mensal</th><th>Vendidas</th><th>Progresso</th><th>Faltam</th></tr></thead><tbody id="goals-rows"></tbody></table></div>
         <div class="goals-toolbar"><button id="goals-prev">Anterior</button><span id="goals-page"></span><button id="goals-next">Próxima</button></div>
         <details><summary>Vendas por conta e última atualização</summary><div id="goals-accounts"></div></details>
@@ -1509,7 +1509,7 @@
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
   <script src="/app.js?v=20260930-dedicated"></script>
-  <script src="/sales-goals.js?v=20260925"></script>
+  <script src="/sales-goals.js?v=20261002"></script>
   <script src="/official-stores.js?v=20260923-clear-pending"></script>
   </body>
 </html>

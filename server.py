@@ -11257,10 +11257,20 @@ def sales_goal_month(value=None):
 def sales_goal_period(store, period):
     months = store.setdefault("months", {})
     if period not in months:
-        previous = sorted(p for p in months if p < period)
-        targets = copy.deepcopy(months[previous[-1]].get("targets", {})) if previous else {}
-        months[period] = {"targets": targets, "accounts": {}}
+        months[period] = {"accounts": {}}
     return months[period]
+
+
+def sales_goal_targets(store):
+    # Migrate once; monthly sales snapshots remain intact. An empty new month
+    # must not erase targets configured in earlier months.
+    if "targets" not in store:
+        targets = {}
+        for period in sorted(store.get("months", {})):
+            for sku, value in (store["months"][period].get("targets") or {}).items():
+                targets[normalized_sku_key(sku)] = value
+        store["targets"] = targets
+    return store["targets"]
 
 
 def cache_sales_goal_orders(payload, account, period, orders):
@@ -11305,8 +11315,12 @@ def query_sales_goals(payload, request):
     period, _, _ = sales_goal_month(request.get("month"))
     with DATA_LOCK:
         store = read_json(SALES_GOALS_FILE, {"months": {}})
+        needs_migration = "targets" not in store
+        targets = sales_goal_targets(store)
         if period == current_month_period() and period not in store["months"]:
             sales_goal_period(store, period)
+            needs_migration = True
+        if needs_migration:
             write_json(SALES_GOALS_FILE, store)
     month = store.get("months", {}).get(period, {"targets": {}, "accounts": {}})
     rows = {}
@@ -11322,17 +11336,27 @@ def query_sales_goals(payload, request):
         for sku, units in account.get("units", {}).items():
             row = rows.setdefault(sku, {"sku": sku, "product": account.get("products", {}).get(sku, sku), "statuses": [], "sold": 0})
             row["sold"] += units
-    for sku in month.get("targets", {}):
+    for sku in targets:
         rows.setdefault(sku, {"sku": sku, "product": sku, "statuses": [], "sold": 0})
     selected = []
     for sku, row in sorted(rows.items()):
-        target = month.get("targets", {}).get(sku)
+        target = targets.get(sku)
         row.update(target=target, remaining=max(0, (target or 0) - row["sold"]),
                    progress=round(row["sold"] / target * 100, 1) if target else 0)
         if request.get("status") and request["status"] not in row["statuses"]:
             continue
         if request.get("registered") == "yes" and not target or request.get("registered") == "no" and target:
             continue
+        achievement = request.get("achievement")
+        if achievement in {"reached", "not_reached", "zero"}:
+            if not target:
+                continue
+            if achievement == "reached" and row["sold"] < target:
+                continue
+            if achievement == "not_reached" and row["sold"] >= target:
+                continue
+            if achievement == "zero" and row["sold"] != 0:
+                continue
         if str(request.get("search") or "").casefold() not in f"{sku} {row['product']}".casefold():
             continue
         selected.append(row)
@@ -11340,7 +11364,7 @@ def query_sales_goals(payload, request):
     expected = {str(a.get("seller_id") or a["id"]) for a in payload.get("accounts", []) if a.get("official") and a.get("status") == "connected"}
     missing = expected - set(month.get("accounts", {}))
     return {"month": period, "months": sorted(set(store.get("months", {})) | {period}, reverse=True),
-            "rows": selected, "editable": period == current_month_period(),
+            "rows": selected, "editable": True,
             "accounts": [{k: v for k, v in a.items() if k not in {"units", "products"}} for a in accounts],
             "warnings": ([f"{len(missing)} conta(s) ainda sem vendas sincronizadas neste mês. Clique em Atualizar vendas."] if missing else [])
                         + (["Há vendas sem SKU identificado; confira os cadastros de origem."] if any(a.get("unknown_units") for a in accounts) else [])}
@@ -11348,8 +11372,6 @@ def query_sales_goals(payload, request):
 
 def save_sales_goals(request):
     period, _, _ = sales_goal_month(request.get("month"))
-    if period != current_month_period():
-        raise RuntimeError("O histórico é somente para consulta. Edite as metas do mês atual.")
     edits = request.get("targets") or {}
     if not isinstance(edits, dict) or len(edits) > 50000:
         raise RuntimeError("Lista de metas inválida.")
@@ -11367,12 +11389,12 @@ def save_sales_goals(request):
             validated[sku] = int(number)
     with DATA_LOCK:
         store = read_json(SALES_GOALS_FILE, {"months": {}})
-        month = sales_goal_period(store, period)
+        targets = sales_goal_targets(store)
         for sku, value in validated.items():
             if value is None:
-                month["targets"].pop(sku, None)
+                targets.pop(sku, None)
             else:
-                month["targets"][sku] = value
+                targets[sku] = value
         write_json(SALES_GOALS_FILE, store)
     return {"ok": True, "saved": len(validated)}
 
