@@ -1903,6 +1903,8 @@ def build_operations(payload):
     }
     revenue = []
     revenue_source_accounts = [account for account in accounts if account.get("official")]
+    daily_records = [analytics_cached_period_record(canonical_store, account, today, today)
+                     for account in revenue_source_accounts]
     for account in revenue_source_accounts:
         record = (
             analytics_cached_period_record(canonical_store, account, current_start, today)
@@ -2062,6 +2064,14 @@ def build_operations(payload):
         "revenue": revenue,
         "total_monthly_revenue": total_revenue,
         "total_monthly_orders": total_orders,
+        "daily_revenue": {
+            "date": today.isoformat(),
+            "amount": round(sum(float(r.get("amount") or 0) for r in daily_records), 2),
+            "orders": sum(int(r.get("orders_count") or 0) for r in daily_records),
+            "complete": bool(daily_records) and all(daily_records),
+            "pending_accounts": [a.get("nickname") for a, r in zip(revenue_source_accounts, daily_records) if not r],
+            "updated_at": min((r.get("updated_at") for r in daily_records if r.get("updated_at")), default=""),
+        },
         "previous_period": previous_period,
         "previous_total_monthly_revenue": previous_total_revenue,
         "previous_total_monthly_orders": previous_total_orders,
@@ -12212,10 +12222,15 @@ def cleanup_async_operation_jobs():
         expired = [
             job_id
             for job_id, job in ASYNC_OPERATION_JOBS.items()
-            if float(job.get("updated_epoch") or job.get("created_epoch") or 0) < cutoff
+            if job.get("status") in {"completed", "error"}
+            and float(job.get("updated_epoch") or job.get("created_epoch") or 0) < cutoff
         ]
         for job_id in expired:
             ASYNC_OPERATION_JOBS.pop(job_id, None)
+        queue_cutoff = time.time() - max(60, int(os.getenv("ASYNC_OPERATION_QUEUE_TIMEOUT_SECONDS", "600")))
+        for job in ASYNC_OPERATION_JOBS.values():
+            if job.get("status") == "queued" and job.get("created_epoch", 0) < queue_cutoff:
+                job.update(status="error", message="A fila excedeu o tempo de espera. Esta operação não foi executada; tente novamente mais tarde.", updated_epoch=time.time())
         live_ids = set(ASYNC_OPERATION_JOBS)
         for key, job_id in list(ASYNC_OPERATION_IDEMPOTENCY.items()):
             if job_id not in live_ids:
@@ -12307,10 +12322,12 @@ def start_async_operation(
                 else CLONE_WORKER_SEMAPHORE
             )
             with semaphore:
+                cleanup_async_operation_jobs()
                 with ASYNC_OPERATION_JOBS_LOCK:
                     current = ASYNC_OPERATION_JOBS.get(job_id)
-                    if current:
-                        current.update({"status": "running", "message": "Processando dados oficiais no Mercado Livre.", "updated_epoch": time.time()})
+                    if not current or current.get("status") != "queued":
+                        return
+                    current.update({"status": "running", "message": "Processando dados oficiais no Mercado Livre.", "updated_epoch": time.time()})
                 try:
                     result = run_meli_work("background" if priority == "background" or heavy else "interactive", work)
                     with ASYNC_OPERATION_JOBS_LOCK:
@@ -23057,6 +23074,8 @@ def build_catalog_api_response(payload=None):
 
 def dashboard_api_response(payload, actor):
     signatures = (
+        datetime.now(APP_TZ).date().isoformat(),
+        file_signature(DATA / ANALYTICS_DAILY_CACHE_FILE),
         file_signature(DATA / APP_DATA_FILE),
         file_signature(DATA / SYNC_PROGRESS_FILE),
         file_signature(DATA / SKU_COSTS_FILE),

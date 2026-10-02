@@ -10893,3 +10893,7 @@ textarea:focus {
 .revenue-reconcile p { line-height:1.6; }.revenue-reconcile label { display:grid;gap:8px; }
 .revenue-reconcile input { padding:10px;border:1px solid var(--line);border-radius:8px;color:var(--ink);background:var(--panel); }
 #sales-reconcile-results { max-height:420px;overflow:auto; }
+.revenue-today { display:grid;gap:4px;margin-top:10px;padding:10px 12px;border-radius:8px;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.22); }
+.revenue-today > span { font-size:12px;font-weight:600; }
+.revenue-today > b { font-size:22px;line-height:1.2;color:var(--ink); }
+.revenue-today > small { line-height:1.4; }

@@ -358,6 +358,8 @@ async function api(path, options = {}) {
   const fetchOptions = { ...options };
   delete fetchOptions.manualProgress;
   delete fetchOptions.progressLabel;
+  delete fetchOptions.timeoutMs;
+  delete fetchOptions.retryPrompt;
   const method = String(fetchOptions.method || "GET").toUpperCase();
   const requestHeaders = { "Content-Type": "application/json", ...(fetchOptions.headers || {}) };
   if (method !== "GET" && method !== "HEAD") {
@@ -367,18 +369,34 @@ async function api(path, options = {}) {
   fetchOptions.headers = requestHeaders;
   try {
     while (true) {
-      const response = await fetch(path, {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs || 120000);
+      const abort = () => controller.abort();
+      fetchOptions.signal?.addEventListener('abort', abort, {once:true});
+      if (fetchOptions.signal?.aborted) controller.abort();
+      let response, payload;
+      try {
+      response = await fetch(path, {
         credentials: "same-origin",
         ...fetchOptions,
+        signal: controller.signal,
       });
-      const payload = await response.json().catch(() => ({}));
+      payload = await response.json();
+      } catch (error) {
+        if (controller.signal.aborted) throw new Error('O servidor não respondeu no prazo. O resultado da solicitação é incerto; confira o resultado antes de repetir uma alteração ou publicação.');
+        if (response && !response.ok) payload = {};
+        else throw error;
+      } finally {
+        window.clearTimeout(timeout);
+        fetchOptions.signal?.removeEventListener('abort', abort);
+      }
       if (!response.ok) {
         if (response.status === 401 && !["/api/auth/me", "/api/auth/login", "/api/auth/setup-master"].includes(path)) {
           showLogin();
         }
         const error = new Error(payload.error || payload.message || `Erro ${response.status}`);
         Object.assign(error, payload, { status: response.status });
-        if (response.status === 502) {
+        if (response.status === 502 && options.retryPrompt !== false) {
           updateManualAction(actionId, {
             status: "error",
             message: "Erro 502. Aguardando sua confirmação para repetir a mesma requisição.",
@@ -413,30 +431,45 @@ async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 
   const actionId = initial._manualActionId || "";
   const startedAt = Date.now();
   const pollUrl = initial.poll_url || `/api/async/jobs/${initial.job_id}`;
+  let pollErrors = 0;
+  try {
   while (Date.now() - startedAt < timeoutMs) {
     if (typeof onProgress === "function") onProgress(initial.message || "Processando no servidor...", initial);
     await new Promise((resolve) => window.setTimeout(resolve, 900));
-    const job = await api(pollUrl);
+    let job;
+    try {
+      job = await api(pollUrl, {manualProgress:false, retryPrompt:false, timeoutMs:Math.max(1, Math.min(20000, timeoutMs - (Date.now()-startedAt)))});
+      pollErrors = 0;
+    } catch (error) {
+      if ([401,403,404].includes(error.status) || ++pollErrors >= 3) {
+        throw new Error(`Não foi possível acompanhar a operação ${initial.job_id}. O resultado ainda não foi confirmado. Confira antes de repetir. ${error.message}`);
+      }
+      updateManualAction(actionId, {message:'Conexão interrompida. Consultando novamente o estado da mesma operação…'});
+      continue;
+    }
     if (typeof onProgress === "function") onProgress(job.message || "Processando no servidor...", job);
     const progress = Number(job.progress ?? job.percent);
     updateManualAction(actionId, {
       message: job.message || "Processando no servidor...",
       progress: Number.isFinite(progress) ? progress : null,
     });
+    initial = {...initial, ...job};
     if (job.status === "completed") {
       finishManualAction(actionId, "success", job.message || "Ação concluída com sucesso.");
       return job.result || {};
     }
     if (job.status === "error") {
       const message = job.message || "O processamento em segundo plano não foi concluído.";
-      finishManualAction(actionId, "error", message);
       const error = new Error(message);
       Object.assign(error, job);
       throw error;
     }
   }
-  finishManualAction(actionId, "error", "O acompanhamento excedeu o tempo desta tela.");
-  throw new Error("O processamento continua no servidor, mas excedeu o tempo de acompanhamento desta tela. Atualize a página para consultar o resultado.");
+  throw new Error(`A operação ${initial.job_id} excedeu o tempo de acompanhamento desta tela. Isso não confirma seu cancelamento: confira o resultado antes de repetir a ação.`);
+  } catch (error) {
+    finishManualAction(actionId, "error", error.message || "O acompanhamento foi interrompido.");
+    throw error;
+  }
 }
 
 async function runManualItemOperation(path, payload, button, progressLabel = "Processando...") {
@@ -1258,6 +1291,12 @@ function renderDashboard() {
       <span>Faturamento real mensal</span>
       <strong>${money.format(ops.total_monthly_revenue || 0)}</strong>
       <small title="${escapeAttr(ops.revenue_calculation_basis || "Pedidos oficiais conciliados")}">${Number(ops.total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos oficiais faturáveis no mês atual</small>
+      <div class="revenue-today">
+        <span>Hoje · todas as contas${ops.daily_revenue?.complete ? '' : ' · parcial'}</span>
+        <b>${ops.daily_revenue ? money.format(ops.daily_revenue.amount) : 'Aguardando sincronização'}</b>
+        <small>${Number(ops.daily_revenue?.orders || 0).toLocaleString('pt-BR')} pedidos${ops.daily_revenue?.updated_at ? ` · atualizado ${formatDateBR(ops.daily_revenue.updated_at)}` : ''}</small>
+        ${ops.daily_revenue?.pending_accounts?.length ? `<small>Aguardando: ${escapeText(ops.daily_revenue.pending_accounts.join(', '))}</small>` : ''}
+      </div>
       ${dashboardPreviousMonth({
         available: ops.previous_month_complete !== false,
         revenue: ops.previous_total_monthly_revenue,
