@@ -44,6 +44,8 @@
   copyCatalog: "all",
   cloneSelectedIds: new Set(),
   cloneTargetIds: new Set(),
+  cloneStores: {},
+  cloneStoreSelections: {},
   alertsPage: 1,
   scanPage: 1,
   competitorsPage: 1,
@@ -5111,7 +5113,9 @@ function renderClone() {
   if (targets) {
     targets.innerHTML = accounts.map((account) => {
       const id = String(account.id || account.seller_id);
-      return `<label><input type="checkbox" value="${escapeAttr(id)}" ${state.cloneTargetIds.has(id) ? "checked" : ""} /><span><strong>${escapeText(account.nickname)}</strong><small>Seller ${escapeText(account.seller_id || "-")}</small></span></label>`;
+      const selected = state.cloneTargetIds.has(id), discovery = state.cloneStores[id];
+      const stores = !selected ? '' : !discovery || discovery.loading ? '<p>Consultando lojas oficiais…</p>' : discovery.error ? `<p>${escapeText(discovery.error)}</p><button type="button" data-clone-stores-retry="${escapeAttr(id)}">Consultar novamente</button>` : discovery.stores.length ? `<small>Selecione as lojas oficiais de destino</small>${discovery.stores.map(store=>`<label><input type="checkbox" data-clone-store-account="${escapeAttr(id)}" value="${escapeAttr(store.value)}" ${(state.cloneStoreSelections[id] || []).includes(store.value) ? 'checked' : ''}><span>${escapeText(store.label)}</span></label>`).join('')}` : '<small>Nenhuma loja oficial identificada. A cópia seguirá a validação padrão da conta.</small>';
+      return `<div class="clone-destination"><label><input type="checkbox" value="${escapeAttr(id)}" ${selected ? "checked" : ""} /><span><small>Conta Mercado Livre</small><strong>${escapeText(account.nickname)}</strong></span></label><div class="clone-store-choices">${stores}</div></div>`;
     }).join("");
   }
   const copyProduct = document.querySelector("#copy-product-filter");
@@ -5131,7 +5135,8 @@ function renderClone() {
       (job) => `
         <article class="clone-job" data-clone-job-card="${job.id}">
           <div>
-            <strong>${job.source} -> ${job.target}</strong>
+            <strong>${escapeText(job.source)} → ${escapeText(job.target)}</strong>
+            ${job.official_store_label ? `<p>Loja oficial: <strong>${escapeText(job.official_store_label)}</strong></p>` : ''}
             <div class="meta-row"><span>${job.items} anúncio(s)</span><span>${escapeText(job.variant_label || "Mesmo tipo")}</span><span>${(job.item_ids || []).join(", ")}</span></div>
             <p>${cloneJobNoteHtml(job.note)}</p>
             ${job.created_details?.length ? cloneCreatedHtml(job.created_details) : ""}
@@ -7964,6 +7969,18 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
     alert("Selecione ao menos uma conta destino.");
     return;
   }
+  const officialStoreIds = {};
+  for (const id of targets) {
+    const discovery = state.cloneStores[id];
+    if (!discovery || discovery.loading || discovery.error) {
+      showToast('Aguarde ou consulte novamente as lojas oficiais das contas selecionadas.', 'error'); return;
+    }
+    if (discovery.stores.length) {
+      const selected = state.cloneStoreSelections[id] || [];
+      if (!selected.length) { showToast('Selecione ao menos uma loja oficial para cada conta de destino.', 'error'); return; }
+      officialStoreIds[id] = selected;
+    }
+  }
   const sourceItem = state.data.catalog.find((item) => item.id === itemIds[0]);
   const variantMap = new Map();
   if (form.get("variant_same")) {
@@ -7993,6 +8010,7 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
       body: JSON.stringify({
         source: form.get("source"),
         targets,
+        official_store_ids: officialStoreIds,
         variants,
         item_ids: itemIds,
         edits: {
@@ -8088,11 +8106,32 @@ document.querySelector("#clone-jobs").addEventListener("click", async (event) =>
   }
 });
 
+async function loadCloneStores(id) {
+  state.cloneStores[id] = {loading:true}; renderClone();
+  try {
+    const queued = await api('/api/clone/stores', {method:'POST',manualProgress:false,body:JSON.stringify({account_id:id})});
+    const result = await waitForAsyncOperation(queued);
+    state.cloneStores[id] = {stores:result.stores || []};
+    const valid = new Set(state.cloneStores[id].stores.map(s=>s.value));
+    state.cloneStoreSelections[id] = (state.cloneStoreSelections[id] || []).filter(value=>valid.has(value));
+  } catch(error) { state.cloneStores[id] = {error:error.message}; }
+  renderClone();
+}
+document.querySelector('#clone-targets')?.addEventListener('click', event=>{
+  const button=event.target.closest('[data-clone-stores-retry]');
+  if(button) loadCloneStores(button.dataset.cloneStoresRetry);
+});
 document.querySelector("#clone-targets")?.addEventListener("change", (event) => {
   const input = event.target.closest('input[type="checkbox"]');
   if (!input) return;
+  if (input.dataset.cloneStoreAccount) {
+    const id=input.dataset.cloneStoreAccount, selected=new Set(state.cloneStoreSelections[id] || []);
+    if(input.checked) selected.add(input.value); else selected.delete(input.value);
+    state.cloneStoreSelections[id]=[...selected]; return;
+  }
   if (input.checked) state.cloneTargetIds.add(input.value);
   else state.cloneTargetIds.delete(input.value);
+  if(input.checked) loadCloneStores(input.value); else renderClone();
 });
 
 document.querySelector("#scan-form").addEventListener("submit", async (event) => {

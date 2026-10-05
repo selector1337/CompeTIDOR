@@ -14607,7 +14607,7 @@ def discover_official_stores_from_items(target_client, target_account, catalog):
     return merge_official_stores(stores)
 
 
-def target_official_stores(target_client, target_account, catalog=None):
+def target_official_stores(target_client, target_account, catalog=None, strict=False):
     seller_id = str(target_account.get("seller_id") or target_account.get("id") or "")
     if not seller_id:
         return []
@@ -14625,6 +14625,8 @@ def target_official_stores(target_client, target_account, catalog=None):
             response = target_client.user_brands(seller_id, interactive=True)
             brands = response.get("brands") or [] if isinstance(response, dict) else response if isinstance(response, list) else []
         except Exception:
+            if strict:
+                raise
             brands = []
         if isinstance(brands, dict):
             brands = [brands]
@@ -15826,6 +15828,7 @@ def create_item_with_clone_retries(
     publication_model="",
     publication_name="",
     kit_mode=False,
+    strict_store=False,
 ):
     payload = json.loads(json.dumps(create_payload, ensure_ascii=False))
     sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [], source_item)
@@ -15843,7 +15846,7 @@ def create_item_with_clone_retries(
         try:
             if publication_model and publication_name:
                 payload = apply_publication_name(payload, publication_name, publication_model)
-            if cross_account:
+            if cross_account or destination_store_id not in (None, ""):
                 removed_store = prepare_cross_account_official_store_payload(payload, destination_store_id)
                 if removed_store and not any(row.get("tipo") == "vinculo_loja_oficial_origem_substituido" for row in adjustments):
                     adjustments.append({
@@ -15857,6 +15860,8 @@ def create_item_with_clone_retries(
             return created
         except Exception as exc:
             last_error = exc
+            if strict_store and official_store_error_kind(exc):
+                raise RuntimeError(f"A Loja Oficial selecionada não foi aceita: {friendly_clone_error(exc)}") from exc
             if meli_rate_limited_error(exc) and rate_limit_attempts < max_rate_limit_attempts:
                 delay = clone_rate_limit_delay(rate_limit_attempts)
                 adjustments.append({"tipo": "limite_temporario_aguardado", "tentativa": rate_limit_attempts + 1, "espera_segundos": round(delay, 2)})
@@ -15966,14 +15971,16 @@ def create_official_clone(payload, job, source_item_id, edits):
         target_client,
         target_account,
         payload.get("catalog") or [],
-    ) if cross_account else []
+    ) if cross_account or job.get("official_store_id") else []
     allowed_store_ids = {
         str(store.get("official_store_id") or "")
         for store in destination_stores
         if store.get("official_store_id") not in (None, "")
     }
     requested_store_id = clean_attribute_value(answers.get("official_store_id") or job.get("official_store_id"))
-    if requested_store_id and allowed_store_ids and requested_store_id not in allowed_store_ids:
+    if job.get("store_explicit") and str(requested_store_id) != str(job.get("official_store_id")):
+        raise RuntimeError("Esta combinação pertence à Loja Oficial selecionada no preview. Prepare outra combinação para mudar o destino.")
+    if requested_store_id and (allowed_store_ids or job.get("store_explicit")) and requested_store_id not in allowed_store_ids:
         error = RuntimeError("Selecione uma Loja Oficial autorizada para a conta destino.")
         error.pending_fields = [official_store_pending_field(source_item_id, destination_stores)]
         raise error
@@ -15995,6 +16002,7 @@ def create_official_clone(payload, job, source_item_id, edits):
         cross_account,
         destination_store_id,
         destination_stores,
+        strict_store=bool(job.get("store_explicit")),
     )
     verified_item = {}
     if created.get("id"):
@@ -22876,6 +22884,15 @@ def create_kit_listing(request, actor=None):
     return {"ok": True, "item": new_item, "created": created}
 
 
+def clone_destination_stores(request):
+    payload = read_payload(include_catalog=False)
+    account = official_account_by_name(payload, request.get("account_id"))
+    if not account or not account.get("official") or not account.get("access_token"):
+        raise RuntimeError("Conta destino não conectada.")
+    stores = target_official_stores(account_client(account), account, read_json(CATALOG_DATA_FILE, []), strict=True)
+    return {"stores": [official_store_option(store) for store in stores]}
+
+
 def prepare_clone_preview(request):
     payload = read_payload(include_catalog=False)
     item_ids = request.get("item_ids") or []
@@ -22922,9 +22939,27 @@ def prepare_clone_preview(request):
     missing_ids = [item_id for item_id in item_ids if item_id not in found_ids]
     if missing_ids:
         raise RuntimeError(f"Anúncios não encontrados na conta origem: {', '.join(missing_ids)}.")
-    combinations = len(target_accounts) * len(variants)
+    selected_stores = request.get("official_store_ids") or {}
+    if not isinstance(selected_stores, dict):
+        raise RuntimeError("Seleção de lojas oficiais inválida.")
+    destinations = []
+    for account in target_accounts:
+        client = account_client(account)
+        stores = target_official_stores(client, account, catalog)
+        choices = selected_stores.get(str(account.get("id") or account.get("seller_id")))
+        if choices is not None:
+            if not isinstance(choices, list) or not choices:
+                raise RuntimeError(f"Selecione ao menos uma Loja Oficial para {account.get('nickname')}.")
+            allowed = {str(s.get("official_store_id")) for s in stores}
+            for choice in dict.fromkeys(str(c) for c in choices):
+                if choice not in allowed:
+                    raise RuntimeError(f"Loja Oficial {choice} não autorizada para {account.get('nickname')}.")
+                destinations.append((account, stores, choice, True))
+        else:
+            destinations.append((account, stores, target_official_store_id(client, account, source_items[0], stores) if stores else None, False))
+    combinations = len(destinations) * len(variants)
     if combinations > max(1, int(os.getenv("MELI_CLONE_MAX_COMBINATIONS", "20"))):
-        raise RuntimeError("Selecione no máximo 20 combinações de conta e tipo por lote.")
+        raise RuntimeError("Limite de combinações excedido: reduza as contas, lojas oficiais ou tipos selecionados.")
     jobs = payload.get("clone_jobs")
     if not isinstance(jobs, list):
         jobs = []
@@ -22932,15 +22967,7 @@ def prepare_clone_preview(request):
     batch_id = f"batch-{uuid.uuid4().hex[:8]}"
     created_jobs = []
     validation_cache = {}
-    for target_account in target_accounts:
-        target_client = account_client(target_account)
-        target_stores = target_official_stores(target_client, target_account, catalog)
-        suggested_store_id = target_official_store_id(
-            target_client,
-            target_account,
-            source_items[0],
-            target_stores,
-        ) if target_stores else None
+    for target_account, target_stores, suggested_store_id, store_explicit in destinations:
         for variant in variants:
             variant = variant if isinstance(variant, dict) else {}
             variant_edits = dict(edits)
@@ -22978,6 +23005,8 @@ def prepare_clone_preview(request):
                     "source_account_id": source_account.get("id"),
                     "target_account_id": target_account.get("id"),
                     "official_store_id": suggested_store_id,
+                    "store_explicit": store_explicit,
+                    "official_store_label": next((official_store_option(s)["label"] for s in target_stores if str(s.get("official_store_id")) == str(suggested_store_id)), ""),
                     "official_store_options": [official_store_option(store) for store in target_stores],
                     "item_ids": item_ids,
                     "items": len(item_ids),
@@ -23820,6 +23849,7 @@ class App(BaseHTTPRequestHandler):
             "/api/sales-goals/save",
             "/api/sales-goals/refresh",
             "/api/clone/preview",
+            "/api/clone/stores",
             "/api/reports/official-stores/query",
             "/api/reports/official-stores/rules",
             "/api/reports/official-stores/preview",
@@ -24974,6 +25004,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/clone/stores":
+            operation = start_async_operation("clone_stores", lambda: clone_destination_stores(request), "Consultando lojas oficiais.")
+            self.send_json({"ok": True, **operation}, status=202)
             return
 
         if parsed.path == "/api/clone/preview":

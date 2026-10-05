@@ -10897,3 +10897,8 @@ textarea:focus {
 .revenue-today > span { font-size:12px;font-weight:600; }
 .revenue-today > b { font-size:22px;line-height:1.2;color:var(--ink); }
 .revenue-today > small { line-height:1.4; }
+.clone-destination { border:1px solid var(--line);border-radius:10px;padding:8px;background:var(--panel); }
+.clone-store-choices { display:grid;gap:6px;padding:8px 3px 0; }
+.clone-store-choices:empty { display:none; }
+.clone-targets .clone-store-choices label { min-height:42px;font-size:12px; }
+.clone-store-choices p { font-size:12px;margin:4px 0; }
