@@ -1289,16 +1289,17 @@ function renderDashboard() {
   const stockRows = filterByStockPeriod(ops.attention_stock || []);
   renderDashboardAccountFilters();
   document.querySelector("#dashboard-revenue").innerHTML = `
-    <article class="revenue-total">
-      <span>Faturamento real mensal</span>
-      <strong>${money.format(ops.total_monthly_revenue || 0)}</strong>
-      <small title="${escapeAttr(ops.revenue_calculation_basis || "Pedidos oficiais conciliados")}">${Number(ops.total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos oficiais faturáveis no mês atual</small>
       <div class="revenue-today">
         <span>Hoje · todas as contas${ops.daily_revenue?.complete ? '' : ' · parcial'}</span>
         <b>${ops.daily_revenue ? money.format(ops.daily_revenue.amount) : 'Aguardando sincronização'}</b>
         <small>${Number(ops.daily_revenue?.orders || 0).toLocaleString('pt-BR')} pedidos${ops.daily_revenue?.updated_at ? ` · atualizado ${formatDateBR(ops.daily_revenue.updated_at)}` : ''}</small>
         ${ops.daily_revenue?.pending_accounts?.length ? `<small>Aguardando: ${escapeText(ops.daily_revenue.pending_accounts.join(', '))}</small>` : ''}
       </div>
+    <article class="revenue-total">
+      <span>Faturamento real mensal</span>
+      <strong>${money.format(ops.total_monthly_revenue || 0)}</strong>
+      <small title="${escapeAttr(ops.revenue_calculation_basis || "Pedidos oficiais conciliados")}">${Number(ops.total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos oficiais faturáveis no mês atual</small>
+
       ${dashboardPreviousMonth({
         available: ops.previous_month_complete !== false,
         revenue: ops.previous_total_monthly_revenue,
@@ -2620,6 +2621,19 @@ function renderAdDescriptionEditor(item) {
       </form>
     </details>
   `;
+}
+
+function pictureSaveReferences(pictures) {
+  if (!Array.isArray(pictures) || !pictures.length || pictures.length > 12) {
+    throw new Error('Mantenha entre 1 e 12 fotos no anúncio.');
+  }
+  return pictures.map((picture, index) => {
+    const id = String(picture?.id || '').trim();
+    if (id) return {id};
+    const source = String(picture?.source || picture?.secure_url || '').trim();
+    if (/^https?:\/\//i.test(source)) return {source};
+    throw new Error(`A foto ${index + 1} ainda não possui uma referência válida no Mercado Livre. Adicione essa foto novamente antes de salvar.`);
+  });
 }
 
 function renderAdPictureEditor(item) {
@@ -7209,7 +7223,7 @@ document.querySelector("#ads-list")?.addEventListener("click", async (event) => 
         item_id: itemId,
         account_id: save.dataset.accountId,
         scope: save.dataset.savePictures,
-        pictures: cached.pictures,
+        pictures: pictureSaveReferences(cached.pictures),
       }),
     });
     const result = await waitForAsyncOperation(queued, (message) => { save.textContent = message || "Salvando fotos..."; });

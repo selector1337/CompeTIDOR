@@ -10902,3 +10902,10 @@ textarea:focus {
 .clone-store-choices:empty { display:none; }
 .clone-targets .clone-store-choices label { min-height:42px;font-size:12px; }
 .clone-store-choices p { font-size:12px;margin:4px 0; }
+#page-dashboard .revenue-grid > .revenue-today { grid-column:1 / -1;display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;margin:0;padding:12px 16px;width:auto;min-width:0; }
+#page-dashboard .revenue-grid > .revenue-today > small:last-child { margin-left:auto; }
+#page-dashboard .revenue-account, #page-dashboard .revenue-total { align-content:start;gap:7px; }
+@media(max-width:600px) {
+  #page-dashboard .revenue-grid > .revenue-today { flex-direction:column;align-items:flex-start;gap:5px; }
+  #page-dashboard .revenue-grid > .revenue-today > small:last-child { margin-left:0; }
+}

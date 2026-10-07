@@ -23144,6 +23144,14 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 class App(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def end_headers(self):
+        # A rejected upload may still have unread bytes in the socket. Reusing
+        # it would parse those bytes as the next request's line/headers.
+        if getattr(self, "command", "") == "POST" and not getattr(self, "_request_body_consumed", False):
+            self.close_connection = True
+            self.send_header("Connection", "close")
+        super().end_headers()
+
     def log_message(self, fmt, *args):
         return
 
@@ -23236,6 +23244,7 @@ class App(BaseHTTPRequestHandler):
             return None
         try:
             raw = self.rfile.read(length) if length else b"{}"
+            self._request_body_consumed = not length or len(raw) == length
             request = json.loads(raw.decode("utf-8") or "{}")
         except UnicodeDecodeError:
             self.send_json({"error": "A requisição precisa estar codificada em UTF-8."}, status=400)
@@ -23786,6 +23795,7 @@ class App(BaseHTTPRequestHandler):
         self.send_json({"error": "Endpoint não encontrado"}, status=404)
 
     def do_POST(self):
+        self._request_body_consumed = False
         parsed_path = urlparse(self.path).path
         automatic_paths = {
             "/api/notifications/meli",
