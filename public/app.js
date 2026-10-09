@@ -4601,7 +4601,7 @@ async function loadSalesReport() {
 function skuCommercialHtml(row) {
   const price = value => value == null ? '—' : money.format(value);
   const margin = value => value == null ? 'Margem indisponível' : `${Number(value).toLocaleString('pt-BR', {maximumFractionDigits:2})}% de margem`;
-  return `<div class="sku-commercial"><small>Custo atual <b>${price(row.sku_cost)}</b></small>${[['classic','Clássico'],['premium','Premium']].map(([key,label])=>`<div title="${escapeAttr(row[key+'_reference'] || 'Sem anúncio de referência')}"><span>${label}</span><b>${price(row[key+'_price'])}</b><small>${margin(row[key+'_margin'])}</small></div>`).join('')}</div>`;
+  return `<div class="sku-commercial"><small>Custo atual <b>${price(row.sku_cost)}</b></small>${[['classic','Clássico'],['premium','Premium']].map(([key,label])=>`<div title="${escapeAttr(row[key+'_reference'] || 'Sem anúncio de referência')}"><span>${label}</span><b>${price(row[key+'_price'])}</b><small class="${row[key+'_margin'] == null || Number(row[key+'_margin']) === 0 ? '' : Number(row[key+'_margin']) > 0 ? 'profit-positive' : 'profit-negative'}" title="${escapeAttr(row[key+'_margin_reason'] || '')}">${row[key+'_margin'] == null && row[key+'_margin_reason'] ? escapeText(row[key+'_margin_reason']) : margin(row[key+'_margin'])}</small></div>`).join('')}</div>`;
 }
 
 function replenishmentFilters(form) {

@@ -10921,3 +10921,6 @@ textarea:focus {
 .replenishment-table { min-width: 1000px; }
 .replenishment-table td:first-child { width: 32%; min-width: 300px; }
 .report-method-note { color: var(--muted); font-size: 12px; margin: 12px 0; }
+
+.sku-commercial > div > small.profit-positive { color: #009966; }
+.sku-commercial > div > small.profit-negative { color: #ed4455; }

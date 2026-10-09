@@ -7289,21 +7289,32 @@ def sku_commercial_index(payload, items=None):
         kind = {"gold_special": "classic", "gold_pro": "premium"}.get(item.get("listing_type_id"))
         if not sku or sku == "-" or not kind:
             continue
-        rank = (normalized_meli_status(item.get("meli_status")) != "active",
+        values = commercial_values_for_item(item, payload, strict=True)
+        missing = []
+        if values.get("cost_amount") is None:
+            missing.append("custo")
+        if item.get("price") in (None, ""):
+            missing.append("preço")
+        if item.get("sale_fee_amount") in (None, "") or item.get("sale_fee_status") not in (None, "", "ok"):
+            missing.append("tarifa")
+        if item.get("shipping_cost") in (None, "") or item.get("shipping_cost_status") not in (None, "", "ok"):
+            missing.append("frete")
+        margin = None if missing else values.get("profit_percentage")
+        reason = "Atualizar " + ", ".join(missing) if missing else "Valor líquido insuficiente para calcular a margem" if margin is None else ""
+        status = normalized_meli_status(item.get("meli_status"))
+        # Keep price, fee and freight from the SAME reference, preferring usable data.
+        rank = (status not in {"active", "paused"}, margin is None, status != "active",
                 bool(item.get("catalog_listing")), str(item.get("account_id") or item.get("account") or ""), str(item.get("id") or ""))
         key = (sku, kind)
         if key not in selected or rank < selected[key][0]:
-            selected[key] = (rank, item)
+            selected[key] = (rank, item, values, margin, reason)
     result = {}
-    for (sku, kind), (_, item) in selected.items():
-        values = commercial_values_for_item(item, payload, strict=True)
-        margin = values.get("profit_percentage")
-        if item.get("shipping_cost") in (None, "") or item.get("shipping_cost_status") not in (None, "", "ok") or item.get("price") in (None, ""):
-            margin = None
+    for (sku, kind), (_, item, values, margin, reason) in selected.items():
         result.setdefault(sku, {}).update({
             "sku_cost": values.get("cost_amount"),
             kind + "_price": item.get("price"),
             kind + "_margin": margin,
+            kind + "_margin_reason": reason,
             kind + "_reference": " / ".join(str(item.get(k) or "") for k in ("account", "id")),
         })
     for sku, record in (payload.get("sku_costs") or {}).items():
@@ -18494,7 +18505,7 @@ def query_sales_report(payload, request, *, target_skus=None, paid_only=False):
 def query_brand_sales_report(payload, request):
     brand = str((request or {}).get("brand") or "").strip()
     brand_key = normalized_attribute_label(brand)
-    general = request.get("general_replenishment") is True
+    general = str(request.get("general_replenishment") or "").lower() == "true"
     if not brand_key and not general:
         raise RuntimeError("Informe uma marca para gerar o relatório.")
 
@@ -20770,6 +20781,8 @@ def statistics_job_signature(request):
         "date_from", "date_to", "comparison_date_from", "comparison_date_to", "period",
         "flex_carrier_cost", "shipping_method", "category", "max_categories", "limit",
         "price_min", "price_max", "only_new",
+        "general_replenishment", "stock_min", "stock_max", "min_units",
+        "margin_min", "product", "cost_filter",
     )
     normalized = {
         key: (
@@ -20809,6 +20822,8 @@ def start_statistics_job(request):
             "date_from", "date_to", "comparison_date_from", "comparison_date_to", "period",
             "flex_carrier_cost", "shipping_method", "category", "max_categories", "limit",
             "price_min", "price_max", "only_new",
+            "general_replenishment", "stock_min", "stock_max", "min_units",
+            "margin_min", "product", "cost_filter",
         )
     }
     signature = statistics_job_signature(safe_request)
