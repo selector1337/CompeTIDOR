@@ -7270,6 +7270,51 @@ def commercial_values_for_item(item, payload, strict=True):
     return row
 
 
+SKU_COMMERCIAL_COLUMNS = [
+    ("sku_cost", "Custo atual do SKU", "currency"),
+    ("classic_price", "Preço Clássico atual", "currency"),
+    ("classic_margin", "Margem Clássico atual (%)", "percent"),
+    ("premium_price", "Preço Premium atual", "currency"),
+    ("premium_margin", "Margem Premium atual (%)", "percent"),
+    ("classic_reference", "Referência Clássico", "text"),
+    ("premium_reference", "Referência Premium", "text"),
+]
+
+
+def sku_commercial_index(payload, items=None):
+    """One deterministic listing per SKU/type; no network calls or invented costs."""
+    selected = {}
+    for item in payload.get("catalog", []) if items is None else items:
+        sku = normalized_sku_key(item.get("sku"))
+        kind = {"gold_special": "classic", "gold_pro": "premium"}.get(item.get("listing_type_id"))
+        if not sku or sku == "-" or not kind:
+            continue
+        rank = (normalized_meli_status(item.get("meli_status")) != "active",
+                bool(item.get("catalog_listing")), str(item.get("account_id") or item.get("account") or ""), str(item.get("id") or ""))
+        key = (sku, kind)
+        if key not in selected or rank < selected[key][0]:
+            selected[key] = (rank, item)
+    result = {}
+    for (sku, kind), (_, item) in selected.items():
+        values = commercial_values_for_item(item, payload, strict=True)
+        margin = values.get("profit_percentage")
+        if item.get("shipping_cost") in (None, "") or item.get("shipping_cost_status") not in (None, "", "ok") or item.get("price") in (None, ""):
+            margin = None
+        result.setdefault(sku, {}).update({
+            "sku_cost": values.get("cost_amount"),
+            kind + "_price": item.get("price"),
+            kind + "_margin": margin,
+            kind + "_reference": " / ".join(str(item.get(k) or "") for k in ("account", "id")),
+        })
+    for sku, record in (payload.get("sku_costs") or {}).items():
+        if isinstance(record, dict) and record.get("cost") not in (None, ""):
+            try:
+                result.setdefault(normalized_sku_key(sku), {})["sku_cost"] = round(max(0, float(record["cost"])), 2)
+            except (ValueError, TypeError):
+                pass
+    return result
+
+
 def catalog_item_matches_sales_filter(item, payload, sales_filter="all", no_sale_days=30, reference=None):
     if sales_filter == "all":
         return True
@@ -11349,7 +11394,9 @@ def query_sales_goals(payload, request):
     for sku in targets:
         rows.setdefault(sku, {"sku": sku, "product": sku, "statuses": [], "sold": 0})
     selected = []
+    commercial = sku_commercial_index(payload)
     for sku, row in sorted(rows.items()):
+        row.update(commercial.get(sku, {}))
         target = targets.get(sku)
         row.update(target=target, remaining=max(0, (target or 0) - row["sold"]),
                    progress=round(row["sold"] / target * 100, 1) if target else 0)
@@ -17401,6 +17448,10 @@ def active_skus_without_sales_rows(payload, request, sold_rows):
                 "last_sale_at": (last_sale or {}).get("date") if isinstance(last_sale, dict) else "",
             }
         )
+    reference_ids = {item_id for row in rows for item_id in row["item_ids"]}
+    commercial = sku_commercial_index(payload, [item for item in payload.get("catalog", []) if str(item.get("id")) in reference_ids])
+    for row in rows:
+        row.update(commercial.get(row["sku"], {}))
     rows.sort(key=lambda row: (str(row.get("last_sale_at") or ""), row["sku"]))
     return rows
 
@@ -18443,7 +18494,8 @@ def query_sales_report(payload, request, *, target_skus=None, paid_only=False):
 def query_brand_sales_report(payload, request):
     brand = str((request or {}).get("brand") or "").strip()
     brand_key = normalized_attribute_label(brand)
-    if not brand_key:
+    general = request.get("general_replenishment") is True
+    if not brand_key and not general:
         raise RuntimeError("Informe uma marca para gerar o relatório.")
 
     account_filter = str((request or {}).get("account") or "all")
@@ -18476,7 +18528,7 @@ def query_brand_sales_report(payload, request):
 
     matching_items = []
     for item in payload.get("catalog") or []:
-        if normalized_attribute_label(item.get("brand") or "") != brand_key:
+        if brand_key and normalized_attribute_label(item.get("brand") or "") != brand_key:
             continue
         if account_filter != "all" and (
             str(item.get("account_id") or "") not in allowed_ids
@@ -18490,14 +18542,14 @@ def query_brand_sales_report(payload, request):
         if not sku or sku == "-":
             continue
         matching_items.append(item)
-    if not matching_items:
+    if not matching_items and not general:
         raise RuntimeError(f"Nenhum SKU da marca {brand} corresponde aos filtros selecionados.")
-    display_brand = str(matching_items[0].get("brand") or brand)
+    display_brand = str(matching_items[0].get("brand") or brand) if matching_items else brand
 
-    sales = query_sales_report(payload, request)
+    sales = query_sales_report(payload, {**request, "sku": ""} if general else request)
     sales_rows = [
         row for row in sales.get("rows") or []
-        if normalized_attribute_label(row.get("brand") or "") == brand_key
+        if not brand_key or normalized_attribute_label(row.get("brand") or "") == brand_key
     ]
 
     grouped = {}
@@ -18667,6 +18719,35 @@ def query_brand_sales_report(payload, request):
             }
         )
 
+    commercial = sku_commercial_index(payload, matching_items)
+    for row in output:
+        row.update(commercial.get(row["sku"], {}))
+    if general:
+        def limit(name, default):
+            raw = request.get(name)
+            if raw in (None, ""):
+                return default
+            try:
+                value = float(raw)
+                if not math.isfinite(value):
+                    raise ValueError()
+                return value
+            except (ValueError, TypeError):
+                raise RuntimeError("Informe valores numéricos válidos nos filtros de reposição.")
+        stock_max = limit("stock_max", 5)
+        min_units = limit("min_units", 1)
+        stock_min = limit("stock_min", 0)
+        margin_min = limit("margin_min", None)
+        search = normalized_attribute_label(request.get("product") or "")
+        sku_filter = normalized_sku_key(request.get("sku") or "")
+        output = [r for r in output if stock_min <= r["current_stock"] <= stock_max
+                  and r["units"] >= min_units
+                  and (not sku_filter or sku_filter in r["sku"])
+                  and (not search or search in normalized_attribute_label(r["product"]))
+                  and (margin_min is None or r["profit_percentage"] is not None and r["profit_percentage"] >= margin_min)
+                  and (request.get("cost_filter") != "known" or r["unit_cost"] is not None)
+                  and (request.get("cost_filter") != "missing" or r["unit_cost"] is None)]
+
     recommendation_order = {
         "Repor agora": 0,
         "Planejar reposição": 1,
@@ -18688,6 +18769,7 @@ def query_brand_sales_report(payload, request):
     return {
         "ok": True,
         "kind": "brand_sales",
+        "general_replenishment": general,
         "brand": display_brand,
         "date_from": start.isoformat(),
         "date_to": end.isoformat(),
@@ -21151,6 +21233,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
     if report_type == "sales_goals":
         result = query_sales_goals(payload, filters)
         columns = [("sku", "SKU", "text"), ("product", "Produto", "text"), ("target", "Meta mensal (un.)", "integer"), ("sold", "Vendidas", "integer"), ("remaining", "Faltam", "integer"), ("progress", "Progresso", "percent")]
+        columns += SKU_COMMERCIAL_COLUMNS
         rows = [{**r, "target": r["target"] or "", "remaining": r["remaining"] if r["target"] else ""} for r in result["rows"]]
         return "Metas de Venda", columns, rows, {"Mês": result["month"], "Critério": "Todas as contas; pedidos não cancelados", "Avisos": " ".join(result["warnings"])}
 
@@ -21390,10 +21473,12 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
             ("recommendation", "Recomendação", "text"),
         ]
         return (
-            f"Vendas e reposição da marca {result.get('brand') or filters.get('brand') or ''}",
-            columns,
+            "Reposição geral de estoque" if result.get("general_replenishment") else f"Vendas e reposição da marca {result.get('brand') or filters.get('brand') or ''}",
+            columns + SKU_COMMERCIAL_COLUMNS,
             result.get("rows") or [],
             {
+                "Estoque máximo": filters.get("stock_max", "—"),
+                "Unidades mínimas vendidas": filters.get("min_units", "—"),
                 "Marca": result.get("brand") or filters.get("brand") or "",
                 "Período": f"{result.get('date_from')} a {result.get('date_to')}",
                 "Conta": filters.get("account") or "Todas",
@@ -21466,7 +21551,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
                 ("available_since", "Disponibilidade acompanhada desde", "datetime"),
                 ("available_days", "Dias disponíveis acompanhados", "integer"),
                 ("availability_note", "Histórico de disponibilidade", "text"),
-            ]
+            ] + SKU_COMMERCIAL_COLUMNS
             rows = [
                 {
                     **row,

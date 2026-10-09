@@ -10909,3 +10909,15 @@ textarea:focus {
   #page-dashboard .revenue-grid > .revenue-today { flex-direction:column;align-items:flex-start;gap:5px; }
   #page-dashboard .revenue-grid > .revenue-today > small:last-child { margin-left:0; }
 }
+
+/* Compact commercial snapshot shared by SKU reports and monthly goals. */
+.sku-commercial { margin-top: 8px; display: grid; gap: 5px; min-width: 200px; font-size: 12px; font-weight: 400; }
+.sku-commercial > small { color: var(--muted); }
+.sku-commercial > div { display: grid; grid-template-columns: 60px auto auto; gap: 2px 8px; padding-top: 4px; border-top: 1px solid var(--line); }
+.sku-commercial > div > small { margin: 0; color: var(--muted); font-size: 11px; }
+.sku-commercial b { font-size: 12px; font-style: normal; }
+.brand-report-filter-bar [hidden] { display: none !important; }
+
+.replenishment-table { min-width: 1000px; }
+.replenishment-table td:first-child { width: 32%; min-width: 300px; }
+.report-method-note { color: var(--muted); font-size: 12px; margin: 12px 0; }

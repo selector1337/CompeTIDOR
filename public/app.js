@@ -765,7 +765,7 @@ function renderReportsHub() {
   if (!selector) return;
   selector.value = state.reportsSection || "";
   document.querySelectorAll("[data-report-section]").forEach((section) => {
-    section.hidden = section.dataset.reportSection !== state.reportsSection;
+    section.hidden = section.dataset.reportSection !== (state.reportsSection === "replenishment" ? "brand" : state.reportsSection);
   });
   if (state.reportsSection === "statistics") {
     const host = document.querySelector("#reports-statistics-host");
@@ -774,7 +774,7 @@ function renderReportsHub() {
     renderStatistics();
   }
   if (state.reportsSection === "sales") renderSalesReport();
-  if (state.reportsSection === "brand") {
+  if (["brand", "replenishment"].includes(state.reportsSection)) {
     if (!state.catalogLoaded) loadCatalogInBackground();
     renderBrandSalesReport();
   }
@@ -4117,7 +4117,7 @@ function renderStatistics() {
     results.innerHTML = `${warning}${messages}<div class="notice">Disponibilidade: dias completos até esta consulta, considerando o anúncio ativo com estoque acompanhado há mais tempo no SKU. Datas antigas de reativação ou reposição não registradas permanecem desconhecidas. Preços são os valores atuais sincronizados.</div>${paginationHtml("statisticsPage", pageInfo)}${pageInfo.items.length ? `
       <div class="statistics-table no-sales-statistics-table" role="table" aria-label="SKUs ativos sem venda">
         <div class="statistics-table-head" role="row">
-          <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Anúncios ativos</span><span>Estoque</span><span>Tipos</span><span>Anúncios ML</span><span>Última venda</span><span>Preço de venda atual</span><span>Histórico dos anúncios ativos</span><span>Disponibilidade com estoque</span>
+          <span>Posição</span><span>Produto e SKU</span><span>Contas</span><span>Anúncios ativos</span><span>Estoque</span><span>Tipos</span><span>Anúncios ML</span><span>Última venda</span><span>Preços e margens atuais</span><span>Histórico dos anúncios ativos</span><span>Disponibilidade com estoque</span>
         </div>
         ${pageInfo.items.map((row, index) => `
           <article class="statistics-row" role="row">
@@ -4132,7 +4132,7 @@ function renderStatistics() {
             <span>${escapeText((row.listing_types || []).join(" e ") || "-")}</span>
             <span class="statistics-item-ids">${(row.item_ids || []).map((id) => `<em>${escapeText(id)}</em>`).join("")}</span>
             <span>${row.last_sale_at ? formatDateBR(row.last_sale_at) : "Sem venda sincronizada"}</span>
-            <span title="${escapeAttr(row.listing_prices_label || '')}">${row.min_sale_price == null ? "Não informado" : `${money.format(row.min_sale_price)}${row.max_sale_price !== row.min_sale_price ? ` a ${money.format(row.max_sale_price)}` : ""}`}</span>
+            <div>${skuCommercialHtml(row)}</div>
             <div class="no-sales-history">
               <span>Primeira identificação: ${row.first_seen_at ? formatDateBR(row.first_seen_at) : "Não registrada"}</span>
               <span>Reativação: ${row.last_reactivated_at ? formatDateBR(row.last_reactivated_at) : "Não registrada"}</span>
@@ -4598,6 +4598,17 @@ async function loadSalesReport() {
   }
 }
 
+function skuCommercialHtml(row) {
+  const price = value => value == null ? '—' : money.format(value);
+  const margin = value => value == null ? 'Margem indisponível' : `${Number(value).toLocaleString('pt-BR', {maximumFractionDigits:2})}% de margem`;
+  return `<div class="sku-commercial"><small>Custo atual <b>${price(row.sku_cost)}</b></small>${[['classic','Clássico'],['premium','Premium']].map(([key,label])=>`<div title="${escapeAttr(row[key+'_reference'] || 'Sem anúncio de referência')}"><span>${label}</span><b>${price(row[key+'_price'])}</b><small>${margin(row[key+'_margin'])}</small></div>`).join('')}</div>`;
+}
+
+function replenishmentFilters(form) {
+  return {general_replenishment: state.reportsSection === 'replenishment',
+    ...Object.fromEntries(['stock_min','stock_max','min_units','margin_min','product','sku','cost_filter'].map(name=>[name,form.elements[name].value]))};
+}
+
 function updateBrandSalesReportPeriodFields() {
   const form = document.querySelector("#brand-sales-report-form");
   if (!form) return;
@@ -4620,6 +4631,16 @@ function renderBrandSalesReport() {
   const summary = document.querySelector("#brand-sales-report-summary");
   const results = document.querySelector("#brand-sales-report-results");
   if (!form || !feedback || !summary || !results) return;
+
+  const general = state.reportsSection === 'replenishment';
+  form.elements.brand.required = !general;
+  form.querySelectorAll('[data-replenishment]').forEach(n=>n.hidden=!general);
+  document.querySelector('.brand-sales-report-panel h2').textContent = general ? 'Reposição geral de estoque' : 'Vendas por marca';
+  form.querySelector('[type="submit"]').textContent = general ? 'Analisar reposição' : 'Analisar marca';
+  if (state.brandSalesReport && Boolean(state.brandSalesReport.general_replenishment) !== general) {
+    state.brandSalesReport = null;
+    state.brandSalesReportJobId = '';
+  }
 
   const selectedAccount = form.elements.account.value || "all";
   form.elements.account.innerHTML = `<option value="all">Todas as contas</option>${connectedAccounts()
@@ -4648,7 +4669,7 @@ function renderBrandSalesReport() {
       : "";
   if (!state.brandSalesReport) {
     summary.innerHTML = "";
-    results.innerHTML = `<div class="notice">Selecione uma marca e um período para comparar giro, resultado e necessidade de reposição de todos os SKUs.</div>`;
+    results.innerHTML = `<div class="notice">Selecione o período e os filtros para comparar vendas e reposição. Na reposição geral, deixe a marca vazia para incluir todas. Estoque: maior quantidade anunciada por SKU, sem somar cópias. Margens sobre o valor líquido após tarifas e frete; dados ausentes ficam indisponíveis.</div>`;
     return;
   }
 
@@ -4672,6 +4693,18 @@ function renderBrandSalesReport() {
     ? `<div class="notice warning-notice">A API atingiu o limite de pedidos configurado. Reduza o período para uma análise integral.</div>`
     : "";
   const messages = (data.warnings || []).map((message) => `<div class="notice">${escapeText(message)}</div>`).join("");
+  if (general) {
+    results.innerHTML = `${warning}${messages}<p class="report-method-note">Estoque anunciado: maior saldo por SKU entre os anúncios filtrados, sem somar cópias. Margem do período: lucro ÷ valor líquido das vendas. Preços e custos atuais são referências sincronizadas.</p>${paginationHtml("brandSalesReportPage", pageInfo)}
+      <div class="brand-report-table-wrap"><table class="brand-report-table replenishment-table"><thead><tr><th>SKU / Produto · valores atuais</th><th>Estoque</th><th>Vendidas no período</th><th>Margem no período</th><th>Cobertura</th><th>Reposição sugerida</th><th>Última venda</th></tr></thead><tbody>
+      ${pageInfo.items.map(row=>`<tr><td><strong>${escapeText(row.sku)}</strong><small>${escapeText(row.product)}</small><small>${escapeText(row.brand)} · ${escapeText(row.accounts_label)}</small>${skuCommercialHtml(row)}</td>
+        <td><strong>${row.current_stock}</strong></td><td><strong>${row.units}</strong><small>${row.orders} pedido(s)</small></td>
+        <td>${row.profit_percentage == null ? 'Indisponível' : `${Number(row.profit_percentage).toLocaleString('pt-BR',{maximumFractionDigits:2})}%`}</td>
+        <td>${row.coverage_days == null ? 'Sem giro' : `${row.coverage_days} dias`}</td>
+        <td><strong>${row.suggested_reorder || 0} un.</strong><small>${escapeText(row.recommendation || '')}</small></td>
+        <td>${row.last_sale_at ? formatDateBR(row.last_sale_at) : 'Sem venda'}</td></tr>`).join('') || '<tr><td colspan="7">Nenhum SKU corresponde aos filtros.</td></tr>'}
+      </tbody></table></div>${paginationHtml("brandSalesReportPage", pageInfo)}`;
+    return;
+  }
   results.innerHTML = `${warning}${messages}${paginationHtml("brandSalesReportPage", pageInfo)}
     <div class="brand-report-table-wrap">
       <table class="brand-report-table">
@@ -4684,7 +4717,7 @@ function renderBrandSalesReport() {
           <tr>
             <td class="brand-report-product">
               ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
-              <span><strong>${escapeText(row.sku)}</strong><small>${escapeText(row.product)}</small><em>${escapeText(row.accounts_label || "")}</em></span>
+              <span><strong>${escapeText(row.sku)}</strong><small>${escapeText(row.product)}</small><em>${escapeText(row.accounts_label || "")}</em>${skuCommercialHtml(row)}</span>
             </td>
             <td><strong>${Number(row.current_stock || 0).toLocaleString("pt-BR")}</strong></td>
             <td>${Number(row.orders || 0).toLocaleString("pt-BR")}</td>
@@ -4711,7 +4744,7 @@ async function loadBrandSalesReport() {
   const form = document.querySelector("#brand-sales-report-form");
   if (!form || state.brandSalesReportLoading) return;
   const brand = form.elements.brand.value.trim();
-  if (!brand) {
+  if (!brand && state.reportsSection !== "replenishment") {
     state.brandSalesReportError = "Informe uma marca para analisar.";
     renderBrandSalesReport();
     return;
@@ -4731,6 +4764,7 @@ async function loadBrandSalesReport() {
         account: form.elements.account.value,
         ml_status: form.elements.ml_status.value,
         coverage_days: form.elements.coverage_days.value,
+        ...replenishmentFilters(form),
         ...range,
       }),
     });
@@ -4802,6 +4836,7 @@ function currentReportFilters(reportType) {
       account: form.elements.account.value,
       ml_status: form.elements.ml_status.value,
       coverage_days: form.elements.coverage_days.value,
+      ...replenishmentFilters(form),
       ...statisticsDateRange(form),
     };
   }
