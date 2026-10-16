@@ -10924,3 +10924,11 @@ textarea:focus {
 
 .sku-commercial > div > small.profit-positive { color: #009966; }
 .sku-commercial > div > small.profit-negative { color: #ed4455; }
+
+.goals-search-wrap { display: flex; align-items: center; position: relative; }
+.goals-search-wrap input { width: 100%; padding-right: 38px; }
+.goals-search-wrap button { position: absolute; right: 6px; border: 0; background: transparent; color: var(--muted); font-size: 22px; padding: 2px 8px; }
+.goals-summary .goal-revenue-estimate { grid-column: 1 / -1; display: flex; align-items: center; gap: 24px; border-left: 3px solid #009966; }
+.goal-revenue-estimate > div { display: grid; gap: 6px; flex-shrink: 0; }
+.goal-revenue-estimate p { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; }
+@media(max-width:780px) { .goals-summary .goal-revenue-estimate { align-items: flex-start; flex-direction: column; gap: 12px; } .goal-revenue-estimate > div { flex-shrink: 1; } }

@@ -7483,11 +7483,20 @@ def sale_fee_snapshot_valid(item, account=None):
 
 
 def shipping_cost_snapshot_valid(item, account=None):
-    return bool(
-        item.get("shipping_cost_basis")
-        and item.get("shipping_cost_basis") == shipping_cost_basis(item, account)
-        and item.get("shipping_cost_status") in {"ok", "not_available", "error"}
-    )
+    if not item.get("shipping_cost_basis") or item["shipping_cost_basis"] != shipping_cost_basis(item, account):
+        return False
+    status = item.get("shipping_cost_status")
+    if status == "ok":
+        return item.get("shipping_cost") not in (None, "")
+    updated = parse_meli_datetime(item.get("shipping_cost_updated_at"))
+    if not updated:
+        return False
+    age = max(0, (datetime.now(APP_TZ) - updated).total_seconds())
+    if status == "error":
+        return age < max(60, int(os.getenv("MELI_SHIPPING_ERROR_RETRY_SECONDS", "900")))
+    if status == "not_available":
+        return age < max(900, int(os.getenv("MELI_SHIPPING_NOT_AVAILABLE_RETRY_SECONDS", "21600")))
+    return False
 
 
 def sale_fee_values(response, listing_type_id):
@@ -7633,7 +7642,8 @@ def refresh_account_shipping_costs(payload, account, item_ids=None, limit=None):
         and item.get("account_id") == account.get("id")
         and item.get("id")
         and (not requested or item.get("id") in requested)
-        and not shipping_cost_snapshot_valid(item, account)
+        and (not shipping_cost_snapshot_valid(item, account)
+             or (requested and item.get("shipping_cost_status") in {"error", "not_available"}))
     ]
     if not rows:
         return []
