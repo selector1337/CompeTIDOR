@@ -7133,6 +7133,7 @@ def synced_catalog_item(account, item, competition=None, previous=None):
         "title": item.get("title") or item.get("id"),
         "account": account.get("nickname"),
         "account_id": account.get("id"),
+        "seller_id": account.get("seller_id") or item.get("seller_id"),
         "site_id": account.get("site_id") or "MLB",
         "official_source": True,
         "item_data_checked_at": now_label(),
@@ -7689,7 +7690,7 @@ def refresh_account_shipping_costs(payload, account, item_ids=None, limit=None):
     return results
 
 
-def preserve_shipping_cost_snapshot(target, previous):
+def preserve_shipping_cost_snapshot(target, previous, account=None):
     previous = previous or {}
     legacy_snapshot = (
         not previous.get("shipping_cost_basis")
@@ -7697,8 +7698,8 @@ def preserve_shipping_cost_snapshot(target, previous):
         and "shipping_cost" in previous
     )
     if not legacy_snapshot and (
-        not shipping_cost_snapshot_valid(previous)
-        or shipping_cost_basis(target) != previous.get("shipping_cost_basis")
+        not shipping_cost_snapshot_valid(previous, account)
+        or shipping_cost_basis(target, account) != previous.get("shipping_cost_basis")
     ):
         target["shipping_cost_status"] = "pending"
         target["shipping_cost_updated_at"] = ""
@@ -7716,7 +7717,7 @@ def preserve_shipping_cost_snapshot(target, previous):
     ):
         if key in previous:
             target[key] = previous[key]
-    target["shipping_cost_basis"] = shipping_cost_basis(target)
+    target["shipping_cost_basis"] = shipping_cost_basis(target, account)
     return target
 
 
@@ -8300,7 +8301,7 @@ def refresh_item_prices_operation(item_ids):
                 )
                 continue
             refreshed = synced_catalog_item(account, official, competition_snapshot(current), previous=current)
-            preserve_shipping_cost_snapshot(refreshed, current)
+            preserve_shipping_cost_snapshot(refreshed, current, account)
             preserve_identifier_snapshot(refreshed, current)
             sale_price = sale_prices_by_id.get(item_id)
             if sale_price:
@@ -11809,7 +11810,7 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
                 previous = existing_by_id.get(item_id, {})
                 row = synced_catalog_item(account, item, competition, previous=previous)
                 preserve_sale_price_snapshot(row, previous)
-                preserve_shipping_cost_snapshot(row, previous)
+                preserve_shipping_cost_snapshot(row, previous, account)
                 preserve_sale_fee_snapshot(row, previous)
                 preserve_identifier_snapshot(row, previous)
                 preserve_clips_snapshot(row, previous)
@@ -11991,7 +11992,7 @@ def refresh_official_account_items(payload, account, batch_size=None, include_co
             updated = synced_catalog_item(account, official, competition, previous=current)
             preserve_sale_price_snapshot(updated, current)
             preserve_identifier_snapshot(updated, current)
-            preserve_shipping_cost_snapshot(updated, current)
+            preserve_shipping_cost_snapshot(updated, current, account)
             preserve_sale_fee_snapshot(updated, current)
             current.update(updated)
             current["updated_at"] = now_label()
