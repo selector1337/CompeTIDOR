@@ -7876,6 +7876,15 @@ def refresh_item_metadata_operation(kind, item_ids):
         raise RuntimeError("Tipo de atualização de anúncio inválido.")
     if results:
         write_payload(payload)
+    if kind == "shipping":
+        # A background sync may have completed the quote before this request.
+        # Return the saved quote as well, otherwise the browser stays pending.
+        maximum = max(1, int(os.getenv("MELI_SHIPPING_COST_ON_DEMAND_LIMIT", "25")))
+        requested = set(list(dict.fromkeys(str(value) for value in item_ids if value))[:maximum])
+        returned = {row.get("id") for row in results}
+        for item in payload.get("catalog", []):
+            if item.get("id") in requested and item.get("id") not in returned and item.get("shipping_cost_status") in {"ok", "error", "not_available"}:
+                results.append({key: item.get(key) for key in CATALOG_SHIPPING_FIELDS | {"id", "account_id"}})
     return {"items": results}
 
 

@@ -540,6 +540,8 @@ async function load() {
   state.meta = meta;
   state.meliConfig = meliConfig;
   state.data = dashboard;
+  state.catalogError = '';
+  state.itemLogsLoaded = false;
   state.catalogLoaded = Boolean((dashboard.catalog || []).length);
   const apiStatus = document.querySelector("#api-status");
   const redirectUri = document.querySelector("#redirect-uri");
@@ -551,23 +553,41 @@ async function load() {
   render();
 }
 
+function loadItemLogsInBackground(force = false) {
+  if (state.itemLogsLoading || (state.itemLogsLoaded && !force)) return;
+  state.itemLogsLoading = api("/api/item-logs", {retryPrompt:false, manualProgress:false, timeoutMs:20000})
+    .then(result => {
+      state.data.item_logs = result.item_logs || [];
+      state.itemLogsLoaded = true;
+      if (state.catalogLoaded) render();
+    })
+    .catch(() => { /* History is auxiliary and must not block the listings. */ })
+    .finally(() => { state.itemLogsLoading = null; });
+}
+
 async function loadCatalogInBackground(force = false) {
   if (!state.data || (state.catalogLoaded && !force)) return;
   if (state.catalogLoading) return state.catalogLoading;
-  state.catalogLoading = Promise.all([api("/api/catalog"), api("/api/item-logs")])
-    .then(([result, logs]) => {
-      state.data.catalog = result.catalog || [];
-      state.data.item_logs = logs.item_logs || [];
+  if (state.catalogError && !force) return;
+  state.catalogError = '';
+  state.catalogLoading = api("/api/catalog", {retryPrompt:false, manualProgress:false, timeoutMs:60000})
+    .then(result => {
+      if (!Array.isArray(result.catalog)) throw new Error('Resposta inválida ao carregar os anúncios.');
+      state.data.catalog = result.catalog;
       state.data.catalog_counts = result.catalog_counts || state.data.catalog_counts || {};
       state.data.sale_fee_progress = result.sale_fee_progress || state.data.sale_fee_progress || {};
       state.data.sku_costs = result.sku_costs || state.data.sku_costs || {};
       state.data.sku_last_sales = result.sku_last_sales || state.data.sku_last_sales || {};
       state.catalogLoaded = true;
-      render();
+      loadItemLogsInBackground(force);
     })
-    .catch((error) => showToast(error.message || "Não foi possível carregar os anúncios.", "error"))
+    .catch(error => {
+      state.catalogError = error.message || 'Não foi possível carregar os anúncios.';
+      showToast(state.catalogError, 'error');
+    })
     .finally(() => {
       state.catalogLoading = null;
+      render();
     });
   return state.catalogLoading;
 }
@@ -2318,7 +2338,7 @@ function renderCatalog() {
               ${item.competition_checked_at ? fact("Verificado em", formatDateBR(item.competition_checked_at)) : ""}
             </div>
             <div class="commercial-strip">
-              ${fact("Frete estimado ML", shippingCostLabel(item))}
+              ${shippingCostFact(item)}
               ${fact("Tarifa de venda", saleFeeLabel(item))}
               ${fact("Valor líquido", netSaleLabel(item))}
               ${fact("Custo do SKU", costLabel(item))}
@@ -2416,8 +2436,13 @@ function renderAds() {
   const list = document.querySelector("#ads-list");
   const renderAnchor = captureListingAnchor(list);
   if (!state.catalogLoaded) {
-    list.innerHTML = `<div class="notice">Carregando anúncios em segundo plano...</div>`;
-    loadCatalogInBackground();
+    if (state.catalogError) {
+      list.innerHTML = `<div class="notice danger-notice" role="alert">Não foi possível carregar os anúncios. ${escapeText(state.catalogError)} <button type="button" data-retry-catalog>Tentar novamente</button></div>`;
+      list.querySelector('[data-retry-catalog]').onclick = () => { loadCatalogInBackground(true); renderAds(); };
+    } else {
+      list.innerHTML = `<div class="notice" role="status">Carregando anúncios em segundo plano...</div>`;
+      loadCatalogInBackground();
+    }
     return;
   }
   if (!list || !state.data) return;
@@ -2543,7 +2568,7 @@ function renderAds() {
           ${fact("Status do anúncio", statusLabel(item.meli_status || item.status))}
         </div>
         <div class="ad-facts ad-commercial-facts" aria-label="Valores do anúncio">
-          ${fact("Frete estimado ML", shippingCostLabel(item))}
+          ${shippingCostFact(item)}
           ${fact("Tarifa de venda", saleFeeLabel(item))}
           ${fact("Valor líquido por venda", netSaleLabel(item))}
           ${fact("Custo do SKU", costLabel(item))}
@@ -2927,12 +2952,28 @@ function renderEqualizationReports() {
 }
 
 function shippingCostLabel(item) {
-  if (item.shipping_cost !== null && item.shipping_cost !== undefined && item.shipping_cost !== "") {
-    return money.format(Number(item.shipping_cost || 0));
-  }
-  if (item.shipping_cost_status === "error") return "Consulta indisponível";
-  if (item.shipping_cost_status === "not_available") return "Não informado pela API";
-  return "Calculando...";
+  if (state.shippingPendingIds?.has(item.id)) return "Consultando frete...";
+  if (item.shipping_cost_status === "error") return "Consulta indisponível · nova tentativa agendada";
+  if (item.shipping_cost_status === "not_available") return "Cotação não informada pelo Mercado Livre";
+  if (item.shipping_cost_status === "ok" && item.shipping_cost != null && item.shipping_cost !== "") return money.format(Number(item.shipping_cost));
+  if ((state.shippingRetryAfter?.[item.id] || 0) > Date.now()) return "Consulta pendente · nova tentativa agendada";
+  return "Aguardando consulta de frete";
+}
+
+function shippingCostFact(item) {
+  return fact("Frete estimado ML", shippingCostLabel(item)).replace('<button ', `<button data-shipping-item="${escapeAttr(item.id)}" `);
+}
+
+function updateShippingCostFacts() {
+  const catalog = new Map((state.data?.catalog || []).map(item => [item.id, item]));
+  document.querySelectorAll('[data-shipping-item]').forEach(node => {
+    const item = catalog.get(node.dataset.shippingItem);
+    if (!item) return;
+    const label = shippingCostLabel(item);
+    node.querySelector('strong').textContent = label;
+    node.dataset.copy = label;
+    node.title = item.shipping_cost_error || 'Copiar Frete estimado ML';
+  });
 }
 
 function saleFeeLabel(item) {
@@ -3120,37 +3161,44 @@ function renderBulkPriceProgress() {
 }
 
 function shippingCostNeedsRefresh(item) {
-  if (!item.official_source) return false;
-  if (item.shipping_cost_basis && ["ok", "not_available", "error"].includes(item.shipping_cost_status)) return false;
+  if (!item.official_source || !item.id) return false;
+  if ((state.shippingRetryAfter?.[item.id] || 0) > Date.now()) return false;
+  if (item.shipping_cost_basis && item.shipping_cost_status === 'ok' && item.shipping_cost != null && item.shipping_cost !== '') return false;
   if (!item.shipping_cost_basis) return true;
-  const raw = String(item.shipping_cost_updated_at || "").replace(" ", "T");
-  const updated = new Date(raw);
+  const updated = new Date(String(item.shipping_cost_updated_at || '').replace(' ', 'T'));
   if (Number.isNaN(updated.getTime())) return true;
-  const age = Date.now() - updated.getTime();
-  const ttl = 30 * 60 * 1000;
-  return age > ttl;
+  const ttl = item.shipping_cost_status === 'not_available' ? 6 * 60 * 60 * 1000 : item.shipping_cost_status === 'error' ? 15 * 60 * 1000 : 0;
+  return Date.now() - updated.getTime() >= ttl;
 }
 
 async function queueShippingCostRefresh(items) {
-  if (state.shippingCostsLoading || state.pricesLoading || !["anuncios", "catalogo"].includes(state.route)) return;
-  const itemIds = (items || []).filter(shippingCostNeedsRefresh).slice(0, 25).map((item) => item.id);
+  if (state.shippingCostsLoading || !["anuncios", "catalogo"].includes(state.route)) return;
+  const current = new Map((state.data?.catalog || []).map(item => [item.id, item]));
+  const candidates = (items || []).map(item => current.get(item.id) || item);
+  const itemIds = [...new Set(candidates.filter(shippingCostNeedsRefresh).slice(0, 25).map(item => item.id))];
   if (!itemIds.length) return;
   state.shippingCostsLoading = true;
-  let changed = false;
+  state.shippingPendingIds = new Set(itemIds);
+  state.shippingRetryAfter ||= {};
+  updateShippingCostFacts();
   try {
     const queued = await api("/api/meli/shipping-costs/refresh", {
-      method: "POST",
+      method: "POST", retryPrompt:false, manualProgress:false, timeoutMs:30000,
       body: JSON.stringify({ item_ids: itemIds }),
     });
-    const result = await waitForAsyncOperation(queued);
-    const updates = new Map((result.items || []).map((item) => [item.id, item]));
-    changed = updates.size > 0;
-    state.data.catalog = state.data.catalog.map((item) => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
+    const result = await waitForAsyncOperation(queued, undefined, 180000);
+    const updates = new Map((result.items || []).map(item => [item.id, item]));
+    state.data.catalog = state.data.catalog.map(item => updates.has(item.id) ? { ...item, ...updates.get(item.id) } : item);
+    itemIds.forEach(id => { state.shippingRetryAfter[id] = Date.now() + 15 * 60 * 1000; });
   } catch (error) {
+    itemIds.forEach(id => { state.shippingRetryAfter[id] = Date.now() + 15 * 60 * 1000; });
     showToast(error.message || "Não foi possível consultar o frete dos anúncios.", "error");
   } finally {
     state.shippingCostsLoading = false;
-    if (changed) refreshListingOnlyWhenAtTop();
+    state.shippingPendingIds = new Set();
+    updateShippingCostFacts();
+    // Drain the remaining visible batch without scrolling or rebuilding editable cards.
+    window.setTimeout(() => queueShippingCostRefresh(candidates), 250);
   }
 }
 
