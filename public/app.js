@@ -3175,7 +3175,7 @@ async function queueShippingCostRefresh(items) {
   if (state.shippingCostsLoading || !["anuncios", "catalogo"].includes(state.route)) return;
   const current = new Map((state.data?.catalog || []).map(item => [item.id, item]));
   const candidates = (items || []).map(item => current.get(item.id) || item);
-  const itemIds = [...new Set(candidates.filter(shippingCostNeedsRefresh).slice(0, 25).map(item => item.id))];
+  const itemIds = [...new Set(candidates.filter(shippingCostNeedsRefresh).slice(0, 5).map(item => item.id))];
   if (!itemIds.length) return;
   state.shippingCostsLoading = true;
   state.shippingPendingIds = new Set(itemIds);

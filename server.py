@@ -2593,7 +2593,7 @@ class MercadoLivreClient:
 
     def item_shipping_cost(self, seller_id, item_id):
         params = {"item_id": item_id, "verbose": "true"}
-        return self.get(f"/users/{seller_id}/shipping_options/free?{urlencode(params)}")
+        return self.get(f"/users/{seller_id}/shipping_options/free?{urlencode(params)}", retries=1, timeout=12)
 
     def listing_prices(
         self, site_id, price, listing_type_id, category_id="",
@@ -7862,6 +7862,16 @@ def refresh_sale_fees_for_items(payload, item_ids):
         if account:
             results.extend(refresh_account_sale_fees(payload, account, ids, len(ids)))
     return results
+
+
+def start_visible_shipping_operation(item_ids):
+    requested = list(dict.fromkeys(str(value) for value in item_ids if value))
+    if len(requested) > 5:
+        raise RuntimeError("Consulte até cinco fretes por lote. Recarregue a página para atualizar a aplicação.")
+    return start_async_operation(
+        "shipping_costs", lambda: refresh_item_metadata_operation("shipping", requested),
+        "Consultando fretes dos anúncios visíveis.", priority="manual",
+    )
 
 
 def refresh_item_metadata_operation(kind, item_ids):
@@ -24642,7 +24652,7 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/meli/shipping-costs/refresh":
             try:
                 item_ids = list(request.get("item_ids") or [])
-                operation = start_async_operation("shipping_costs", lambda: refresh_item_metadata_operation("shipping", item_ids), "Atualizando fretes em segundo plano.", priority="background")
+                operation = start_visible_shipping_operation(item_ids)
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
