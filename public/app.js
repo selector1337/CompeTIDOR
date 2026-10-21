@@ -3427,27 +3427,30 @@ function reputationPeriodLabel(period) {
 function renderReputationMetrics(metrics) {
   return metrics.map(metric => {
     const rows = [
-      ['claims', 'Reclamações'], ['mediations', 'Mediações'],
+      ['claims', 'Reclamações'],
       ['cancellations', 'Vendas canceladas pelo vendedor'],
       ['delayed_handling_time', 'Envios atrasados'],
     ];
     const cards = rows.map(([key, label]) => {
       const detail = metric.metric_details?.[key] || {};
-      const hasRate = typeof detail.rate === 'number' && Number.isFinite(detail.rate);
-      const rate = hasRate ? `${detail.rate.toLocaleString('pt-BR', {maximumFractionDigits: 2})}%` : 'Não informado';
-      const quantity = Number.isInteger(detail.value) ? `${detail.value.toLocaleString('pt-BR')} venda(s) afetada(s)` : 'Quantidade não informada';
+      const useReal = typeof detail.real_rate === 'number' && Number.isFinite(detail.real_rate);
+      const displayedRate = useReal ? detail.real_rate : detail.rate;
+      const displayedCount = useReal ? detail.real_value : detail.value;
+      const hasRate = typeof displayedRate === 'number' && Number.isFinite(displayedRate);
+      const rate = hasRate ? `${displayedRate.toLocaleString('pt-BR', {maximumFractionDigits: 2})}%` : 'Não informado';
+      const quantity = Number.isInteger(displayedCount) ? `${displayedCount.toLocaleString('pt-BR')} venda(s) afetada(s)` : 'Quantidade não informada';
       return `<div class="reputation-metric ${hasRate ? '' : 'unavailable'}">
         <span>${escapeText(label)}</span><strong>${rate}</strong>
         <small>${hasRate ? escapeText(quantity) : 'Percentual não retornado pela API para esta conta.'}</small>
         ${hasRate ? `<small>${escapeText(reputationPeriodLabel(detail.period))}</small>` : ''}
-        ${detail.real_rate != null ? `<small>Sem proteção: ${Number(detail.real_rate).toLocaleString('pt-BR')}%</small>` : ''}
+        
         ${detail.stale ? `<small class="error-text">Último dado disponível · ${escapeText(detail.updated_at || '')}</small>` : ''}
       </div>`;
     }).join('');
-    return `<article class="metric-item">
+    return `<article class="metric-item reputation-account">
       <div class="metric-header"><strong>${escapeText(metric.account || '')}</strong><span>Consulta: ${escapeText(metric.updated_at || 'Aguardando sincronização')}</span></div>
       <div class="reputation-metrics-grid">${cards}</div>
-      <div class="reputation-logistics"><strong>Agências ML e Flex</strong><span>Indicadores específicos indisponíveis nesta integração. A taxa geral de atraso não representa o desempenho de cada modalidade.</span></div>
+      <p class="reputation-source-note">Taxas reais de ocorrências · quando há proteção, mostramos os valores anteriores à aplicação do benefício.</p>
     </article>`;
   }).join('') || '<div class="notice">Aguardando a consulta de reputação das contas conectadas.</div>';
 }

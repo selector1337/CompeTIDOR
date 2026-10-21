@@ -6389,7 +6389,7 @@ def auto_official_sync_loop():
                     )
                     metric_updated = parse_meli_datetime(metric.get("updated_at"))
                     metric_stale = (
-                        metric.get("reputation_snapshot_version") != 3
+                        metric.get("reputation_snapshot_version") != 4
                         or not metric_updated
                         or (datetime.now(APP_TZ) - metric_updated).total_seconds() >= 900
                     )
@@ -8514,6 +8514,7 @@ def reputation_metric_details(metrics, previous=None):
             "value": int(count) if count is not None and count.is_integer() else None,
             "period": str(source.get("period") or ""),
             "real_rate": round(real_rate * 100, 2) if real_rate is not None else None,
+            "real_value": numeric(excluded.get("real_value")),
             "updated_at": now_label() if source else "",
             "stale": False,
         }
@@ -8564,7 +8565,7 @@ def upsert_metric(payload, account, user_profile):
         "account_id": stable_account_id,
         "reputation_level": incoming_level if "level_id" in reputation else current_metric.get("reputation_level") or "",
         "power_seller_status": incoming_power if "power_seller_status" in reputation else current_metric.get("power_seller_status") or "",
-        "reputation_snapshot_version": 3,
+        "reputation_snapshot_version": 4,
         "claims": claims,
         "cancellations": cancellations,
         "late_shipments": late,
@@ -11502,7 +11503,13 @@ def query_sales_goals(payload, request):
         rows.setdefault(sku, {"sku": sku, "product": sku, "statuses": [], "sold": 0})
     selected = []
     commercial = sku_commercial_index(payload)
+    pricing_rules = (read_json("goal_pricing.json", {"rules": {}}).get("rules") or {})
     for sku, row in sorted(rows.items()):
+        row["automatic_pricing_active"] = bool((pricing_rules.get(sku) or {}).get("enabled"))
+        if request.get("automatic_pricing") == "active" and not row["automatic_pricing_active"]:
+            continue
+        if request.get("automatic_pricing") == "inactive" and row["automatic_pricing_active"]:
+            continue
         row.update(commercial.get(sku, {}))
         target = targets.get(sku)
         row.update(target=target, remaining=max(0, (target or 0) - row["sold"]),

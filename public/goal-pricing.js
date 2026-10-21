@@ -23,7 +23,8 @@
   function button(value) {
     if (!admin()) return '';
     const rule=rules.find(r=>r.sku.toUpperCase()===value.toUpperCase());
-    return `<button type="button" class="ghost-button goal-rule-open" data-goal-rule="${escapeAttr(value)}">Preços automáticos${rule ? (rule.enabled?' · Ativos':' · Pausados') : ''}</button>`;
+    const status=rule?.enabled ? 'active' : rule ? 'paused' : 'new';
+    return `<button type="button" class="goal-rule-open is-${status}" data-goal-rule="${escapeAttr(value)}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M13 3 4 14h7l-1 7 10-12h-7l1-6Z"/></svg><span>Preços automáticos</span><span class="goal-rule-status">${rule ? (rule.enabled?'Ativos':'Pausados') : 'Configurar'}</span><span aria-hidden="true">›</span></button>`;
   }
   function draw() {
     const r = rules.find(r=>r.sku.toUpperCase()===sku.toUpperCase()) || {};
@@ -90,7 +91,7 @@
     busy=true;
     const buttons=Array.from(dialog.querySelectorAll('button'),b=>[b,b.disabled]);
     buttons.forEach(([b])=>b.disabled=true);
-    try { await request('save',{...body,sku});await loadDetail();draw();dialog.querySelector('#goal-rule-feedback').textContent='Solicitação salva. O processamento ocorre em segundo plano.'; }
+    try { await request('save',{...body,sku});await loadDetail();window.salesGoalsPage?.pricingChanged(sku,Boolean(rules.find(r=>r.sku.toUpperCase()===sku.toUpperCase())?.enabled));draw();dialog.querySelector('#goal-rule-feedback').textContent='Solicitação salva. O processamento ocorre em segundo plano.'; }
     catch(e){dialog.querySelector('#goal-rule-feedback').textContent=e.message;}
     finally{busy=false;buttons.forEach(([b,disabled])=>{if(b.isConnected)b.disabled=disabled;});}
   }
