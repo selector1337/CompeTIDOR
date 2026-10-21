@@ -1090,6 +1090,12 @@ def merge_critical_records(collection, incoming, latest):
             current_sync = str(current.get("last_sync") or current.get("sync_finished_at") or "")
             saved_sync = str(saved.get("last_sync") or saved.get("sync_finished_at") or "")
             row = {**current, **saved} if saved_sync >= current_sync else {**saved, **current}
+            store_source = max((saved, current), key=lambda record: float(record.get("official_store_names_attempted_at") or 0))
+            for field in ("official_store_names", "official_store_names_updated_at", "official_store_names_attempted_at", "official_store_names_error"):
+                if field in store_source:
+                    row[field] = store_source[field]
+                else:
+                    row.pop(field, None)
             token_source = current if account_token_revision(current) > account_token_revision(saved) else saved
             for field in (*ACCOUNT_TOKEN_FIELDS, "status", "official"):
                 if field in token_source:
@@ -6383,9 +6389,9 @@ def auto_official_sync_loop():
                     )
                     metric_updated = parse_meli_datetime(metric.get("updated_at"))
                     metric_stale = (
-                        not (metric.get("reputation_level") or metric.get("power_seller_status"))
+                        metric.get("reputation_snapshot_version") != 3
                         or not metric_updated
-                        or (datetime.now(APP_TZ) - metric_updated).total_seconds() >= 3600
+                        or (datetime.now(APP_TZ) - metric_updated).total_seconds() >= 900
                     )
                     if metric_stale:
                         client = account_client(account)
@@ -6393,6 +6399,9 @@ def auto_official_sync_loop():
                         changed = True
                 except Exception as exc:
                     account["reputation_sync_error"] = str(exc)
+                    changed = True
+            for account in official_accounts:
+                if refresh_account_store_names(account):
                     changed = True
             if changed:
                 write_payload(payload)
@@ -8476,6 +8485,41 @@ def append_item_log(payload, item, user, action, changes=None, sale_id=None):
     payload["item_logs"] = logs[:max(1000, int(os.getenv("COMPETIDOR_ITEM_LOG_LIMIT", "20000")))]
 
 
+def reputation_metric_details(metrics, previous=None):
+    """Keep the official rate, affected sales and period together (zero is valid)."""
+    details = {}
+    def numeric(value, maximum=None):
+        if value is None or isinstance(value, bool) or value == "":
+            return None
+        try:
+            number = float(value)
+        except (ValueError, TypeError):
+            return None
+        if not math.isfinite(number) or number < 0 or (maximum is not None and number > maximum):
+            return None
+        return number
+    for key in ("claims", "mediations", "cancellations", "delayed_handling_time"):
+        source = metrics.get(key)
+        if key not in metrics and isinstance((previous or {}).get(key), dict):
+            details[key] = {**previous[key], "stale": True}
+            continue
+        source = source if isinstance(source, dict) else {}
+        rate = numeric(source.get("rate"), 1)
+        count = numeric(source.get("value"))
+        excluded = source.get("excluded") or {}
+        excluded = excluded if isinstance(excluded, dict) else {}
+        real_rate = numeric(excluded.get("real_rate"), 1)
+        details[key] = {
+            "rate": round(rate * 100, 2) if rate is not None else None,
+            "value": int(count) if count is not None and count.is_integer() else None,
+            "period": str(source.get("period") or ""),
+            "real_rate": round(real_rate * 100, 2) if real_rate is not None else None,
+            "updated_at": now_label() if source else "",
+            "stale": False,
+        }
+    return details
+
+
 def upsert_metric(payload, account, user_profile):
     reputation = user_profile.get("seller_reputation", {}) or {}
     metrics = reputation.get("metrics", {}) or {}
@@ -8500,7 +8544,7 @@ def upsert_metric(payload, account, user_profile):
         source = metrics.get(source_key)
         if isinstance(source, dict) and source.get("rate") is not None:
             return percent_rate(source.get("rate"))
-        return current_metric.get(target_key, 0)
+        return current_metric.get(target_key)
 
     claims = metric_rate("claims", "claims")
     cancellations = metric_rate("cancellations", "cancellations")
@@ -8510,21 +8554,23 @@ def upsert_metric(payload, account, user_profile):
     # Nunca substitua uma reputação confirmada por esse snapshot incompleto.
     has_incoming_metric = any(
         isinstance(metrics.get(key), dict) and metrics.get(key, {}).get("rate") is not None
-        for key in ("claims", "cancellations", "delayed_handling_time")
+        for key in ("claims", "mediations", "cancellations", "delayed_handling_time")
     )
-    if current_metric and not (incoming_level or incoming_power or has_incoming_metric):
+    if current_metric and not ("level_id" in reputation or "power_seller_status" in reputation or has_incoming_metric):
         return
 
     metric = {
         "account": account.get("nickname"),
         "account_id": stable_account_id,
-        "reputation_level": incoming_level or current_metric.get("reputation_level") or "",
-        "power_seller_status": incoming_power or current_metric.get("power_seller_status") or "",
+        "reputation_level": incoming_level if "level_id" in reputation else current_metric.get("reputation_level") or "",
+        "power_seller_status": incoming_power if "power_seller_status" in reputation else current_metric.get("power_seller_status") or "",
+        "reputation_snapshot_version": 3,
         "claims": claims,
         "cancellations": cancellations,
         "late_shipments": late,
-        "agency_score": max(0, round(100 - late, 2)),
-        "flex_score": max(0, round(100 - late, 2)),
+        "metric_details": reputation_metric_details(metrics, current_metric.get("metric_details")),
+        "agency_score": None,
+        "flex_score": None,
         "period": "Período relevante Mercado Livre",
         "updated_at": now_label(),
     }
@@ -11855,6 +11901,7 @@ def sync_official_account(payload, account_id, limit=None, progress=None):
     account["sync_status"] = f"{len(imported)} anúncios importados da API oficial"
     account["sync_total_item_ids"] = len(item_ids)
     upsert_metric(payload, account, user_profile)
+    refresh_account_store_names(account)
     # Estoque zerado antigo não gera alerta na sincronização completa; alertas vêm de transição no refresh automático.
     return {"account": public_account(account), "items": len(imported), "catalog": imported}
 
@@ -14722,6 +14769,39 @@ def discover_official_stores_from_items(target_client, target_account, catalog):
                 "status": "active",
             })
     return merge_official_stores(stores)
+
+
+def refresh_account_store_names(account, client=None):
+    """Refresh one small account-level directory; never query per listing/render."""
+    now = time.time()
+    attempted = float(account.get("official_store_names_attempted_at") or 0)
+    updated = float(account.get("official_store_names_updated_at") or 0)
+    if now - attempted < 300 or now - updated < 21600:
+        return False
+    account["official_store_names_attempted_at"] = now
+    try:
+        client = client or account_client(account)
+        response = client.user_brands(account.get("seller_id") or account.get("id"))
+        brands = response.get("brands", []) if isinstance(response, dict) else response
+        if isinstance(brands, dict):
+            brands = [brands]
+        if not isinstance(brands, list):
+            raise ValueError("Resposta de lojas oficiais inválida")
+        names = dict(account.get("official_store_names") or {})
+        for brand in brands:
+            if not isinstance(brand, dict):
+                continue
+            store_id = brand.get("official_store_id") or brand.get("id")
+            name = clean_attribute_value(brand.get("fantasy_name") or brand.get("name") or brand.get("normalized_name"))
+            if store_id not in (None, "") and name:
+                names[str(store_id)] = name
+        account["official_store_names"] = names
+        account["official_store_names_updated_at"] = now
+        account.pop("official_store_names_error", None)
+    except Exception as exc:
+        # Keep confirmed names through temporary API failures; retry after five minutes.
+        account["official_store_names_error"] = str(exc)
+    return True
 
 
 def target_official_stores(target_client, target_account, catalog=None, strict=False):

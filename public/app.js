@@ -1423,24 +1423,8 @@ function renderDashboard() {
     </article>
   `).join("") + paginationHtml("dashboardTopSkuPage", topSkuPage) || `<div class="notice">Nenhum SKU vendido hoje foi sincronizado.</div>`;
 
-  document.querySelector("#dashboard-metrics").innerHTML = state.data.metrics
-    .map(
-      (metric) => `
-        <article class="metric-item">
-          <div class="metric-header">
-            <strong>${metric.account}</strong>
-            <span>${metric.period}</span>
-          </div>
-          <div class="metric-bars">
-            ${metricLine("Reclamações", metric.claims, 8, true)}
-            ${metricLine("Envios em atraso", metric.late_shipments, 10, true)}
-            ${metricLine("Agências ML", metric.agency_score, 100, false)}
-            ${metricLine("Flex", metric.flex_score, 100, false)}
-          </div>
-        </article>
-      `
-    )
-    .join("");
+  document.querySelector("#dashboard-metrics").innerHTML = renderReputationMetrics(state.data.metrics || []);
+
 }
 
 function renderDashboardAccountFilters() {
@@ -2439,7 +2423,7 @@ function adsOfficialStore(item) {
   const id=item.official_store_id;
   const account=String(item.account_id || item.account || '');
   const key=id==null || id==='' ? 'none' : JSON.stringify([account,String(id)]);
-  const label=key==='none' ? 'Loja oficial não informada' : item.official_store_name || adsOfficialStoreLabels.get(key) || `Loja oficial #${id}`;
+  const label=key==='none' ? 'Loja oficial não informada' : adsOfficialStoreLabels.get(key) || item.official_store_name || `Loja oficial #${id}`;
   return {key,label};
 }
 function renderAdsOfficialStoreOptions() {
@@ -2448,6 +2432,14 @@ function renderAdsOfficialStoreOptions() {
   for(const item of state.data.catalog) {
     const store=adsOfficialStore(item);
     if(store.key!=='none' && item.official_store_name)adsOfficialStoreLabels.set(store.key,item.official_store_name);
+  }
+  for (const account of state.data.accounts || []) {
+    for (const [id, name] of Object.entries(account.official_store_names || {})) {
+      if (!name) continue;
+      for (const identity of [account.id, account.seller_id, account.nickname]) {
+        if (identity != null && identity !== '') adsOfficialStoreLabels.set(JSON.stringify([String(identity), String(id)]), name);
+      }
+    }
   }
   for(const item of state.data.catalog) {
     if(state.adsAccount!=='all' && item.account!==state.adsAccount)continue;
@@ -3428,27 +3420,36 @@ function formatDuration(seconds) {
   return remainder ? `${hours}h ${remainder}min` : `${hours}h`;
 }
 
-function metricLine(label, value, max, inverse) {
-  const numeric = Number(value || 0);
-  const percent = Math.min(100, Math.max(0, Math.round((numeric / max) * 100)));
-  const color = inverse
-    ? percent > 60
-      ? "#dc2626"
-      : percent > 35
-        ? "#d97706"
-        : "#0f9f6e"
-    : percent > 88
-      ? "#0f9f6e"
-      : percent > 75
-        ? "#d97706"
-        : "#dc2626";
-  return `
-    <div class="metric-line">
-      <span>${label}</span>
-      <div class="progress"><span style="width:${percent}%; background:${color}; color:${color}"></span></div>
-      <strong>${numeric.toLocaleString("pt-BR", { minimumFractionDigits: 0, maximumFractionDigits: 2 })}%</strong>
-    </div>
-  `;
+function reputationPeriodLabel(period) {
+  return String(period || '').replace(/^(\d+) days?$/, '$1 dias') || 'Período não informado';
+}
+
+function renderReputationMetrics(metrics) {
+  return metrics.map(metric => {
+    const rows = [
+      ['claims', 'Reclamações'], ['mediations', 'Mediações'],
+      ['cancellations', 'Vendas canceladas pelo vendedor'],
+      ['delayed_handling_time', 'Envios atrasados'],
+    ];
+    const cards = rows.map(([key, label]) => {
+      const detail = metric.metric_details?.[key] || {};
+      const hasRate = typeof detail.rate === 'number' && Number.isFinite(detail.rate);
+      const rate = hasRate ? `${detail.rate.toLocaleString('pt-BR', {maximumFractionDigits: 2})}%` : 'Não informado';
+      const quantity = Number.isInteger(detail.value) ? `${detail.value.toLocaleString('pt-BR')} venda(s) afetada(s)` : 'Quantidade não informada';
+      return `<div class="reputation-metric ${hasRate ? '' : 'unavailable'}">
+        <span>${escapeText(label)}</span><strong>${rate}</strong>
+        <small>${hasRate ? escapeText(quantity) : 'Percentual não retornado pela API para esta conta.'}</small>
+        ${hasRate ? `<small>${escapeText(reputationPeriodLabel(detail.period))}</small>` : ''}
+        ${detail.real_rate != null ? `<small>Sem proteção: ${Number(detail.real_rate).toLocaleString('pt-BR')}%</small>` : ''}
+        ${detail.stale ? `<small class="error-text">Último dado disponível · ${escapeText(detail.updated_at || '')}</small>` : ''}
+      </div>`;
+    }).join('');
+    return `<article class="metric-item">
+      <div class="metric-header"><strong>${escapeText(metric.account || '')}</strong><span>Consulta: ${escapeText(metric.updated_at || 'Aguardando sincronização')}</span></div>
+      <div class="reputation-metrics-grid">${cards}</div>
+      <div class="reputation-logistics"><strong>Agências ML e Flex</strong><span>Indicadores específicos indisponíveis nesta integração. A taxa geral de atraso não representa o desempenho de cada modalidade.</span></div>
+    </article>`;
+  }).join('') || '<div class="notice">Aguardando a consulta de reputação das contas conectadas.</div>';
 }
 
 function renderCompetitors() {

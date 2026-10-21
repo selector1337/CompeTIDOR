@@ -10968,3 +10968,12 @@ textarea:focus {
 .goal-rule-dialog [data-audit-filter] {background:#10171e;color:#e7edf3;border:1px solid #405160;border-radius:6px;padding:6px;}
 .goal-audit-scroll small {display:block;margin-top:5px;white-space:normal;overflow-wrap:anywhere;color:#b2c4d3;}
 #goal-rule-audit {min-width:0;border-bottom:1px solid #405160;padding-bottom:18px;margin-top:20px;}
+
+/* Reputation: official rates, affected sales and periods without invented scores. */
+.reputation-metrics-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; margin-top:12px; }
+.reputation-metric { display:flex; flex-direction:column; gap:6px; padding:14px; border:1px solid var(--border); border-radius:8px; min-width:0; }
+.reputation-metric > span { font-weight:600; min-height:2.5em; }
+.reputation-metric > strong { font-size:1.35rem; }
+.reputation-metric small, .reputation-logistics span { color:var(--muted); line-height:1.45; }
+.reputation-metric.unavailable > strong { color:var(--muted); font-size:1rem; }
+.reputation-logistics { display:flex; flex-wrap:wrap; gap:8px 16px; margin-top:12px; font-size:.85rem; }
