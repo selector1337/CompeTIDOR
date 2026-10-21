@@ -1,0 +1,21 @@
+[Unit]
+Description=CompeTIDOR emergency recovery
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=COMPETIDOR_DATA_DIR=/var/lib/competidor
+EnvironmentFile=-/etc/competidor.env
+ExecStart=/usr/bin/python3 /usr/local/lib/competidor-recovery/recovery_service.py
+Restart=on-failure
+RestartSec=5
+StateDirectory=competidor-recovery
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

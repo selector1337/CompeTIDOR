@@ -24,6 +24,7 @@ def main():
     output = {'item_id':args.item_id, 'account':account.get('nickname'), 'cached':{k:item.get(k) for k in ['shipping_cost','shipping_cost_status','shipping_cost_updated_at','shipping_mode','shipping_logistic_type','free_shipping']}}
     if not account.get('access_token') or not account.get('seller_id'):
         output['error']='Conta sem token ou seller_id'; print(json.dumps(output,ensure_ascii=False)); return
+    output['cache_validation'] = {'with_account':server.shipping_cost_snapshot_valid(item,account), 'without_account':server.shipping_cost_snapshot_valid(item), 'listing_has_seller_id':bool(item.get('seller_id'))}
     start=time.monotonic()
     try:
         # Use existing token; no token refresh, local writes or listing changes.

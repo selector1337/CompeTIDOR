@@ -6,7 +6,7 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20261016-goals" />
+  <link rel="stylesheet" href="/styles.css?v=20261019-audit" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
@@ -424,6 +424,7 @@
             ser exatamente igual ao cadastrado no Mercado Livre. Cada autorização salva uma conta oficial separada.
             Para adicionar outra loja, entre no Mercado Livre com o usuário dessa loja e clique novamente no botão de conexão.
           </div>
+          <details class="recovery-panel" data-users-admin-only hidden><summary>Recuperação da aplicação</summary><p>Use quando a aplicação estiver travada. O reinício interrompe operações em andamento.</p><a class="ghost-button" href="/recovery/" target="_blank" rel="noopener">Abrir reinício de emergência</a></details>
           <div id="account-feedback"></div>
           <div id="accounts-list" class="accounts-list"></div>
         </div>
@@ -898,6 +899,7 @@
           </div>
           <div class="filter-bar">
             <label>Conta <select id="ads-account-filter"></select></label>
+            <label>Loja oficial <select id="ads-official-store-filter"><option value="all">Todas as lojas oficiais</option></select></label>
             <label>Produto <input id="ads-product-filter" type="search" placeholder="Nome do produto" /></label>
             <label>Marca <input id="ads-brand-filter" type="search" placeholder="Marca" /></label>
             <label>SKU <input id="ads-sku-filter" type="search" placeholder="SKU exato" /></label>
@@ -1517,8 +1519,9 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20261016-shipping-priority"></script>
-  <script src="/sales-goals.js?v=20261016"></script>
+  <script src="/app.js?v=20261021-official-store-filter"></script>
+  <script src="/goal-pricing.js?v=20261021-continuous"></script>
+  <script src="/sales-goals.js?v=20261019"></script>
   <script src="/official-stores.js?v=20260923-clear-pending"></script>
   </body>
 </html>

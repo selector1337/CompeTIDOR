@@ -2178,16 +2178,15 @@ def request_json(url, method="GET", payload=None, headers=None, retries=None, ti
         if background_request:
             wait_for_interactive_meli_priority()
         try:
-            if background_request:
-                with BACKGROUND_MELI_REQUEST_SEMAPHORE:
-                    status, response_body, response_headers = HTTP_TRANSPORT.request(
-                        url, method=method, body=body, headers=request_headers, timeout=request_timeout
-                    )
-            else:
-                with INTERACTIVE_MELI_REQUEST_SEMAPHORE:
-                    status, response_body, response_headers = HTTP_TRANSPORT.request(
-                        url, method=method, body=body, headers=request_headers, timeout=request_timeout
-                    )
+            semaphore = BACKGROUND_MELI_REQUEST_SEMAPHORE if background_request else INTERACTIVE_MELI_REQUEST_SEMAPHORE
+            if not semaphore.acquire(timeout=request_timeout):
+                raise RuntimeError('A fila de chamadas à API está ocupada. Esta chamada não foi enviada; confira o resultado da operação antes de repeti-la.')
+            try:
+                status, response_body, response_headers = HTTP_TRANSPORT.request(
+                    url, method=method, body=body, headers=request_headers, timeout=request_timeout
+                )
+            finally:
+                semaphore.release()
             text = response_body.decode("utf-8", errors="replace")
             if 200 <= status < 300:
                 return json.loads(text) if text else {}
@@ -2199,6 +2198,9 @@ def request_json(url, method="GET", payload=None, headers=None, retries=None, ti
                 delay = float(retry_after) if retry_after else min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5)
             except (TypeError, ValueError):
                 delay = min(8.0, 0.6 * (2**attempt)) + random.uniform(0.1, 0.5)
+            if not math.isfinite(delay) or delay > 60:
+                raise RuntimeError(f'HTTP {status}: a API solicitou uma espera prolongada. Aguarde antes de tentar novamente.')
+            delay = max(0, delay)
             time.sleep(delay)
         except TimeoutError as exc:
             last_error = RuntimeError(f"A API do Mercado Livre não respondeu em até {request_timeout:g} segundos.")
@@ -2229,12 +2231,17 @@ def meli_background_work_busy():
 
 
 def wait_for_interactive_meli_priority():
+    # Never wait for an interactive job to finish: it may need a lock owned
+    # by this background caller. The separate API semaphores still reserve
+    # interactive capacity after this short, bounded courtesy yield.
+    deadline = time.monotonic() + max(0, min(5, float(os.getenv('MELI_BACKGROUND_PRIORITY_YIELD_SECONDS', '1'))))
     while True:
         with ASYNC_OPERATION_JOBS_LOCK:
             interactive_busy = bool(ACTIVE_CLONE_OPERATIONS)
-        if not interactive_busy:
+        remaining = deadline - time.monotonic()
+        if not interactive_busy or remaining <= 0:
             return
-        time.sleep(0.2)
+        time.sleep(min(0.2, remaining))
 
 
 def run_meli_work(priority, work, *args, **kwargs):
@@ -11375,6 +11382,7 @@ def cache_sales_goal_orders(payload, account, period, orders):
                if str(i.get("account_id")) == str(account.get("id"))}
     units, products, seen, unknown = {}, {}, set(), 0
     revenue, count = 0.0, 0
+    last_sales = {}
     for order in orders:
         identity = str(order.get("id") or "")
         if identity and identity in seen:
@@ -11396,8 +11404,10 @@ def cache_sales_goal_orders(payload, account, period, orders):
                 continue
             units[sku] = units.get(sku, 0) + quantity
             products[sku] = item.get("title") or sku
+            if sold_at and (sku not in last_sales or sold_at > parse_meli_datetime(last_sales[sku])):
+                last_sales[sku] = sold_at.isoformat()
     record = {"account": account.get("nickname"), "units": units, "products": products,
-              "orders_count": count, "amount": round(revenue, 2), "unknown_units": unknown,
+              "last_sales": last_sales, "orders_count": count, "amount": round(revenue, 2), "unknown_units": unknown,
               "updated_at": now_label(), "updated_at_ns": time.time_ns()}
     with DATA_LOCK:
         store = read_json(SALES_GOALS_FILE, {"months": {}})
@@ -11405,6 +11415,16 @@ def cache_sales_goal_orders(payload, account, period, orders):
         month["accounts"][str(account.get("seller_id") or account["id"])] = record
         write_json(SALES_GOALS_FILE, store)
     return record
+
+
+_GOAL_PRICING_SERVICE = None
+
+def goal_pricing_service():
+    global _GOAL_PRICING_SERVICE
+    if _GOAL_PRICING_SERVICE is None:
+        from goal_pricing import GoalPricing
+        _GOAL_PRICING_SERVICE = GoalPricing(sys.modules[__name__])
+    return _GOAL_PRICING_SERVICE
 
 
 def query_sales_goals(payload, request):
@@ -12330,6 +12350,10 @@ def async_operation_result(job_id):
     with ASYNC_OPERATION_JOBS_LOCK:
         job = ASYNC_OPERATION_JOBS.get(str(job_id or ""))
         snapshot = dict(job) if job else None
+    if snapshot:
+        now = time.time()
+        snapshot['elapsed_seconds'] = max(0, int(now - snapshot.get('created_epoch', now)))
+        snapshot['seconds_since_progress'] = max(0, int(now - snapshot.get('updated_epoch', now)))
     # Completed results can be large. Never serialize them while holding the
     # lock used by health checks and all workers to publish their progress.
     return copy.deepcopy(snapshot) if snapshot else None
@@ -12399,9 +12423,6 @@ def start_async_operation(
         interactive = not heavy and priority in {"interactive", "manual"}
         previous_job_id = getattr(MELI_WORK_CONTEXT, "job_id", None)
         MELI_WORK_CONTEXT.job_id = job_id
-        if interactive:
-            with ASYNC_OPERATION_JOBS_LOCK:
-                ACTIVE_CLONE_OPERATIONS.add(job_id)
         try:
             semaphore = (
                 HEAVY_WORKER_SEMAPHORE if heavy
@@ -12415,6 +12436,8 @@ def start_async_operation(
                     current = ASYNC_OPERATION_JOBS.get(job_id)
                     if not current or current.get("status") != "queued":
                         return
+                    if interactive:
+                        ACTIVE_CLONE_OPERATIONS.add(job_id)
                     current.update({"status": "running", "message": "Processando dados oficiais no Mercado Livre.", "updated_epoch": time.time()})
                 try:
                     result = run_meli_work("background" if priority == "background" or heavy else "interactive", work)
@@ -13145,6 +13168,12 @@ def save_price_schedule(request, actor=None):
         )
         if not item:
             raise RuntimeError("Anúncio não encontrado para criar o agendamento.")
+        try:
+            if goal_pricing_service().managed(item_id):
+                raise RuntimeError("Este anúncio está sob regra de meta de venda. Pause a regra antes de agendar preços.")
+        except ImportError:
+            pass
+
         try:
             scheduled_price = round(float(request.get("scheduled_price") or 0), 2)
         except (TypeError, ValueError) as exc:
@@ -21079,6 +21108,15 @@ def start_report_job(request):
 
 def report_filtered_catalog(payload, report_type, filters):
     account_filter = str(filters.get("account") or "all")
+    official_store_filter = filters.get("official_store") or "all"
+    if official_store_filter not in ("all", "none"):
+        try:
+            official_store_filter = json.loads(official_store_filter)
+            if not isinstance(official_store_filter, list) or len(official_store_filter) != 2:
+                raise ValueError()
+            official_store_filter = [str(value) for value in official_store_filter]
+        except (ValueError, TypeError):
+            raise RuntimeError("Filtro de loja oficial inválido.")
     search = normalized_attribute_label(filters.get("search") or filters.get("product") or "")
     brand_search = normalized_attribute_label(filters.get("brand") or "")
     sku_search = normalized_attribute_label(filters.get("sku") or "")
@@ -21101,6 +21139,14 @@ def report_filtered_catalog(payload, report_type, filters):
             str(item.get("account_id") or ""),
             str(item.get("account") or ""),
         }:
+            continue
+        store_id = item.get("official_store_id")
+        if official_store_filter == "none" and store_id not in (None, ""):
+            continue
+        if isinstance(official_store_filter, list) and official_store_filter != [
+            str(item.get("account_id") or item.get("account") or ""),
+            str(store_id) if store_id is not None else "",
+        ]:
             continue
         if status_filter != "all":
             if status_filter == "internal" and not item.get("internal_competition"):
@@ -23605,9 +23651,15 @@ class App(BaseHTTPRequestHandler):
             with ASYNC_OPERATION_JOBS_LOCK:
                 active_interactive = len(ACTIVE_CLONE_OPERATIONS)
                 job_counts = {}
+                oldest_active_job_seconds = 0
+                longest_without_progress_seconds = 0
+                health_now = time.time()
                 for job in ASYNC_OPERATION_JOBS.values():
                     key = f"{job.get('priority') or 'interactive'}_{job.get('status') or 'unknown'}"
                     job_counts[key] = job_counts.get(key, 0) + 1
+                    if job.get('status') in {'queued', 'running'}:
+                        oldest_active_job_seconds = max(oldest_active_job_seconds, int(health_now-job.get('created_epoch',health_now)))
+                        longest_without_progress_seconds = max(longest_without_progress_seconds, int(health_now-job.get('updated_epoch',health_now)))
             with HTTP_POOL_ACTIVITY_LOCK:
                 pool_activity = dict(HTTP_POOL_ACTIVITY)
             saturated_pools = []
@@ -23625,6 +23677,8 @@ class App(BaseHTTPRequestHandler):
                     "active_sync_accounts": active_syncs,
                     "active_interactive_operations": active_interactive,
                     "operation_jobs": job_counts,
+                    "oldest_active_job_seconds": max(0, oldest_active_job_seconds),
+                    "longest_without_progress_seconds": max(0, longest_without_progress_seconds),
                     "notification_queue": MELI_NOTIFICATION_QUEUE.qsize(),
                     "http_max_concurrent_requests": HTTP_MAX_CONCURRENT_REQUESTS,
                     "http_fast_max_concurrent_requests": HTTP_FAST_MAX_CONCURRENT_REQUESTS,
@@ -23985,6 +24039,8 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/item/activate_pickup",
             "/api/meli/item/delete",
             "/api/sales-goals/query",
+            "/api/sales-goals/pricing/query",
+            "/api/sales-goals/pricing/save",
             "/api/sales/reconcile",
             "/api/sales-goals/save",
             "/api/sales-goals/refresh",
@@ -24090,6 +24146,20 @@ class App(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/") and not parsed.path.startswith("/api/auth/"):
             if not self.require_auth(payload):
                 return
+
+        if parsed.path in {"/api/sales-goals/pricing/query", "/api/sales-goals/pricing/save"}:
+            actor = self.current_user(payload)
+            try:
+                service = goal_pricing_service()
+                if parsed.path.endswith("/query"):
+                    self.send_json(service.listing(request.get('sku')))
+                elif not can_manage_users(actor):
+                    self.send_json({"error":"Somente Master e Administradores."}, status=403)
+                else:
+                    self.send_json({"ok":True,"rule":service.save(request,actor)})
+            except Exception as exc:
+                self.send_json({"error":str(exc)}, status=400)
+            return
 
         if parsed.path == "/api/returns/sync":
             account_ids = request.get("account_ids") or []
@@ -25338,6 +25408,11 @@ if __name__ == "__main__":
     threading.Thread(target=auto_sale_fee_loop, daemon=True).start()
     threading.Thread(target=auto_catalog_competition_loop, daemon=True).start()
     threading.Thread(target=price_schedule_loop, name="price-schedules", daemon=True).start()
+    try:
+        threading.Thread(target=goal_pricing_service().loop, name="goal-pricing", daemon=True).start()
+    except ImportError:
+        print("Automação de metas indisponível: implante goal_pricing.py junto com server.py.", flush=True)
+
     threading.Thread(target=memory_maintenance_loop, name="memory-maintenance", daemon=True).start()
     print(
         f"CompeTIDOR rodando em http://127.0.0.1:{port} "

@@ -10,6 +10,7 @@
   catalogSales: "all",
   catalogNoSaleDays: 30,
   adsAccount: "all",
+  adsOfficialStore: "all",
   adsProduct: "",
   adsBrand: "",
   adsSku: "",
@@ -2417,6 +2418,7 @@ function renderFilterOptions() {
   setOptions("#catalog-account-filter", accounts, state.catalogAccount, "Todas");
   setOptions("#catalog-ml-status-filter", mlStatuses, state.catalogMlStatus, "Todos", statusLabel);
   setOptions("#ads-account-filter", accounts, state.adsAccount, "Todas");
+  renderAdsOfficialStoreOptions();
   setOptions("#ads-status-filter", mlStatuses, state.adsStatus, "Todos", statusLabel);
 }
 
@@ -2430,6 +2432,36 @@ function setOptions(selector, values, current, allLabel, formatter = (value) => 
     el.dataset.optionsKey = key;
   }
   el.value = values.includes(old) ? old : current;
+}
+
+const adsOfficialStoreLabels = new Map();
+function adsOfficialStore(item) {
+  const id=item.official_store_id;
+  const account=String(item.account_id || item.account || '');
+  const key=id==null || id==='' ? 'none' : JSON.stringify([account,String(id)]);
+  const label=key==='none' ? 'Loja oficial não informada' : item.official_store_name || adsOfficialStoreLabels.get(key) || `Loja oficial #${id}`;
+  return {key,label};
+}
+function renderAdsOfficialStoreOptions() {
+  const select=document.querySelector('#ads-official-store-filter');if(!select)return;
+  const options=new Map();adsOfficialStoreLabels.clear();
+  for(const item of state.data.catalog) {
+    const store=adsOfficialStore(item);
+    if(store.key!=='none' && item.official_store_name)adsOfficialStoreLabels.set(store.key,item.official_store_name);
+  }
+  for(const item of state.data.catalog) {
+    if(state.adsAccount!=='all' && item.account!==state.adsAccount)continue;
+    const store=adsOfficialStore(item);
+    options.set(store.key,store.label+(state.adsAccount==='all' && store.key!=='none' ? ` · ${item.account || item.account_id || ''}` : ''));
+  }
+  if(state.adsOfficialStore!=='all' && !options.has(state.adsOfficialStore))state.adsOfficialStore='all';
+  const entries=[...options].sort((a,b)=>a[1].localeCompare(b[1],'pt-BR'));
+  const signature=JSON.stringify(entries);
+  if(select.dataset.optionsKey!==signature){
+    select.innerHTML='<option value="all">Todas as lojas oficiais</option>'+entries.map(([key,label])=>`<option value="${escapeAttr(key)}">${escapeText(label)}</option>`).join('');
+    select.dataset.optionsKey=signature;
+  }
+  select.value=state.adsOfficialStore;
 }
 
 function renderAds() {
@@ -2457,6 +2489,7 @@ function renderAds() {
     const sku = `${item.sku || ""}`.trim().toLowerCase();
     const code = `${item.id || ""}`.toLowerCase();
     return (state.adsAccount === "all" || item.account === state.adsAccount)
+      && (state.adsOfficialStore === "all" || adsOfficialStore(item).key === state.adsOfficialStore)
       && (state.adsStatus === "all" || normalizedMlStatus(item.meli_status) === state.adsStatus)
       && (state.adsListingType === "all" || item.listing_type_id === state.adsListingType)
       && (state.adsCatalog === "all" || (state.adsCatalog === "catalog" ? isCatalogItem(item) : !isCatalogItem(item)))
@@ -2558,6 +2591,7 @@ function renderAds() {
         </div>
         <div class="ad-facts ad-facts-general" aria-label="Dados gerais do anúncio">
           ${fact("Conta", item.account)}
+          ${fact("Loja oficial", adsOfficialStore(item).label)}
           ${fact("Código do anúncio", item.id)}
           ${fact("SKU", item.sku || "-")}
           ${item.brand ? fact("Marca", item.brand) : ""}
@@ -4910,6 +4944,7 @@ function currentReportFilters(reportType) {
   }
   return {
     account: state.adsAccount,
+    official_store: state.adsOfficialStore,
     product: state.adsProduct,
     brand: state.adsBrand,
     sku: state.adsSku,
@@ -6592,6 +6627,7 @@ document.addEventListener("click", (event) => {
   ["#catalog-sales-filter", "catalogSales"],
   ["#catalog-no-sale-days", "catalogNoSaleDays"],
   ["#ads-account-filter", "adsAccount"],
+  ["#ads-official-store-filter", "adsOfficialStore"],
   ["#ads-product-filter", "adsProduct"],
   ["#ads-brand-filter", "adsBrand"],
   ["#ads-sku-filter", "adsSku"],
@@ -6630,6 +6666,7 @@ document.addEventListener("click", (event) => {
       state.catalogPage = 1;
       scheduleRender("catalog", renderCatalog);
     }
+    if (key === "adsAccount") state.adsOfficialStore = "all";
     if (key.startsWith("ads")) {
       state.adsPage = 1;
       scheduleRender("ads", renderAds);
@@ -6754,6 +6791,7 @@ document.querySelector("#costs-list")?.addEventListener("click", async (event) =
 document.querySelector("#clear-ads-filters")?.addEventListener("click", () => {
   Object.assign(state, {
     adsAccount: "all",
+    adsOfficialStore: "all",
     adsProduct: "",
     adsBrand: "",
     adsSku: "",
@@ -6769,6 +6807,7 @@ document.querySelector("#clear-ads-filters")?.addEventListener("click", () => {
   });
   const values = {
     "#ads-account-filter": "all",
+    "#ads-official-store-filter": "all",
     "#ads-product-filter": "",
     "#ads-brand-filter": "",
     "#ads-sku-filter": "",

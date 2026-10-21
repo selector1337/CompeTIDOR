@@ -56,7 +56,7 @@
     $('goals-summary').insertAdjacentHTML('beforeend', `<article class="goal-revenue-estimate"><div><small>Faturamento bruto ao atingir todas as metas${estimate.missing ? ' · estimativa parcial' : ''}</small><strong>${estimate.count > estimate.missing ? money.format(estimate.total) : '—'}</strong></div><p>${estimate.count} SKU(s) com meta, independentemente dos filtros. Média dos preços atuais de Clássico e Premium; se houver só um preço, ele é utilizado. Sem descontar tarifas, frete ou custos.${estimate.missing ? ` ${estimate.missing} SKU(s) sem preço foram excluídos do valor.` : ''}${Object.keys(edits).length ? ' Inclui alterações de metas ainda não salvas.' : ''}</p></article>`);
     $('goals-rows').innerHTML = all.slice(page*50,page*50+50).map(r=> {
       const percent = r.target ? r.sold/r.target*100 : 0;
-      return `<tr><td><strong>${esc(r.sku)}</strong><small>${esc(r.product)}</small>${skuCommercialHtml(r)}</td><td><input type="number" min="1" step="1" aria-label="Meta mensal ${escapeAttr(r.sku)}" data-goal-sku="${escapeAttr(r.sku)}" value="${r.target || ''}" placeholder="Sem meta" ${!editable() || busy ? 'disabled' : ''}></td><td>${r.sold.toLocaleString('pt-BR')}</td><td><div class="goal-progress" role="progressbar" aria-label="Progresso ${escapeAttr(r.sku)}" aria-valuenow="${Math.min(100,percent)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${Math.min(100,percent)}%"></span></div><small>${r.target ? `${percent.toFixed(1)}% · ${r.sold >= r.target ? 'Meta atingida' : 'Em andamento'}` : 'Cadastre uma meta'}</small></td><td>${r.target ? Math.max(0,r.target-r.sold).toLocaleString('pt-BR') : '—'}</td></tr>`;
+      return `<tr><td><strong>${esc(r.sku)}</strong><small>${esc(r.product)}</small>${skuCommercialHtml(r)}${window.goalPricingPage?.button(r.sku) || ''}</td><td><input type="number" min="1" step="1" aria-label="Meta mensal ${escapeAttr(r.sku)}" data-goal-sku="${escapeAttr(r.sku)}" value="${r.target || ''}" placeholder="Sem meta" ${!editable() || busy ? 'disabled' : ''}></td><td>${r.sold.toLocaleString('pt-BR')}</td><td><div class="goal-progress" role="progressbar" aria-label="Progresso ${escapeAttr(r.sku)}" aria-valuenow="${Math.min(100,percent)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${Math.min(100,percent)}%"></span></div><small>${r.target ? `${percent.toFixed(1)}% · ${r.sold >= r.target ? 'Meta atingida' : 'Em andamento'}` : 'Cadastre uma meta'}</small></td><td>${r.target ? Math.max(0,r.target-r.sold).toLocaleString('pt-BR') : '—'}</td></tr>`;
     }).join('') || '<tr><td colspan="5">Nenhum SKU neste filtro.</td></tr>';
     $('goals-page').textContent = `${page+1} / ${Math.max(1,Math.ceil(all.length/50))} · ${all.length} SKU(s)`;
     $('goals-save').disabled = !editable() || !Object.keys(edits).length || busy;
@@ -66,6 +66,7 @@
     document.querySelectorAll('#page-metas [data-export-report]').forEach(b=>b.disabled=busy || Object.keys(edits).length>0);
   }
   async function load() {
+    await window.goalPricingPage?.load();
     if (data && data.month !== $('goals-month').value) { data=null; render(); }
     data = await operation('query', {month:$('goals-month').value});
     loadedAt = Date.now();
