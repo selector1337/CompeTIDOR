@@ -11000,3 +11000,24 @@ textarea:focus {
 .reputation-source-note { margin:14px 0 0;color:var(--muted);font-size:11px;line-height:1.6; }
 @media(max-width:1250px) { .goals-filters {grid-template-columns:repeat(3,minmax(0,1fr));} #dashboard-metrics {grid-template-columns:1fr;} }
 @media(max-width:600px) { .goals-filters {grid-template-columns:repeat(2,minmax(0,1fr));} .reputation-metrics-grid {grid-template-columns:1fr;} .reputation-metric > span {min-height:0;} .goal-rule-open {flex-wrap:wrap;} }
+/* Sales goals remain interactive while snapshots refresh. */
+.goal-stock-line {display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:10px 0;color:var(--muted);font-size:12px;}
+.goal-stock-line > span {padding:3px 8px;border:1px solid var(--line);border-radius:20px;}
+.goal-rule-summary {display:grid;gap:5px;margin:10px 0;color:var(--muted);font-size:12px;line-height:1.5;}
+.goal-rule-summary > span:first-child {color:var(--ink);}
+.goal-export-button {display:inline-flex;align-items:center;gap:8px;padding:10px 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font:inherit;font-weight:600;cursor:pointer;}
+.goal-export-button:hover {border-color:var(--muted);background:var(--panel-2,var(--panel));}
+.goal-export-button:disabled {opacity:.45;cursor:default;}
+.goal-rule-dialog {width:min(1080px,94vw);max-width:1080px;}
+.goal-simulation {margin:20px 0;padding:16px;border:1px solid var(--line);border-radius:12px;}
+.goal-simulation [data-simulation] {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;}
+.goal-simulation [data-simulation] > p {grid-column:1/-1;}
+.goal-simulation-card {display:grid;gap:8px;background:var(--panel);padding:14px;border-radius:10px;border:1px solid var(--line);}
+.goal-simulation-card small {color:var(--muted);overflow-wrap:anywhere;}
+.goal-simulation-values {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;}
+.goal-simulation-values span {display:grid;gap:5px;font-size:12px;color:var(--muted);}
+.goal-simulation-values b {color:var(--ink);}
+@media(max-width:650px){.goal-simulation [data-simulation]{grid-template-columns:1fr;}.goal-simulation-values{grid-template-columns:repeat(2,minmax(0,1fr));}}
+.goal-rule-dialog .goal-simulation-card {background:#1b252e;color:#e5eef5;border-color:#334450;}
+.goal-rule-dialog .goal-simulation-card small,.goal-rule-dialog .goal-simulation-values span {color:#aebfce;}
+.goal-rule-dialog .goal-simulation-values b {color:#e5eef5;}

@@ -8,6 +8,26 @@ from urllib.parse import urlencode
 FILE = 'goal_pricing.json'
 HISTORY_LIMIT = 1000
 
+def rule_summary(rule):
+    items = list((rule.get('items') or {}).values())
+    initialized = [i for i in items if i.get('initialized') and i.get('original', 0) > 0]
+    original = sum(i['original'] for i in initialized)
+    current = sum(i.get('observed_price', i['last']) for i in initialized)
+    due = [max(i.get('retry_after', 0), i.get('last_action', 0) + rule.get('interval_hours', 0)*3600,
+               rule.get('last_sale', 0) + rule.get('sale_pause_hours', 0)*3600)
+           for i in items if not i.get('blocked')]
+    historical = {}
+    for event in rule.get('history', []):
+        if event.get('outcome') == 'success' and event.get('from') is not None and event.get('to') is not None and event['to'] < event['from']:
+            identity = event.get('item_id')
+            historical[identity] = historical.get(identity, 0) + 1
+    return {**{k:rule.get(k) for k in ('sku','enabled','status')},
+            'next_change_at': min(due) if due and rule.get('enabled') else None,
+            'confirmed_changes': sum(i.get('confirmed_changes', historical.get(identity, 0)) for identity, i in (rule.get('items') or {}).items()),
+            'reduction_percent': round((original-current)/original*100, 2) if original else None,
+            'initialized_count':len(initialized), 'item_count':len(items)}
+
+
 class GoalPricing:
     def __init__(self, app):
         self.a = app
@@ -23,11 +43,13 @@ class GoalPricing:
             rule = rules.get(self.a.normalized_sku_key(sku))
             return {'rules': [rule] if rule else []}
         # The goals list only needs badges; fetch detailed logs on demand.
-        return {'rules': [{k:r.get(k) for k in ('sku','enabled','status')} for r in rules.values()]}
+        return {'rules': [rule_summary(r) for r in rules.values()]}
 
     def event(self, rule, identity, outcome, message, before=None, target=None):
         """Persist with the surrounding state commit; never call an uncertain write success."""
         tracking = rule.get('items', {}).get(identity, {})
+        if outcome == 'success' and before is not None and target is not None and target < before:
+            tracking['confirmed_changes'] = tracking.get('confirmed_changes', sum(1 for h in rule.get('history', []) if h.get('item_id') == identity and h.get('outcome') == 'success' and h.get('from') is not None and h.get('to') is not None and h['to'] < h['from'])) + 1
         fingerprint = [outcome, message, before, target]
         key = 'last_event' if identity else 'last_rule_event'
         holder = tracking if identity else rule
@@ -137,7 +159,7 @@ class GoalPricing:
             seen.add(seller)
             record = records.get(seller, {})
             if now - record.get('updated_at_ns',0)/1e9 > 900 or 'last_sales' not in record:
-                raise RuntimeError('Aguardando conferência recente das vendas de todas as contas.')
+                raise RuntimeError('Aguardando conferência recente das vendas da conta ' + str(account.get('nickname') or seller) + '.')
             if record.get('unknown_units'): raise RuntimeError('Existem vendas sem SKU identificado; confira os cadastros antes de reduzir preços.')
             sold += record.get('units',{}).get(sku,0)
             date = self.a.parse_meli_datetime(record.get('last_sales',{}).get(sku))
@@ -150,7 +172,13 @@ class GoalPricing:
         rules = list(self.read()['rules'].values())
         if now - self.last_refresh > 600 and any(r.get('enabled') and not r.get('restoring') for r in rules):
             self.last_refresh = now
-            self.a.reconcile_month_sales({'month':self.a.current_month_period()})
+            try:
+                result = self.a.reconcile_month_sales({'month':self.a.current_month_period()})
+                if isinstance(result, dict) and any(r.get('status') == 'error' for r in result.get('results', [])):
+                    self.last_refresh = now - 540  # retry failed sales verification in one minute
+            except Exception as exc:
+                self.last_refresh = now - 540
+                print('Conferência de vendas das metas:', str(exc), flush=True)
         with self.a.PRICE_SCHEDULE_LOCK, self.lock:
             store = self.read()
             payload = self.a.read_payload()
@@ -163,7 +191,13 @@ class GoalPricing:
             budget = 20
             deadline = time.monotonic()+20
             payload_changed = False
-            for rule in store['rules'].values():
+            rule_keys = list(store['rules'])
+            cursor = int(store.get('cursor', 0)) % max(1, len(rule_keys))
+            for rule_index in list(range(cursor, len(rule_keys))) + list(range(cursor)):
+                if budget <= 0 or time.monotonic() > deadline:
+                    break
+                rule = store['rules'][rule_keys[rule_index]]
+                store['cursor'] = (rule_index + 1) % max(1, len(rule_keys))
                 if not rule.get('enabled'): continue
                 try:
                     # Include new matching listings/accounts without changing existing baselines.
@@ -182,7 +216,7 @@ class GoalPricing:
                     rule['period'] = self.a.current_month_period()
                     restore = bool(rule.get('restoring'))
                     rule['status'] = 'Restaurando preços originais' if restore else 'Aguardando intervalo sem vendas'
-                    for identity, tracking in rule['items'].items():
+                    for identity, tracking in sorted(rule['items'].items(), key=lambda pair: pair[1].get('checked_at', 0)):
                         if budget <= 0 or time.monotonic() > deadline: break
                         if tracking.get('blocked') and not rule.get('restoring'): continue
                         if tracking.get('retry_after',0) > now: continue
@@ -190,6 +224,7 @@ class GoalPricing:
                         if restore and tracking.get('pending') is None and abs(tracking['last']-tracking['original']) < .009 and (not rule.get('restoring') or tracking.get('restore_done')): continue
                         if not restore and tracking.get('pending') is None and tracking.get('initialized') and now < max(tracking['last_action']+rule['interval_hours']*3600,last_sale+rule['sale_pause_hours']*3600): continue
                         budget -= 1
+                        tracking['checked_at'] = now
                         try:
                             item = catalog.get(identity)
                             account = accounts.get(tracking['account_id'])
@@ -226,7 +261,7 @@ class GoalPricing:
                                 self.event(rule,identity,'waiting','Preço original já estava aplicado; nenhuma alteração enviada',price,price)
                                 continue
                             if not tracking.get('initialized'):
-                                tracking.update(original=price,last=price,initialized=True,last_action=now,status='Preço original registrado; aguardando intervalo')
+                                tracking.update(original=price,last=price,initialized=True,status='Preço original registrado; aguardando intervalo')
                                 self.a.write_json(FILE,store)
                                 continue
                             if abs(price-tracking['last']) > .009:

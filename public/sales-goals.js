@@ -1,6 +1,6 @@
 (() => {
   const $ = id => document.getElementById(id), esc = value => escapeText(String(value ?? ''));
-  let data = null, busy = false, page = 0, edits = {}, loadedAt = 0;
+  let data = null, busy = false, page = 0, edits = {}, loadedAt = 0, loading = false, loadVersion = 0;
   function currentMonth() {
     const parts = new Intl.DateTimeFormat('en', {timeZone:'America/Sao_Paulo', year:'numeric', month:'2-digit'}).formatToParts(new Date());
     return `${parts.find(p=>p.type==='year').value}-${parts.find(p=>p.type==='month').value}`;
@@ -13,12 +13,13 @@
     const queued = await api('/api/sales-goals/' + action, {method:'POST', body:JSON.stringify(body), manualProgress:action !== 'query'});
     return waitForAsyncOperation(queued, message => $('goals-feedback').textContent = message || 'Processando…');
   }
-  async function run(work) {
-    if (busy) return;
-    busy = true;
-    document.querySelectorAll('#page-metas button, #page-metas input, #page-metas select').forEach(n=>n.disabled=true);
+  async function run(work, background=false) {
+    if (busy || (background && loading)) return;
+    if (background) loading=true; else busy=true;
+    $('goals-refresh').disabled=busy;
+    $('goals-month').disabled=busy;
     try { await work(); } catch (error) { $('goals-feedback').textContent = error.message; }
-    finally { busy = false; document.querySelectorAll('#page-metas button, #page-metas input, #page-metas select').forEach(n=>n.disabled=false); render(); }
+    finally { if(background)loading=false;else busy=false; $('goals-refresh').disabled=busy; $('goals-month').disabled=busy; if(!document.activeElement?.dataset.goalSku)render(); }
   }
   function goalRevenueEstimate() {
     let total = 0, missing = 0, count = 0;
@@ -37,12 +38,12 @@
     const f = filters();
     return data.rows.map(r=>({...r, target:Object.hasOwn(edits,r.sku) ? Number(edits[r.sku]) || null : r.target})).filter(r =>
       (f.automatic_pricing !== 'active' || r.automatic_pricing_active) && (f.automatic_pricing !== 'inactive' || !r.automatic_pricing_active) &&
-      (!f.status || r.statuses.includes(f.status)) && (!f.search || `${r.sku} ${r.product}`.toLocaleLowerCase().includes(f.search.toLocaleLowerCase())) &&
+      (!f.status || (r.listing_status || (r.statuses.includes('active')?'active':r.statuses.includes('paused')?'paused':'unavailable')) === f.status) && (!f.search || `${r.sku} ${r.product}`.toLocaleLowerCase().includes(f.search.toLocaleLowerCase())) &&
       (f.registered !== 'yes' || r.target) && (f.registered !== 'no' || !r.target) &&
       (!f.achievement || (r.target && (f.achievement === 'reached' ? r.sold >= r.target : f.achievement === 'not_reached' ? r.sold < r.target : r.sold === 0))));
   }
   function render() {
-    $('goals-search-clear').disabled = busy || !$('goals-search').value;
+    $('goals-search-clear').disabled = !$('goals-search').value;
     if (!data) {
       $('goals-rows').innerHTML = '<tr><td colspan="5">Consulte o mês para carregar as metas.</td></tr>';
       $('goals-summary').innerHTML = ''; $('goals-accounts').innerHTML = '';
@@ -57,19 +58,22 @@
     $('goals-summary').insertAdjacentHTML('beforeend', `<article class="goal-revenue-estimate"><div><small>Faturamento bruto ao atingir todas as metas${estimate.missing ? ' · estimativa parcial' : ''}</small><strong>${estimate.count > estimate.missing ? money.format(estimate.total) : '—'}</strong></div><p>${estimate.count} SKU(s) com meta, independentemente dos filtros. Média dos preços atuais de Clássico e Premium; se houver só um preço, ele é utilizado. Sem descontar tarifas, frete ou custos.${estimate.missing ? ` ${estimate.missing} SKU(s) sem preço foram excluídos do valor.` : ''}${Object.keys(edits).length ? ' Inclui alterações de metas ainda não salvas.' : ''}</p></article>`);
     $('goals-rows').innerHTML = all.slice(page*50,page*50+50).map(r=> {
       const percent = r.target ? r.sold/r.target*100 : 0;
-      return `<tr><td><strong>${esc(r.sku)}</strong><small>${esc(r.product)}</small>${skuCommercialHtml(r)}${window.goalPricingPage?.button(r.sku) || ''}</td><td><input type="number" min="1" step="1" aria-label="Meta mensal ${escapeAttr(r.sku)}" data-goal-sku="${escapeAttr(r.sku)}" value="${r.target || ''}" placeholder="Sem meta" ${!editable() || busy ? 'disabled' : ''}></td><td>${r.sold.toLocaleString('pt-BR')}</td><td><div class="goal-progress" role="progressbar" aria-label="Progresso ${escapeAttr(r.sku)}" aria-valuenow="${Math.min(100,percent)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${Math.min(100,percent)}%"></span></div><small>${r.target ? `${percent.toFixed(1)}% · ${r.sold >= r.target ? 'Meta atingida' : 'Em andamento'}` : 'Cadastre uma meta'}</small></td><td>${r.target ? Math.max(0,r.target-r.sold).toLocaleString('pt-BR') : '—'}</td></tr>`;
+      return `<tr><td><strong>${esc(r.sku)}</strong><small>${esc(r.product)}</small><div class="goal-stock-line"><span>${r.listing_status==='paused'?'Pausado':r.listing_status==='active'?'Ativo':esc(r.statuses.join(' / '))}</span><strong title="${escapeAttr(r.stock_reference || '')}">Estoque: ${r.stock == null?'—':esc(r.stock)} un.</strong><small>Um anúncio base</small></div>${skuCommercialHtml(r)}${window.goalPricingPage?.button(r.sku) || ''}${window.goalPricingPage?.summary(r.pricing_summary) || ''}</td><td><input type="number" min="1" step="1" aria-label="Meta mensal ${escapeAttr(r.sku)}" data-goal-sku="${escapeAttr(r.sku)}" value="${r.target || ''}" placeholder="Sem meta" ${!editable() ? 'disabled' : ''}></td><td>${r.sold.toLocaleString('pt-BR')}</td><td><div class="goal-progress" role="progressbar" aria-label="Progresso ${escapeAttr(r.sku)}" aria-valuenow="${Math.min(100,percent)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${Math.min(100,percent)}%"></span></div><small>${r.target ? `${percent.toFixed(1)}% · ${r.sold >= r.target ? 'Meta atingida' : 'Em andamento'}` : 'Cadastre uma meta'}</small></td><td>${r.target ? Math.max(0,r.target-r.sold).toLocaleString('pt-BR') : '—'}</td></tr>`;
     }).join('') || '<tr><td colspan="5">Nenhum SKU neste filtro.</td></tr>';
     $('goals-page').textContent = `${page+1} / ${Math.max(1,Math.ceil(all.length/50))} · ${all.length} SKU(s)`;
     $('goals-save').disabled = !editable() || !Object.keys(edits).length || busy;
-    $('goals-prev').disabled = busy || page === 0;
-    $('goals-next').disabled = busy || (page+1)*50 >= all.length;
+    $('goals-prev').disabled = page === 0;
+    $('goals-next').disabled = (page+1)*50 >= all.length;
     $('goals-accounts').innerHTML = data.accounts.map(a=>`<p><strong>${esc(a.account)}</strong> · ${a.orders_count} pedidos · ${money.format(a.amount)} · Atualizado em ${esc(a.updated_at)}</p>`).join('') || '<p>Ainda não há vendas sincronizadas para este mês.</p>';
     document.querySelectorAll('#page-metas [data-export-report]').forEach(b=>b.disabled=busy || Object.keys(edits).length>0);
   }
   async function load() {
-    await window.goalPricingPage?.load();
+    const version=++loadVersion, month=$('goals-month').value;
     if (data && data.month !== $('goals-month').value) { data=null; render(); }
-    data = await operation('query', {month:$('goals-month').value});
+    const result = await operation('query', {month});
+    if(version!==loadVersion || month!==$('goals-month').value)return;
+    data=result;
+    window.goalPricingPage?.setRows(data.rows);
     loadedAt = Date.now();
     $('goals-feedback').textContent = data.warnings.join(' ') || 'Metas válidas para todos os meses. Vendas atualizadas automaticamente pela sincronização das contas.';
   }
@@ -80,14 +84,16 @@
     if (errors.length) $('goals-feedback').textContent = errors.map(r=>`${r.account}: ${r.error}`).join(' · ');
   });
   $('goals-save').onclick = () => run(async()=> {
-    await operation('save', {month:$('goals-month').value, targets:edits}); edits={}; await load(); $('goals-feedback').textContent='Metas salvas para todos os meses.';
+    const submitted={...edits}; await operation('save', {month:$('goals-month').value, targets:submitted}); for(const [sku,value] of Object.entries(submitted))if(edits[sku]===value)delete edits[sku]; await load(); $('goals-feedback').textContent='Metas salvas para todos os meses.';
   });
-  $('goals-rows').onchange = e => {
+  $('goals-rows').oninput = e => {
     if (!e.target.dataset.goalSku) return;
     if (!e.target.validity.valid) { $('goals-feedback').textContent='Informe uma quantidade inteira maior que zero, ou deixe vazio para remover a meta.'; return; }
     edits[e.target.dataset.goalSku]=e.target.value;
     // Wait until blur finishes before replacing the focused input's table row.
-    setTimeout(()=>{if(!busy)render();},0);
+    $('goals-save').disabled = !editable() || busy;
+    document.querySelectorAll('#page-metas [data-export-report]').forEach(b=>b.disabled=true);
+    e.target.onblur=()=>setTimeout(render,0);
   };
   $('goals-search-clear').onclick = () => { $('goals-search').value=''; page=0; render(); $('goals-search').focus(); };
   ['goals-search','goals-status','goals-registered','goals-achievement','goals-automatic-pricing'].forEach(id=>$(id).oninput=()=>{page=0;render();});
@@ -102,7 +108,7 @@
     if ($('goals-month').value === lastCurrentMonth && now !== lastCurrentMonth) $('goals-month').value = now;
     lastCurrentMonth = now;
     if (data && data.month === $('goals-month').value && Date.now()-loadedAt < 60000) return;
-    run(load);
+    run(load,true);
   }
   window.salesGoalsPage={filters,open:refreshView,pricingChanged:(sku,enabled)=>{
     const row=data?.rows.find(r=>r.sku.toUpperCase()===sku.toUpperCase());

@@ -7330,6 +7330,10 @@ def sku_commercial_index(payload, items=None):
         result.setdefault(sku, {}).update({
             "sku_cost": values.get("cost_amount"),
             kind + "_price": item.get("price"),
+            kind + "_fee": values.get("sale_fee_amount") if "tarifa" not in missing else None,
+            kind + "_shipping": values.get("shipping_cost") if "frete" not in missing else None,
+            kind + "_net": values.get("net_sale_amount") if not missing else None,
+            kind + "_profit": values.get("profit_amount") if not missing else None,
             kind + "_margin": margin,
             kind + "_margin_reason": reason,
             kind + "_reference": " / ".join(str(item.get(k) or "") for k in ("account", "id")),
@@ -11487,6 +11491,7 @@ def query_sales_goals(payload, request):
             write_json(SALES_GOALS_FILE, store)
     month = store.get("months", {}).get(period, {"targets": {}, "accounts": {}})
     rows = {}
+    stock_references = {}
     for item in payload.get("catalog", []):
         sku = normalized_sku_key(item.get("sku"))
         if not sku or sku == "-":
@@ -11495,6 +11500,10 @@ def query_sales_goals(payload, request):
         status = normalized_meli_status(item.get("meli_status") or item.get("status") or "")
         if status not in row["statuses"]:
             row["statuses"].append(status)
+        rank = (status != "active", status != "paused", bool(item.get("catalog_listing")), str(item.get("id") or ""))
+        if sku not in stock_references or rank < stock_references[sku][0]:
+            stock_references[sku] = (rank, item)
+
     for account in month.get("accounts", {}).values():
         for sku, units in account.get("units", {}).items():
             row = rows.setdefault(sku, {"sku": sku, "product": account.get("products", {}).get(sku, sku), "statuses": [], "sold": 0})
@@ -11502,7 +11511,12 @@ def query_sales_goals(payload, request):
     for sku in targets:
         rows.setdefault(sku, {"sku": sku, "product": sku, "statuses": [], "sold": 0})
     selected = []
-    commercial = sku_commercial_index(payload)
+    active_references = {(normalized_sku_key(i.get("sku")), i.get("listing_type_id"))
+                         for i in payload.get("catalog", []) if normalized_meli_status(i.get("meli_status")) == "active"}
+    commercial_items = [i for i in payload.get("catalog", [])
+                        if normalized_meli_status(i.get("meli_status")) == "active"
+                        or (normalized_sku_key(i.get("sku")), i.get("listing_type_id")) not in active_references]
+    commercial = sku_commercial_index(payload, commercial_items)
     pricing_rules = (read_json("goal_pricing.json", {"rules": {}}).get("rules") or {})
     for sku, row in sorted(rows.items()):
         row["automatic_pricing_active"] = bool((pricing_rules.get(sku) or {}).get("enabled"))
@@ -11511,10 +11525,16 @@ def query_sales_goals(payload, request):
         if request.get("automatic_pricing") == "inactive" and row["automatic_pricing_active"]:
             continue
         row.update(commercial.get(sku, {}))
+        base = stock_references.get(sku, (None, {}))[1]
+        row["stock"] = base.get("stock")
+        row["stock_reference"] = " / ".join(str(base.get(k) or "") for k in ("account", "id"))
+        row["listing_status"] = "active" if "active" in row["statuses"] else "paused" if "paused" in row["statuses"] else "unavailable"
+        from goal_pricing import rule_summary
+        row["pricing_summary"] = rule_summary(pricing_rules[sku]) if sku in pricing_rules else None
         target = targets.get(sku)
         row.update(target=target, remaining=max(0, (target or 0) - row["sold"]),
                    progress=round(row["sold"] / target * 100, 1) if target else 0)
-        if request.get("status") and request["status"] not in row["statuses"]:
+        if request.get("status") and request["status"] != row["listing_status"]:
             continue
         if request.get("registered") == "yes" and not target or request.get("registered") == "no" and target:
             continue
@@ -21411,7 +21431,7 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
     if report_type == "sales_goals":
         result = query_sales_goals(payload, filters)
         columns = [("sku", "SKU", "text"), ("product", "Produto", "text"), ("target", "Meta mensal (un.)", "integer"), ("sold", "Vendidas", "integer"), ("remaining", "Faltam", "integer"), ("progress", "Progresso", "percent")]
-        columns += SKU_COMMERCIAL_COLUMNS
+        columns += [("stock", "Estoque (um anúncio base)", "integer"), ("stock_reference", "Referência de estoque", "text")] + SKU_COMMERCIAL_COLUMNS
         rows = [{**r, "target": r["target"] or "", "remaining": r["remaining"] if r["target"] else ""} for r in result["rows"]]
         return "Metas de Venda", columns, rows, {"Mês": result["month"], "Critério": "Todas as contas; pedidos não cancelados", "Avisos": " ".join(result["warnings"])}
 

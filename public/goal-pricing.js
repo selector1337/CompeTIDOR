@@ -1,7 +1,7 @@
 (() => {
   const formatCurrency = v => new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(v);
   const esc = v => escapeText(String(v ?? ''));
-  let rules = [], sku = '', busy = false, auditPage = 0, auditFilter = '';
+  let rules = [], sku = '', busy = false, auditPage = 0, auditFilter = '', commercialRows = [];
   const labels={success:'Confirmado',error:'Falha',pending:'Aguardando confirmação',blocked:'Bloqueado',waiting:'Sem alteração'};
   const money=v=>v==null?'—':formatCurrency(v);
   const retryDate=v=>new Intl.DateTimeFormat('pt-BR',{timeZone:'America/Sao_Paulo',dateStyle:'short',timeStyle:'medium'}).format(new Date(v*1000));
@@ -19,6 +19,29 @@
   async function loadDetail() {
     const result=await request('query',{sku});
     rules=[...rules.filter(r=>r.sku.toUpperCase()!==sku.toUpperCase()),...(result.rules||[])];
+  }
+  function summary(r) {
+    if(!r)return '';
+    const next=r.next_change_at ? retryDate(r.next_change_at) : 'Sem previsão';
+    return `<div class="goal-rule-summary"><span>${esc(r.status || 'Aguardando processamento')}</span><span>Próxima janela: <b>${esc(next)}</b></span><span>${r.confirmed_changes || 0} reduções confirmadas por anúncio · ${r.reduction_percent==null?'Redução ainda não confirmada':esc(r.reduction_percent)+'% de redução média ponderada'}</span><small>${r.initialized_count||0}/${r.item_count||0} preços originais confirmados. Horários sujeitos a vendas, fila e limites.</small></div>`;
+  }
+  function simulation(form) {
+    const row=commercialRows.find(r=>r.sku.toUpperCase()===sku.toUpperCase());
+    if(!row)return '<p>Dados comerciais ainda não carregados. Abra pela lista de metas.</p>';
+    const val=name=>Number(form.elements[name].value), step=val('step'), interval=val('interval_hours'), floor=val('floor_price');
+    const margin=form.elements.floor_margin.value===''?null:val('floor_margin'), mode=form.elements.mode.value;
+    return ['classic','premium'].map(kind=>{
+      const price=Number(row[kind+'_price']),fee=row[kind+'_fee'],ship=row[kind+'_shipping'],cost=row.sku_cost;
+      const known=[fee,ship,cost].every(v=>v!=null && Number.isFinite(Number(v)) && Number(v)>=0) && price>0;
+      let minimum=floor,steps=0,current=price;
+      const rate=known?Number(fee)/price:null;
+      if(margin!==null && known && rate<1 && margin>=0 && margin<100)minimum=Math.max(minimum,(Number(cost)/(1-margin/100)+Number(ship))/(1-rate));
+      let valid=price>0 && step>0 && interval>=1 && minimum>0 && (mode!=='percent'||step<100) && (margin===null || (known && margin>=0 && margin<100 && rate<1));
+      if(valid)while(steps<100000){const next=Math.max(floor,Math.round((mode==='amount'?current-step:current*(1-step/100))*100)/100);if(next<=0||next>=current||next+0.000001<minimum)break;current=next;steps++;}
+      const net=known?price-Number(fee)-Number(ship):null,profit=net==null?null:net-Number(cost);
+      const hours=steps*interval;
+      return `<article class="goal-simulation-card"><strong>${kind==='classic'?'Clássico':'Premium'}</strong><small>${esc(row[kind+'_reference']||'Sem anúncio base')}</small><div class="goal-simulation-values">${[['Preço',price>0?price:null],['Tarifa',fee],['Frete',ship],['Custo',cost],['Líquido',net],['Lucro',profit]].map(([label,value])=>`<span>${label}<b>${money(value)}</b></span>`).join('')}</div><p>Margem atual: <b>${known&&net>0?((profit/net)*100).toLocaleString('pt-BR',{maximumFractionDigits:2})+'%':'Indisponível'}</b></p><p>${valid&&steps<100000?`${steps} reduções · aproximadamente ${Math.floor(hours/24)} dia(s) e ${hours%24} hora(s)<br>Preço final estimado: <b>${money(current)}</b>`:'Preencha a regra e confira custo, tarifa e frete para estimar.'}</p></article>`;
+    }).join('')+'<p class="muted">Estimativa a partir dos anúncios base e preços atuais, sem novas vendas. A tarifa proporcional e o frete ficam constantes nesta simulação. Vendas, pausas, fila, falhas e mudanças de tarifas podem ampliar o prazo; cada redução é validada pela API antes do envio.</p>';
   }
   function button(value) {
     if (!admin()) return '';
@@ -41,7 +64,7 @@
       ${field('step','Valor da redução',r.step??1,.01)}
       ${field('floor_price','Preço mínimo (R$; 0 para usar só margem)',r.floor_price??0,0)}
       ${field('floor_margin','Margem mínima (%; opcional)',r.floor_margin??'',0)}
-      </div><p class="muted">O primeiro ciclo confirma e registra o preço original de cada anúncio. Atingir a meta ou mudar de mês não restaura preços nem reinicia o intervalo. A regra continua reduzindo até os limites cadastrados, respeitando a pausa após vendas. A margem considera custo, tarifa e frete sobre a receita líquida; dados incompletos bloqueiam a redução.</p>
+      </div><section class="goal-simulation"><h3>Rentabilidade e duração estimada</h3><div data-simulation></div></section><p class="muted">O primeiro ciclo confirma e registra o preço original de cada anúncio. Atingir a meta ou mudar de mês não restaura preços nem reinicia o intervalo. A regra continua reduzindo até os limites cadastrados, respeitando a pausa após vendas. A margem considera custo, tarifa e frete sobre a receita líquida; dados incompletos bloqueiam a redução.</p>
       <p class="muted">Pausar mantém os preços atuais. Para editar uma regra existente, pause e restaure os preços primeiro. Alterações manuais de preço interrompem a automação do anúncio.</p>
       <div class="goal-rule-actions"><button type="submit" name="save" ${locked?'disabled':''}>Salvar desativada</button><button type="submit" name="activate" ${locked?'disabled':''}>Salvar e ativar</button>
       ${r.sku?`<button type="button" data-action="${r.enabled?'pause':'resume'}">${r.enabled?'Pausar':'Retomar'}</button><button type="button" data-action="restore">Restaurar preços e desativar</button>`:''}</div>
@@ -49,6 +72,9 @@
 
     </form>`;
     renderAudit();
+    const form=dialog.querySelector('form');
+    const updateSimulation=()=>{dialog.querySelector('[data-simulation]').innerHTML=simulation(form);};
+    form.addEventListener('input',updateSimulation);updateSimulation();
     dialog.querySelector('[data-close]').onclick=()=>dialog.close();
     dialog.querySelector('form').onsubmit=e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.currentTarget));body.enabled=e.submitter?.name==='activate';change(body);};
     dialog.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>change({action:b.dataset.action}));
@@ -101,5 +127,5 @@
     try{await loadDetail();draw();dialog.showModal();}
     catch(err){document.getElementById('goals-feedback').textContent=err.message;}
   });
-  window.goalPricingPage={button,load};
+  window.goalPricingPage={button,load,summary,setRows:rows=>{commercialRows=rows;rules=rows.filter(r=>r.pricing_summary).map(r=>({...rules.find(old=>old.sku===r.sku),...r.pricing_summary}));}};
 })();
