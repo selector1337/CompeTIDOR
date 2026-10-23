@@ -1,4 +1,5 @@
 """Persistent, opt-in SKU goal pricing. External prices are always reconciled before writes."""
+from contextlib import contextmanager
 import copy
 import math
 import threading
@@ -8,21 +9,49 @@ from urllib.parse import urlencode
 FILE = 'goal_pricing.json'
 HISTORY_LIMIT = 1000
 
+@contextmanager
+def bounded_locks(*locks):
+    acquired = []
+    try:
+        for lock in locks:
+            if not lock.acquire(timeout=1):
+                raise RuntimeError('Fila de preços ocupada; nova tentativa no próximo ciclo.')
+            acquired.append(lock)
+        yield
+    finally:
+        for lock in reversed(acquired):
+            lock.release()
+
+
+def item_due(rule, item):
+    if item.get('blocked'):
+        return None
+    if item.get('pending') is not None or not item.get('initialized') or rule.get('restoring'):
+        return item.get('retry_after', 0)
+    return max(item.get('retry_after', 0), item.get('last_action', 0)+rule.get('interval_hours', 0)*3600,
+               rule.get('last_sale', 0)+rule.get('sale_pause_hours', 0)*3600)
+
+
 def rule_summary(rule):
     items = list((rule.get('items') or {}).values())
     initialized = [i for i in items if i.get('initialized') and i.get('original', 0) > 0]
     original = sum(i['original'] for i in initialized)
     current = sum(i.get('observed_price', i['last']) for i in initialized)
-    due = [max(i.get('retry_after', 0), i.get('last_action', 0) + rule.get('interval_hours', 0)*3600,
-               rule.get('last_sale', 0) + rule.get('sale_pause_hours', 0)*3600)
-           for i in items if not i.get('blocked')]
+    due = [value for i in items if (value := item_due(rule, i)) is not None]
+    now = time.time()
+    pending_count = sum(i.get('pending') is not None for i in items)
+    blocked_count = sum(bool(i.get('blocked')) for i in items)
+    retry_count = sum(bool(i.get('retry_after')) for i in items)
     historical = {}
     for event in rule.get('history', []):
         if event.get('outcome') == 'success' and event.get('from') is not None and event.get('to') is not None and event['to'] < event['from']:
             identity = event.get('item_id')
             historical[identity] = historical.get(identity, 0) + 1
     return {**{k:rule.get(k) for k in ('sku','enabled','status')},
-            'next_change_at': min(due) if due and rule.get('enabled') else None,
+            'next_change_at': max(now, min(due)) if due and rule.get('enabled') else None,
+            'due_count':sum(value <= now for value in due), 'pending_count':pending_count,
+            'blocked_count':blocked_count, 'retry_count':retry_count,
+            'checked_at':rule.get('checked_at'), 'sales_error':rule.get('sales_error'),
             'confirmed_changes': sum(i.get('confirmed_changes', historical.get(identity, 0)) for identity, i in (rule.get('items') or {}).items()),
             'reduction_percent': round((original-current)/original*100, 2) if original else None,
             'initialized_count':len(initialized), 'item_count':len(items)}
@@ -33,6 +62,8 @@ class GoalPricing:
         self.a = app
         self.lock = threading.RLock()
         self.last_refresh = 0
+        self.independent_refresh = False
+        self.last_heartbeat = 0
 
     def read(self):
         return self.a.read_json(FILE, {'rules': {}})
@@ -58,6 +89,8 @@ class GoalPricing:
         if identity:
             tracking.update(outcome=outcome, result_at=self.a.now_label())
         if duplicate: return
+        if outcome in {'error', 'blocked'}:
+            print('Metas automáticas:', rule.get('sku'), identity or 'regra', outcome, message, flush=True)
         original = tracking.get('original') if tracking.get('initialized') else None
         current = tracking.get('observed_price', tracking.get('last')) if original is not None else None
         reduction = round(original-current, 2) if original is not None and current is not None else None
@@ -170,7 +203,7 @@ class GoalPricing:
         now = now or time.time()
         if not any(r.get('enabled') for r in self.read()['rules'].values()): return
         rules = list(self.read()['rules'].values())
-        if now - self.last_refresh > 600 and any(r.get('enabled') and not r.get('restoring') for r in rules):
+        if not self.independent_refresh and now - self.last_refresh > 600 and any(r.get('enabled') and not r.get('restoring') for r in rules):
             self.last_refresh = now
             try:
                 result = self.a.reconcile_month_sales({'month':self.a.current_month_period()})
@@ -179,7 +212,7 @@ class GoalPricing:
             except Exception as exc:
                 self.last_refresh = now - 540
                 print('Conferência de vendas das metas:', str(exc), flush=True)
-        with self.a.PRICE_SCHEDULE_LOCK, self.lock:
+        with bounded_locks(self.a.PRICE_SCHEDULE_LOCK, self.lock):
             store = self.read()
             payload = self.a.read_payload()
             catalog = {i['id']:i for i in payload.get('catalog',[]) if i.get('id')}
@@ -208,7 +241,15 @@ class GoalPricing:
                                 price=float(item.get('price') or 0)
                                 if price > 0:
                                     rule['items'][item['id']]={'account_id':item['account_id'],'account_name':account.get('nickname',item['account_id']),'type':item['listing_type_id'],'original':price,'last':price,'initialized':False,'last_action':now,'status':'Novo anúncio; aguardando validação'}
-                    target, sold, last_sale = self.sales(payload, rule['sku'], now, sales_store) if not rule.get('restoring') else (None,0,0)
+                    sales_error = ''
+                    try:
+                        target, sold, last_sale = self.sales(payload, rule['sku'], now, sales_store) if not rule.get('restoring') else (None,0,0)
+                    except Exception as exc:
+                        sales_error = str(exc)
+                        target, sold, last_sale = None, 0, rule.get('last_sale', 0)
+                    rule.update(sales_error=sales_error, checked_at=self.a.now_label())
+                    if sales_error:
+                        self.event(rule, None, 'blocked', sales_error)
                     last_sale = max(last_sale, rule.get('last_sale',0))
                     rule['last_sale'] = last_sale
                     # Goals and calendar boundaries never reset the pricing flow.
@@ -220,6 +261,7 @@ class GoalPricing:
                         if budget <= 0 or time.monotonic() > deadline: break
                         if tracking.get('blocked') and not rule.get('restoring'): continue
                         if tracking.get('retry_after',0) > now: continue
+                        if sales_error and tracking.get('initialized') and tracking.get('pending') is None and not rule.get('restoring'): continue
                         desired = tracking['original'] if restore else None
                         if restore and tracking.get('pending') is None and abs(tracking['last']-tracking['original']) < .009 and (not rule.get('restoring') or tracking.get('restore_done')): continue
                         if not restore and tracking.get('pending') is None and tracking.get('initialized') and now < max(tracking['last_action']+rule['interval_hours']*3600,last_sale+rule['sale_pause_hours']*3600): continue
@@ -331,13 +373,51 @@ class GoalPricing:
                         rule.update(enabled=False,restoring=False)
                     if not restore and any(i.get('blocked') or i.get('retry_after',0)>now for i in rule['items'].values()):
                         rule['status']='Há anúncios aguardando conferência. Consulte o acompanhamento.'
+                    if sales_error:
+                        rule['status'] = sales_error
+                    elif not restore:
+                        if any(not i.get('initialized') for i in rule['items'].values()):
+                            rule['status'] = 'Confirmando preços originais; anúncios pendentes na fila'
+                        elif any(i.get('pending') is not None for i in rule['items'].values()):
+                            rule['status'] = 'Conferindo alterações enviadas; retentativa automática'
+                        elif any(i.get('blocked') for i in rule['items'].values()):
+                            rule['status'] = 'Alteração externa detectada; confira os anúncios bloqueados'
+                        elif any(i.get('retry_after',0)>now for i in rule['items'].values()):
+                            rule['status'] = 'Falha temporária; retentativa automática programada'
+                        elif any((item_due(rule,i) or 0)<=now for i in rule['items'].values()):
+                            rule['status'] = 'Janela atingida; aguardando atendimento na fila'
+
                 except Exception as exc:
                     rule['status']=str(exc)
                     self.event(rule,None,'blocked',str(exc))
             self.a.write_json(FILE,store)
             if payload_changed: self.a.write_payload(payload)
+            if now - self.last_heartbeat >= 300:
+                self.last_heartbeat = now
+                enabled = [r for r in store['rules'].values() if r.get('enabled')]
+                tracked = [i for r in enabled for i in r.get('items', {}).values()]
+                print('Metas automáticas: ciclo concluído;', len(enabled), 'regras;',
+                      sum(bool(i.get('initialized')) for i in tracked), '/', len(tracked), 'originais confirmados;',
+                      sum(i.get('pending') is not None for i in tracked), 'confirmações pendentes;',
+                      sum(bool(i.get('blocked')) for i in tracked), 'bloqueios externos;',
+                      sum(bool(r.get('sales_error')) for r in enabled), 'regras aguardando vendas', flush=True)
+
+
+    def refresh_sales_loop(self):
+        self.a.MELI_WORK_CONTEXT.priority = 'background'
+        while True:
+            delay = 60
+            try:
+                if any(r.get('enabled') and not r.get('restoring') for r in self.read()['rules'].values()):
+                    result = self.a.reconcile_month_sales({'month':self.a.current_month_period()})
+                    delay = 60 if any(r.get('status') == 'error' for r in (result or {}).get('results', [])) else 300
+            except Exception as exc:
+                print('Conferência de vendas das metas:', str(exc), flush=True)
+            time.sleep(delay)
 
     def loop(self):
+        self.independent_refresh = True
+        threading.Thread(target=self.refresh_sales_loop, name='goal-pricing-sales', daemon=True).start()
         self.a.MELI_WORK_CONTEXT.priority = 'background'
         while True:
             try: self.tick()

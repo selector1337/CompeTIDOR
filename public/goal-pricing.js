@@ -22,8 +22,8 @@
   }
   function summary(r) {
     if(!r)return '';
-    const next=r.next_change_at ? retryDate(r.next_change_at) : 'Sem previsão';
-    return `<div class="goal-rule-summary"><span>${esc(r.status || 'Aguardando processamento')}</span><span>Próxima janela: <b>${esc(next)}</b></span><span>${r.confirmed_changes || 0} reduções confirmadas por anúncio · ${r.reduction_percent==null?'Redução ainda não confirmada':esc(r.reduction_percent)+'% de redução média ponderada'}</span><small>${r.initialized_count||0}/${r.item_count||0} preços originais confirmados. Horários sujeitos a vendas, fila e limites.</small></div>`;
+    const next=r.due_count ? 'Janela atingida · na fila de conferência' : r.next_change_at ? retryDate(r.next_change_at) : 'Sem previsão';
+    return `<div class="goal-rule-summary"><span>${esc(r.status || 'Aguardando processamento')}</span><span>Próxima janela: <b>${esc(next)}</b></span><span>${r.pending_count||0} confirmações pendentes · ${r.retry_count||0} retentativas · ${r.blocked_count||0} bloqueios para revisão</span><span>${r.confirmed_changes || 0} reduções confirmadas por anúncio · ${r.reduction_percent==null?'Redução ainda não confirmada':esc(r.reduction_percent)+'% de redução média ponderada'}</span><small>${r.initialized_count||0}/${r.item_count||0} preços originais confirmados. Horários sujeitos a vendas, fila e limites.</small></div>`;
   }
   function simulation(form) {
     const row=commercialRows.find(r=>r.sku.toUpperCase()===sku.toUpperCase());
