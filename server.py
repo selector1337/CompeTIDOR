@@ -7324,9 +7324,9 @@ def sku_commercial_index(payload, items=None):
                 bool(item.get("catalog_listing")), str(item.get("account_id") or item.get("account") or ""), str(item.get("id") or ""))
         key = (sku, kind)
         if key not in selected or rank < selected[key][0]:
-            selected[key] = (rank, item, values, margin, reason)
+            selected[key] = (rank, item, values, margin, reason, missing)
     result = {}
-    for (sku, kind), (_, item, values, margin, reason) in selected.items():
+    for (sku, kind), (_, item, values, margin, reason, missing) in selected.items():
         result.setdefault(sku, {}).update({
             "sku_cost": values.get("cost_amount"),
             kind + "_price": item.get("price"),
