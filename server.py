@@ -11644,7 +11644,13 @@ def reconcile_month_sales(request):
     if not any(a.get("official") and a.get("status") == "connected" for a in payload.get("accounts", [])):
         raise RuntimeError("Nenhuma conta oficial conectada para conferir as vendas.")
     results, seen = [], set()
-    for account in payload.get("accounts", []):
+    goals = read_json(SALES_GOALS_FILE, {"months": {}})
+    records = goals.get("months", {}).get(period, {}).get("accounts", {})
+    # Start with the oldest sales snapshot instead of always refreshing the
+    # first account while accounts at the end keep blocking price rules.
+    accounts = sorted(payload.get("accounts", []), key=lambda a: int(
+        records.get(str(a.get("seller_id") or a.get("id")), {}).get("updated_at_ns") or 0))
+    for account in accounts:
         seller = str(account.get("seller_id") or "")
         if not account.get("official") or account.get("status") != "connected" or seller in seen:
             continue

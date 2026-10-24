@@ -284,12 +284,11 @@ class GoalPricing:
                     rule['status'] = 'Restaurando preços originais' if restore else 'Aguardando intervalo sem vendas'
                     for identity, tracking in sorted(rule['items'].items(), key=lambda pair: pair[1].get('checked_at', 0)):
                         if budget <= 0 or time.monotonic() > deadline: break
-                        if tracking.get('blocked') and not rule.get('restoring'): continue
                         if tracking.get('retry_after',0) > now: continue
-                        if sales_error and tracking.get('initialized') and tracking.get('pending') is None and not rule.get('restoring'): continue
+                        if sales_error and tracking.get('initialized') and tracking.get('pending') is None and not tracking.get('blocked') and not rule.get('restoring'): continue
                         desired = tracking['original'] if restore else None
                         if restore and tracking.get('pending') is None and abs(tracking['last']-tracking['original']) < .009 and (not rule.get('restoring') or tracking.get('restore_done')): continue
-                        if not restore and tracking.get('pending') is None and tracking.get('initialized') and now < max(tracking['last_action']+rule['interval_hours']*3600,last_sale+rule['sale_pause_hours']*3600): continue
+                        if not restore and not tracking.get('blocked') and tracking.get('pending') is None and tracking.get('initialized') and now < max(tracking['last_action']+rule['interval_hours']*3600,last_sale+rule['sale_pause_hours']*3600): continue
                         budget -= 1
                         tracking['checked_at'] = now
                         try:
@@ -302,6 +301,16 @@ class GoalPricing:
                             price = self.a.response_item_price(live)
                             if price is None or not math.isfinite(price) or price <= 0: raise RuntimeError('Preço atual não confirmado pelo Mercado Livre.')
                             tracking.update(observed_price=price, observed_at=self.a.now_label())
+                            if tracking.get('blocked') and not restore:
+                                expected = [tracking['last']]
+                                if tracking.get('pending') is not None: expected.append(tracking['pending'])
+                                if not any(abs(price-value) < .009 for value in expected):
+                                    tracking.update(retry_after=now+300, status='Divergência de preço persiste; nova conferência automática em 5 minutos')
+                                    self.event(rule,identity,'blocked',tracking['status'],tracking['last'],price)
+                                    continue
+                                tracking.update(blocked=False,retry_after=0,status='Preço esperado confirmado; bloqueio removido automaticamente')
+                                self.event(rule,identity,'waiting',tracking['status'],price,price)
+                                if sales_error and tracking.get('pending') is None: continue
                             if tracking.get('pending') is not None:
                                 pending = tracking['pending']
                                 if abs(price-pending) < .009:
@@ -319,7 +328,7 @@ class GoalPricing:
                                     self.event(rule,identity,'error',tracking['status'],price,pending)
                                 elif rule.get('restoring'): tracking.update(last=price,pending=None,blocked=False)
                                 else:
-                                    tracking.update(blocked=True,status='Preço alterado externamente; intervenção necessária')
+                                    tracking.update(blocked=True,retry_after=now+300,status='Preço divergente do esperado; nova conferência automática em 5 minutos')
                                     self.event(rule,identity,'blocked',tracking['status'],price,pending)
                                 self.commit_rule(store, sku)
                                 continue
@@ -335,7 +344,7 @@ class GoalPricing:
                                 if rule.get('restoring'):
                                     tracking.update(last=price,blocked=False)
                                 else:
-                                    tracking.update(blocked=True,status='Preço alterado fora da regra; pausado para evitar sobrescrita')
+                                    tracking.update(blocked=True,retry_after=now+300,status='Preço divergente do esperado; nova conferência automática em 5 minutos')
                                     self.event(rule,identity,'blocked',tracking['status'],tracking['last'],price)
                                     continue
                             if not restore and live.get('status') not in {'active','paused'}:
@@ -406,7 +415,7 @@ class GoalPricing:
                         elif any(i.get('pending') is not None for i in rule['items'].values()):
                             rule['status'] = 'Conferindo alterações enviadas; retentativa automática'
                         elif any(i.get('blocked') for i in rule['items'].values()):
-                            rule['status'] = 'Alteração externa detectada; confira os anúncios bloqueados'
+                            rule['status'] = 'Preço divergente do esperado; conferência automática programada'
                         elif any(i.get('retry_after',0)>now for i in rule['items'].values()):
                             rule['status'] = 'Falha temporária; retentativa automática programada'
                         elif any((item_due(rule,i) or 0)<=now for i in rule['items'].values()):
@@ -443,6 +452,9 @@ class GoalPricing:
             try:
                 if any(r.get('enabled') and not r.get('restoring') for r in self.read()['rules'].values()):
                     result = self.a.reconcile_month_sales({'month':self.a.current_month_period()})
+                    for row in (result or {}).get('results', []):
+                        if row.get('status') == 'error':
+                            print('Conferência de vendas das metas:', row.get('account'), row.get('error'), 'Nova tentativa após 60 segundos.', flush=True)
                     delay = 60 if any(r.get('status') == 'error' for r in (result or {}).get('results', [])) else 300
             except Exception as exc:
                 print('Conferência de vendas das metas:', str(exc), flush=True)
