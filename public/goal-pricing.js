@@ -115,6 +115,7 @@
     if((body.enabled || body.action==='resume') && !confirm(`Ativar reduções para ${sku} em TODAS as contas e nas duas modalidades?`))return;
     if(body.action==='restore' && !confirm('Restaurar os preços originais registrados, inclusive se houve alteração manual, e desativar a regra?'))return;
     busy=true;
+    dialog.querySelector('#goal-rule-feedback').textContent='Salvando solicitação… Se houver uma alteração deste SKU em andamento, aguardaremos sua conferência.';
     const buttons=Array.from(dialog.querySelectorAll('button'),b=>[b,b.disabled]);
     buttons.forEach(([b])=>b.disabled=true);
     try { await request('save',{...body,sku});await loadDetail();window.salesGoalsPage?.pricingChanged(sku,Boolean(rules.find(r=>r.sku.toUpperCase()===sku.toUpperCase())?.enabled));draw();dialog.querySelector('#goal-rule-feedback').textContent='Solicitação salva. O processamento ocorre em segundo plano.'; }

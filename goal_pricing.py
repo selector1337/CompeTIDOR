@@ -61,12 +61,28 @@ class GoalPricing:
     def __init__(self, app):
         self.a = app
         self.lock = threading.RLock()
+        self.worker_lock = threading.RLock()
+        self.rule_locks = {}
         self.last_refresh = 0
         self.independent_refresh = False
         self.last_heartbeat = 0
 
     def read(self):
         return self.a.read_json(FILE, {'rules': {}})
+
+    def rule_lock(self, sku):
+        with self.lock:
+            return self.rule_locks.setdefault(sku, threading.RLock())
+
+    def commit_rule(self, store, sku=None):
+        # The worker snapshot may predate a user save for another SKU. Merge only
+        # the rule whose lock we own; never replace the whole stale snapshot.
+        with self.lock:
+            latest = self.read()
+            if sku is not None:
+                latest['rules'][sku] = copy.deepcopy(store['rules'][sku])
+            latest['cursor'] = store.get('cursor', 0)
+            self.a.write_json(FILE, latest)
 
     def listing(self, sku=None):
         rules = self.read()['rules']
@@ -111,10 +127,13 @@ class GoalPricing:
         return any(r.get('enabled') and item_id in r.get('items', {}) for r in self.read()['rules'].values())
 
     def save(self, req, actor):
-        if not self.lock.acquire(timeout=0.1):
-            raise RuntimeError("Uma verificação de preços está em andamento. Tente novamente em instantes.")
-        try: return self._save(req, actor)
-        finally: self.lock.release()
+        if not self.a.can_manage_users(actor) or actor.get('status') not in {'ativo','active'}:
+            raise RuntimeError('Somente Master e Administradores podem configurar preços automáticos.')
+        sku = self.a.normalized_sku_key(req.get('sku'))
+        # Serialize edits of this SKU with its in-flight price confirmation,
+        # without holding the shared storage lock while waiting for the API.
+        with self.rule_lock(sku):
+            return self._save(req, actor)
 
     def _save(self, req, actor):
         if not self.a.can_manage_users(actor) or actor.get('status') not in {'ativo','active'}:
@@ -212,7 +231,7 @@ class GoalPricing:
             except Exception as exc:
                 self.last_refresh = now - 540
                 print('Conferência de vendas das metas:', str(exc), flush=True)
-        with bounded_locks(self.a.PRICE_SCHEDULE_LOCK, self.lock):
+        with bounded_locks(self.a.PRICE_SCHEDULE_LOCK, self.worker_lock):
             store = self.read()
             payload = self.a.read_payload()
             catalog = {i['id']:i for i in payload.get('catalog',[]) if i.get('id')}
@@ -229,10 +248,16 @@ class GoalPricing:
             for rule_index in list(range(cursor, len(rule_keys))) + list(range(cursor)):
                 if budget <= 0 or time.monotonic() > deadline:
                     break
-                rule = store['rules'][rule_keys[rule_index]]
                 store['cursor'] = (rule_index + 1) % max(1, len(rule_keys))
-                if not rule.get('enabled'): continue
+                sku = rule_keys[rule_index]
+                rule_lock = self.rule_lock(sku)
+                if not rule_lock.acquire(blocking=False): continue
+                # A pause/edit can have arrived since the cycle snapshot.
+                rule = None
                 try:
+                    rule = self.read()['rules'].get(sku)
+                    if rule is None or not rule.get('enabled'): continue
+                    store['rules'][sku] = rule
                     # Include new matching listings/accounts without changing existing baselines.
                     if not rule.get('restoring'):
                         for item in by_sku.get(rule['sku'], []):
@@ -296,7 +321,7 @@ class GoalPricing:
                                 else:
                                     tracking.update(blocked=True,status='Preço alterado externamente; intervenção necessária')
                                     self.event(rule,identity,'blocked',tracking['status'],price,pending)
-                                self.a.write_json(FILE,store)
+                                self.commit_rule(store, sku)
                                 continue
                             if rule.get('restoring') and abs(price-tracking['original']) < .009:
                                 tracking.update(last=price,restore_done=True,blocked=False,retry_after=0,status='Original confirmado')
@@ -304,7 +329,7 @@ class GoalPricing:
                                 continue
                             if not tracking.get('initialized'):
                                 tracking.update(original=price,last=price,initialized=True,status='Preço original registrado; aguardando intervalo')
-                                self.a.write_json(FILE,store)
+                                self.commit_rule(store, sku)
                                 continue
                             if abs(price-tracking['last']) > .009:
                                 if rule.get('restoring'):
@@ -350,7 +375,7 @@ class GoalPricing:
                             tracking['price_attempts']=tracking.get('price_attempts',0)+1
                             tracking['retry_after']=0
                             self.event(rule,identity,'pending','Envio preparado; aguardando confirmação do Mercado Livre',price,desired)
-                            self.a.write_json(FILE,store)  # durable intent BEFORE remote mutation
+                            self.commit_rule(store, sku)  # durable intent BEFORE remote mutation
                             response=client.put('/items/'+identity,{'price':desired},retries=1,timeout=12)
                             confirmed=self.a.response_item_price(response)
                             if confirmed is None or not math.isfinite(confirmed) or abs(confirmed-desired)>.009:
@@ -359,7 +384,7 @@ class GoalPricing:
                             tracking.update(last=confirmed,pending=None,last_action=now,retry_after=0,restore_done=bool(restore),status='Original restaurado' if restore else 'Preço reduzido')
                             tracking.update(observed_price=confirmed, observed_at=self.a.now_label())
                             self.event(rule,identity,'success',tracking['status'],price,confirmed)
-                            self.a.write_json(FILE,store)
+                            self.commit_rule(store, sku)
                             item.update(price=confirmed,price_source='goal_rule',sale_fee_status='pending',sale_fee_basis='',sale_fee_updated_at='',item_data_checked_at=self.a.now_label())
                             self.a.append_item_log(payload,item,{'name':'Metas de venda'},tracking['status'],{'price':{'from':price,'to':confirmed}})
                             payload_changed = True
@@ -388,9 +413,17 @@ class GoalPricing:
                             rule['status'] = 'Janela atingida; aguardando atendimento na fila'
 
                 except Exception as exc:
+                    if rule is None: raise
                     rule['status']=str(exc)
                     self.event(rule,None,'blocked',str(exc))
-            self.a.write_json(FILE,store)
+                finally:
+                    try:
+                        if rule is not None and rule.get('enabled') is not None:
+                            store['rules'][sku] = rule
+                            self.commit_rule(store, sku)
+                    finally:
+                        rule_lock.release()
+            self.commit_rule(store)
             if payload_changed: self.a.write_payload(payload)
             if now - self.last_heartbeat >= 300:
                 self.last_heartbeat = now
