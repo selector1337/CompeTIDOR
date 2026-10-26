@@ -4,10 +4,18 @@ import copy
 import math
 import threading
 import time
+import uuid
 from urllib.parse import urlencode
 
 FILE = 'goal_pricing.json'
 HISTORY_LIMIT = 1000
+SCOPES = {'both': {'gold_special', 'gold_pro'}, 'classic': {'gold_special'}, 'premium': {'gold_pro'}}
+
+def rule_types(rule):
+    return set(rule.get('types') or SCOPES['both'])
+
+def rule_scope(rule):
+    return next((key for key, types in SCOPES.items() if types == rule_types(rule)), 'both')
 
 @contextmanager
 def bounded_locks(*locks):
@@ -47,7 +55,7 @@ def rule_summary(rule):
         if event.get('outcome') == 'success' and event.get('from') is not None and event.get('to') is not None and event['to'] < event['from']:
             identity = event.get('item_id')
             historical[identity] = historical.get(identity, 0) + 1
-    return {**{k:rule.get(k) for k in ('sku','enabled','status')},
+    return {**{k:rule.get(k) for k in ('sku','enabled','status')}, 'listing_scope':rule_scope(rule),
             'next_change_at': max(now, min(due)) if due and rule.get('enabled') else None,
             'due_count':sum(value <= now for value in due), 'pending_count':pending_count,
             'blocked_count':blocked_count, 'retry_count':retry_count,
@@ -87,10 +95,17 @@ class GoalPricing:
     def listing(self, sku=None):
         rules = self.read()['rules']
         if sku:
-            rule = rules.get(self.a.normalized_sku_key(sku))
-            return {'rules': [rule] if rule else []}
+            return {'rules': [{**r, 'rule_id':key, 'listing_scope':rule_scope(r)} for key,r in rules.items()
+                              if r.get('sku') == self.a.normalized_sku_key(sku)]}
         # The goals list only needs badges; fetch detailed logs on demand.
-        return {'rules': [rule_summary(r) for r in rules.values()]}
+        return {'rules': [{**rule_summary(r),'rule_id':key} for key,r in rules.items()]}
+
+    def check_overlap(self, store, sku, key, types):
+        for other_key, other in store['rules'].items():
+            if other_key != key and other.get('sku') == sku and (
+                other.get('enabled') or any(i.get('pending') is not None for i in other.get('items',{}).values())
+            ) and rule_types(other) & types:
+                raise RuntimeError('Já existe uma regra ativa ou com confirmação pendente para esta modalidade. Pause a regra sobreposta antes de ativar outra.')
 
     def event(self, rule, identity, outcome, message, before=None, target=None):
         """Persist with the surrounding state commit; never call an uncertain write success."""
@@ -147,11 +162,17 @@ class GoalPricing:
             return value
         with self.lock:
             store = self.read()
-            previous = store['rules'].get(sku)
+            key = str(req.get('rule_id') or sku)
+            if req.get('new_rule'):
+                key = sku if sku not in store['rules'] else 'rule-' + uuid.uuid4().hex
+            previous = store['rules'].get(key)
+            if req.get('rule_id') and (not previous or previous.get('sku') != sku):
+                raise RuntimeError('Regra não encontrada para este SKU.')
             action = req.get('action', 'save')
             if action not in {'save','pause','restore','resume'}: raise RuntimeError('Ação inválida.')
             if action in {'pause', 'restore', 'resume'}:
                 if not previous: raise RuntimeError('Regra não encontrada.')
+                if action != 'pause': self.check_overlap(store,sku,key,rule_types(previous))
                 previous.update(enabled=action != 'pause', restoring=action == 'restore', status='Restauração solicitada' if action == 'restore' else 'Ativa' if action == 'resume' else 'Pausada; preços atuais mantidos')
                 if action == 'restore':
                     for item in previous['items'].values(): item.update(restore_done=False,retry_after=0)
@@ -160,13 +181,16 @@ class GoalPricing:
                 previous['updated_by']=actor.get('name') or actor.get('id')
                 previous['updated_at']=self.a.now_label()
                 self.a.write_json(FILE, store)
-                return previous
+                return {**previous, 'rule_id':key, 'listing_scope':rule_scope(previous)}
             if previous and (previous.get('enabled') or any(i.get('pending') is not None or i.get('last') != i.get('original') for i in previous.get('items', {}).values())):
                 raise RuntimeError('Restaure os preços da regra anterior antes de alterar sua configuração.')
             payload = self.a.read_payload()
             targets = self.a.sales_goal_targets(self.a.read_json(self.a.SALES_GOALS_FILE, {'months':{}}))
             if not targets.get(sku): raise RuntimeError('Cadastre uma meta para este SKU primeiro.')
-            types = {'gold_special','gold_pro'}
+            scope = req.get('listing_scope', rule_scope(previous or {}))
+            if scope not in SCOPES: raise RuntimeError('Selecione Clássico, Premium ou ambos.')
+            types = SCOPES[scope]
+            if req.get('enabled') is True: self.check_overlap(store,sku,key,types)
             allowed = {a['id'] for a in payload.get('accounts',[]) if a.get('official') and a.get('status') == 'connected'}
             accounts = allowed
             if not accounts:
@@ -193,9 +217,9 @@ class GoalPricing:
                         interval_hours=interval, sale_pause_hours=cooldown, floor_price=floor, floor_margin=margin,
                         enabled=req.get('enabled') is True, restoring=False, items=items, period=self.a.current_month_period(),
                         created_at=self.a.now_label(), updated_by=actor.get('name') or actor.get('id'), status='Ativa' if req.get('enabled') is True else 'Desativada', history=copy.deepcopy((previous or {}).get('history', []))[-HISTORY_LIMIT:])
-            store['rules'][sku] = rule
+            store['rules'][key] = rule
             self.a.write_json(FILE, store)
-            return copy.deepcopy(rule)
+            return {**copy.deepcopy(rule), 'rule_id':key, 'listing_scope':scope}
 
     def sales(self, payload, sku, now, store=None):
         if store is None: store = self.a.read_json(self.a.SALES_GOALS_FILE, {'months':{}})
@@ -250,7 +274,7 @@ class GoalPricing:
                     break
                 store['cursor'] = (rule_index + 1) % max(1, len(rule_keys))
                 sku = rule_keys[rule_index]
-                rule_lock = self.rule_lock(sku)
+                rule_lock = self.rule_lock(store['rules'][sku]['sku'])
                 if not rule_lock.acquire(blocking=False): continue
                 # A pause/edit can have arrived since the cycle snapshot.
                 rule = None
@@ -262,7 +286,7 @@ class GoalPricing:
                     if not rule.get('restoring'):
                         for item in by_sku.get(rule['sku'], []):
                             account = accounts.get(item.get('account_id'),{})
-                            if self.a.normalized_sku_key(item.get('sku')) == rule['sku'] and account.get('official') and account.get('status') == 'connected' and item.get('listing_type_id') in {'gold_special','gold_pro'} and self.a.normalized_meli_status(item.get('meli_status')) in {'active','paused'} and item['id'] not in rule['items']:
+                            if self.a.normalized_sku_key(item.get('sku')) == rule['sku'] and account.get('official') and account.get('status') == 'connected' and item.get('listing_type_id') in rule_types(rule) and self.a.normalized_meli_status(item.get('meli_status')) in {'active','paused'} and item['id'] not in rule['items']:
                                 price=float(item.get('price') or 0)
                                 if price > 0:
                                     rule['items'][item['id']]={'account_id':item['account_id'],'account_name':account.get('nickname',item['account_id']),'type':item['listing_type_id'],'original':price,'last':price,'initialized':False,'last_action':now,'status':'Novo anúncio; aguardando validação'}

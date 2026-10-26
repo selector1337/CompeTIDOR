@@ -7524,6 +7524,7 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
       button.dataset.pauseAd ? "Pausando..." : button.dataset.activateAd ? "Ativando..." : "Salvando...",
     );
     mergeCatalogItem(result?.item);
+    (result?.updated_items || []).forEach(mergeCatalogItem);
     if (button.dataset.pauseAd) showToast("Anúncio pausado com sucesso.");
     else if (button.dataset.activateAd) showToast("Anúncio ativado com sucesso.");
     else {

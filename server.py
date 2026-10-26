@@ -11519,7 +11519,8 @@ def query_sales_goals(payload, request):
     commercial = sku_commercial_index(payload, commercial_items)
     pricing_rules = (read_json("goal_pricing.json", {"rules": {}}).get("rules") or {})
     for sku, row in sorted(rows.items()):
-        row["automatic_pricing_active"] = bool((pricing_rules.get(sku) or {}).get("enabled"))
+        sku_rules = [(key, rule) for key, rule in pricing_rules.items() if rule.get('sku',key) == sku]
+        row["automatic_pricing_active"] = any(rule.get('enabled') for key,rule in sku_rules)
         if request.get("automatic_pricing") == "active" and not row["automatic_pricing_active"]:
             continue
         if request.get("automatic_pricing") == "inactive" and row["automatic_pricing_active"]:
@@ -11530,7 +11531,11 @@ def query_sales_goals(payload, request):
         row["stock_reference"] = " / ".join(str(base.get(k) or "") for k in ("account", "id"))
         row["listing_status"] = "active" if "active" in row["statuses"] else "paused" if "paused" in row["statuses"] else "unavailable"
         from goal_pricing import rule_summary
-        row["pricing_summary"] = rule_summary(pricing_rules[sku]) if sku in pricing_rules else None
+        summaries = [{**rule_summary(rule), 'rule_id':key} for key,rule in sku_rules]
+        row["pricing_summaries"] = summaries
+        row["pricing_summary"] = summaries[0] if len(summaries) == 1 else {
+            'sku':sku, 'enabled':row['automatic_pricing_active'], 'rules':summaries
+        } if summaries else None
         target = targets.get(sku)
         row.update(target=target, remaining=max(0, (target or 0) - row["sold"]),
                    progress=round(row["sold"] / target * 100, 1) if target else 0)
@@ -12963,6 +12968,7 @@ def update_item_operation(request, actor=None):
             new_gtin = ", ".join(expected_gtin_codes)
             changes["gtin"] = {"from": item.get("gtin") or "", "to": new_gtin}
             item["gtin"] = new_gtin
+            item.update(gtin_status="ok", gtin_error="", gtin_updated_at=now_label())
         if update.get("status") == "paused":
             changes["status"] = {"from": item.get("meli_status"), "to": "paused"}
             item["status"] = "paused"
@@ -12986,7 +12992,7 @@ def update_item_operation(request, actor=None):
             row for row in payload.get("catalog", [])
             if row.get("id") != item_id
             and str(row.get("sku") or "").strip().upper() == source_sku
-            and row.get("official_source")
+            and any(a.get("official") and str(a.get("id")) == str(row.get("account_id")) for a in payload.get("accounts", []))
         ]
         total_siblings = len(siblings)
         for index, sibling in enumerate(siblings, 1):
@@ -13060,6 +13066,7 @@ def update_item_operation(request, actor=None):
                     new_gtin = ", ".join(sibling_expected_gtin)
                     changes["gtin"] = {"from": sibling.get("gtin") or "", "to": new_gtin}
                     sibling["gtin"] = new_gtin
+                    sibling.update(gtin_status="ok", gtin_error="", gtin_updated_at=now_label())
                 sibling["updated_at"] = now_label()
                 apply_item_net_values(sibling)
                 changed_labels = []
@@ -13102,6 +13109,8 @@ def update_item_operation(request, actor=None):
         "official": official,
         "item": updated_item,
         "propagated_sku_updates": propagated_sku_updates,
+        "updated_items": [row for row in payload.get("catalog", []) if row.get("id") in
+                          {r["item_id"] for r in propagated_sku_updates if r.get("status") == "updated"}],
         "propagated_dimensions": propagated_sku_updates,
         "propagated_label": ", ".join(propagated_labels[:-1]) + (
             f" e {propagated_labels[-1]}" if len(propagated_labels) > 1 else (propagated_labels[0] if propagated_labels else "")

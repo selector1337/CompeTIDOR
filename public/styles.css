@@ -11073,3 +11073,4 @@ textarea:focus {
   #dashboard-metrics .reputation-metric > span {min-height:0;}
 }
 #goals-prev,#goals-next {appearance:none;-webkit-appearance:none;}
+.goal-rule-picker {margin:16px 0;padding:14px;background:var(--panel);border:1px solid var(--line);border-radius:10px;}.goal-rule-picker label {display:grid;gap:8px;font-size:12px;font-weight:600;}.goal-rule-picker select {width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);}
