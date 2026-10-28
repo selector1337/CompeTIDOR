@@ -11074,3 +11074,6 @@ textarea:focus {
 }
 #goals-prev,#goals-next {appearance:none;-webkit-appearance:none;}
 .goal-rule-picker {margin:16px 0;padding:14px;background:var(--panel);border:1px solid var(--line);border-radius:10px;}.goal-rule-picker label {display:grid;gap:8px;font-size:12px;font-weight:600;}.goal-rule-picker select {width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);}
+.kit-manual-option { display: flex; align-items: flex-start; gap: 10px; padding: 14px; margin: 12px 0; border: 1px solid var(--border); border-radius: 10px; }
+.kit-manual-option input { width: auto; flex: 0 0 auto; margin-top: 3px; accent-color: #ffe000; }
+.kit-manual-option small { display: block; margin-top: 6px; font-weight: normal; line-height: 1.5; }

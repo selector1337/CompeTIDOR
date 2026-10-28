@@ -2422,8 +2422,9 @@ const adsOfficialStoreLabels = new Map();
 function adsOfficialStore(item) {
   const id=item.official_store_id;
   const account=String(item.account_id || item.account || '');
+  const owner=(state.data.accounts || []).find(row => [row.id, row.seller_id, row.nickname].some(value => value != null && String(value) === account));
   const key=id==null || id==='' ? 'none' : JSON.stringify([account,String(id)]);
-  const label=key==='none' ? 'Loja oficial não informada' : adsOfficialStoreLabels.get(key) || item.official_store_name || `Loja oficial #${id}`;
+  const label=key==='none' ? 'Loja oficial não informada' : owner?.official_store_names?.[id] || item.official_store_name || adsOfficialStoreLabels.get(key) || `Loja oficial #${id}`;
   return {key,label};
 }
 function renderAdsOfficialStoreOptions() {
@@ -5780,6 +5781,7 @@ function renderKits() {
       <div>
         <strong>${escapeText(item.title)}</strong>
         <small>SKU ${escapeText(item.sku || "-")} · ${money.format(item.price || 0)} · estoque ${Number(item.stock || 0)}</small>
+        <small>Loja oficial: ${escapeText(adsOfficialStore(item).label)}</small>
         <span class="kit-mode-badge ${isCatalogListing(item) ? "catalog" : "traditional"}">${isCatalogListing(item) ? "Catálogo" : "Tradicional"}</span>
       </div>
       <button class="icon-button" type="button" data-kit-add="${escapeAttr(item.id)}" title="${selectedIds.has(item.id) ? "Já selecionado" : "Adicionar ao kit"}" ${selectedIds.has(item.id) ? "disabled" : ""}>+</button>
@@ -5790,7 +5792,7 @@ function renderKits() {
     return `<article class="kit-component">
       <span class="kit-order">${index + 1}</span>
       ${item.thumbnail ? `<img src="${escapeAttr(item.thumbnail)}" alt="" />` : `<span class="copy-thumb copy-thumb-empty"></span>`}
-      <div><strong>${escapeText(item.title || row.item_id)}</strong><small>SKU ${escapeText(item.sku || "-")}</small></div>
+      <div><strong>${escapeText(item.title || row.item_id)}</strong><small>SKU ${escapeText(item.sku || "-")}</small><small>Loja oficial: ${escapeText(adsOfficialStore(item).label)}</small></div>
       <label>Qtd. <input type="number" min="1" max="999" value="${row.quantity}" data-kit-quantity="${escapeAttr(row.item_id)}" /></label>
       <button class="icon-button danger-button" type="button" data-kit-remove="${escapeAttr(row.item_id)}" title="Remover">×</button>
     </article>`;
@@ -5845,15 +5847,17 @@ function applyKitPreview(preview) {
   state.kitPendingFields = [];
   state.kitPictures = (preview.pictures || []).map((picture) => ({ ...picture, preview: picture.source }));
   const form = document.querySelector("#kit-form");
+  const manualFields = document.querySelector("#kit-manual-fields")?.checked;
   form.hidden = false;
   renderKitPendingFields();
   for (const name of ["title", "sku", "gtin", "price", "stock", "listing_type_id"]) {
+    if (manualFields && ["title", "sku"].includes(name)) continue;
     if (form.elements[name]) form.elements[name].value = preview[name] ?? "";
   }
   for (const name of ["package_weight", "package_height", "package_width", "package_length"]) {
     form.elements[name].value = measureInputValue(preview[name]);
   }
-  form.elements.description.value = preview.description || "";
+  if (!manualFields) form.elements.description.value = preview.description || "";
   const officialStoreField = document.querySelector("#kit-official-store-field");
   const officialStoreSelect = form.elements.official_store_id;
   const stores = preview.official_store_options || [];
@@ -5963,6 +5967,7 @@ function renderCopyItems() {
                   <span>${listingTypeLabel(item.listing_type_id)}</span>
                   <span>${money.format(item.price || 0)}</span>
                   <span>Estoque ${Number(item.stock || 0)}</span>
+                  <span>Loja oficial: ${escapeText(adsOfficialStore(item).label)}</span>
                 </span>
               </span>
             </label>
