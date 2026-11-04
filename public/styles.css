@@ -11077,3 +11077,23 @@ textarea:focus {
 .kit-manual-option { display: flex; align-items: flex-start; gap: 10px; padding: 14px; margin: 12px 0; border: 1px solid var(--border); border-radius: 10px; }
 .kit-manual-option input { width: auto; flex: 0 0 auto; margin-top: 3px; accent-color: #ffe000; }
 .kit-manual-option small { display: block; margin-top: 6px; font-weight: normal; line-height: 1.5; }
+
+/* November dashboard, pricing and authentication improvements */
+.goal-original-price { color: var(--muted); font-size: .85em; margin-right: 10px; font-weight: 400; text-decoration-thickness: 1px; }
+.goal-calendar { border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: grid; gap: 12px; margin: 18px 0; }
+.goal-calendar > div { display:flex; flex-wrap:wrap; gap:12px; }
+.goal-calendar > div label {display:flex;align-items:center;gap:5px;}
+.goal-calendar input[type=checkbox] {width:auto;}
+.dashboard-account-choice {display:flex;align-items:center;gap:12px;margin:12px 0;}
+.publisher-picture[draggable] {cursor:grab;}
+.publisher-picture:has(input:not(:checked)) {opacity:.45;}
+.login-screen {background:radial-gradient(ellipse at 20% 10%,#263a38 0,transparent 55%),#0d1319;gap:32px;}
+.login-screen::before {opacity:.15;}
+.login-card {background:#18212a;border:1px solid #34424d;border-radius:24px;padding:36px;box-shadow:0 24px 80px #0005;color:#edf2f7;}
+.login-card header small {color:#ffe000;font-size:11px;letter-spacing:1.5px;}
+.login-card h1 {font-size:26px;margin:10px 0;}
+.login-card header p {color:#aebbc8;margin:0 0 24px;}
+.login-card .primary {border-radius:12px;min-height:48px;background:#ffe000;color:#151a20;border:0;appearance:none;}
+.login-brand {justify-self:center;width:180px;min-height:0;padding:12px;background:#fff;border-radius:20px;box-shadow:0 12px 40px #0003;}
+.login-brand .login-logo {width:156px;height:156px;max-height:156px;filter:none;}
+.login-card input {border-radius:10px;min-height:46px;}

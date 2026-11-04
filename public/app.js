@@ -526,7 +526,8 @@ async function load() {
   const [meta, dashboard] = await Promise.all([api("/api/meta"), api("/api/dashboard")]);
   let meliConfig;
   try {
-    meliConfig = await api("/api/meli/config");
+    meliConfig = state.meliConfig || {locked:true, issues:[], redirect_uri:meta.meli?.redirect_uri || ''};
+    api("/api/meli/config", {manualProgress:false,retryPrompt:false}).then(config=>{state.meliConfig=config;if(state.route==='contas'){renderAccounts();renderMeliConfig();}}).catch(()=>{});
   } catch (error) {
     meliConfig = {
       client_id: "",
@@ -568,7 +569,11 @@ function loadItemLogsInBackground(force = false) {
 
 async function loadCatalogInBackground(force = false) {
   if (!state.data || (state.catalogLoaded && !force)) return;
-  if (state.catalogLoading) return state.catalogLoading;
+  if (state.catalogLoading) {
+    if (!force) return state.catalogLoading;
+    await state.catalogLoading;
+    return loadCatalogInBackground(true);
+  }
   if (state.catalogError && !force) return;
   state.catalogError = '';
   state.catalogLoading = api("/api/catalog", {retryPrompt:false, manualProgress:false, timeoutMs:60000})
@@ -580,6 +585,7 @@ async function loadCatalogInBackground(force = false) {
       state.data.sku_costs = result.sku_costs || state.data.sku_costs || {};
       state.data.sku_last_sales = result.sku_last_sales || state.data.sku_last_sales || {};
       state.catalogLoaded = true;
+      state.catalogFetchedAt = Date.now();
       loadItemLogsInBackground(force);
     })
     .catch(error => {
@@ -748,6 +754,7 @@ function render() {
 
 function renderRoute() {
   if (!state.data) return;
+  if (["catalogo", "anuncios", "copiar", "kits"].includes(state.route) && state.catalogLoaded && Date.now()-(state.catalogFetchedAt||0)>60000 && !state.catalogLoading) loadCatalogInBackground(true);
   if (["catalogo", "anuncios", "copiar", "kits", "custos", "compras"].includes(state.route) && !state.catalogLoaded) {
     loadCatalogInBackground();
   }
@@ -1307,7 +1314,7 @@ function adTitleEditState(item) {
 
 function renderDashboard() {
   const ops = state.data.operations || {};
-  const stockRows = filterByStockPeriod(ops.attention_stock || []);
+  const stockRows = dashboardStockRows(ops.attention_stock || []);
   renderDashboardAccountFilters();
   document.querySelector("#dashboard-revenue").innerHTML = `
       <div class="revenue-today">
@@ -1436,8 +1443,15 @@ function renderDashboardAccountFilters() {
   };
   fill("#dashboard-shipment-account", state.dashboardShipmentAccount);
   fill("#dashboard-sales-account", state.dashboardSalesAccount);
+  fill("#dashboard-stock-account", state.dashboardStockAccount || "all");
 }
 
+function dashboardStockRows(rows) {
+  rows = filterByStockPeriod(rows).filter(row => !state.dashboardStockAccount || state.dashboardStockAccount === 'all' || row.account === state.dashboardStockAccount);
+  if (state.dashboardStockAccount && state.dashboardStockAccount !== 'all') return rows;
+  const seen = new Set();
+  return rows.filter(row => {const key = row.sku && row.sku !== '-' ? row.sku.trim().toUpperCase() : row.id; if(seen.has(key))return false;seen.add(key);return true;}).map(row=>({...row, grouped:true}));
+}
 function filterByStockPeriod(rows) {
   return rows.filter((item) => isDateInPeriod(item.occurred_at, state.stockPeriod, state.stockCustomDate, state.stockCustomEndDate));
 }
@@ -1478,8 +1492,8 @@ function opsRows(rows, empty, tone = "") {
           <div>
             <strong>${item.title}</strong>
             <div class="chip-row">
-              ${copyChip("Loja", item.account)}
-              ${copyChip("MLB", item.id)}
+              ${item.grouped ? "" : copyChip("Loja", item.account)}
+              ${item.grouped ? "" : copyChip("MLB", item.id)}
               ${copyChip("SKU", item.sku || "-")}
               ${copyChip("Data", formatDateBR(item.occurred_at))}
             </div>
@@ -4688,7 +4702,7 @@ async function loadSalesReport() {
 function skuCommercialHtml(row) {
   const price = value => value == null ? '—' : money.format(value);
   const margin = value => value == null ? 'Margem indisponível' : `${Number(value).toLocaleString('pt-BR', {maximumFractionDigits:2})}% de margem`;
-  return `<div class="sku-commercial"><small>Custo atual <b>${price(row.sku_cost)}</b></small>${[['classic','Clássico'],['premium','Premium']].map(([key,label])=>`<div title="${escapeAttr(row[key+'_reference'] || 'Sem anúncio de referência')}"><span>${label}</span><b>${price(row[key+'_price'])}</b><small class="${row[key+'_margin'] == null || Number(row[key+'_margin']) === 0 ? '' : Number(row[key+'_margin']) > 0 ? 'profit-positive' : 'profit-negative'}" title="${escapeAttr(row[key+'_margin_reason'] || '')}">${row[key+'_margin'] == null && row[key+'_margin_reason'] ? escapeText(row[key+'_margin_reason']) : margin(row[key+'_margin'])}</small></div>`).join('')}</div>`;
+  return `<div class="sku-commercial"><small>Custo atual <b>${price(row.sku_cost)}</b></small>${[['classic','Clássico'],['premium','Premium']].map(([key,label])=>`<div title="${escapeAttr(row[key+'_reference'] || 'Sem anúncio de referência')}"><span>${label}</span><b>${row[key+'_original_price'] > row[key+'_price'] ? `<del class="goal-original-price" title="Preço original do anúncio base">${price(row[key+'_original_price'])}</del> ` : ""}${price(row[key+'_price'])}</b><small class="${row[key+'_margin'] == null || Number(row[key+'_margin']) === 0 ? '' : Number(row[key+'_margin']) > 0 ? 'profit-positive' : 'profit-negative'}" title="${escapeAttr(row[key+'_margin_reason'] || '')}">${row[key+'_margin'] == null && row[key+'_margin_reason'] ? escapeText(row[key+'_margin_reason']) : margin(row[key+'_margin'])}</small></div>`).join('')}</div>`;
 }
 
 function replenishmentFilters(form) {
@@ -4880,8 +4894,10 @@ async function loadBrandSalesReport() {
 
 function currentReportFilters(reportType) {
   if (reportType === "sales_goals") return window.salesGoalsPage.filters();
+  if (reportType === "dashboard_catalog") return {};
   if (reportType === "dashboard_stock") {
     return {
+      account: state.dashboardStockAccount || "all",
       period: state.stockPeriod,
       date_from: state.stockCustomDate,
       date_to: state.stockCustomEndDate,
@@ -5357,12 +5373,12 @@ function updatePublisherIdentifierRequirements() {
 function renderPublisherPictures() {
   const root = document.querySelector("#publisher-pictures");
   if (!root) return;
-  const imported = (state.productDraft?.pictures || []).map((url) => ({ source: url, preview: url }));
-  const rows = [...imported, ...(state.productUploadedPictures || [])].slice(0, 12);
+  if (!state.productPictureRows) state.productPictureRows = [...(state.productDraft?.pictures || []).map(url=>({source:url,preview:url})), ...(state.productUploadedPictures || [])].map(p=>({...p,selected:true}));
+  const rows = state.productPictureRows;
   root.innerHTML = rows.map((picture, index) => `
-    <label class="publisher-picture">
+    <label class="publisher-picture" draggable="true" data-picture-index="${index}">
       <input type="checkbox" ${picture.id ? "data-publisher-uploaded-picture" : "data-publisher-picture"}
-        value="${escapeAttr(picture.id || picture.source)}" checked />
+        value="${escapeAttr(picture.id || picture.source)}" ${picture.selected ? "checked" : ""} />
       <span>${index + 1}</span>
       <img src="${escapeAttr(picture.preview || picture.source || "")}" alt="Foto ${index + 1}" loading="lazy" />
     </label>
@@ -5374,12 +5390,26 @@ function renderPublisherPictures() {
       if (input?.hasAttribute("data-publisher-picture") && state.productDraft) {
         state.productDraft.pictures = (state.productDraft.pictures || []).filter((url) => url !== input.value);
       }
+      if (card) state.productPictureRows.splice(Number(card.dataset.pictureIndex), 1);
       card?.remove();
-      root.querySelectorAll(".publisher-picture > span").forEach((span, index) => { span.textContent = String(index + 1); });
+      root.querySelectorAll(".publisher-picture").forEach((card, index) => { card.dataset.pictureIndex=String(index);card.querySelector('span').textContent=String(index+1); });
     }, { once: true });
   });
   const status = document.querySelector("#publisher-picture-upload-status");
-  if (status) status.textContent = `${rows.length} de 12 fotos`;
+  if (status) status.textContent = `${rows.filter(p=>p.selected).length} fotos selecionadas de ${rows.length} · arraste para ordenar (primeira = capa)`;
+  root.onchange = event => {
+    const card=event.target.closest('[data-picture-index]');if(!card)return;
+    rows[Number(card.dataset.pictureIndex)].selected=event.target.checked;
+    renderPublisherPictures();
+  };
+  root.ondragstart = event => {const card=event.target.closest('[data-picture-index]');if(card)event.dataTransfer.setData('text/plain',card.dataset.pictureIndex);};
+  root.ondragover = event => event.preventDefault();
+  root.ondrop = event => {
+    event.preventDefault();const card=event.target.closest('[data-picture-index]');
+    const raw=event.dataTransfer.getData('text/plain'), from=Number(raw), to=Number(card?.dataset.pictureIndex);
+    if(!card || raw==='' || !Number.isInteger(from) || from<0 || from>=rows.length)return;
+    rows.splice(to,0,rows.splice(from,1)[0]);renderPublisherPictures();
+  };
 }
 
 function updatePublisherStoreRequirements() {
@@ -5414,6 +5444,7 @@ document.querySelector('#product-publish-form [name="gtin"]')?.addEventListener(
 
 function applyAssistedProduct(product) {
   state.productDraft = product;
+  state.productPictureRows = null;
   state.productPublicationId = window.crypto?.randomUUID?.() || `publish-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   state.productUploadedPictures = [];
   const form = document.querySelector("#product-publish-form");
@@ -5522,6 +5553,7 @@ function collectAssistedPublication() {
       package_width: values.get("package_width"), package_length: values.get("package_length"),
       pictures: [...form.querySelectorAll("[data-publisher-picture]:checked")].map((input) => input.value),
       uploaded_picture_ids: [...form.querySelectorAll("[data-publisher-uploaded-picture]:checked")].map((input) => input.value),
+      ordered_pictures: (state.productPictureRows || []).filter(p=>p.selected).map(p=>p.id?{id:p.id}:{source:p.source}),
       attributes,
     },
   };
@@ -6263,6 +6295,7 @@ document.querySelector("#dashboard-shipment-account")?.addEventListener("change"
   renderDashboard();
 });
 
+document.querySelector('#dashboard-stock-account')?.addEventListener('change', e => {state.dashboardStockAccount=e.target.value;state.dashboardStockPage=1;renderDashboard();});
 document.querySelector("#dashboard-sales-account")?.addEventListener("change", (event) => {
   state.dashboardSalesAccount = event.target.value;
   state.dashboardSalesPage = 1;
@@ -8004,7 +8037,7 @@ document.querySelector("#publisher-picture-upload")?.addEventListener("change", 
   }
   const files = [...event.target.files];
   for (const file of files) {
-    if ((state.productDraft?.pictures?.length || 0) + state.productUploadedPictures.length >= 12) {
+    if ((state.productPictureRows || []).filter(p=>p.selected).length >= 12) {
       showToast("O Mercado Livre aceita no máximo 12 fotos por anúncio.", "error");
       break;
     }
@@ -8023,6 +8056,7 @@ document.querySelector("#publisher-picture-upload")?.addEventListener("change", 
       });
       const uploaded = await waitForAsyncOperation(queued);
       state.productUploadedPictures.push({ id: uploaded.id, preview: dataUrl });
+      state.productPictureRows.push({id:uploaded.id,preview:dataUrl,selected:true});
       renderPublisherPictures();
     } catch (error) {
       showToast(`${file.name}: ${error.message || "falha no upload"}`, "error");
@@ -8778,6 +8812,9 @@ document.querySelector("#setup-form").addEventListener("submit", async (event) =
 document.querySelector("#login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const feedback = document.querySelector("#login-feedback");
+  const button = event.currentTarget.querySelector('button[type="submit"]');
+  if(button.disabled)return;
+  button.disabled=true;button.textContent='Entrando…';
   const form = new FormData(event.currentTarget);
   feedback.textContent = "";
   try {
@@ -8794,7 +8831,7 @@ document.querySelector("#login-form").addEventListener("submit", async (event) =
       return;
     }
     feedback.textContent = error.message || "Não foi possível entrar.";
-  }
+  } finally {button.disabled=false;button.textContent='Entrar';}
 });
 
 async function logout() {
@@ -8847,6 +8884,21 @@ window.addEventListener("resize", () => {
   }
   centerMobileNavigation(false);
 });
+
+let dashboardRefreshing = false;
+window.setInterval(async () => {
+  if (!document.hidden && state.currentUser && ['anuncios','catalogo'].includes(state.route) && state.catalogLoaded && !state.catalogLoading && Date.now()-(state.catalogFetchedAt||0)>30000 && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '')) {
+    loadCatalogInBackground(true);
+  }
+  if (document.hidden || !state.currentUser || !state.data || state.route !== 'dashboard' || dashboardRefreshing) return;
+  dashboardRefreshing = true;
+  try {
+    const fresh = await api('/api/dashboard', {manualProgress:false,retryPrompt:false,timeoutMs:20000});
+    for (const key of ['operations','recent_sales','metrics','accounts']) if(fresh[key])state.data[key]=fresh[key];
+    renderDashboard();
+  } catch (_) { /* Retry next interval; preserve the visible snapshot. */ }
+  finally { dashboardRefreshing=false; }
+}, 30000);
 
 window.setInterval(async () => {
   if (state.route !== "contas" || !state.data?.accounts?.some((account) => account.sync_progress?.status === "running")) return;

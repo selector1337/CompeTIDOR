@@ -755,9 +755,6 @@ BACKGROUND_MELI_MAX_IN_FLIGHT = configured_int(
 INTERACTIVE_MELI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(INTERACTIVE_MELI_MAX_IN_FLIGHT)
 BACKGROUND_MELI_REQUEST_SEMAPHORE = threading.BoundedSemaphore(BACKGROUND_MELI_MAX_IN_FLIGHT)
 MELI_WORK_CONTEXT = threading.local()
-ASSISTED_PUBLICATION_MAX_COMBINATIONS = max(
-    1, min(32, int(os.getenv("MELI_ASSISTED_PUBLICATION_MAX_COMBINATIONS", "16")))
-)
 
 MELI_AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -1123,6 +1120,7 @@ def merge_price_schedules(incoming, latest):
 
 
 CATALOG_COMPETITION_FIELDS = {
+    "catalog_losing_since",
     "competition_status", "competition_consistent", "competition_checked_at", "competition_reason",
     "winner_item_id", "winner_seller_id", "winner_name", "winner_price", "winner_confirmed", "winner_source",
     "catalog_reference_seller_id", "catalog_reference_name", "catalog_reference_price", "price_to_win",
@@ -1217,6 +1215,12 @@ def write_payload(payload, replace_collections=None):
             latest.get("item_logs", []),
         )
         if incoming_revision < latest_revision:
+            incoming_sales = payload.setdefault("sales_snapshot_epochs", {})
+            for account_name, stamp in (latest.get("sales_snapshot_epochs") or {}).items():
+                if stamp > incoming_sales.get(account_name, 0):
+                    for collection in ("recent_sales", "daily_sku_sales"):
+                        payload[collection] = [r for r in payload.get(collection, []) if r.get("account") != account_name] + [r for r in latest.get(collection, []) if r.get("account") == account_name]
+                    incoming_sales[account_name] = stamp
             payload["monthly_revenue"] = merge_monthly_revenue(payload.get("monthly_revenue") or {}, latest.get("monthly_revenue") or {})
             for field in ("official_store_rules", "official_store_batches"):
                 payload[field] = {**(payload.get(field) or {}), **(latest.get(field) or {})}
@@ -1245,6 +1249,9 @@ def write_payload(payload, replace_collections=None):
         payload["_revision"] = latest_revision + 1
         catalog_loaded = bool(payload.get("_catalog_loaded", True))
         if catalog_loaded:
+            saved_items = {row.get("id"): row for row in read_json(CATALOG_DATA_FILE, [])}
+            for row in payload.get("catalog", []):
+                track_catalog_loss(row, saved_items.get(row.get("id")))
             write_json(CATALOG_DATA_FILE, payload.get("catalog", []))
             payload["catalog_counts_snapshot"] = catalog_counts(payload.get("catalog", []))
             payload["operations_snapshot"] = build_operations(payload)
@@ -1586,6 +1593,11 @@ def public_payload(payload, actor=None, include_catalog=True):
         if include_catalog
         else clean.get("operations_snapshot") or build_operations(clean)
     )
+    if not include_catalog:
+        current_operations = build_operations(clean)
+        for key in current_operations:
+            if key.startswith(("total_", "previous_")) or key in {"revenue", "daily_revenue", "top_skus_today"}:
+                clean["operations"][key] = current_operations[key]
     clean["users"] = visible_users_for(actor, ensure_users(clean))
     clean.pop("_catalog_loaded", None)
     clean.pop("_revision", None)
@@ -1994,7 +2006,7 @@ def build_operations(payload):
             or item.get("competition_status") in {"competing", "sharing"}
             and item.get("winner_name") not in ("", None, item.get("account"))
         ):
-            catalog_attention.append({**row, "winner_name": item.get("winner_name"), "winner_price": item.get("winner_price")})
+            catalog_attention.append({**row, "occurred_at": item.get("catalog_losing_since") or row["occurred_at"], "winner_name": item.get("winner_name"), "winner_price": item.get("winner_price")})
 
     stock.sort(key=lambda item: item["occurred_at"], reverse=True)
     catalog_attention.sort(key=lambda item: item["occurred_at"], reverse=True)
@@ -2086,8 +2098,8 @@ def build_operations(payload):
         "total_revenue_change_percent": percentage_change(total_revenue, previous_total_revenue) if previous_month_complete else None,
         "total_orders_change_percent": percentage_change(total_orders, previous_total_orders) if previous_month_complete else None,
         "revenue_calculation_basis": "total_amount dos pedidos oficiais com valor positivo, excluindo cancelados e inválidos",
-        "attention_stock": stock[:200],
-        "attention_catalog": catalog_attention[:200],
+        "attention_stock": stock,
+        "attention_catalog": catalog_attention,
         "claims": claims,
         "pending_shipments": shipments,
         "top_skus_today": top_skus_today,
@@ -7129,6 +7141,16 @@ def track_item_availability(item, previous=None, observed_at=None):
     return item
 
 
+def track_catalog_loss(row, previous=None):
+    def losing(item):
+        return not item.get("internal_competition") and (item.get("status") == "losing" or (item.get("competition_status") in {"competing", "sharing"} and item.get("winner_name") not in ("", None, item.get("account"))))
+    if losing(row):
+        row["catalog_losing_since"] = ((previous or {}).get("catalog_losing_since") if losing(previous or {}) else None) or row.get("catalog_losing_since") or now_label()
+    else:
+        row["catalog_losing_since"] = ""
+    return row
+
+
 def synced_catalog_item(account, item, competition=None, previous=None):
     stock = item_available_quantity(item)
     catalog_product_id = item.get("catalog_product_id") or "-"
@@ -7194,6 +7216,7 @@ def synced_catalog_item(account, item, competition=None, previous=None):
     for field in ("assisted_publication_id", "assisted_publication_mode", "assisted_traditional_item_id"):
         if (previous or {}).get(field):
             row[field] = previous[field]
+    track_catalog_loss(row, previous)
     return track_item_availability(row, previous)
 
 
@@ -7336,6 +7359,7 @@ def sku_commercial_index(payload, items=None):
             kind + "_profit": values.get("profit_amount") if not missing else None,
             kind + "_margin": margin,
             kind + "_margin_reason": reason,
+            kind + "_reference_id": item.get("id"),
             kind + "_reference": " / ".join(str(item.get(k) or "") for k in ("account", "id")),
         })
     for sku, record in (payload.get("sku_costs") or {}).items():
@@ -9117,11 +9141,12 @@ def official_order_is_revenue(order):
     return status not in REVENUE_IGNORED_ORDER_STATUSES and official_order_revenue_amount(order) > 0
 
 
-def sync_recent_sales(payload, account, client):
+def sync_recent_sales(payload, account, client, orders=None, dashboard_only=False):
     period, date_from, date_to = current_month_window()
     try:
-        orders = fetch_seller_orders_window(client, account.get("seller_id"), date_from, date_to)
-        orders = reconcile_known_order_ids(payload, account, client, period, orders)
+        if orders is None:
+            orders = fetch_seller_orders_window(client, account.get("seller_id"), date_from, date_to)
+            orders = reconcile_known_order_ids(payload, account, client, period, orders)
     except Exception as exc:
         account["sales_sync_status"] = policy_error_message(exc, "a leitura das vendas reais do mês")
         mark_monthly_revenue_error(payload, account, period, account["sales_sync_status"])
@@ -9160,7 +9185,8 @@ def sync_recent_sales(payload, account, client):
                 "date": order.get("date_created") or order.get("last_updated") or now_label(),
             }
             rows.append(sale)
-    hydrate_sale_thumbnails(rows, client)
+    if not dashboard_only:
+        hydrate_sale_thumbnails(rows, client)
     update_sku_last_sales(rows)
     existing = [
         item
@@ -9194,6 +9220,9 @@ def sync_recent_sales(payload, account, client):
     daily = [row for row in payload.get("daily_sku_sales", []) if row.get("account") != account.get("nickname")]
     daily.extend(by_sku.values())
     payload["daily_sku_sales"] = daily
+    payload.setdefault("sales_snapshot_epochs", {})[account.get("nickname")] = time.time_ns()
+    if dashboard_only:
+        return rows
     account["sales_sync_status"] = f"{revenue_orders} pedidos reais sincronizados no mês"
     upsert_monthly_revenue(payload, account, revenue_total, revenue_orders, period, account["sales_sync_status"], orders=orders)
     try:
@@ -11533,6 +11562,11 @@ def query_sales_goals(payload, request):
         from goal_pricing import rule_summary
         summaries = [{**rule_summary(rule), 'rule_id':key} for key,rule in sku_rules]
         row["pricing_summaries"] = summaries
+        for kind in ("classic", "premium"):
+            identity = row.get(kind + "_reference_id")
+            tracking = next((r.get("items", {}).get(identity) for r in [r for _, r in sku_rules] if r.get("items", {}).get(identity, {}).get("initialized")), None)
+            if tracking:
+                row[kind + "_original_price"] = tracking.get("original")
         row["pricing_summary"] = summaries[0] if len(summaries) == 1 else {
             'sku':sku, 'enabled':row['automatic_pricing_active'], 'rules':summaries
         } if summaries else None
@@ -11675,6 +11709,10 @@ def reconcile_month_sales(request):
                 fresh = read_payload(include_catalog=False)
                 fresh["accounts"] = merge_critical_records("accounts", [account], fresh.get("accounts", []))
                 upsert_monthly_revenue(fresh, account, record["amount"], record["orders_count"], period, "Pedidos conferidos com a API oficial", orders=orders)
+                if period == current_month_period():
+                    sync_recent_sales(fresh, account, client, orders=orders, dashboard_only=True)
+                    snapshot = fresh.setdefault("operations_snapshot", {})
+                    snapshot["top_skus_today"] = build_operations(fresh)["top_skus_today"]
                 write_payload(fresh)
             results.append({"account": account.get("nickname"), "orders": record["orders_count"], "amount": record["amount"], "status": "ok",
                             "previous_orders": old.get("orders_count"), "previous_amount": old.get("amount")})
@@ -16491,6 +16529,19 @@ def build_assisted_publication_payload(draft, variant):
     ))
     if not pictures and not uploaded_picture_ids:
         raise RuntimeError("Selecione ao menos uma imagem para o anúncio.")
+    ordered = None
+    if isinstance(draft.get("ordered_pictures"), list):
+        ordered = []
+        seen_pictures = set()
+        for picture in draft["ordered_pictures"]:
+            if not isinstance(picture, dict): continue
+            identity = ("id", picture.get("id")) if picture.get("id") in uploaded_picture_ids else ("url", picture.get("source"))
+            if identity[0] == "url" and identity[1] not in pictures: continue
+            if identity not in seen_pictures:
+                ordered.append({identity[0]: identity[1]})
+                seen_pictures.add(identity)
+        if not ordered: raise RuntimeError("Selecione ao menos uma imagem para o anúncio.")
+        if len(ordered) > 12: raise RuntimeError("Selecione no máximo 12 fotos por anúncio.")
     attributes = apply_assisted_item_condition(
         assisted_publication_attributes(draft), draft.get("condition")
     )
@@ -16504,7 +16555,7 @@ def build_assisted_publication_payload(draft, variant):
         "buying_mode": "buy_it_now",
         "listing_type_id": listing_type_id,
         "condition": clean_attribute_value(draft.get("condition")) or "new",
-        "pictures": [
+        "pictures": ordered if ordered is not None else [
             *({"url": url} for url in pictures),
             *({"id": picture_id} for picture_id in uploaded_picture_ids),
         ],
@@ -16852,11 +16903,6 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
         raise RuntimeError("Selecione ao menos uma conta conectada.")
     variants = assisted_publication_variants(request)
     publication_modes = assisted_publication_modes(request)
-    if len(accounts) * len(variants) * len(publication_modes) > ASSISTED_PUBLICATION_MAX_COMBINATIONS:
-        raise RuntimeError(
-            f"Publique no máximo {ASSISTED_PUBLICATION_MAX_COMBINATIONS} combinações "
-            "de conta, tipo e modalidade por operação."
-        )
     if len(publication_modes) == 2:
         return publish_linked_assisted_product(payload, request, actor, accounts, variants)
     draft = request.get("draft") or {}
@@ -16945,6 +16991,7 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                 normalized["assisted_publication_mode"] = publication_mode
                 normalized["description_override"] = description
                 payload.setdefault("catalog", []).append(normalized)
+                write_payload(payload)
                 append_item_log(payload, normalized, actor or {}, "Cadastro assistido por link", {
                     "source_url": {"from": draft.get("source_url") or "", "to": item_id or ""},
                     "listing_type_id": {"from": "", "to": variant.get("listing_type_id")},
@@ -21136,7 +21183,7 @@ def start_report_job(request):
     output_format = str((request or {}).get("format") or "xlsx").lower()
     if report_type not in {
         "statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization",
-        "dashboard_stock", "customers", "sales_goals",
+        "dashboard_stock", "dashboard_catalog", "customers", "sales_goals",
     }:
         raise RuntimeError("Selecione um relatório disponível para exportar.")
     if output_format not in {"xlsx", "pdf"}:
@@ -21174,7 +21221,7 @@ def start_report_job(request):
             title, columns, rows, metadata = report_dataset(
                 read_payload(include_catalog=report_type in {
                     "statistics", "sales", "brand_sales", "purchases", "catalog", "ads", "equalization",
-                    "dashboard_stock", "sales_goals",
+                    "dashboard_stock", "dashboard_catalog", "sales_goals",
                 }),
                 report_type,
                 filters,
@@ -21450,6 +21497,10 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
         rows = [{**r, "target": r["target"] or "", "remaining": r["remaining"] if r["target"] else ""} for r in result["rows"]]
         return "Metas de Venda", columns, rows, {"Mês": result["month"], "Critério": "Todas as contas; pedidos não cancelados", "Avisos": " ".join(result["warnings"])}
 
+    if report_type == "dashboard_catalog":
+        rows = build_operations(payload)["attention_catalog"]
+        return "Produtos perdendo catálogo", [("occurred_at", "Início da perda", "datetime"), ("account", "Conta", "text"), ("sku", "SKU", "text"), ("id", "Anúncio ML", "text"), ("title", "Produto", "text")], rows, {"Ordem": "Perdas mais recentes primeiro", "Gerado em": now_label()}
+
     if report_type == "dashboard_stock":
         period = str(filters.get("period") or "week").lower()
         custom_from = str(filters.get("date_from") or "")[:10]
@@ -21493,6 +21544,18 @@ def report_dataset(payload, report_type, filters, statistics_result=None):
                 "meli_status": normalized_meli_status(item.get("meli_status")) or item.get("status") or "",
             })
         rows.sort(key=lambda row: str(row.get("occurred_at") or ""), reverse=True)
+        selected_account = filters.get("account") or "all"
+        if selected_account != "all":
+            rows = [row for row in rows if row["account"] == selected_account]
+        else:
+            seen = set()
+            unique = []
+            for row in rows:
+                key = normalized_sku_key(row["sku"]) if row["sku"] != "-" else row["item_id"]
+                if key not in seen:
+                    seen.add(key)
+                    unique.append({**row, "account": "Todas as contas", "item_id": ""})
+            rows = unique
         period_labels = {
             "today": "Hoje", "yesterday": "Ontem", "week": "Últimos 7 dias",
             "custom": f"{custom_from} a {custom_to}",
@@ -22803,6 +22866,8 @@ def execute_clone_job(payload, job, incoming_answers=None):
             }
         )
         catalog.append(new_item)
+        write_payload(payload)
+        catalog = payload["catalog"]
         copied.append(new_item)
         created_details.append(
             {
@@ -23256,8 +23321,6 @@ def prepare_clone_preview(request):
         else:
             destinations.append((account, stores, target_official_store_id(client, account, source_items[0], stores) if stores else None, False))
     combinations = len(destinations) * len(variants)
-    if combinations > max(1, int(os.getenv("MELI_CLONE_MAX_COMBINATIONS", "20"))):
-        raise RuntimeError("Limite de combinações excedido: reduza as contas, lojas oficiais ou tipos selecionados.")
     jobs = payload.get("clone_jobs")
     if not isinstance(jobs, list):
         jobs = []
@@ -23347,8 +23410,6 @@ def execute_clone_batch_request(request):
     ]
     if not selected:
         raise RuntimeError("Nenhum preview do lote foi encontrado.")
-    if len(selected) > max(1, int(os.getenv("MELI_CLONE_MAX_COMBINATIONS", "20"))):
-        raise RuntimeError("O lote excede o limite de combinações permitido.")
     copied = []
     for job in selected:
         if job.get("status") == "copied":
@@ -24239,8 +24300,10 @@ class App(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/auth/login":
+            before_users = json.dumps(payload.get("users"), sort_keys=True)
             users = ensure_users(payload)
-            write_payload(payload)
+            if json.dumps(payload.get("users"), sort_keys=True) != before_users:
+                write_payload(payload)
             if not users:
                 self.send_json({"error": "Crie o usuário master no primeiro acesso.", "setup_required": True}, status=409)
                 return
@@ -24278,7 +24341,15 @@ class App(BaseHTTPRequestHandler):
                 elif not can_manage_users(actor):
                     self.send_json({"error":"Somente Master e Administradores."}, status=403)
                 else:
-                    self.send_json({"ok":True,"rule":service.save(request,actor)})
+                    request_copy = json.loads(json.dumps(request))
+                    actor_copy = dict(actor)
+                    operation = start_async_operation(
+                        "goal_pricing_save",
+                        lambda: {"ok": True, "rule": service.save(request_copy, actor_copy)},
+                        "Salvando regra; se necessário, aguardando a confirmação de preço deste SKU.",
+                        priority="interactive",
+                    )
+                    self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error":str(exc)}, status=400)
             return

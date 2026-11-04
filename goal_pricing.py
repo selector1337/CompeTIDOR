@@ -5,11 +5,55 @@ import math
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 FILE = 'goal_pricing.json'
 HISTORY_LIMIT = 1000
 SCOPES = {'both': {'gold_special', 'gold_pro'}, 'classic': {'gold_special'}, 'premium': {'gold_pro'}}
+
+def validate_schedule(req):
+    days = req.get('weekdays') or []
+    if not isinstance(days, list) or any(type(day) is not int or day not in range(7) for day in days):
+        raise RuntimeError('Selecione dias da semana válidos.')
+    result = {'weekdays': sorted(set(days))}
+    for key, fmt in [('specific_date', '%Y-%m-%d'), ('start_time', '%H:%M'), ('end_time', '%H:%M')]:
+        value = str(req.get(key) or '')
+        if value:
+            try: datetime.strptime(value, fmt)
+            except ValueError: raise RuntimeError('Data ou horário inválido: ' + key)
+        result[key] = value
+    if bool(result['start_time']) != bool(result['end_time']):
+        raise RuntimeError('Informe o início e o fim do intervalo de horário.')
+    return result
+
+def schedule_allows(rule, now):
+    local = datetime.fromtimestamp(now, timezone(timedelta(hours=-3)))
+    clock = local.strftime('%H:%M')
+    start, end = rule.get('start_time'), rule.get('end_time')
+    # In overnight windows, the early morning belongs to the preceding start day.
+    if start and end and start > end and clock < end:
+        local -= timedelta(days=1)
+    if rule.get('specific_date') and local.strftime('%Y-%m-%d') != rule['specific_date']: return False
+    if rule.get('weekdays') and local.weekday() not in rule['weekdays']: return False
+    if start and end and start != end:
+        return start <= clock < end if start < end else clock >= start or clock < end
+    return True
+
+def next_schedule_time(rule, now):
+    if schedule_allows(rule, now): return now
+    local = datetime.fromtimestamp(now, timezone(timedelta(hours=-3)))
+    first = local
+    if rule.get('specific_date'):
+        first = datetime.strptime(rule['specific_date'], '%Y-%m-%d').replace(tzinfo=local.tzinfo)
+        if first.date() < (local - timedelta(days=1)).date(): return None
+    for day in range(9):
+        candidate = (first + timedelta(days=day)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if rule.get('start_time'):
+            hour, minute = map(int, rule['start_time'].split(':'))
+            candidate = candidate.replace(hour=hour, minute=minute)
+        if candidate.timestamp() >= now and schedule_allows(rule, candidate.timestamp()): return candidate.timestamp()
+    return None
 
 def rule_types(rule):
     return set(rule.get('types') or SCOPES['both'])
@@ -33,7 +77,7 @@ def bounded_locks(*locks):
 
 def item_due(rule, item):
     if item.get('blocked'):
-        return None
+        return item.get('retry_after', 0)
     if item.get('pending') is not None or not item.get('initialized') or rule.get('restoring'):
         return item.get('retry_after', 0)
     return max(item.get('retry_after', 0), item.get('last_action', 0)+rule.get('interval_hours', 0)*3600,
@@ -47,6 +91,8 @@ def rule_summary(rule):
     current = sum(i.get('observed_price', i['last']) for i in initialized)
     due = [value for i in items if (value := item_due(rule, i)) is not None]
     now = time.time()
+    due = [next_schedule_time(rule, max(now, value)) for value in due] if not rule.get('restoring') else due
+    due = [value for value in due if value is not None]
     pending_count = sum(i.get('pending') is not None for i in items)
     blocked_count = sum(bool(i.get('blocked')) for i in items)
     retry_count = sum(bool(i.get('retry_after')) for i in items)
@@ -71,6 +117,7 @@ class GoalPricing:
         self.lock = threading.RLock()
         self.worker_lock = threading.RLock()
         self.rule_locks = {}
+        self.waiting_saves = {}
         self.last_refresh = 0
         self.independent_refresh = False
         self.last_heartbeat = 0
@@ -147,8 +194,14 @@ class GoalPricing:
         sku = self.a.normalized_sku_key(req.get('sku'))
         # Serialize edits of this SKU with its in-flight price confirmation,
         # without holding the shared storage lock while waiting for the API.
-        with self.rule_lock(sku):
-            return self._save(req, actor)
+        with self.lock:
+            self.waiting_saves[sku] = self.waiting_saves.get(sku, 0) + 1
+        try:
+            with self.rule_lock(sku):
+                return self._save(req, actor)
+        finally:
+            with self.lock:
+                self.waiting_saves[sku] -= 1
 
     def _save(self, req, actor):
         if not self.a.can_manage_users(actor) or actor.get('status') not in {'ativo','active'}:
@@ -182,14 +235,17 @@ class GoalPricing:
                 previous['updated_at']=self.a.now_label()
                 self.a.write_json(FILE, store)
                 return {**previous, 'rule_id':key, 'listing_scope':rule_scope(previous)}
-            if previous and (previous.get('enabled') or any(i.get('pending') is not None or i.get('last') != i.get('original') for i in previous.get('items', {}).values())):
-                raise RuntimeError('Restaure os preços da regra anterior antes de alterar sua configuração.')
+            if previous and previous.get('restoring'):
+                raise RuntimeError('Aguarde a restauração terminar antes de editar a regra.')
+            schedule = validate_schedule(req)
             payload = self.a.read_payload()
             targets = self.a.sales_goal_targets(self.a.read_json(self.a.SALES_GOALS_FILE, {'months':{}}))
             if not targets.get(sku): raise RuntimeError('Cadastre uma meta para este SKU primeiro.')
             scope = req.get('listing_scope', rule_scope(previous or {}))
             if scope not in SCOPES: raise RuntimeError('Selecione Clássico, Premium ou ambos.')
             types = SCOPES[scope]
+            if previous and types != rule_types(previous):
+                raise RuntimeError('Para mudar a modalidade, crie outra regra. Edite os parâmetros desta sem perder seu histórico.')
             if req.get('enabled') is True: self.check_overlap(store,sku,key,types)
             allowed = {a['id'] for a in payload.get('accounts',[]) if a.get('official') and a.get('status') == 'connected'}
             accounts = allowed
@@ -210,14 +266,21 @@ class GoalPricing:
                 if any(s.get('enabled') and s.get('item_id') == item['id'] for s in payload.get('price_schedules',[])):
                     raise RuntimeError('Há um agendamento de preço neste SKU. Desative-o antes de ativar a regra.')
                 price = float(item.get('price') or 0)
-                if not math.isfinite(price) or price <= 0 or floor > price: raise RuntimeError('Preço mínimo superior ao preço de um dos anúncios selecionados.')
+                if not math.isfinite(price) or price <= 0 or (not previous and floor > price): raise RuntimeError('Preço mínimo superior ao preço de um dos anúncios selecionados.')
                 items[item['id']] = {'account_id':item['account_id'], 'account_name':next((a.get('nickname',a['id']) for a in payload['accounts'] if a['id']==item['account_id']),item['account_id']), 'type':item['listing_type_id'], 'original':price, 'last':price, 'initialized':False, 'last_action':time.time(), 'status':'Aguardando validação do preço original'}
             if not items: raise RuntimeError('Nenhum anúncio ativo ou pausado deste SKU foi encontrado.')
+            if previous:
+                items = {**items, **copy.deepcopy(previous.get('items', {}))}
             rule = dict(sku=sku, accounts=sorted(accounts), types=sorted(types), mode=mode, step=step,
                         interval_hours=interval, sale_pause_hours=cooldown, floor_price=floor, floor_margin=margin,
                         enabled=req.get('enabled') is True, restoring=False, items=items, period=self.a.current_month_period(),
                         created_at=self.a.now_label(), updated_by=actor.get('name') or actor.get('id'), status='Ativa' if req.get('enabled') is True else 'Desativada', history=copy.deepcopy((previous or {}).get('history', []))[-HISTORY_LIMIT:])
             store['rules'][key] = rule
+            rule.update(schedule)
+            if previous:
+                rule['created_at'] = previous.get('created_at', rule['created_at'])
+                rule['last_sale'] = previous.get('last_sale', 0)
+                self.event(rule, None, 'waiting', 'Regra editada; preços originais, histórico e confirmações preservados')
             self.a.write_json(FILE, store)
             return {**copy.deepcopy(rule), 'rule_id':key, 'listing_scope':scope}
 
@@ -274,6 +337,7 @@ class GoalPricing:
                     break
                 store['cursor'] = (rule_index + 1) % max(1, len(rule_keys))
                 sku = rule_keys[rule_index]
+                if self.waiting_saves.get(store['rules'][sku]['sku'], 0): continue
                 rule_lock = self.rule_lock(store['rules'][sku]['sku'])
                 if not rule_lock.acquire(blocking=False): continue
                 # A pause/edit can have arrived since the cycle snapshot.
@@ -307,6 +371,7 @@ class GoalPricing:
                     restore = bool(rule.get('restoring'))
                     rule['status'] = 'Restaurando preços originais' if restore else 'Aguardando intervalo sem vendas'
                     for identity, tracking in sorted(rule['items'].items(), key=lambda pair: pair[1].get('checked_at', 0)):
+                        if self.waiting_saves.get(rule['sku'], 0): break
                         if budget <= 0 or time.monotonic() > deadline: break
                         if tracking.get('retry_after',0) > now: continue
                         if sales_error and tracking.get('initialized') and tracking.get('pending') is None and not tracking.get('blocked') and not rule.get('restoring'): continue
@@ -374,6 +439,9 @@ class GoalPricing:
                             if not restore and live.get('status') not in {'active','paused'}:
                                 tracking.update(status='Anúncio encerrado ou indisponível; nenhuma redução',retry_after=now+3600); continue
                             if not restore:
+                                if not schedule_allows(rule, now):
+                                    tracking.update(status='Fora da programação; aguardando dia e horário permitidos', retry_after=now+60)
+                                    continue
                                 desired = max(rule['floor_price'], round(price-rule['step'] if rule['mode']=='amount' else price*(1-rule['step']/100),2))
                                 if desired <= 0 or desired >= price:
                                     tracking.update(status='Preço mínimo atingido',last_action=now)
@@ -440,6 +508,8 @@ class GoalPricing:
                             rule['status'] = 'Conferindo alterações enviadas; retentativa automática'
                         elif any(i.get('blocked') for i in rule['items'].values()):
                             rule['status'] = 'Preço divergente do esperado; conferência automática programada'
+                        elif not schedule_allows(rule, now):
+                            rule['status'] = 'Fora da programação; aguardando dia e horário permitidos'
                         elif any(i.get('retry_after',0)>now for i in rule['items'].values()):
                             rule['status'] = 'Falha temporária; retentativa automática programada'
                         elif any((item_due(rule,i) or 0)<=now for i in rule['items'].values()):

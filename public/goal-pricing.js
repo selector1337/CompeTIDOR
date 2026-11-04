@@ -3,6 +3,7 @@
   const esc = v => escapeText(String(v ?? ''));
   let rules = [], sku = '', busy = false, auditPage = 0, auditFilter = '', commercialRows = [];
   let selectedRuleId = null, creatingRule = false;
+  const pendingSaves = new Map();
   const scopeLabel = scope => ({classic:'Clássico',premium:'Premium',both:'Clássico e Premium'}[scope] || 'Clássico e Premium');
   const skuRules = () => rules.filter(r=>r.sku.toUpperCase()===sku.toUpperCase());
   const selectedRule = () => creatingRule ? {} : skuRules().find(r=>(r.rule_id||r.sku)===(selectedRuleId||sku)) || skuRules()[0] || {};
@@ -13,8 +14,8 @@
   dialog.className = 'goal-rule-dialog';
   document.body.append(dialog);
   const admin = () => ['master','admin'].includes(document.body.dataset.role);
-  async function request(action, body={}) {
-    return api('/api/sales-goals/pricing/'+action, {method:'POST',body:JSON.stringify(body),manualProgress:false,retryPrompt:false});
+  async function request(action, body={}, options={}) {
+    return api('/api/sales-goals/pricing/'+action, {method:'POST',body:JSON.stringify(body),manualProgress:false,retryPrompt:false,...options});
   }
   async function load() {
     try { rules = ((await request('query')).rules || []).map(r=>({...rules.find(old=>(old.rule_id||old.sku)===(r.rule_id||r.sku)),...r})); }
@@ -58,7 +59,7 @@
   }
   function draw() {
     const r = selectedRule();
-    const locked = r.enabled || Object.values(r.items || {}).some(i=>i.pending!=null || i.last!==i.original);
+    const locked = Boolean(r.restoring);
     const field = (name,label,value,min,step='any') => `<label>${label}<input name="${name}" type="number" min="${min}" step="${step}" value="${esc(value)}" ${locked?'disabled':''}></label>`;
     dialog.innerHTML = `<form><header><div><small>METAS DE VENDA · ${esc(sku)}</small><h2>Preços automáticos</h2></div><button type="button" data-close aria-label="Fechar">×</button></header>
       <p>Anúncios ativos ou pausados deste SKU em todas as contas conectadas, nas modalidades escolhidas. Novos anúncios dessas modalidades também serão incluídos.</p>
@@ -66,7 +67,7 @@
       <div class="notice">${esc(r.status || 'Desativada — configure e ative quando desejar.')}</div>
       ${r.sku?'<section id="goal-rule-audit"></section>':''}
       <div class="goal-rule-grid">
-      <label>Aplicar aos anúncios<select name="listing_scope" ${locked?'disabled':''}><option value="both" ${!r.listing_scope||r.listing_scope==='both'?'selected':''}>Clássico e Premium</option><option value="classic" ${r.listing_scope==='classic'?'selected':''}>Somente Clássico</option><option value="premium" ${r.listing_scope==='premium'?'selected':''}>Somente Premium</option></select></label>
+      <label>Aplicar aos anúncios<select name="listing_scope" ${r.sku||locked?'disabled':''}><option value="both" ${!r.listing_scope||r.listing_scope==='both'?'selected':''}>Clássico e Premium</option><option value="classic" ${r.listing_scope==='classic'?'selected':''}>Somente Clássico</option><option value="premium" ${r.listing_scope==='premium'?'selected':''}>Somente Premium</option></select></label>
       ${field('interval_hours','Intervalo sem vendas (horas)',r.interval_hours??24,1)}
       ${field('sale_pause_hours','Pausa após cada venda (horas)',r.sale_pause_hours??24,1)}
       <label>Reduzir em<select name="mode" ${locked?'disabled':''}><option value="amount" ${r.mode==='amount'?'selected':''}>R$ por alteração</option><option value="percent" ${r.mode==='percent'?'selected':''}>% do preço atual</option></select></label>
@@ -74,8 +75,9 @@
       ${field('floor_price','Preço mínimo (R$; 0 para usar só margem)',r.floor_price??0,0)}
       ${field('floor_margin','Margem mínima (%; opcional)',r.floor_margin??'',0)}
       </div><section class="goal-simulation"><h3>Rentabilidade e duração estimada</h3><div data-simulation></div></section><p class="muted">O primeiro ciclo confirma e registra o preço original de cada anúncio. Atingir a meta ou mudar de mês não restaura preços nem reinicia o intervalo. A regra continua reduzindo até os limites cadastrados, respeitando a pausa após vendas. A margem considera custo, tarifa e frete sobre a receita líquida; dados incompletos bloqueiam a redução.</p>
-      <p class="muted">Pausar mantém os preços atuais. Para editar uma regra existente, pause e restaure os preços primeiro. Alterações manuais de preço interrompem a automação do anúncio.</p>
-      <div class="goal-rule-actions"><button type="submit" name="save" ${locked?'disabled':''}>Salvar desativada</button><button type="submit" name="activate" ${locked?'disabled':''}>Salvar e ativar</button>
+      <fieldset class="goal-calendar"><legend>Programação opcional · horário de Brasília</legend><div>${['Seg','Ter','Qua','Qui','Sex','Sáb','Dom'].map((day,index)=>`<label><input type="checkbox" name="weekday" value="${index}" ${(r.weekdays||[]).includes(index)?'checked':''}>${day}</label>`).join('')}</div><label>Data específica<input type="date" name="specific_date" value="${esc(r.specific_date||'')}"></label><label>Das<input type="time" name="start_time" value="${esc(r.start_time||'')}"></label><label>Até<input type="time" name="end_time" value="${esc(r.end_time||'')}"></label><small>Em branco: todos os dias e horários. Os filtros se combinam. Se o fim for anterior ao início, o intervalo termina no dia seguinte. Vendas e confirmações continuam sendo conferidas fora do horário.</small></fieldset>
+      <p class="muted">Edite os campos e salve para atualizar a regra sem restaurar preços. Histórico e preços originais são preservados. Para outra modalidade, cadastre uma nova regra. A duração acima considera tempo contínuo sem restrições de calendário.</p>
+      <div class="goal-rule-actions"><button type="submit" name="save" ${locked?'disabled':''}>Salvar desativada</button><button type="submit" name="activate" ${locked?'disabled':''}>${r.enabled?'Salvar alterações e manter ativa':'Salvar e ativar'}</button>
       ${r.sku?`<button type="button" data-action="${r.enabled?'pause':'resume'}">${r.enabled?'Pausar':'Retomar'}</button><button type="button" data-action="restore">Restaurar preços e desativar</button>`:''}</div>
       <p role="status" id="goal-rule-feedback"></p>
 
@@ -86,7 +88,7 @@
     form.addEventListener('input',updateSimulation);updateSimulation();
     dialog.querySelector('[data-rule-picker]').onchange=e=>{creatingRule=e.target.value==='__new__';selectedRuleId=creatingRule?null:e.target.value;auditPage=0;draw();};
     dialog.querySelector('[data-close]').onclick=()=>dialog.close();
-    dialog.querySelector('form').onsubmit=e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.currentTarget));body.enabled=e.submitter?.name==='activate';change(body);};
+    dialog.querySelector('form').onsubmit=e=>{e.preventDefault();const data=new FormData(e.currentTarget);const body=Object.fromEntries(data);body.weekdays=data.getAll('weekday').map(Number);body.enabled=e.submitter?.name==='activate';change(body);};
     dialog.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>change({action:b.dataset.action}));
   }
   function priceEvolution(i) {
@@ -122,18 +124,39 @@
   }
   async function change(body) {
     if(busy || !admin())return;
-    if((body.enabled || body.action==='resume') && !confirm(`Ativar reduções para ${sku} em TODAS as contas: ${scopeLabel(body.listing_scope||selectedRule().listing_scope)}?`))return;
+    if(!pendingSaves.has(sku) && (body.enabled || body.action==='resume') && !confirm(`Ativar reduções para ${sku} em TODAS as contas: ${scopeLabel(body.listing_scope||selectedRule().listing_scope)}?`))return;
     if(body.action==='restore' && !confirm('Restaurar os preços originais registrados, inclusive se houve alteração manual, e desativar a regra?'))return;
     busy=true;
     dialog.querySelector('#goal-rule-feedback').textContent='Salvando solicitação… Se houver uma alteração deste SKU em andamento, aguardaremos sua conferência.';
-    const buttons=Array.from(dialog.querySelectorAll('button'),b=>[b,b.disabled]);
+    const buttons=Array.from(dialog.querySelectorAll('button,input,select,textarea'),b=>[b,b.disabled]);
     buttons.forEach(([b])=>b.disabled=true);
-    try { const current=selectedRule();const result=await request('save',{...body,sku,rule_id:current.rule_id||undefined,new_rule:creatingRule});selectedRuleId=result.rule?.rule_id||current.rule_id||sku;creatingRule=false;await loadDetail();window.salesGoalsPage?.pricingChanged(sku,skuRules().some(r=>r.enabled));draw();dialog.querySelector('#goal-rule-feedback').textContent='Solicitação salva. O processamento ocorre em segundo plano.'; }
-    catch(e){dialog.querySelector('#goal-rule-feedback').textContent=e.message;}
+    try {
+      const current=selectedRule();
+      let attempt=pendingSaves.get(sku);
+      if(!attempt){attempt={body:{...body,sku,rule_id:current.rule_id||undefined,new_rule:creatingRule},key:window.crypto?.randomUUID?.() || `goal-${Date.now()}-${Math.random().toString(36).slice(2)}`};pendingSaves.set(sku,attempt);}
+      else dialog.querySelector('#goal-rule-feedback').textContent='Conferindo o salvamento anterior. Alterações novas devem ser feitas após sua confirmação.';
+      if(!attempt.job)attempt.job=await request('save',attempt.body,{headers:{'X-Idempotency-Key':attempt.key},timeoutMs:20000});
+      const result=attempt.job.job_id ? await waitForAsyncOperation(attempt.job,message=>{dialog.querySelector('#goal-rule-feedback').textContent=message || 'Salvamento em andamento…';}) : attempt.job;
+      pendingSaves.delete(sku);
+      selectedRuleId=result.rule?.rule_id||current.rule_id||sku;creatingRule=false;
+      if(result.rule){rules=rules.filter(r=>(r.rule_id||r.sku)!==selectedRuleId);rules.push(result.rule);}
+      else {try{await loadDetail();}catch(_){/* The save response already confirmed success. */}}
+      draw();
+      dialog.querySelector('#goal-rule-feedback').textContent='Regra salva e confirmada. A automação seguirá a configuração cadastrada.';
+      try{window.salesGoalsPage?.pricingChanged(sku,skuRules().some(r=>r.enabled));}catch(_){}
+    }
+    catch(e){
+      if(e.status==='error' || (Number(e.status)>=400 && Number(e.status)<500))pendingSaves.delete(sku);
+      const feedback=dialog.querySelector('#goal-rule-feedback');feedback.textContent=e.message || 'Não foi possível confirmar o salvamento.';
+      if(pendingSaves.has(sku)){
+        feedback.append(document.createTextNode(' O salvamento pode continuar no servidor. '));
+        const retry=document.createElement('button');retry.type='button';retry.textContent='Conferir o mesmo salvamento';retry.onclick=()=>change({});feedback.append(retry);
+      }
+    }
     finally{busy=false;buttons.forEach(([b,disabled])=>{if(b.isConnected)b.disabled=disabled;});}
   }
   document.addEventListener('click',async e=>{
-    const b=e.target.closest('[data-goal-rule]');if(!b || !admin())return;
+    const b=e.target.closest('[data-goal-rule]');if(!b || !admin() || busy)return;
     sku=b.dataset.goalRule;auditPage=0;auditFilter='';selectedRuleId=null;creatingRule=false;
     try{await loadDetail();draw();dialog.showModal();}
     catch(err){document.getElementById('goals-feedback').textContent=err.message;}

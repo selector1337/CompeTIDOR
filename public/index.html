@@ -6,14 +6,14 @@
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
-  <link rel="stylesheet" href="/styles.css?v=20261028-kit-stores" />
+  <link rel="stylesheet" href="/styles.css?v=20261104-dashboard-pricing" />
   </head>
   <body class="auth-loading">
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
       <div class="login-brand">
         <img class="login-logo" src="/competidor-login.png" alt="CompeTIDOR" />
       </div>
-      <form id="login-form" class="login-card">
+      <form id="login-form" class="login-card"><header><small>SEU CENTRO DE OPERAÇÕES</small><h1>Bem-vindo de volta</h1><p>Acesse suas contas, vendas e anúncios.</p></header>
         <label>E-mail <input name="email" type="text" inputmode="email" autocomplete="username" placeholder="seu@email.com" required /></label>
         <label>Senha <input name="password" type="password" autocomplete="current-password" placeholder="Sua senha" required /></label>
         <button class="primary" type="submit">Entrar</button>
@@ -135,7 +135,7 @@
               <label>Até <input id="stock-custom-end-date" type="date" /></label>
               <button type="button" id="stock-apply-period">Aplicar período</button>
             </div>
-            <div id="dashboard-stock" class="ops-list"></div>
+            <label class="dashboard-account-choice">Conta <select id="dashboard-stock-account"><option value="all">Todas as contas</option></select></label><div id="dashboard-stock" class="ops-list"></div>
           </div>
           <div class="panel">
             <div class="panel-heading compact">
@@ -144,7 +144,7 @@
                 <h2>Produtos perdendo catálogo</h2>
               </div>
             </div>
-            <div id="dashboard-catalog-loss" class="ops-list"></div>
+            <div class="report-actions"><button class="mini-button" type="button" data-export-report="dashboard_catalog" data-export-format="pdf">PDF</button><button class="mini-button" type="button" data-export-report="dashboard_catalog" data-export-format="xlsx">Excel</button></div><div id="dashboard-catalog-loss" class="ops-list"></div>
           </div>
           <div class="panel">
             <div class="panel-heading compact">
@@ -1520,9 +1520,9 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20261028-kit-stores"></script>
-  <script src="/goal-pricing.js?v=20261026-pricing-scopes"></script>
-  <script src="/sales-goals.js?v=20261023-goals-retries"></script>
+  <script src="/app.js?v=20261104-dashboard-pricing"></script>
+  <script src="/goal-pricing.js?v=20261104-pricing-save2"></script>
+  <script src="/sales-goals.js?v=20261104-dashboard-pricing"></script>
   <script src="/official-stores.js?v=20260923-clear-pending"></script>
   </body>
 </html>
