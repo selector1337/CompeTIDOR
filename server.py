@@ -1545,8 +1545,7 @@ def public_payload(payload, actor=None, include_catalog=True):
     if include_catalog:
         reclassify_internal_competition(payload)
         remove_internal_catalog_alerts(payload)
-    if payload.get("catalog"):
-        enrich_recent_sale_thumbnails(payload)
+    enrich_recent_sale_thumbnails(payload)
     if include_catalog:
         clean = json.loads(json.dumps(payload))
     else:
@@ -1619,13 +1618,18 @@ def normalize_catalog_alert_price(message):
 
 
 def enrich_recent_sale_thumbnails(payload):
+    rows = [*payload.get("recent_sales", []), *payload.get("daily_sku_sales", [])]
+    if not any(row.get("item_id") and not row.get("thumbnail") for row in rows):
+        return False
+    # The fast dashboard intentionally omits the full catalog, but its local
+    # thumbnails remain available without a Mercado Livre request.
+    catalog = payload.get("catalog") or read_json(CATALOG_DATA_FILE, [])
     catalog_by_id = {
         item.get("id"): item
-        for item in payload.get("catalog", [])
+        for item in catalog
         if item.get("id") and item.get("thumbnail")
     }
     changed = False
-    rows = [*payload.get("recent_sales", []), *payload.get("daily_sku_sales", [])]
     known_by_item = {
         str(row.get("item_id")): row.get("thumbnail")
         for row in rows
@@ -9154,7 +9158,13 @@ def sync_recent_sales(payload, account, client, orders=None, dashboard_only=Fals
     rows = []
     revenue_total = 0.0
     revenue_orders = 0
-    catalog_by_id = {item.get("id"): item for item in payload.get("catalog", []) if item.get("id")}
+    catalog = payload.get("catalog") or (read_json(CATALOG_DATA_FILE, []) if dashboard_only else [])
+    catalog_by_id = {item.get("id"): item for item in catalog if item.get("id")}
+    known_thumbnails = {
+        str(row["item_id"]): row["thumbnail"]
+        for row in [*payload.get("recent_sales", []), *payload.get("daily_sku_sales", [])]
+        if row.get("item_id") and row.get("thumbnail")
+    }
     for order in orders:
         order_total = official_order_revenue_amount(order)
         if official_order_is_revenue(order):
@@ -9174,7 +9184,7 @@ def sync_recent_sales(payload, account, client, orders=None, dashboard_only=Fals
                 "account": account.get("nickname"),
                 "product": item.get("title") or "Produto sem título",
                 "item_id": item.get("id") or "",
-                "thumbnail": item.get("thumbnail") or item.get("secure_thumbnail") or (catalog_by_id.get(item.get("id")) or {}).get("thumbnail") or "",
+                "thumbnail": item.get("secure_thumbnail") or item.get("thumbnail") or (catalog_by_id.get(item.get("id")) or {}).get("thumbnail") or known_thumbnails.get(str(item.get("id") or ""), ""),
                 "sku": official_sku,
                 "quantity": quantity,
                 "unit_price": unit_price,
