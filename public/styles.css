@@ -11097,3 +11097,4 @@ textarea:focus {
 .login-brand {justify-self:center;width:180px;min-height:0;padding:12px;background:#fff;border-radius:20px;box-shadow:0 12px 40px #0003;}
 .login-brand .login-logo {width:156px;height:156px;max-height:156px;filter:none;}
 .login-card input {border-radius:10px;min-height:46px;}
+.connection-recovery {position:fixed;z-index:100000;top:24px;left:50%;transform:translateX(-50%);width:min(540px,calc(100vw - 32px));padding:22px;border:1px solid #e4bb33;border-radius:16px;background:#18212a;color:#edf2f7;box-shadow:0 12px 40px #0006;} .connection-recovery p {color:#bac6d2;line-height:1.5;} .connection-recovery button {padding:10px 16px;border:0;border-radius:8px;background:#ffe000;color:#18212a;font-weight:700;cursor:pointer;}

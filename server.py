@@ -635,6 +635,7 @@ HTTP_MANUAL_MAX_CONCURRENT_REQUESTS = max(
 )
 HTTP_FAST_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_FAST_MAX_CONCURRENT_REQUESTS)
 HTTP_GOALS_QUERY_SEMAPHORE = threading.BoundedSemaphore(2)
+HTTP_SESSION_REQUEST_SEMAPHORE = threading.BoundedSemaphore(2)
 HTTP_MANUAL_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_MANUAL_MAX_CONCURRENT_REQUESTS)
 HTTP_POOL_ACTIVITY_LOCK = threading.Lock()
 HTTP_POOL_ACTIVITY = {"default": 0, "fast": 0, "manual": 0}
@@ -23830,6 +23831,8 @@ class App(BaseHTTPRequestHandler):
         semaphore = HTTP_FAST_REQUEST_SEMAPHORE if (
             parsed_path in fast_paths or parsed_path.startswith(fast_prefixes)
         ) else HTTP_REQUEST_SEMAPHORE
+        if parsed_path == "/api/auth/me":
+            semaphore = HTTP_SESSION_REQUEST_SEMAPHORE
         self.run_with_request_slot(self._do_GET, semaphore)
 
     def _do_GET(self):
@@ -23912,7 +23915,7 @@ class App(BaseHTTPRequestHandler):
                 self.send_json_body(body, headers=headers)
             return
         polling = parsed.path.startswith(("/api/async/jobs/", "/api/statistics/jobs/", "/api/reports/jobs/", "/api/spreadsheet/jobs/"))
-        payload = read_poll_authorization() if polling else read_payload(include_catalog=False)
+        payload = read_poll_authorization() if polling or parsed.path == "/api/auth/me" else read_payload(include_catalog=False)
 
         if parsed.path == "/api/auth/me":
             user = self.current_user(payload)

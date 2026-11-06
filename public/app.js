@@ -386,7 +386,9 @@ async function api(path, options = {}) {
       });
       payload = await response.json();
       } catch (error) {
-        if (controller.signal.aborted) throw new Error('O servidor não respondeu no prazo. O resultado da solicitação é incerto; confira o resultado antes de repetir uma alteração ou publicação.');
+        if (controller.signal.aborted) throw new Error(['GET','HEAD'].includes(method)
+          ? 'A consulta ao servidor não respondeu no prazo. Tente carregar os dados novamente.'
+          : 'O servidor não respondeu no prazo. O resultado da solicitação é incerto; confira o resultado antes de repetir uma alteração ou publicação.');
         if (response && !response.ok) payload = {};
         else throw error;
       } finally {
@@ -523,7 +525,11 @@ function showToast(message, type = "success") {
 }
 
 async function load() {
-  const [meta, dashboard] = await Promise.all([api("/api/meta"), api("/api/dashboard")]);
+  const controller = new AbortController();
+  const readOptions = {manualProgress:false,retryPrompt:false,timeoutMs:20000,signal:controller.signal};
+  let meta, dashboard;
+  try { [meta, dashboard] = await Promise.all([api("/api/meta",readOptions), api("/api/dashboard",readOptions)]); }
+  catch(error){controller.abort();throw error;}
   let meliConfig;
   try {
     meliConfig = state.meliConfig || {locked:true, issues:[], redirect_uri:meta.meli?.redirect_uri || ''};
@@ -600,7 +606,7 @@ async function loadCatalogInBackground(force = false) {
 }
 
 async function checkSession() {
-  const result = await api("/api/auth/me");
+  const result = await api("/api/auth/me", {manualProgress:false,retryPrompt:false,timeoutMs:15000});
   if (result.setup_required) {
     showSetup();
     return;
@@ -8804,6 +8810,7 @@ document.querySelector("#setup-form").addEventListener("submit", async (event) =
     state.currentUser = result.user;
     showApp();
     await load();
+    startupRecovery.complete();
   } catch (error) {
     feedback.textContent = error.message || "Não foi possível criar o usuário master.";
   }
@@ -8825,6 +8832,7 @@ document.querySelector("#login-form").addEventListener("submit", async (event) =
     state.currentUser = result.user;
     showApp();
     await load();
+    startupRecovery.complete();
   } catch (error) {
     if (error.setup_required) {
       showSetup();
@@ -8836,6 +8844,7 @@ document.querySelector("#login-form").addEventListener("submit", async (event) =
 
 async function logout() {
   await api("/api/auth/logout", { method: "POST", body: "{}" });
+  startupRecovery.complete();
   state.currentUser = null;
   showLogin();
 }
@@ -8887,6 +8896,7 @@ window.addEventListener("resize", () => {
 
 let dashboardRefreshing = false;
 window.setInterval(async () => {
+  if(navigator.onLine===false)return;
   if (!document.hidden && state.currentUser && ['anuncios','catalogo'].includes(state.route) && state.catalogLoaded && !state.catalogLoading && Date.now()-(state.catalogFetchedAt||0)>30000 && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '')) {
     loadCatalogInBackground(true);
   }
@@ -8919,6 +8929,41 @@ sidebar?.querySelectorAll("nav a").forEach((link) => {
   });
 });
 sidebar?.addEventListener("mouseleave", () => sidebar.classList.remove("force-collapsed"));
+
+function installStartupRecovery(check) {
+  let running=false, timer=null, failures=0, notice=null, pending=true;
+  const clearTimer=()=>{if(timer!==null){clearTimeout(timer);timer=null;}};
+  function show(message) {
+    if(!notice){
+      notice=document.createElement('section');notice.className='connection-recovery';notice.setAttribute('role','status');
+      const heading=document.createElement('strong');heading.textContent='Conexão temporariamente indisponível';
+      const detail=document.createElement('p');detail.dataset.recoveryDetail='';
+      const retry=document.createElement('button');retry.type='button';retry.textContent='Tentar reconectar';retry.onclick=attempt;
+      notice.append(heading,detail,retry);document.body.append(notice);
+    }
+    notice.querySelector('[data-recovery-detail]').textContent=message;
+    notice.querySelector('button').disabled=running;
+  }
+  async function attempt() {
+    if(running || !pending)return;
+    clearTimer();
+    if(navigator.onLine===false){show('Sem conexão com a internet. A página foi preservada; tentaremos novamente quando a conexão voltar.');return;}
+    running=true;if(notice)notice.querySelector('button').disabled=true;
+    try {
+      await check();pending=false;failures=0;notice?.remove();notice=null;
+    } catch(error) {
+      if(!pending)return;
+      failures++;
+      const delay=Math.min(60000,5000*2**Math.min(failures-1,4));
+      show('Não foi possível carregar a aplicação agora. A página foi preservada. Nova tentativa automática em '+(delay/1000)+' segundos.');
+      timer=setTimeout(()=>{timer=null;if(document.hidden){timer=setTimeout(attempt,30000);}else attempt();},delay);
+    } finally {running=false;if(notice)notice.querySelector('button').disabled=false;}
+  }
+  window.addEventListener('online',()=>{if(pending)attempt();});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden && pending)attempt();});
+  attempt();
+  return {retry:attempt,complete:()=>{pending=false;clearTimer();notice?.remove();notice=null;}};
+}
 
 function fixStaticCopyLabels() {
   const descriptionInput = document.querySelector('input[name="description_override"]');
@@ -8960,7 +9005,5 @@ function fixStaticCopyLabels() {
 if (!location.hash) location.hash = "#/dashboard";
 applyTheme();
 fixStaticCopyLabels();
-checkSession().catch((error) => {
-  document.body.innerHTML = `<main class="error"><h1>CompeTIDOR</h1><p>${error.message}</p></main>`;
-});
+const startupRecovery = installStartupRecovery(checkSession);
 
