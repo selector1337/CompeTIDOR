@@ -634,6 +634,7 @@ HTTP_MANUAL_MAX_CONCURRENT_REQUESTS = max(
     4, min(32, int(os.getenv("COMPETIDOR_HTTP_MANUAL_MAX_CONCURRENT_REQUESTS", "16")))
 )
 HTTP_FAST_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_FAST_MAX_CONCURRENT_REQUESTS)
+HTTP_GOALS_QUERY_SEMAPHORE = threading.BoundedSemaphore(2)
 HTTP_MANUAL_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_MANUAL_MAX_CONCURRENT_REQUESTS)
 HTTP_POOL_ACTIVITY_LOCK = threading.Lock()
 HTTP_POOL_ACTIVITY = {"default": 0, "fast": 0, "manual": 0}
@@ -11519,15 +11520,10 @@ def goal_pricing_service():
 
 def query_sales_goals(payload, request):
     period, _, _ = sales_goal_month(request.get("month"))
-    with DATA_LOCK:
-        store = read_json(SALES_GOALS_FILE, {"months": {}})
-        needs_migration = "targets" not in store
-        targets = sales_goal_targets(store)
-        if period == current_month_period() and period not in store["months"]:
-            sales_goal_period(store, period)
-            needs_migration = True
-        if needs_migration:
-            write_json(SALES_GOALS_FILE, store)
+    # Files are replaced atomically. A read must not wait for a catalog write
+    # or create a new month on disk merely to show the page.
+    store = read_json(SALES_GOALS_FILE, {"months": {}})
+    targets = sales_goal_targets(store)
     month = store.get("months", {}).get(period, {"targets": {}, "accounts": {}})
     rows = {}
     stock_references = {}
@@ -11557,8 +11553,11 @@ def query_sales_goals(payload, request):
                         or (normalized_sku_key(i.get("sku")), i.get("listing_type_id")) not in active_references]
     commercial = sku_commercial_index(payload, commercial_items)
     pricing_rules = (read_json("goal_pricing.json", {"rules": {}}).get("rules") or {})
+    rules_by_sku = {}
+    for key, rule in pricing_rules.items():
+        rules_by_sku.setdefault(rule.get('sku', key), []).append((key, rule))
     for sku, row in sorted(rows.items()):
-        sku_rules = [(key, rule) for key, rule in pricing_rules.items() if rule.get('sku',key) == sku]
+        sku_rules = rules_by_sku.get(sku, [])
         row["automatic_pricing_active"] = any(rule.get('enabled') for key,rule in sku_rules)
         if request.get("automatic_pricing") == "active" and not row["automatic_pricing_active"]:
             continue
@@ -24182,6 +24181,8 @@ class App(BaseHTTPRequestHandler):
             "/api/meli/identifiers/refresh",
         }
         semaphore = HTTP_REQUEST_SEMAPHORE if parsed_path in automatic_paths else HTTP_MANUAL_REQUEST_SEMAPHORE
+        if parsed_path == "/api/sales-goals/query":
+            semaphore = HTTP_GOALS_QUERY_SEMAPHORE
         self.run_with_request_slot(self._do_POST, semaphore)
 
     def _do_POST(self):
@@ -25388,6 +25389,13 @@ class App(BaseHTTPRequestHandler):
 
         if parsed.path in {"/api/sales-goals/query", "/api/sales-goals/save", "/api/sales-goals/refresh"}:
             action = parsed.path.rsplit("/", 1)[-1]
+            if action == "query":
+                try:
+                    local = {**payload, "catalog": read_json(CATALOG_DATA_FILE, [])}
+                    self.send_json(query_sales_goals(local, request))
+                except Exception as exc:
+                    self.send_json({"error": "Não foi possível consultar as metas salvas: " + str(exc)}, status=500)
+                return
             if action == "save" and (self.current_user(payload) or {}).get("role") == "viewer":
                 self.send_json({"error": "Perfil sem permissão para editar metas."}, status=403)
                 return

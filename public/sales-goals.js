@@ -10,7 +10,7 @@
   function editable() { return data?.editable && document.body.dataset.role !== 'viewer'; }
   function filters() { return {month:$('goals-month').value, search:$('goals-search').value, status:$('goals-status').value, registered:$('goals-registered').value, achievement:$('goals-achievement').value, automatic_pricing:$('goals-automatic-pricing').value}; }
   async function operation(action, body) {
-    const queued = await api('/api/sales-goals/' + action, {method:'POST', body:JSON.stringify(body), manualProgress:action !== 'query'});
+    const queued = await api('/api/sales-goals/' + action, {method:'POST', body:JSON.stringify(body), manualProgress:action !== 'query', ...(action==='query'?{retryPrompt:false,timeoutMs:20000}:{})});
     return waitForAsyncOperation(queued, message => $('goals-feedback').textContent = message || 'Processando…');
   }
   async function run(work, background=false) {
@@ -70,12 +70,29 @@
   async function load() {
     const version=++loadVersion, month=$('goals-month').value;
     if (data && data.month !== $('goals-month').value) { data=null; render(); }
-    const result = await operation('query', {month});
+    let result;
+    $('goals-feedback').textContent = data ? 'Atualizando a consulta; os dados anteriores continuam disponíveis.' : 'Carregando metas salvas…';
+    for(let attempt=0;attempt<2;attempt++){
+      try {result=await operation('query',{month});break;}
+      catch(error){
+        if(version!==loadVersion || month!==$('goals-month').value)return;
+        if(attempt===0 && ![400,401,403].includes(Number(error.status))){
+          $('goals-feedback').textContent='A consulta não respondeu. Tentando carregar as metas novamente…';
+          await new Promise(resolve=>setTimeout(resolve,1000));
+          continue;
+        }
+        const feedback=$('goals-feedback');
+        feedback.textContent='Não foi possível carregar as metas agora. Nenhuma meta ou preço foi alterado por esta consulta.';
+        const retry=document.createElement('button');retry.type='button';retry.className='mini-button';retry.textContent='Tentar carregar novamente';retry.onclick=()=>run(load,true);feedback.append(' ',retry);
+        return;
+      }
+    }
     if(version!==loadVersion || month!==$('goals-month').value)return;
     data=result;
     window.goalPricingPage?.setRows(data.rows);
     loadedAt = Date.now();
     $('goals-feedback').textContent = data.warnings.join(' ') || 'Metas válidas para todos os meses. Vendas atualizadas automaticamente pela sincronização das contas.';
+    return true;
   }
   $('goals-refresh').onclick = () => run(async()=> {
     const result = await operation('refresh', {month:$('goals-month').value});
@@ -84,7 +101,9 @@
     if (errors.length) $('goals-feedback').textContent = errors.map(r=>`${r.account}: ${r.error}`).join(' · ');
   });
   $('goals-save').onclick = () => run(async()=> {
-    const submitted={...edits}; await operation('save', {month:$('goals-month').value, targets:submitted}); for(const [sku,value] of Object.entries(submitted))if(edits[sku]===value)delete edits[sku]; await load(); $('goals-feedback').textContent='Metas salvas para todos os meses.';
+    const submitted={...edits}; await operation('save', {month:$('goals-month').value, targets:submitted}); for(const [sku,value] of Object.entries(submitted))if(edits[sku]===value)delete edits[sku];
+    if(await load())$('goals-feedback').textContent='Metas salvas para todos os meses.';
+    else $('goals-feedback').prepend('Metas salvas. ');
   });
   $('goals-rows').oninput = e => {
     if (!e.target.dataset.goalSku) return;
