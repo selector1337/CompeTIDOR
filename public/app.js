@@ -431,6 +431,19 @@ async function api(path, options = {}) {
   }
 }
 
+async function pollReportJob(url, deadline) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("O acompanhamento do relatório excedeu 15 minutos. A consulta pode continuar no servidor; tente consultar novamente para acompanhar o mesmo processamento.");
+    try {
+      return await api(url, { manualProgress: false, retryPrompt: false, timeoutMs: Math.min(20000, remaining) });
+    } catch (error) {
+      if ([400, 401, 403, 404].includes(error.status) || attempt === 2) throw error;
+      await new Promise(resolve => window.setTimeout(resolve, 1000 * (attempt + 1)));
+    }
+  }
+}
+
 async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 1000) {
   if (!initial?.job_id) return initial;
   const actionId = initial._manualActionId || "";
@@ -1047,13 +1060,14 @@ async function loadAnalytics() {
     };
     let job = await api("/api/analytics/query", { method: "POST", manualProgress: false, body: JSON.stringify(body) });
     state.analyticsJobId = job.id || "";
+    const reportDeadline = Date.now() + 15 * 60 * 1000;
     while (["queued", "processing"].includes(job.status)) {
       if (requestToken !== state.analyticsRequestToken) return;
       state.analyticsProgress = job.message || "Consultando as vendas oficiais...";
       updateManualAction(actionId, { message: state.analyticsProgress, progress: Number.isFinite(Number(job.progress)) ? Number(job.progress) : null });
       renderAnalytics();
       await new Promise((resolve) => window.setTimeout(resolve, 1800));
-      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+      job = await pollReportJob(`/api/statistics/jobs/${encodeURIComponent(job.id)}`, reportDeadline);
     }
     if (job.status !== "completed" || !job.result) throw new Error(job.message || "A análise não foi concluída.");
     if (requestToken !== state.analyticsRequestToken) return;
@@ -2059,12 +2073,13 @@ async function loadPurchaseOpportunities() {
       body: JSON.stringify(purchaseOpportunityRequest()),
     });
     state.purchaseOpportunityJobId = job.id || "";
+    const reportDeadline = Date.now() + 15 * 60 * 1000;
     while (["queued", "processing"].includes(job.status)) {
       state.purchaseOpportunityProgress = job.message || "Enriquecendo ranking, preços e concorrência...";
       updateManualAction(actionId, { message: state.purchaseOpportunityProgress, progress: Number(job.progress || 0) });
       renderPurchaseOpportunities();
       await new Promise((resolve) => setTimeout(resolve, 1300));
-      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+      job = await pollReportJob(`/api/statistics/jobs/${encodeURIComponent(job.id)}`, reportDeadline);
     }
     if (job.status !== "completed" || !job.result) throw new Error(job.message || "A pesquisa não foi concluída.");
     state.purchaseOpportunities = job.result;
@@ -2177,12 +2192,13 @@ async function loadPurchaseAnalysis() {
   try {
     let job = await api("/api/purchases/query", { method: "POST", manualProgress: false, body: JSON.stringify(purchaseRequestFromForm()) });
     state.purchaseJobId = job.id || "";
+    const reportDeadline = Date.now() + 15 * 60 * 1000;
     while (["queued", "processing"].includes(job.status)) {
       state.purchaseProgress = job.message || "Calculando demanda, curvas e reposição...";
       updateManualAction(actionId, { message: state.purchaseProgress, progress: Number(job.progress || 0) });
       renderPurchases();
       await new Promise((resolve) => setTimeout(resolve, 1600));
-      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+      job = await pollReportJob(`/api/statistics/jobs/${encodeURIComponent(job.id)}`, reportDeadline);
     }
     if (job.status !== "completed" || !job.result) throw new Error(job.message || "A análise de compras não foi concluída.");
     state.purchaseAnalysis = job.result;
@@ -4543,6 +4559,7 @@ async function loadStatistics() {
       }),
     });
     state.statisticsJobId = job.id || "";
+    const reportDeadline = Date.now() + 15 * 60 * 1000;
     while (["queued", "processing"].includes(job.status)) {
       if (requestToken !== state.statisticsRequestToken) return;
       state.statisticsProgress = job.message || "Consulta em andamento no servidor...";
@@ -4552,7 +4569,7 @@ async function loadStatistics() {
       });
       renderStatistics();
       await new Promise((resolve) => window.setTimeout(resolve, 1800));
-      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+      job = await pollReportJob(`/api/statistics/jobs/${encodeURIComponent(job.id)}`, reportDeadline);
     }
     if (job.status !== "completed" || !job.result) {
       throw new Error(job.message || "A consulta de estatísticas não foi concluída.");
@@ -4683,12 +4700,13 @@ async function loadSalesReport() {
       }),
     });
     state.salesReportJobId = job.id || "";
+    const reportDeadline = Date.now() + 15 * 60 * 1000;
     while (["queued", "processing"].includes(job.status)) {
       state.salesReportProgress = job.message || "Consultando vendas oficiais...";
       updateManualAction(actionId, { message: state.salesReportProgress, progress: Number(job.progress || 0) });
       renderSalesReport();
       await new Promise((resolve) => setTimeout(resolve, 1600));
-      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+      job = await pollReportJob(`/api/statistics/jobs/${encodeURIComponent(job.id)}`, reportDeadline);
     }
     if (job.status !== "completed" || !job.result) throw new Error(job.message || "O relatório não foi concluído.");
     state.salesReport = job.result;
@@ -4876,12 +4894,13 @@ async function loadBrandSalesReport() {
       }),
     });
     state.brandSalesReportJobId = job.id || "";
+    const reportDeadline = Date.now() + 15 * 60 * 1000;
     while (["queued", "processing"].includes(job.status)) {
       state.brandSalesReportProgress = job.message || "Analisando vendas e estoque da marca...";
       updateManualAction(actionId, { message: state.brandSalesReportProgress, progress: Number(job.progress || 0) });
       renderBrandSalesReport();
       await new Promise((resolve) => setTimeout(resolve, 1600));
-      job = await api(`/api/statistics/jobs/${encodeURIComponent(job.id)}`);
+      job = await pollReportJob(`/api/statistics/jobs/${encodeURIComponent(job.id)}`, reportDeadline);
     }
     if (job.status !== "completed" || !job.result) throw new Error(job.message || "O relatório não foi concluído.");
     state.brandSalesReport = job.result;
@@ -4993,7 +5012,8 @@ async function downloadReport(button) {
   button.textContent = "Gerando...";
   const actionId = beginManualAction("Gerando relatório", "Preparando os dados do relatório...");
   try {
-    const response = await fetch("/api/reports/export", {
+    const started = await api("/api/reports/export", {
+      manualProgress: false, retryPrompt: false, timeoutMs: 20000,
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
@@ -5012,23 +5032,14 @@ async function downloadReport(button) {
                 : "",
       }),
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.error || "Não foi possível gerar o relatório.");
-    }
-    const started = await response.json();
     let reportJob = started;
+    const reportDeadline = Date.now() + 15 * 60 * 1000;
     while (["queued", "processing"].includes(reportJob.status)) {
       button.textContent = reportJob.row_count
         ? `Gerando ${Number(reportJob.row_count).toLocaleString("pt-BR")} linhas...`
         : "Preparando relatório...";
       await new Promise((resolve) => setTimeout(resolve, 1200));
-      const progressResponse = await fetch(`/api/reports/jobs/${encodeURIComponent(started.id)}`, {
-        credentials: "same-origin",
-      });
-      const progress = await progressResponse.json().catch(() => ({}));
-      if (!progressResponse.ok) throw new Error(progress.error || "Não foi possível acompanhar a geração do relatório.");
-      reportJob = progress;
+      reportJob = await pollReportJob(`/api/reports/jobs/${encodeURIComponent(started.id)}`, reportDeadline);
       updateManualAction(actionId, {
         message: reportJob.message || "Gerando relatório...",
         progress: Number.isFinite(Number(reportJob.progress)) ? Number(reportJob.progress) : null,

@@ -748,6 +748,11 @@ INTERACTIVE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=CLONE_CONCURRENT_JOBS,
 MANUAL_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=MANUAL_CONCURRENT_JOBS, thread_name_prefix="manual-job")
 BACKGROUND_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=BACKGROUND_CONCURRENT_JOBS, thread_name_prefix="background-job")
 HEAVY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=HEAVY_CONCURRENT_JOBS, thread_name_prefix="heavy-job")
+# Interactive reports must not queue behind historical imports or scheduled
+# replenishment scans. Keep concurrency bounded and exports independent of API I/O.
+ANALYTICS_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="analytics-job")
+STATISTICS_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="statistics-job")
+EXPORT_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="export-job")
 INTERACTIVE_MELI_MAX_IN_FLIGHT = configured_int(
     "MELI_INTERACTIVE_MAX_IN_FLIGHT", "interactive_meli_max_in_flight", maximum=12
 )
@@ -21140,7 +21145,12 @@ def start_statistics_job(request):
                         }
                     )
 
-    HEAVY_JOB_EXECUTOR.submit(worker)
+    executor = (
+        ANALYTICS_JOB_EXECUTOR if safe_request.get("kind") == "analytics"
+        else HEAVY_JOB_EXECUTOR if safe_request.get("kind") == "purchase_opportunities"
+        else STATISTICS_JOB_EXECUTOR
+    )
+    executor.submit(worker)
     return {key: value for key, value in job.items() if key not in {"result", "signature", "created_epoch"}}
 
 
@@ -21281,7 +21291,7 @@ def start_report_job(request):
                     {"status": "error", "message": str(exc), "finished_at": now_label()}
                 )
 
-    HEAVY_JOB_EXECUTOR.submit(worker)
+    EXPORT_JOB_EXECUTOR.submit(worker)
     return report_job_result(job_id)
 
 
