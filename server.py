@@ -14093,7 +14093,10 @@ def clone_attribute_row(attribute):
     if not attr_id:
         return {}
     row = {"id": attr_id}
-    if attribute.get("value_id") not in (None, ""):
+    # Identifiers must carry the barcode, not a source account's attribute ID.
+    if str(attr_id).upper() in GTIN_IDENTIFIER_ATTRS and clean_attribute_value(attribute.get("value_name")):
+        row["value_name"] = clean_attribute_value(attribute.get("value_name"))
+    elif attribute.get("value_id") not in (None, ""):
         row["value_id"] = attribute.get("value_id")
     elif clean_attribute_value(attribute.get("value_name")):
         row["value_name"] = clean_attribute_value(attribute.get("value_name"))
@@ -16051,6 +16054,14 @@ def clone_retry_adjustments_from_error(
         code = str(cause.get("code") or "")
         message = str(cause.get("message") or "")
         cause_type = str(cause.get("type") or "")
+        if code == "item.attribute.invalid_product_identifier" and not kit_mode:
+            # ML also uses this code for a *missing* GTIN. The required-field
+            # pass above has already restored it; do not erase that repair.
+            if cause_type == "warning" or (
+                required_error_ids.intersection(GTIN_IDENTIFIER_ATTRS)
+                and clone_payload_has_attribute(create_payload, "GTIN")
+            ):
+                continue
         if code in {"item.attributes.ignored", "invalid.item.attribute.values", "item.attribute.invalid_product_identifier"}:
             attrs_to_remove.extend(attribute_ids_from_error_text(message))
         if code == "item.attribute.invalid_product_identifier":
@@ -16076,9 +16087,11 @@ def clone_retry_adjustments_from_error(
                     continue
                 pending = pending_clone_attribute("GTIN", source_item, category_attributes or [], item_id)
                 if pending:
-                    pending["message"] = "Confira o código de barras da embalagem e a categoria do anúncio. Produtos idênticos podem usar o mesmo GTIN; não invente um código diferente."
-                    pending["default_value"] = ""
+                    pending["message"] = "O Mercado Livre recusou o código enviado para este produto ou categoria. O código foi preservado; confira a categoria e o código da embalagem."
+                    pending["default_value"] = ", ".join(source_clone_identifiers(create_payload) or source_identifiers)
+                    pending["rejected_value"] = True
                     pending_fields.append(pending)
+                    attrs_to_remove = [attr for attr in attrs_to_remove if attr not in GTIN_IDENTIFIER_ATTRS]
                 if not source_identifiers:
                     empty_reason = pending_clone_attribute("EMPTY_GTIN_REASON", source_item, category_attributes or [], item_id)
                     if empty_reason:
@@ -16134,7 +16147,7 @@ def clone_retry_adjustments_from_error(
                 pending["message"] = "Informe exatamente no formato aceito pelo Mercado Livre."
                 pending_fields.append(pending)
 
-    if "item.attribute.invalid" in error_text or "Value name of attribute" in error_text:
+    if re.search(r"item\.attribute\.invalid(?:[\s\"':]|$)", error_text) or "Value name of attribute" in error_text:
         for attr_id in attribute_ids_from_error_text(error_text):
             pending = pending_clone_attribute(attr_id, source_item, category_attributes or [], item_id)
             if pending:
@@ -16436,6 +16449,8 @@ def create_item_with_clone_retries(
         message = "Revise campos obrigatórios antes de copiar este anúncio."
         if labels:
             message = f"O Mercado Livre exige o preenchimento de: {labels}."
+        if any(field.get("rejected_value") for field in deduped_fields):
+            message = "O Mercado Livre recusou o GTIN/EAN enviado para este produto ou categoria. O código informado foi preservado para conferência."
         error = RuntimeError(message)
         error.pending_fields = deduped_fields
         error.original_error = str(last_error)
