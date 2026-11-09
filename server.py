@@ -2406,13 +2406,14 @@ class MercadoLivreClient:
             timeout=timeout,
         )
 
-    def post(self, path, payload):
+    def post(self, path, payload, timeout=None):
         validate_meli_path(path)
         return request_json(
             f"{MELI_API_URL}{path}",
             method="POST",
             payload=payload,
             headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"},
+            timeout=timeout,
         )
 
     def put(self, path, payload, retries=None, timeout=None):
@@ -2711,7 +2712,10 @@ class MercadoLivreClient:
             raise RuntimeError(f"HTTP {status}: {text}")
         return json.loads(text) if text else {}
 
-    def create_item_description(self, item_id, plain_text):
+    def create_item_description(self, item_id, plain_text, interactive=False):
+        if interactive:
+            return self.post(f"/items/{item_id}/description", {"plain_text": plain_text},
+                             timeout=interactive_request_options()["timeout"])
         return self.post(f"/items/{item_id}/description", {"plain_text": plain_text})
 
     def update_item_description(self, item_id, plain_text, interactive=False):
@@ -6846,7 +6850,7 @@ def cached_public_buybox(client, catalog_product_id, item=None):
 def winner_listing_type(value):
     if not isinstance(value, dict):
         return ""
-    explicit = value.get("listing_type_id")
+    explicit = value.get("listing_type_id") or first_present(value, ["listing_type.id", "item.listing_type_id"], "")
     if explicit in {"gold_pro", "gold_special"}:
         return explicit
     installments = value.get("installments")
@@ -6866,24 +6870,53 @@ def winner_listing_type(value):
     return ""
 
 
+WINNER_PAGE_CACHE = {}
+WINNER_PAGE_CACHE_LOCK = threading.Lock()
+
+
+def winner_item_public_terms(item_id):
+    item_id = str(item_id or "").upper()
+    if not re.fullmatch(r"MLB\d+", item_id):
+        return {}
+    with WINNER_PAGE_CACHE_LOCK:
+        cached = WINNER_PAGE_CACHE.get(item_id)
+        if cached and time.monotonic() - cached[0] < (300 if cached[1] else 30):
+            return dict(cached[1])
+    try:
+        result = fetch_public_buybox_url(f"https://produto.mercadolivre.com.br/MLB-{item_id[3:]}-_JM")
+        # A catalog redirect can display a different seller. Only accept a page
+        # whose final URL still identifies the exact winning listing.
+        ids = {match.replace("-", "").upper() for match in re.findall(r"MLB-?\d+", result.get("url") or "", re.I)}
+        if item_id not in ids:
+            result = {}
+    except Exception:
+        result = {}
+    with WINNER_PAGE_CACHE_LOCK:
+        if len(WINNER_PAGE_CACHE) >= 1000:
+            WINNER_PAGE_CACHE.clear()
+        WINNER_PAGE_CACHE[item_id] = (time.monotonic(), result)
+    return dict(result)
+
+
 def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, source_item=None, expected_price=None, details=None):
     winner = winner if isinstance(winner, dict) else {}
     seller_id = str(winner.get("seller_id") or first_present(winner, ["seller.id"], "") or "")
     seller_name = winner_embedded_name(winner)
-    winner_item = {}
+    winner_item = {"listing_type_id": winner_listing_type(winner)}
     if winner_item_id:
         try:
-            winner_item = client.item(winner_item_id) or {}
+            fetched_item = client.item(winner_item_id) or {}
+            winner_item.update({key: value for key, value in fetched_item.items() if value not in (None, "")})
             seller_id = seller_id or str(winner_item.get("seller_id") or first_present(winner_item, ["seller.id"], "") or "")
             seller_name = seller_name or winner_embedded_name(winner_item)
         except Exception:
-            winner_item = {}
+            pass
         if not seller_id or not seller_name or not winner_listing_type(winner_item):
             try:
                 bulk_rows = client.items_bulk([str(winner_item_id)])
                 bulk_item = next((row for row in bulk_rows or [] if str(row.get("id") or "") == str(winner_item_id)), {})
                 seller_id = seller_id or str(bulk_item.get("seller_id") or first_present(bulk_item, ["seller.id"], "") or "")
-                winner_item = {**bulk_item, **winner_item}
+                winner_item = {**bulk_item, **{key: value for key, value in winner_item.items() if value not in (None, "")}}
                 seller_name = seller_name or winner_embedded_name(bulk_item)
             except Exception:
                 pass
@@ -6900,7 +6933,7 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
                 if offer_type and not winner_listing_type(winner_item):
                     winner_item["listing_type_id"] = offer_type
                 seller_name = seller_name or winner_embedded_name(offer)
-                if seller_id or seller_name:
+                if seller_id and seller_name and winner_listing_type(winner_item):
                     break
         except Exception:
             pass
@@ -6921,6 +6954,15 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
                     winner_item["listing_type_id"] = winner_listing_type(public)
                 seller_name = seller_name or public_name
         except Exception:
+            pass
+    if not winner_listing_type(winner_item) and winner_item_id and seller_name and expected_price not in (None, ""):
+        public = winner_item_public_terms(winner_item_id)
+        normalize_name = lambda name: " ".join(str(name or "").casefold().split())
+        try:
+            if (normalize_name(public.get("seller_name")) == normalize_name(seller_name)
+                    and abs(float(public.get("price")) - float(expected_price)) <= 0.02):
+                winner_item["listing_type_id"] = winner_listing_type(public)
+        except (TypeError, ValueError):
             pass
     if details is not None:
         details["winner_listing_type_id"] = winner_listing_type(winner_item) or winner_listing_type(winner)
@@ -14966,11 +15008,16 @@ def discover_official_stores_from_items_uncached(target_client, target_account, 
     ]
     limit = max(20, min(200, int(os.getenv("MELI_OFFICIAL_STORE_DISCOVERY_ITEMS", "100"))))
     stores = []
-    for start in range(0, min(len(item_ids), limit), 20):
+    def fetch_stores_batch(ids):
         try:
-            items = target_client.items_bulk(item_ids[start:start + 20])
+            return call_interactive_client_method(target_client.items_bulk, ids)
         except Exception:
-            break
+            return []
+    batches = [item_ids[start:start + 20] for start in range(0, min(len(item_ids), limit), 20)]
+    priority = getattr(MELI_WORK_CONTEXT, "priority", "interactive")
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="clone-stores") as executor:
+        results = list(executor.map(lambda ids: run_meli_work(priority, fetch_stores_batch, ids), batches))
+    for items in results:
         for item in items or []:
             store_id = item.get("official_store_id") or first_present(item, ["official_store.id"], None)
             if store_id in (None, ""):
@@ -16474,10 +16521,18 @@ def create_official_clone(payload, job, source_item_id, edits):
     target_account_id = str(target_account.get("id") or target_account.get("seller_id") or "")
     cross_account = bool(source_account_id and target_account_id and source_account_id != target_account_id)
     create_payload = build_clone_item_payload(source_item, edits)
-    try:
-        category_attributes = cached_category_attributes(source_client, source_item.get("category_id"))
-    except Exception:
-        category_attributes = []
+    def read_category():
+        try:
+            return cached_category_attributes(source_client, source_item.get("category_id"))
+        except Exception:
+            return []
+    priority = getattr(MELI_WORK_CONTEXT, "priority", "interactive")
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="clone-prepare") as executor:
+        category_future = executor.submit(run_meli_work, priority, read_category)
+        stores_future = executor.submit(run_meli_work, priority, target_official_stores,
+            target_client, target_account, payload.get("catalog") or []) if cross_account or job.get("official_store_id") else None
+        category_attributes = category_future.result()
+        destination_stores = stores_future.result() if stores_future else []
     catalog_product = bundle.get("catalog_product") or {}
     if catalog_product:
         source_item["_clone_catalog_product"] = catalog_product
@@ -16486,11 +16541,6 @@ def create_official_clone(payload, job, source_item_id, edits):
     create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
     update_async_operation_progress("Conferindo a loja oficial e preparando a cópia.")
-    destination_stores = target_official_stores(
-        target_client,
-        target_account,
-        payload.get("catalog") or [],
-    ) if cross_account or job.get("official_store_id") else []
     allowed_store_ids = {
         str(store.get("official_store_id") or "")
         for store in destination_stores
@@ -16538,9 +16588,10 @@ def create_official_clone(payload, job, source_item_id, edits):
         description_text = bundle.get("description") or ""
     if description_text and created.get("id"):
         try:
-            target_client.create_item_description(created["id"], description_text)
-        except Exception:
-            pass
+            call_interactive_client_method(target_client.create_item_description, created["id"], description_text)
+        except Exception as exc:
+            created["_verification_warning"] = (created.get("_verification_warning", "") +
+                f" Anúncio criado; não foi possível confirmar a descrição: {exc}").strip()
     return created, source_item, verified_item
 
 
