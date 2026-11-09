@@ -1,4 +1,4 @@
-﻿from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import date, datetime, time as datetime_time, timedelta
 from zoneinfo import ZoneInfo
@@ -747,6 +747,8 @@ BACKGROUND_WORKER_SEMAPHORE = threading.BoundedSemaphore(BACKGROUND_CONCURRENT_J
 INTERACTIVE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=CLONE_CONCURRENT_JOBS, thread_name_prefix="interactive-job")
 MANUAL_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=MANUAL_CONCURRENT_JOBS, thread_name_prefix="manual-job")
 BACKGROUND_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=BACKGROUND_CONCURRENT_JOBS, thread_name_prefix="background-job")
+PUBLICATION_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="publication-job")
+PUBLICATION_WORKER_SEMAPHORE = threading.BoundedSemaphore(2)
 HEAVY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=HEAVY_CONCURRENT_JOBS, thread_name_prefix="heavy-job")
 # Interactive reports must not queue behind historical imports or scheduled
 # replenishment scans. Keep concurrency bounded and exports independent of API I/O.
@@ -2563,9 +2565,9 @@ class MercadoLivreClient:
                 items.append(body)
         return items
 
-    def item_pictures_bulk(self, item_ids):
+    def item_pictures_bulk(self, item_ids, interactive=False):
         ids = ",".join(str(item_id) for item_id in item_ids if item_id)
-        rows = self.get(f"/items?ids={ids}&attributes=id,pictures")
+        rows = self.get(f"/items?ids={ids}&attributes=id,pictures", **(interactive_request_options() if interactive else {}))
         items = []
         for row in rows if isinstance(rows, list) else []:
             body = row.get("body") if isinstance(row, dict) else None
@@ -2665,8 +2667,8 @@ class MercadoLivreClient:
     def product_winners(self, catalog_product_id):
         return self.get(f"/products/{catalog_product_id}/items?site_id=MLB")
 
-    def category_attributes(self, category_id):
-        return self.get(f"/categories/{category_id}/attributes")
+    def category_attributes(self, category_id, interactive=False):
+        return self.get(f"/categories/{category_id}/attributes", **(interactive_request_options() if interactive else {}))
 
     def create_item(self, payload):
         return self.post("/items", payload)
@@ -12592,6 +12594,8 @@ def start_async_operation(
     kind, work, message="Processamento adicionado à fila.", heavy=False,
     priority="interactive", idempotency_key="",
 ):
+    if kind in {"clone_execute", "product_publish"} and not heavy:
+        priority = "publication"
     cleanup_async_operation_jobs()
     idempotency_key = clean_attribute_value(
         idempotency_key or getattr(HTTP_REQUEST_CONTEXT, "idempotency_key", "")
@@ -12625,12 +12629,13 @@ def start_async_operation(
             ASYNC_OPERATION_IDEMPOTENCY[idempotency_key] = job_id
 
     def worker():
-        interactive = not heavy and priority in {"interactive", "manual"}
+        interactive = not heavy and priority in {"interactive", "manual", "publication"}
         previous_job_id = getattr(MELI_WORK_CONTEXT, "job_id", None)
         MELI_WORK_CONTEXT.job_id = job_id
         try:
             semaphore = (
                 HEAVY_WORKER_SEMAPHORE if heavy
+                else PUBLICATION_WORKER_SEMAPHORE if priority == "publication"
                 else BACKGROUND_WORKER_SEMAPHORE if priority == "background"
                 else MANUAL_WORKER_SEMAPHORE if priority == "manual"
                 else CLONE_WORKER_SEMAPHORE
@@ -12687,6 +12692,7 @@ def start_async_operation(
 
     executor = (
         HEAVY_JOB_EXECUTOR if heavy
+        else PUBLICATION_JOB_EXECUTOR if priority == "publication"
         else BACKGROUND_JOB_EXECUTOR if priority == "background"
         else MANUAL_JOB_EXECUTOR if priority == "manual"
         else INTERACTIVE_JOB_EXECUTOR
@@ -13981,7 +13987,7 @@ def complete_clone_source_pictures(client, item_id, source_item):
     method = getattr(client, "item_pictures_bulk", None)
     if callable(method):
         try:
-            rows = method([item_id]) or []
+            rows = call_interactive_client_method(method, [item_id]) or []
             matching = next(
                 (
                     row for row in rows
@@ -14118,10 +14124,7 @@ def clone_attribute_row(attribute):
 def clone_source_item(client, item_id):
     method = getattr(client, "item_for_clone", None)
     if callable(method):
-        try:
-            return method(item_id)
-        except Exception:
-            pass
+        return method(item_id)
     return client.item(item_id)
 
 
@@ -14926,8 +14929,9 @@ OFFICIAL_STORE_DISCOVERY_CACHE = {}
 
 
 def discover_official_stores_from_items(target_client, target_account, catalog):
-    cache_key = (str(DATA), str(target_account.get("seller_id") or target_account.get("id")),
-                 tuple(sorted((str(row.get("id")), str(row.get("official_store_id") or "")) for row in catalog or [])))
+    # Newly created listings must not invalidate the account directory on every
+    # copy. Current local stores are merged by target_official_stores separately.
+    cache_key = (str(DATA), str(target_account.get("seller_id") or target_account.get("id")))
     with OFFICIAL_STORE_CACHE_LOCK:
         cached = OFFICIAL_STORE_DISCOVERY_CACHE.get(cache_key)
         if cached and time.monotonic() - cached[0] < 300:
@@ -15506,7 +15510,7 @@ def cached_category_attributes(client, category_id):
         cached = CATEGORY_ATTRIBUTES_CACHE.get(category_id)
         if cached and now - cached["time"] < ttl:
             return cached["attributes"]
-    attributes = client.category_attributes(category_id)
+    attributes = call_interactive_client_method(client.category_attributes, category_id)
     attributes = attributes if isinstance(attributes, list) else []
     with CATEGORY_ATTRIBUTES_LOCK:
         CATEGORY_ATTRIBUTES_CACHE[category_id] = {"time": now, "attributes": attributes}
@@ -16221,6 +16225,90 @@ def normalize_created_item_response(value):
     raise RuntimeError("O Mercado Livre criou o anúncio, mas retornou uma confirmação em formato inesperado.")
 
 
+PUBLICATION_KEY_LOCKS = [threading.Lock() for _ in range(64)]
+
+class PublicationPending(RuntimeError):
+    publication_pending = True
+
+
+def guarded_publication_create(app, client, body, seller_id, operation_key, verify_only=False):
+    key = hashlib.sha256((str(seller_id) + ':' + operation_key).encode()).hexdigest()
+    filename = f"publication-attempt-{key}.json"
+    # One small atomic file per operation: no growing shared ledger on every POST.
+    with PUBLICATION_KEY_LOCKS[int(key[:8], 16) % len(PUBLICATION_KEY_LOCKS)]:
+        record = app.read_json(filename, {}) or None
+        def save(value):
+            app.write_json(filename, value or {})
+        if record and record.get('created'):
+            return {**record['created'], '_publication_reused': True}
+        if not record and verify_only:
+            raise PublicationPending('Esta tentativa anterior teve resposta incerta e não possui registro de confirmação. Confira o código MLB da cópia já criada antes de preparar outra publicação. Nenhum novo pedido foi enviado.')
+        if not record:
+            record = {'started': time.time(), 'seller_id': str(seller_id), 'body': body, 'status': 'pending'}
+            # Persist intent before the POST, including across application restarts.
+            save(record)
+            try:
+                created = app.normalize_created_item_response(client.create_item(body))
+                if not created.get('id'):
+                    raise PublicationPending('A API não retornou o código do anúncio.')
+            except Exception as exc:
+                status = app.meli_error_status(exc)
+                if 400 <= status < 500 and status != 408:
+                    save(None)  # Explicit rejection: validation correction is allowed.
+                    raise
+                record['error'] = str(exc)
+                save(record)
+            else:
+                record.update(created=created, status='confirmed')
+                try:
+                    save(record)
+                except Exception:
+                    created['_verification_warning'] = 'Anúncio confirmado, mas o registro da confirmação está pendente. Não publique novamente.'
+                return created
+        # Only reads from here: a 500 or timeout may hide a successful creation.
+        for attempt in range(3):
+            try:
+                response = client.seller_recent_items(seller_id, limit=50)
+                ids = response.get('results') or []
+                candidates = client.items_bulk(ids, interactive=True) if ids else []
+                matches = [item for item in candidates if publication_matches_attempt(app, item, record)]
+                if len(matches) == 1:
+                    record.update(created=matches[0], status='confirmed')
+                    save(record)
+                    return {**matches[0], '_publication_reused': True}
+            except Exception:
+                pass
+            if attempt < 2:
+                time.sleep(1)
+        raise PublicationPending('O Mercado Livre retornou uma resposta incerta. A publicação pode ter sido criada e está aguardando confirmação. Use Conferir publicação; o pedido de criação não será reenviado.')
+
+
+def publication_matches_attempt(app, item, record):
+    if not isinstance(item, dict) or not item.get('id'):
+        return False
+    body = record['body']
+    created = app.parse_meli_datetime(item.get('date_created'))
+    if not created or created.timestamp() < record['started']:
+        return False
+    if str(item.get('seller_id')) != record['seller_id']:
+        return False
+    sku = app.item_sku(body)
+    if not sku or sku == '-' or app.item_sku(item) != sku:
+        return False
+    for field in ('category_id', 'listing_type_id', 'official_store_id', 'catalog_product_id'):
+        if str(item.get(field) or '') != str(body.get(field) or ''):
+            return False
+    if bool(item.get('catalog_listing')) != bool(body.get('catalog_listing')):
+        return False
+    title = body.get('title') or body.get('family_name')
+    if title and title not in (item.get('title'), item.get('family_name')):
+        return False
+    try:
+        return abs(float(item['price']) - float(body['price'])) < .01
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def create_item_with_clone_retries(
     target_client,
     create_payload,
@@ -16261,9 +16349,9 @@ def create_item_with_clone_retries(
                         "campos": ["official_store_id"],
                         "destino": destination_store_id,
                     })
+            update_async_operation_progress("Enviando ou conferindo a publicação no Mercado Livre.")
             if publication_context and publication_context.get("seller_id") and publication_context.get("key"):
-                import publication_guard
-                created = publication_guard.create(sys.modules[__name__], target_client, payload,
+                created = guarded_publication_create(sys.modules[__name__], target_client, payload,
                     publication_context["seller_id"], publication_context["key"], verify_only=publication_context.get("verify_only", False))
             else:
                 created = normalize_created_item_response(target_client.create_item(payload))
@@ -16364,6 +16452,7 @@ def create_official_clone(payload, job, source_item_id, edits):
         raise RuntimeError("Conta destino oficial não encontrada para clonar via Mercado Livre.")
     source_client = account_client(source_account)
     target_client = account_client(target_account)
+    update_async_operation_progress("Lendo dados e descrição do anúncio de origem.")
     bundle = clone_source_bundle(payload, source_account.get("id"), source_item_id, include_description=True)
     source_item = bundle["source_item"]
     source_account_id = str(source_account.get("id") or source_account.get("seller_id") or "")
@@ -16381,6 +16470,7 @@ def create_official_clone(payload, job, source_item_id, edits):
     hydrate_required_clone_attributes(create_payload, source_item, category_attributes, catalog_product)
     create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
+    update_async_operation_progress("Conferindo a loja oficial e preparando a cópia.")
     destination_stores = target_official_stores(
         target_client,
         target_account,
@@ -25810,6 +25900,7 @@ if __name__ == "__main__":
     else:
         print("HTTPS local desativado; TLS deve terminar no proxy reverso.")
     http_server.serve_forever()
+
 
 
 
