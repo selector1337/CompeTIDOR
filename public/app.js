@@ -431,6 +431,16 @@ async function api(path, options = {}) {
   }
 }
 
+async function followPendingPublication(result, repeat, onProgress, isPending) {
+  for (let attempt = 0; attempt < 3 && isPending(result); attempt++) {
+    onProgress("Aguardando confirmação do anúncio já enviado...");
+    await new Promise(resolve => window.setTimeout(resolve, 5000));
+    try { result = await repeat(); }
+    catch (_) { break; } // Keep the known pending result, never replace it with failure.
+  }
+  return result;
+}
+
 async function pollReportJob(url, deadline) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const remaining = deadline - Date.now();
@@ -5317,7 +5327,7 @@ function renderClone() {
             <p>${cloneJobNoteHtml(job.note)}</p>
             ${job.created_details?.length ? cloneCreatedHtml(job.created_details) : ""}
             ${job.errors?.length ? cloneErrorsHtml(job.errors, job.validation_version) : ""}
-            ${["preview_ready", "review_required", "partial_error", "error"].includes(job.status) ? `<button class="mini-button" data-execute-clone="${job.id}">${!job.validation_version ? "Revalidar e copiar" : job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button>` : ""}
+            ${["preview_ready", "review_required", "partial_error", "error", "confirmation_pending"].includes(job.status) ? `<button class="mini-button" data-execute-clone="${job.id}">${job.status === "confirmation_pending" ? "Conferir publicação" : !job.validation_version ? "Revalidar e copiar" : job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button>` : ""}
           </div>
           <span class="badge ${cloneJobStatusTone(job.status)}">${cloneJobStatusLabel(job.status)}</span>
         </article>
@@ -5595,10 +5605,10 @@ function renderPublisherResults(result) {
   const root = document.querySelector("#publisher-results");
   if (!root) return;
   applyPublisherPendingFields(result?.results || []);
-  root.innerHTML = `<div class="publisher-result-summary"><strong>${Number(result.created || 0)} anúncio(s) criado(s)</strong><span>${Number(result.reused || 0)} já existente(s) · ${Number(result.failed || 0)} falha(s)</span></div>
+  root.innerHTML = `<div class="publisher-result-summary"><strong>${Number(result.created || 0)} anúncio(s) criado(s)</strong><span>${Number(result.reused || 0)} já existente(s) · ${Number(result.pending || 0)} aguardando confirmação · ${Number(result.failed || 0)} falha(s)</span></div>
     <div class="publisher-result-grid">${(result.results || []).map((row) => row.status === "created" ? `
       <a href="${escapeAttr(row.permalink || "#")}" target="_blank" rel="noreferrer"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${escapeText(row.item_id || "Criado")}</strong><span>${escapeText(row.title || "")}</span>${row.catalog_link_status ? `<em>${row.catalog_link_status === "linked" ? `Vinculado ao tradicional ${escapeText(row.traditional_item_id)}` : "Vínculo aguardando confirmação"}</em>` : ""}${row.warning ? `<span class="publisher-result-warning">${escapeText(row.warning)}</span>` : ""}${row.reused ? "<small>Anúncio existente reutilizado</small>" : ""}</a>
-    ` : `<article class="${row.pending_fields?.length ? "review" : "error"}"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${row.pending_fields?.length ? "Ajuste necessário" : "Não publicado"}</strong><span>${escapeText(row.error || "Erro não identificado")}</span>${row.pending_fields?.length ? `<em>${escapeText(publisherPendingGuidance(row))}</em>` : ""}</article>`).join("")}</div>`;
+    ` : `<article class="${row.status === "pending" || row.pending_fields?.length ? "review" : "error"}"><small>${escapeText(row.account)} · ${row.listing_type_id === "gold_pro" ? "Premium" : "Clássico"} · ${row.publication_mode === "catalog" ? "Catálogo" : "Tradicional"}</small><strong>${row.status === "pending" ? "Aguardando confirmação" : row.pending_fields?.length ? "Ajuste necessário" : "Não publicado"}</strong><span>${escapeText(row.error || "Erro não identificado")}</span>${row.pending_fields?.length ? `<em>${escapeText(publisherPendingGuidance(row))}</em>` : ""}</article>`).join("")}</div>`;
 }
 
 function applyPublisherPendingFields(rows) {
@@ -5660,6 +5670,7 @@ function cloneJobNoteHtml(note) {
 function cloneJobStatusLabel(status) {
   return ({
     copied: "Copiado",
+    confirmation_pending: "Aguardando confirmação",
     preview_ready: "Pronto para copiar",
     review_required: "Revisão necessária",
     partial_error: "Concluído parcialmente",
@@ -5669,7 +5680,7 @@ function cloneJobStatusLabel(status) {
 
 function cloneJobStatusTone(status) {
   if (status === "copied") return "winning";
-  if (status === "review_required" || status === "preview_ready") return "sharing";
+  if (status === "confirmation_pending" || status === "review_required" || status === "preview_ready") return "sharing";
   return "losing";
 }
 
@@ -5786,7 +5797,7 @@ function cloneErrorsHtml(errors, validationVersion = 0) {
     `;
   }
   return `
-    <div class="notice danger-notice">
+    <div class="notice ${errors.every(row => row.publication_pending) ? "warning-notice" : "danger-notice"}">
       ${errors.map((row) => `
         <div class="clone-error-block">
           <strong>${escapeText(row.item_id)}</strong>
@@ -8139,7 +8150,7 @@ document.querySelector("#product-publish-form")?.addEventListener("submit", asyn
     renderPublisherResults(result);
     const pendingRow = (result.results || []).find((row) => row.pending_fields?.length);
     showToast(
-      result.requires_review
+      result.pending ? "Aguardando confirmação do Mercado Livre. Use Conferir publicação para consultar o mesmo envio." : result.requires_review
         ? (pendingRow ? publisherPendingGuidance(pendingRow) : "Confira os avisos e o estado do vínculo nos resultados da publicação.")
         : `${result.created || 0} anúncio(s) criado(s)${result.failed ? `; ${result.failed} falharam` : ""}.`,
       result.failed ? "error" : "success",
@@ -8294,12 +8305,20 @@ document.querySelector("#clone-jobs").addEventListener("click", async (event) =>
       method: "POST",
       body: JSON.stringify({ job_id: button.dataset.executeClone, field_answers: fieldAnswers }),
     });
-    const result = await waitForAsyncOperation(queued, (message) => {
+    let result = await waitForAsyncOperation(queued, (message) => {
       button.textContent = message.includes("fila") ? "Cópia na fila..." : "Copiando...";
     });
+    const confirmedCopies = new Map((result.copied || []).map(row => [row.id, row]));
+    result = await followPendingPublication(result, async () => {
+      const next = await api("/api/clone/execute", {method:"POST", manualProgress:false, body:JSON.stringify({job_id:button.dataset.executeClone,field_answers:fieldAnswers})});
+      const checked = await waitForAsyncOperation(next, message => {button.textContent = message;});
+      (checked.copied || []).forEach(row => confirmedCopies.set(row.id, row));
+      checked.copied = [...confirmedCopies.values()];
+      return checked;
+    }, message => {button.textContent = message;}, value => value.job?.status === "confirmation_pending");
     state.data.catalog.push(...(result.copied || []));
     state.data.clone_jobs = state.data.clone_jobs.map((job) => (job.id === result.job.id ? result.job : job));
-    showToast("Anúncios copiados com sucesso.");
+    showToast(result.job?.status === "confirmation_pending" ? "Aguardando confirmação do Mercado Livre. Use Conferir publicação; não será criada outra cópia." : result.job?.errors?.length ? "Confira os resultados de cada anúncio." : "Anúncios copiados com sucesso.");
     render();
   } catch (error) {
     showToast(error.message || "Não foi possível copiar os anúncios.", "error");

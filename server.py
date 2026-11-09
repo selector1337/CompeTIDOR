@@ -1056,6 +1056,7 @@ def merge_clone_jobs(incoming, latest):
         "preview_ready": 1,
         "review_required": 2,
         "partial_error": 3,
+        "confirmation_pending": 3,
         "error": 3,
         "copied": 4,
     }
@@ -1253,6 +1254,13 @@ def write_payload(payload, replace_collections=None):
                     payload.get("catalog", []),
                     read_json(CATALOG_DATA_FILE, []),
                 )
+        deletions = {}
+        for record in [*(latest.get("deleted_items") or []), *(payload.get("deleted_items") or [])]:
+            if record.get("item_id"):
+                deletions[str(record["item_id"])] = record
+        payload["deleted_items"] = list(deletions.values())
+        if payload.get("_catalog_loaded", True):
+            payload["catalog"] = [row for row in payload.get("catalog", []) if str(row.get("id") or "") not in deletions]
         payload["_revision"] = latest_revision + 1
         catalog_loaded = bool(payload.get("_catalog_loaded", True))
         if catalog_loaded:
@@ -2538,14 +2546,15 @@ class MercadoLivreClient:
     def item_for_clone(self, item_id):
         return self.get(f"/items/{item_id}?include_attributes=all", **interactive_request_options())
 
-    def items_bulk(self, item_ids):
+    def items_bulk(self, item_ids, interactive=False):
+        options = {"retries": 1, "timeout": 5} if interactive else {}
         ids = ",".join(item_ids)
         try:
-            rows = self.get(f"/items/bulk?ids={ids}")
+            rows = self.get(f"/items/bulk?ids={ids}", **options)
         except Exception:
             # Mercado Livre keeps the former endpoint during the migration
             # window; retain it for accounts not enabled on /items/bulk yet.
-            rows = self.get(f"/items?ids={ids}&include_attributes=all")
+            rows = self.get(f"/items?ids={ids}&include_attributes=all", **options)
         items = []
         for row in rows if isinstance(rows, list) else []:
             body = row.get("body") if isinstance(row, dict) else None
@@ -6735,6 +6744,7 @@ def fetch_public_buybox_url(url, product_title=""):
     return {
         "seller_name": seller_name,
         "price": price,
+        "installments_text": " ".join(line for line in main_area.splitlines() if re.search(r"\b(?:sem|com)\s+juros\b", line, re.I)),
         "url": final_url,
         "source": "public_product_page",
     }
@@ -6831,6 +6841,29 @@ def cached_public_buybox(client, catalog_product_id, item=None):
     return value
 
 
+def winner_listing_type(value):
+    if not isinstance(value, dict):
+        return ""
+    explicit = value.get("listing_type_id")
+    if explicit in {"gold_pro", "gold_special"}:
+        return explicit
+    installments = value.get("installments")
+    if isinstance(installments, dict):
+        try:
+            quantity = int(installments.get("quantity") or 0)
+            rate = float(installments["rate"])
+            if quantity > 1 and math.isfinite(rate) and rate >= 0:
+                return "gold_pro" if rate == 0 else "gold_special"
+        except (KeyError, TypeError, ValueError):
+            pass
+    text = str(value.get("installments_text") or "")
+    if re.search(r"\bsem\s+juros\b", text, re.I):
+        return "gold_pro"
+    if re.search(r"\bcom\s+juros\b", text, re.I):
+        return "gold_special"
+    return ""
+
+
 def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, source_item=None, expected_price=None, details=None):
     winner = winner if isinstance(winner, dict) else {}
     seller_id = str(winner.get("seller_id") or first_present(winner, ["seller.id"], "") or "")
@@ -6843,7 +6876,7 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
             seller_name = seller_name or winner_embedded_name(winner_item)
         except Exception:
             winner_item = {}
-        if not seller_id or not seller_name:
+        if not seller_id or not seller_name or not winner_listing_type(winner_item):
             try:
                 bulk_rows = client.items_bulk([str(winner_item_id)])
                 bulk_item = next((row for row in bulk_rows or [] if str(row.get("id") or "") == str(winner_item_id)), {})
@@ -6852,7 +6885,7 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
                 seller_name = seller_name or winner_embedded_name(bulk_item)
             except Exception:
                 pass
-    if catalog_product_id and (not seller_id or not seller_name):
+    if catalog_product_id and (not seller_id or not seller_name or not winner_listing_type(winner_item)):
         try:
             offers = client.product_winners(catalog_product_id)
             rows = offers.get("results") if isinstance(offers, dict) else offers
@@ -6861,8 +6894,9 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
                 if winner_item_id and offer_item_id != str(winner_item_id):
                     continue
                 seller_id = seller_id or str(offer.get("seller_id") or first_present(offer, ["seller.id"], "") or "")
-                if offer.get("listing_type_id"):
-                    winner_item.setdefault("listing_type_id", offer["listing_type_id"])
+                offer_type = winner_listing_type(offer)
+                if offer_type and not winner_listing_type(winner_item):
+                    winner_item["listing_type_id"] = offer_type
                 seller_name = seller_name or winner_embedded_name(offer)
                 if seller_id or seller_name:
                     break
@@ -6875,15 +6909,19 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
             seller_name = ""
     # The public page is only used to resolve the display name when its buy-box
     # price agrees with the price already returned by the official API.
-    if not seller_name and catalog_product_id and expected_price not in (None, ""):
+    if (not seller_name or not winner_listing_type(winner_item)) and catalog_product_id and expected_price not in (None, ""):
         try:
             public = cached_public_buybox(client, catalog_product_id, source_item)
             if abs(float(public.get("price") or 0) - float(expected_price or 0)) <= 0.02:
-                seller_name = clean_attribute_value(public.get("seller_name"))
+                public_name = clean_attribute_value(public.get("seller_name"))
+                # Price alone cannot identify an offer when sellers share a price.
+                if seller_name and public_name.casefold() == seller_name.casefold() and not winner_listing_type(winner_item):
+                    winner_item["listing_type_id"] = winner_listing_type(public)
+                seller_name = seller_name or public_name
         except Exception:
             pass
     if details is not None:
-        details["winner_listing_type_id"] = winner_item.get("listing_type_id") or winner.get("listing_type_id") or ""
+        details["winner_listing_type_id"] = winner_listing_type(winner_item) or winner_listing_type(winner)
     return seller_id, seller_name
 
 
@@ -13611,19 +13649,49 @@ def delete_item_operation(request, actor=None):
     account_id = str(request.get("account_id") or "")
     item = next((row for row in payload.get("catalog", []) if str(row.get("id") or "") == item_id), None)
     if not item:
+        if any(str(row.get("item_id")) == item_id and (not account_id or str(row.get("account_id")) == account_id) for row in payload.get("deleted_items", [])):
+            return {"ok": True, "item_id": item_id, "deleted": True, "already_deleted": True}
         raise RuntimeError("Anúncio não encontrado.")
+    if account_id and account_id != str(item.get("account_id") or ""):
+        raise RuntimeError("A conta selecionada não pertence ao anúncio.")
     account = next(
         (row for row in payload.get("accounts", []) if row.get("official") and (
-            str(row.get("id") or "") == account_id or str(row.get("id") or "") == str(item.get("account_id") or "")
+            str(row.get("id") or "") == str(item.get("account_id") or "")
         )),
         None,
     )
     if not account:
         raise RuntimeError("Conta oficial não encontrada para excluir o anúncio.")
     client = account_client(account)
-    if str(item.get("meli_status") or "").lower() != "closed":
-        run_interactive_meli_call(client.update_item, item_id, {"status": "closed"})
-    official = run_interactive_meli_call(client.update_item, item_id, {"deleted": True})
+    official = run_interactive_meli_call(client.item_for_clone, item_id)
+    if not isinstance(official, dict) or str(official.get("id") or "") != item_id:
+        raise RuntimeError("Não foi possível confirmar o estado atual do anúncio. Nenhuma exclusão foi enviada.")
+    def is_deleted(value):
+        return isinstance(value, dict) and (value.get("deleted") is True or "deleted" in (value.get("sub_status") or []))
+    def confirmed_update(body, predicate):
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = run_interactive_meli_call(client.update_item, item_id, body)
+                if isinstance(response, dict) and str(response.get("id") or "") == item_id and predicate(response):
+                    return response
+            except Exception as exc:
+                last_error = exc
+            # Reconcile a timeout before resending this idempotent state update.
+            response = run_interactive_meli_call(client.item_for_clone, item_id)
+            if isinstance(response, dict) and str(response.get("id") or "") == item_id and predicate(response):
+                return response
+            if last_error and meli_error_status(last_error) in {400, 401, 403, 404}:
+                raise last_error
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+        raise RuntimeError("A alteração ainda não foi confirmada pelo Mercado Livre. O anúncio foi mantido na lista; tente conferir novamente.") from last_error
+    if not is_deleted(official):
+        forbidden = official.get("status") == "under_review" and "forbidden" in (official.get("sub_status") or [])
+        if official.get("status") != "closed" and not forbidden:
+            official = confirmed_update({"status": "closed"}, lambda value: value.get("status") == "closed" or is_deleted(value))
+        if not is_deleted(official):
+            official = confirmed_update({"deleted": True}, is_deleted)
     payload["catalog"] = [row for row in payload.get("catalog", []) if str(row.get("id") or "") != item_id]
     deleted_items = payload.setdefault("deleted_items", [])
     deleted_items.insert(0, {
@@ -13635,7 +13703,6 @@ def delete_item_operation(request, actor=None):
         "deleted_at": datetime.now(APP_TZ).isoformat(),
         "actor": (actor or {}).get("email") or (actor or {}).get("name") or "Usuário",
     })
-    del deleted_items[5000:]
     write_payload(payload)
     return {"ok": True, "official": official, "item_id": item_id, "deleted": True}
 
@@ -14855,7 +14922,25 @@ def catalog_official_stores(catalog, target_account):
     return merge_official_stores(stores)
 
 
+OFFICIAL_STORE_DISCOVERY_CACHE = {}
+
+
 def discover_official_stores_from_items(target_client, target_account, catalog):
+    cache_key = (str(DATA), str(target_account.get("seller_id") or target_account.get("id")),
+                 tuple(sorted((str(row.get("id")), str(row.get("official_store_id") or "")) for row in catalog or [])))
+    with OFFICIAL_STORE_CACHE_LOCK:
+        cached = OFFICIAL_STORE_DISCOVERY_CACHE.get(cache_key)
+        if cached and time.monotonic() - cached[0] < 300:
+            return copy.deepcopy(cached[1])
+    result = discover_official_stores_from_items_uncached(target_client, target_account, catalog)
+    with OFFICIAL_STORE_CACHE_LOCK:
+        if len(OFFICIAL_STORE_DISCOVERY_CACHE) >= 32:
+            OFFICIAL_STORE_DISCOVERY_CACHE.clear()
+        OFFICIAL_STORE_DISCOVERY_CACHE[cache_key] = (time.monotonic(), result)
+    return result
+
+
+def discover_official_stores_from_items_uncached(target_client, target_account, catalog):
     seller_ids = {
         str(value)
         for value in (target_account.get("id"), target_account.get("seller_id"))
@@ -16150,6 +16235,7 @@ def create_item_with_clone_retries(
     publication_name="",
     kit_mode=False,
     strict_store=False,
+    publication_context=None,
 ):
     payload = json.loads(json.dumps(create_payload, ensure_ascii=False))
     sanitized_attributes = sanitize_clone_payload_attributes(payload, category_attributes or [], source_item)
@@ -16175,12 +16261,19 @@ def create_item_with_clone_retries(
                         "campos": ["official_store_id"],
                         "destino": destination_store_id,
                     })
-            created = normalize_created_item_response(target_client.create_item(payload))
+            if publication_context and publication_context.get("seller_id") and publication_context.get("key"):
+                import publication_guard
+                created = publication_guard.create(sys.modules[__name__], target_client, payload,
+                    publication_context["seller_id"], publication_context["key"], verify_only=publication_context.get("verify_only", False))
+            else:
+                created = normalize_created_item_response(target_client.create_item(payload))
             if adjustments and isinstance(created, dict):
                 created["_clone_adjustments"] = adjustments
             return created
         except Exception as exc:
             last_error = exc
+            if getattr(exc, "publication_pending", False):
+                raise
             if strict_store and official_store_error_kind(exc):
                 raise RuntimeError(f"A Loja Oficial selecionada não foi aceita: {friendly_clone_error(exc)}") from exc
             if meli_rate_limited_error(exc) and rate_limit_attempts < max_rate_limit_attempts:
@@ -16324,11 +16417,15 @@ def create_official_clone(payload, job, source_item_id, edits):
         destination_store_id,
         destination_stores,
         strict_store=bool(job.get("store_explicit")),
+        publication_context={"seller_id": target_account.get("seller_id"), "key": f"clone:{job['id']}:{source_item_id}" if job.get("id") else "",
+            "verify_only": any(str(row.get("item_id")) == str(source_item_id) and (
+                row.get("publication_pending") or meli_error_status(RuntimeError(row.get("error") or "")) >= 500
+            ) for row in job.get("errors", []))},
     )
     verified_item = {}
     if created.get("id"):
         try:
-            verified_item = target_client.item(created["id"])
+            verified_item = dict(created) if all(created.get(field) is not None for field in ("title", "price", "status")) else target_client.item_for_clone(created["id"]) if callable(getattr(target_client, "item_for_clone", None)) else target_client.item(created["id"])
         except Exception as exc:
             created["_verification_warning"] = f"Anúncio criado, mas ainda não apareceu na leitura imediata da API: {exc}"
     description_text = (edits.get("description") or "").strip()
@@ -16878,8 +16975,8 @@ def publish_linked_assisted_product(payload, request, actor, accounts, variants)
                         results.extend(published["results"])
                         traditional_id = next((row["item_id"] for row in published["results"] if row.get("status") == "created"), "")
                     if not traditional_id:
-                        results.append({**base, "status": "error", "publication_mode": "catalog",
-                                        "error": "A publicação de Catálogo aguarda a criação do tradicional."})
+                        results.append({**base, "status": "pending", "publication_mode": "catalog",
+                                        "error": "A publicação de Catálogo aguarda a confirmação do tradicional."})
                         continue
                     prior_catalog = next((row for row in payload.get("catalog") or [] if
                                           row.get("account_id") == account.get("id")
@@ -16933,8 +17030,9 @@ def publish_linked_assisted_product(payload, request, actor, accounts, variants)
                 update_async_operation_progress("Conferindo publicações vinculadas.", len(results), len(accounts) * len(variants) * 2, results[-1])
     return {"created": sum(row.get("status") == "created" and not row.get("reused") for row in results),
             "reused": sum(bool(row.get("reused")) for row in results),
+            "pending": sum(row.get("status") == "pending" for row in results),
             "failed": sum(row.get("status") == "error" for row in results), "results": results,
-            "requires_review": any(row.get("pending_fields") or row.get("warning") for row in results),
+            "requires_review": any(row.get("status") == "pending" or row.get("pending_fields") or row.get("warning") for row in results),
             "publication_id": publication_id}
 
 
@@ -17020,6 +17118,7 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                     destination_store_id=destination_store_id,
                     destination_stores=destination_stores,
                     publication_name=draft.get("title") or "",
+                    publication_context={"seller_id": account.get("seller_id"), "key": f"publish:{request['publication_id']}:{variant.get('listing_type_id')}:{publication_mode}" if request.get("publication_id") else ""},
                 )
                 if package_adjustments:
                     created.setdefault("_clone_adjustments", []).extend(package_adjustments)
@@ -17031,7 +17130,7 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                     except Exception:
                         description_warning = "Anúncio criado, mas a descrição não foi salva. Revise a descrição no anúncio existente."
                 try:
-                    verified = client.item_for_clone(item_id) if item_id else {}
+                    verified = dict(created) if all(created.get(field) is not None for field in ("title", "price", "status")) else client.item_for_clone(item_id) if item_id else {}
                 except Exception:
                     verified = {}
                 official = {**source_item, **created, **verified}
@@ -17039,7 +17138,11 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                 normalized["assisted_publication_id"] = str(request.get("publication_id") or "")[:100]
                 normalized["assisted_publication_mode"] = publication_mode
                 normalized["description_override"] = description
-                payload.setdefault("catalog", []).append(normalized)
+                existing = next((row for row in payload.get("catalog", []) if row.get("id") == item_id), None)
+                if existing is not None:
+                    existing.update(normalized)
+                else:
+                    payload.setdefault("catalog", []).append(normalized)
                 write_payload(payload)
                 append_item_log(payload, normalized, actor or {}, "Cadastro assistido por link", {
                     "source_url": {"from": draft.get("source_url") or "", "to": item_id or ""},
@@ -17074,7 +17177,7 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                         ),
                     )]
                 error_result = {
-                    "status": "error", "account": account.get("nickname"), "account_id": account.get("id"),
+                    "status": "pending" if getattr(exc, "publication_pending", False) else "error", "account": account.get("nickname"), "account_id": account.get("id"),
                     "listing_type_id": variant.get("listing_type_id"), "error": friendly_clone_error(exc),
                     "publication_mode": publication_mode,
                 }
@@ -17086,7 +17189,8 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
             )
     created_count = sum(row.get("status") == "created" for row in results)
     has_pending_fields = any(row.get("pending_fields") for row in results)
-    if not created_count and not has_pending_fields:
+    pending_count = sum(row.get("status") == "pending" for row in results)
+    if not created_count and not has_pending_fields and not pending_count:
         detail = "; ".join(row.get("error") or "falha não identificada" for row in results[:3])
         raise RuntimeError(f"Nenhum anúncio foi criado. {detail}")
     if created_count:
@@ -17098,9 +17202,10 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                     row["warning"] = (row.get("warning", "") + " Anúncio confirmado; registro local pendente: " + str(exc)).strip()
     return {
         "created": created_count,
+        "pending": pending_count,
         "failed": sum(row.get("status") == "error" for row in results),
         "results": results,
-        "requires_review": has_pending_fields or any(row.get("warning") for row in results),
+        "requires_review": bool(pending_count) or has_pending_fields or any(row.get("warning") for row in results),
     }
 
 
@@ -22883,9 +22988,12 @@ def execute_clone_job(payload, job, incoming_answers=None):
     existing_ids = {item.get("id") for item in catalog if item.get("id")}
     copied = []
     errors = []
-    created_details = []
+    created_details = list(job.get("created_details") or [])
+    confirmed_sources = {row.get("source_item_id") for row in created_details}
     edits = job.get("edits") or {}
     for item_id in job.get("item_ids", []):
+        if item_id in confirmed_sources:
+            continue
         source_item = next((item for item in catalog if item.get("id") == item_id), None)
         if not source_item:
             errors.append({"item_id": item_id, "error": "O anúncio de origem não foi encontrado na base sincronizada."})
@@ -22904,10 +23012,14 @@ def execute_clone_job(payload, job, incoming_answers=None):
                     }
                 )
             else:
-                errors.append({"item_id": item_id, "error": friendly_clone_error(exc)})
+                errors.append({"item_id": item_id, "error": friendly_clone_error(exc), "publication_pending": bool(getattr(exc, "publication_pending", False))})
             continue
         new_id = created.get("id") or f"COPY-{uuid.uuid4().hex[:6].upper()}"
         if new_id in existing_ids:
+            existing = next(row for row in catalog if row.get("id") == new_id)
+            created_details.append({"source_item_id": item_id, "item_id": new_id,
+                "title": existing.get("title"), "sku": existing.get("sku"),
+                "status": existing.get("meli_status"), "permalink": existing.get("permalink") or ""})
             continue
         existing_ids.add(new_id)
         target_account = official_account_by_name(payload, job.get("target_account_id") or job.get("target")) or {}
@@ -22951,12 +23063,12 @@ def execute_clone_job(payload, job, incoming_answers=None):
         )
     has_pending = any(row.get("pending_fields") for row in errors)
     job["validation_version"] = 3
-    job["status"] = "copied" if copied and not errors else "review_required" if has_pending else "partial_error" if copied else "error"
-    job["copied_items"] = [item.get("id") for item in copied]
+    job["status"] = "confirmation_pending" if any(row.get("publication_pending") for row in errors) else "copied" if created_details and not errors else "review_required" if has_pending else "partial_error" if created_details else "error"
+    job["copied_items"] = [item.get("item_id") for item in created_details]
     job["created_details"] = created_details
     job["errors"] = errors
     created_codes = ", ".join(item.get("item_id") for item in created_details if item.get("item_id"))
-    job["note"] = f"{len(copied)} anúncio(s) criado(s) oficialmente no Mercado Livre para {job.get('target')}."
+    job["note"] = f"{len(created_details)} anúncio(s) criado(s) oficialmente no Mercado Livre para {job.get('target')}."
     if created_codes:
         job["note"] += f" Códigos criados: {created_codes}."
     if errors:
