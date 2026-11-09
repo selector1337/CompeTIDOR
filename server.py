@@ -1129,7 +1129,7 @@ def merge_price_schedules(incoming, latest):
 CATALOG_COMPETITION_FIELDS = {
     "catalog_losing_since",
     "competition_status", "competition_consistent", "competition_checked_at", "competition_reason",
-    "winner_item_id", "winner_seller_id", "winner_name", "winner_price", "winner_confirmed", "winner_source",
+    "winner_item_id", "winner_seller_id", "winner_name", "winner_listing_type_id", "winner_price", "winner_confirmed", "winner_source",
     "catalog_reference_seller_id", "catalog_reference_name", "catalog_reference_price", "price_to_win",
     "current_price", "visit_share", "competitors_sharing_first_place", "runner_up_item_id",
     "runner_up_seller_id", "runner_up_name", "runner_up_price", "runner_up_source",
@@ -6831,7 +6831,7 @@ def cached_public_buybox(client, catalog_product_id, item=None):
     return value
 
 
-def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, source_item=None, expected_price=None):
+def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, source_item=None, expected_price=None, details=None):
     winner = winner if isinstance(winner, dict) else {}
     seller_id = str(winner.get("seller_id") or first_present(winner, ["seller.id"], "") or "")
     seller_name = winner_embedded_name(winner)
@@ -6848,6 +6848,7 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
                 bulk_rows = client.items_bulk([str(winner_item_id)])
                 bulk_item = next((row for row in bulk_rows or [] if str(row.get("id") or "") == str(winner_item_id)), {})
                 seller_id = seller_id or str(bulk_item.get("seller_id") or first_present(bulk_item, ["seller.id"], "") or "")
+                winner_item = {**bulk_item, **winner_item}
                 seller_name = seller_name or winner_embedded_name(bulk_item)
             except Exception:
                 pass
@@ -6860,6 +6861,8 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
                 if winner_item_id and offer_item_id != str(winner_item_id):
                     continue
                 seller_id = seller_id or str(offer.get("seller_id") or first_present(offer, ["seller.id"], "") or "")
+                if offer.get("listing_type_id"):
+                    winner_item.setdefault("listing_type_id", offer["listing_type_id"])
                 seller_name = seller_name or winner_embedded_name(offer)
                 if seller_id or seller_name:
                     break
@@ -6879,6 +6882,8 @@ def resolve_winner_identity(client, winner, winner_item_id, catalog_product_id, 
                 seller_name = clean_attribute_value(public.get("seller_name"))
         except Exception:
             pass
+    if details is not None:
+        details["winner_listing_type_id"] = winner_item.get("listing_type_id") or winner.get("listing_type_id") or ""
     return seller_id, seller_name
 
 
@@ -6967,7 +6972,7 @@ def normalize_competition(client, account, item):
                 winner_item_id,
                 catalog_product_id,
                 item,
-                winner.get("price"),
+                winner.get("price"), details=data,
             )
             if str(winner_item_id) == str(item_id):
                 winner_seller_id = str(account.get("seller_id") or winner_seller_id)
@@ -6986,6 +6991,7 @@ def normalize_competition(client, account, item):
             data["winner_price"] = price.get("current_price")
             data["winner_confirmed"] = price.get("current_price") not in (None, "")
             data["winner_source"] = "price_to_win"
+            data["winner_listing_type_id"] = item.get("listing_type_id") or ""
     except Exception as exc:
         data["competition_reason"] = str(exc)
 
@@ -7005,7 +7011,7 @@ def normalize_competition(client, account, item):
                     winner_item_id,
                     catalog_product_id,
                     item,
-                    winner_price,
+                    winner_price, details=data,
                 )
                 data.update(
                     {
@@ -7025,6 +7031,7 @@ def normalize_competition(client, account, item):
         data["winner_seller_id"] = ""
         data["winner_name"] = "Aguardando API oficial"
         data["winner_price"] = None
+        data["winner_listing_type_id"] = ""
     if data["competition_status"] == "not_listed" and not data.get("winner_seller_id"):
         data["winner_name"] = "Sem vencedor disponível"
     if data.get("winner_confirmed") and str(data.get("winner_item_id") or "") == str(item_id or ""):
@@ -7330,6 +7337,26 @@ SKU_COMMERCIAL_COLUMNS = [
     ("classic_reference", "Referência Clássico", "text"),
     ("premium_reference", "Referência Premium", "text"),
 ]
+
+
+def add_goal_margin_comparison(row, kind, sku_rules):
+    from goal_pricing import rule_types
+    listing_type = {"classic": "gold_special", "premium": "gold_pro"}[kind]
+    applicable = [rule for _, rule in sku_rules if rule.get("enabled") and listing_type in rule_types(rule)]
+    floors = [float(rule["floor_margin"]) for rule in applicable if rule.get("floor_margin") is not None]
+    row[kind + "_minimum_margin"] = max(floors) if floors else None
+    row[kind + "_original_margin"] = None
+    original = row.get(kind + "_original_price")
+    current = row.get(kind + "_price")
+    if original is None:
+        row[kind + "_original_margin"] = row.get(kind + "_margin")
+        return
+    fee, shipping, cost = row.get(kind + "_fee"), row.get(kind + "_shipping"), row.get("sku_cost")
+    if not current or any(value is None for value in (fee, shipping, cost)):
+        return
+    net = float(original) * (1 - float(fee) / float(current)) - float(shipping)
+    if net > 0:
+        row[kind + "_original_margin"] = round((net - float(cost)) / net * 100, 2)
 
 
 def sku_commercial_index(payload, items=None):
@@ -11402,6 +11429,7 @@ COMPETITION_FIELDS = (
     "winner_item_id",
     "winner_seller_id",
     "winner_name",
+    "winner_listing_type_id",
     "winner_price",
     "winner_confirmed",
     "winner_source",
@@ -11582,6 +11610,7 @@ def query_sales_goals(payload, request):
             tracking = next((r.get("items", {}).get(identity) for r in [r for _, r in sku_rules] if r.get("items", {}).get(identity, {}).get("initialized")), None)
             if tracking:
                 row[kind + "_original_price"] = tracking.get("original")
+            add_goal_margin_comparison(row, kind, sku_rules)
         row["pricing_summary"] = summaries[0] if len(summaries) == 1 else {
             'sku':sku, 'enabled':row['automatic_pricing_active'], 'rules':summaries
         } if summaries else None
@@ -16893,8 +16922,11 @@ def publish_linked_assisted_product(payload, request, actor, accounts, variants)
                     if not confirmed:
                         result["warning"] = "Catálogo criado pelo fluxo de associação, mas o vínculo ainda não foi confirmado. Ao repetir, apenas verificaremos esse anúncio."
                     results.append(result)
-                    append_item_log(payload, normalized, actor or {}, "Catálogo associado ao tradicional", {"traditional_item_id": traditional_id, "confirmed": confirmed})
-                    write_payload(payload)
+                    try:
+                        append_item_log(payload, normalized, actor or {}, "Catálogo associado ao tradicional", {"traditional_item_id": traditional_id, "confirmed": confirmed})
+                        write_payload(payload)
+                    except Exception as exc:
+                        result["warning"] = (result.get("warning", "") + " Anúncio confirmado; registro local pendente: " + str(exc) + ". Não publique novamente.").strip()
                 except Exception as exc:
                     results.append({**base, "status": "error", "publication_mode": "catalog" if traditional_id else "traditional",
                                     "traditional_item_id": traditional_id, "error": friendly_clone_error(exc)})
@@ -16943,6 +16975,8 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
             update_async_operation_progress(
                 f"Publicando {label} · {mode_label} na conta {account.get('nickname')}.", progress - 1, total
             )
+            created = {}
+            item_id = ""
             try:
                 mode_draft = {
                     **(catalog_draft if publication_mode == "catalog" else draft),
@@ -17020,6 +17054,16 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                     "warning": description_warning,
                 })
             except Exception as exc:
+                if item_id:
+                    results.append({
+                        "status": "created", "account": account.get("nickname"), "account_id": account.get("id"),
+                        "listing_type_id": variant.get("listing_type_id"), "item_id": item_id,
+                        "publication_mode": publication_mode, "title": draft.get("title"),
+                        "permalink": created.get("permalink") or "",
+                        "warning": "Anúncio criado e confirmado. Falha ao finalizar o registro local: " + str(exc) + ". Não publique novamente.",
+                    })
+                    update_async_operation_progress(f"Processado {progress} de {total} anúncio(s).", progress, total, results[-1])
+                    continue
                 pending_fields = list(getattr(exc, "pending_fields", []) or [])
                 if official_store_error_kind(exc) == "required" and not pending_fields:
                     pending_fields = [official_store_pending_field(
@@ -17046,7 +17090,12 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
         detail = "; ".join(row.get("error") or "falha não identificada" for row in results[:3])
         raise RuntimeError(f"Nenhum anúncio foi criado. {detail}")
     if created_count:
-        write_payload(payload)
+        try:
+            write_payload(payload)
+        except Exception as exc:
+            for row in results:
+                if row.get("status") == "created":
+                    row["warning"] = (row.get("warning", "") + " Anúncio confirmado; registro local pendente: " + str(exc)).strip()
     return {
         "created": created_count,
         "failed": sum(row.get("status") == "error" for row in results),

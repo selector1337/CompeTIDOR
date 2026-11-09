@@ -11098,3 +11098,9 @@ textarea:focus {
 .login-brand .login-logo {width:156px;height:156px;max-height:156px;filter:none;}
 .login-card input {border-radius:10px;min-height:46px;}
 .connection-recovery {position:fixed;z-index:100000;top:24px;left:50%;transform:translateX(-50%);width:min(540px,calc(100vw - 32px));padding:22px;border:1px solid #e4bb33;border-radius:16px;background:#18212a;color:#edf2f7;box-shadow:0 12px 40px #0006;} .connection-recovery p {color:#bac6d2;line-height:1.5;} .connection-recovery button {padding:10px 16px;border:0;border-radius:8px;background:#ffe000;color:#18212a;font-weight:700;cursor:pointer;}
+
+.goal-margins {display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;}
+.goal-margins small {display:flex;gap:6px;align-items:baseline;color:var(--muted);font-size:11px;}
+.goal-margins small b {color:var(--text);font-size:12px;}
+.goal-margins .profit-positive b {color:#14bd91;}
+@media(max-width:900px){.sku-commercial > div {grid-template-columns:60px 1fr;}.goal-margins {grid-column:1 / -1;padding:5px 0;}}

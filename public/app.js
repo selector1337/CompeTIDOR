@@ -2351,6 +2351,7 @@ function renderCatalog() {
               ${item.meli_status ? fact("Status ML", statusLabel(item.meli_status)) : ""}
               ${fact("Vencedor", catalogWinnerName(item))}
               ${fact("Preço vencedor", catalogWinnerPrice(item))}
+              ${fact("Tipo vencedor", catalogWinnerType(item))}
               ${item.winner_confirmed && item.winner_item_id ? fact("Anúncio vencedor", item.winner_item_id) : ""}
               ${item.status === "winning" && item.runner_up_name ? fact("Próxima oferta", item.runner_up_name) : ""}
               ${item.status === "winning" && item.runner_up_price ? fact("Preço próxima oferta", money.format(item.runner_up_price)) : ""}
@@ -2385,7 +2386,7 @@ function renderCatalog() {
           <div class="score">
             <small>Participação estimada</small>
             <strong>${Math.max(0, Math.min(100, Number(item.share) || 0))}%</strong>
-            <small>Vencedor: ${catalogWinnerName(item)}</small>
+            <small>Vencedor: ${catalogWinnerName(item)} · ${catalogWinnerType(item)}</small>
           </div>
         </article>
       `
@@ -2406,6 +2407,11 @@ function catalogPublicUrl(item) {
   return item.catalog_product_id && item.catalog_product_id !== "-"
     ? `https://www.mercadolivre.com.br/p/${item.catalog_product_id}`
     : item.permalink || "#";
+}
+
+function catalogWinnerType(item) {
+  if (!item.winner_confirmed) return "Não informado";
+  return ({gold_special: "Clássico", gold_pro: "Premium"})[item.winner_listing_type_id] || "Não informado";
 }
 
 function catalogWinnerPrice(item) {
@@ -4726,7 +4732,7 @@ async function loadSalesReport() {
 function skuCommercialHtml(row) {
   const price = value => value == null ? '—' : money.format(value);
   const margin = value => value == null ? 'Margem indisponível' : `${Number(value).toLocaleString('pt-BR', {maximumFractionDigits:2})}% de margem`;
-  return `<div class="sku-commercial"><small>Custo atual <b>${price(row.sku_cost)}</b></small>${[['classic','Clássico'],['premium','Premium']].map(([key,label])=>`<div title="${escapeAttr(row[key+'_reference'] || 'Sem anúncio de referência')}"><span>${label}</span><b>${row[key+'_original_price'] > row[key+'_price'] ? `<del class="goal-original-price" title="Preço original do anúncio base">${price(row[key+'_original_price'])}</del> ` : ""}${price(row[key+'_price'])}</b><small class="${row[key+'_margin'] == null || Number(row[key+'_margin']) === 0 ? '' : Number(row[key+'_margin']) > 0 ? 'profit-positive' : 'profit-negative'}" title="${escapeAttr(row[key+'_margin_reason'] || '')}">${row[key+'_margin'] == null && row[key+'_margin_reason'] ? escapeText(row[key+'_margin_reason']) : margin(row[key+'_margin'])}</small></div>`).join('')}</div>`;
+  return `<div class="sku-commercial"><small>Custo atual <b>${price(row.sku_cost)}</b></small>${[['classic','Clássico'],['premium','Premium']].map(([key,label])=>`<div title="${escapeAttr(row[key+'_reference'] || 'Sem anúncio de referência')}"><span>${label}</span><b>${row[key+'_original_price'] > row[key+'_price'] ? `<del class="goal-original-price" title="Preço original do anúncio base">${price(row[key+'_original_price'])}</del> ` : ""}${price(row[key+'_price'])}</b>${Object.prototype.hasOwnProperty.call(row, key+'_original_margin') ? `<span class="goal-margins"><small title="Estimativa no preço original, usando custo, taxa proporcional e frete atuais">Original <b>${row[key+'_original_margin'] == null ? '—' : Number(row[key+'_original_margin']).toLocaleString('pt-BR',{maximumFractionDigits:2})+'%'}</b></small><small class="${Number(row[key+'_margin']) > 0 ? 'profit-positive' : ''}" title="${escapeAttr(row[key+'_margin_reason'] || '')}">Atual <b>${row[key+'_margin'] == null ? '—' : Number(row[key+'_margin']).toLocaleString('pt-BR',{maximumFractionDigits:2})+'%'}</b></small><small>Mínima <b>${row[key+'_minimum_margin'] == null ? 'Não definida' : Number(row[key+'_minimum_margin']).toLocaleString('pt-BR',{maximumFractionDigits:2})+'%'}</b></small></span>` : `<small class="${row[key+'_margin'] == null || Number(row[key+'_margin']) === 0 ? '' : Number(row[key+'_margin']) > 0 ? 'profit-positive' : 'profit-negative'}" title="${escapeAttr(row[key+'_margin_reason'] || '')}">${row[key+'_margin'] == null && row[key+'_margin_reason'] ? escapeText(row[key+'_margin_reason']) : margin(row[key+'_margin'])}</small>`}</div>`).join('')}</div>`;
 }
 
 function replenishmentFilters(form) {
