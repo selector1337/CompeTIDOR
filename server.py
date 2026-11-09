@@ -14848,10 +14848,14 @@ def build_clone_item_payload(source_item, edits):
         payload["variations"] = variations
         payload.pop("available_quantity", None)
     payload.update(clone_extra_required_fields(source_item))
-    if source_item.get("catalog_product_id"):
-        payload["catalog_product_id"] = source_item.get("catalog_product_id")
     if is_catalog_listing(source_item):
         payload["catalog_listing"] = True
+        if source_item.get("catalog_product_id"):
+            payload["catalog_product_id"] = source_item.get("catalog_product_id")
+    else:
+        # A traditional item may carry a catalog association without being a
+        # catalog offer. Do not impose that association on its new copy.
+        payload["attributes"] = [a for a in payload["attributes"] if str(a.get("id") or "").upper() != "CATALOG_PRODUCT_ID"]
     shipping = clone_shipping_payload(source_item)
     if shipping:
         payload["shipping"] = shipping
@@ -15957,6 +15961,20 @@ def clone_retry_adjustments_from_error(
                         field["label"] += f" — variação {index + 1}"
                         pending_fields.append(field)
     package_error = clone_package_error_kind(exc)
+    rejected_package_fields = catalog_too_small_package_fields(exc)
+    if rejected_package_fields:
+        for attr_id, field_name in SELLER_PACKAGE_ATTRIBUTE_FIELDS.items():
+            if field_name not in rejected_package_fields:
+                continue
+            field = pending_clone_attribute(attr_id, source_item, category_attributes or [], item_id)
+            if not field:
+                field = clone_pending_field(f"attribute:{attr_id}", clone_attribute_label(attr_id), "number", "", item_id)
+            row = next((a for a in create_payload.get("attributes", []) if a.get("id") == attr_id), {})
+            field["default_value"] = clone_attribute_display_value(row)
+            field["message"] = "O Mercado Livre recusou esta medida como inferior à do produto. Confira a medida real da embalagem; use cm para dimensões e g para peso."
+            field["package_rejected"] = True
+            pending_fields.append(field)
+        return create_payload, False, []
     repaired_package = []
     if package_error in {"missing", "format"}:
         requires_units = ("unit" in lowered_error and ("'cm'" in lowered_error or "'g'" in lowered_error))
@@ -16227,9 +16245,8 @@ def friendly_clone_error(exc):
         labels = ", ".join(clone_attribute_label(value.upper()) for value in ids)
         return (
             f"O Mercado Livre recebeu a embalagem, mas considera {labels or 'as medidas informadas'} "
-            "inferiores às dimensões do produto. Confira se o produto de catálogo selecionado é exatamente "
-            "o mesmo e informe as medidas da embalagem real: centímetros e peso em gramas. "
-            "Se a embalagem já está correta, a ficha de dimensões do catálogo precisa ser revisada no Mercado Livre."
+            "inferiores às dimensões do produto. Confira as medidas reais da embalagem: "
+            "dimensões em centímetros e peso em gramas. Essa validação também pode ocorrer em anúncios tradicionais."
         )
     if meli_rate_limited_error(exc):
         return "O Mercado Livre limitou temporariamente as criações. A aplicação tentou novamente com espera progressiva; aguarde alguns instantes e repita se necessário."
@@ -16498,6 +16515,8 @@ def create_item_with_clone_retries(
             message = f"O Mercado Livre exige o preenchimento de: {labels}."
         if any(field.get("rejected_value") for field in deduped_fields):
             message = "O Mercado Livre recusou o GTIN/EAN enviado para este produto ou categoria. O código informado foi preservado para conferência."
+        if any(field.get("package_rejected") for field in deduped_fields):
+            message = friendly_clone_error(last_error)
         error = RuntimeError(message)
         error.pending_fields = deduped_fields
         error.original_error = str(last_error)
