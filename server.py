@@ -24148,6 +24148,7 @@ class App(BaseHTTPRequestHandler):
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
             ".webp": "image/webp",
+            ".webmanifest": "application/manifest+json",
         }
         signature = file_signature(target)
         cache_key = str(target)

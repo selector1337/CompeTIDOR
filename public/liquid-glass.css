@@ -3862,3 +3862,7 @@ html:root body .page,
   .page .purchase-opportunity-primary-fields > label { grid-row: 1 / span 3; }
   .page .purchase-opportunity-primary-fields > button.primary { grid-column: 3; grid-row: 2; }
 }
+
+#dashboard-metrics .metric-header { flex-wrap: wrap; }
+#dashboard-metrics .rep-id { flex: 1 1 auto; }
+#dashboard-metrics .rep-id strong { overflow-wrap: normal; word-break: normal; white-space: nowrap; }
