@@ -1612,7 +1612,7 @@ def public_payload(payload, actor=None, include_catalog=True):
     if not include_catalog:
         current_operations = build_operations(clean)
         for key in current_operations:
-            if key.startswith(("total_", "previous_")) or key in {"revenue", "daily_revenue", "top_skus_today"}:
+            if key.startswith(("total_", "previous_")) or key in {"revenue", "daily_revenue", "daily_revenue_series", "top_skus_today"}:
                 clean["operations"][key] = current_operations[key]
     clean["users"] = visible_users_for(actor, ensure_users(clean))
     clean.pop("_catalog_loaded", None)
@@ -2099,6 +2099,23 @@ def build_operations(payload):
         reverse=True,
     )[:20]
 
+    def daily_revenue_series(start, end):
+        # Somente dias conciliados em todas as contas oficiais; os demais ficam None
+        # para o gráfico mostrar a lacuna em vez de um valor presumido.
+        series = []
+        day = start
+        while day <= end:
+            entries = [analytics_cached_period_record(canonical_store, account, day, day)
+                       for account in revenue_source_accounts]
+            complete = bool(entries) and all(entries)
+            series.append({
+                "date": day.isoformat(),
+                "amount": round(sum(float(entry.get("amount") or 0) for entry in entries), 2) if complete else None,
+                "orders": sum(int(entry.get("orders_count") or 0) for entry in entries) if complete else None,
+            })
+            day += timedelta(days=1)
+        return series
+
     return {
         "revenue": revenue,
         "total_monthly_revenue": total_revenue,
@@ -2110,6 +2127,10 @@ def build_operations(payload):
             "complete": bool(daily_records) and all(daily_records),
             "pending_accounts": [a.get("nickname") for a, r in zip(revenue_source_accounts, daily_records) if not r],
             "updated_at": min((r.get("updated_at") for r in daily_records if r.get("updated_at")), default=""),
+        },
+        "daily_revenue_series": {
+            "current": daily_revenue_series(current_start, today),
+            "previous": daily_revenue_series(previous_start, previous_end),
         },
         "previous_period": previous_period,
         "previous_total_monthly_revenue": previous_total_revenue,

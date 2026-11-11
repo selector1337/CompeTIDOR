@@ -1333,6 +1333,99 @@ function dashboardRevenueProjection(currentRevenue, previousRevenue, previousAva
   return `<div class="revenue-projection ${tone}">Projeção no fechamento: <b>${money.format(projected)}</b>${comparison}</div>`;
 }
 
+function renderDashboardRevenueChart(ops) {
+  const host = document.querySelector("[data-revenue-chart]");
+  if (!host) return;
+  const current = ops.daily_revenue_series?.current || [];
+  const previous = ops.daily_revenue_series?.previous || [];
+  const known = current.filter((row) => Number.isFinite(row.amount));
+  if (known.length < 2) {
+    host.innerHTML = `<p class="revenue-chart-empty">O gráfico diário aparece quando as vendas do mês estiverem conciliadas em todas as contas.</p>`;
+    return;
+  }
+  const now = new Date();
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const monthLabel = (offset) => new Date(now.getFullYear(), now.getMonth() + offset, 1).toLocaleString("pt-BR", { month: "long" });
+  const values = (rows) => Array.from({ length: daysInMonth }, (_, index) => {
+    const value = rows[index]?.amount;
+    return Number.isFinite(value) ? value : null;
+  });
+  const cur = values(current);
+  const prev = values(previous);
+  const max = Math.max(1, ...cur.filter((value) => value !== null), ...prev.filter((value) => value !== null)) * 1.12;
+  const W = 600, H = 150;
+  const x = (index) => (daysInMonth === 1 ? 0 : (index / (daysInMonth - 1)) * W);
+  const y = (value) => H - (value / max) * H;
+  const segments = (list) => {
+    const parts = [];
+    let part = [];
+    list.forEach((value, index) => {
+      if (value === null) { if (part.length) parts.push(part); part = []; return; }
+      part.push([x(index), y(value)]);
+    });
+    if (part.length) parts.push(part);
+    return parts;
+  };
+  const smooth = (points) => points.length === 1
+    ? `M${points[0][0]},${points[0][1]}h0.1`
+    : points.reduce((path, point, index) => {
+      if (!index) return `M${point[0].toFixed(1)},${point[1].toFixed(1)}`;
+      const p0 = points[index - 2] || points[index - 1], p1 = points[index - 1], p3 = points[index + 1] || point;
+      const c1 = [p1[0] + (point[0] - p0[0]) / 6, Math.min(H, p1[1] + (point[1] - p0[1]) / 6)];
+      const c2 = [point[0] - (p3[0] - p1[0]) / 6, Math.min(H, point[1] - (p3[1] - p1[1]) / 6)];
+      return `${path} C${c1[0].toFixed(1)},${c1[1].toFixed(1)} ${c2[0].toFixed(1)},${c2[1].toFixed(1)} ${point[0].toFixed(1)},${point[1].toFixed(1)}`;
+    }, "");
+  const currentPaths = segments(cur);
+  const area = currentPaths.map((points) => `${smooth(points)} L${points[points.length - 1][0].toFixed(1)},${H} L${points[0][0].toFixed(1)},${H} Z`).join(" ");
+  const line = currentPaths.map(smooth).join(" ");
+  const prevLine = segments(prev).map(smooth).join(" ");
+  const comparable = cur.map((value, index) => (value !== null && prev[index] !== null ? index : -1)).filter((index) => index >= 0);
+  const sameCurrent = comparable.reduce((sum, index) => sum + cur[index], 0);
+  const samePrevious = comparable.reduce((sum, index) => sum + prev[index], 0);
+  const change = comparable.length && samePrevious > 0 ? ((sameCurrent - samePrevious) / samePrevious) * 100 : null;
+  const compact = (value) => value >= 1000 ? `R$ ${(value / 1000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mil` : money.format(value);
+  const ticks = [1, 8, 15, 22, daysInMonth];
+  const lastKnown = cur.reduce((last, value, index) => (value !== null ? index : last), -1);
+  host.innerHTML = `
+    <div class="revenue-chart-head">
+      ${change === null ? "" : `<span class="revenue-chart-delta ${change >= 0 ? "positive" : "negative"}">${change >= 0 ? "▲" : "▼"} ${Math.abs(change).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</span><span>vs. mesmo período de ${escapeText(monthLabel(-1))}</span>`}
+      <span class="revenue-chart-legend"><i class="current"></i>${escapeText(monthLabel(0))}<i class="previous"></i>${escapeText(monthLabel(-1))}</span>
+    </div>
+    <div class="revenue-chart-plot">
+      <span class="revenue-chart-scale">${escapeText(compact(max / 1.12))}</span>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+        <defs><linearGradient id="revenue-chart-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#ffd60a" stop-opacity=".5"/><stop offset="1" stop-color="#ffd60a" stop-opacity="0"/></linearGradient></defs>
+        <line class="grid" x1="0" x2="${W}" y1="${(H / 3).toFixed(1)}" y2="${(H / 3).toFixed(1)}"/><line class="grid" x1="0" x2="${W}" y1="${((2 * H) / 3).toFixed(1)}" y2="${((2 * H) / 3).toFixed(1)}"/>
+        <path class="previous" d="${prevLine}"/>
+        <path class="area" d="${area}" fill="url(#revenue-chart-fill)"/>
+        <path class="line" d="${line}"/>
+      </svg>
+      ${lastKnown >= 0 ? `<span class="revenue-chart-last" style="left:${((x(lastKnown) / W) * 100).toFixed(2)}%;top:${((y(cur[lastKnown]) / H) * 100).toFixed(2)}%"></span>` : ""}
+      <span class="revenue-chart-cursor" hidden></span>
+      <div class="revenue-chart-tip" role="status" hidden></div>
+    </div>
+    <div class="revenue-chart-axis">${ticks.map((day) => `<span style="left:${((x(day - 1) / W) * 100).toFixed(2)}%">${day}</span>`).join("")}</div>`;
+  const plot = host.querySelector(".revenue-chart-plot");
+  const tip = host.querySelector(".revenue-chart-tip");
+  const cursor = host.querySelector(".revenue-chart-cursor");
+  const show = (event) => {
+    const rect = plot.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+    const index = Math.round(ratio * (daysInMonth - 1));
+    const left = (x(index) / W) * 100;
+    const line = (label, value) => `<span>${escapeText(`${index + 1} de ${label}`)}</span><b>${value === null ? "Sem conciliação" : money.format(value)}</b>`;
+    tip.innerHTML = `${line(monthLabel(0), cur[index])}${line(monthLabel(-1), prev[index])}`;
+    tip.style.left = `${Math.min(82, Math.max(18, left))}%`;
+    cursor.style.left = `${left}%`;
+    tip.hidden = false;
+    cursor.hidden = false;
+  };
+  const hide = () => { tip.hidden = true; cursor.hidden = true; };
+  plot.addEventListener("pointermove", show);
+  plot.addEventListener("pointerdown", show);
+  plot.addEventListener("pointerleave", hide);
+}
+
 function adTitleEditState(item) {
   if (!item?.official_source) return { allowed: false, reason: "Disponível apenas para anúncios de contas oficiais." };
   if (isCatalogItem(item)) return { allowed: false, reason: "O título de anúncios de catálogo é definido pelo Mercado Livre." };
@@ -1347,16 +1440,17 @@ function renderDashboard() {
   const stockRows = dashboardStockRows(ops.attention_stock || []);
   renderDashboardAccountFilters();
   document.querySelector("#dashboard-revenue").innerHTML = `
+    <article class="revenue-total revenue-hero">
+      <span>Faturamento real · ${escapeText(new Date().toLocaleString("pt-BR", { month: "long" }))}</span>
+      <strong>${money.format(ops.total_monthly_revenue || 0)}</strong>
+      <small title="${escapeAttr(ops.revenue_calculation_basis || "Pedidos oficiais conciliados")}">${Number(ops.total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos oficiais faturáveis no mês atual</small>
+      <div class="revenue-chart" data-revenue-chart></div>
       <div class="revenue-today">
         <span>Hoje · todas as contas${ops.daily_revenue?.complete ? '' : ' · parcial'}</span>
         <b>${ops.daily_revenue ? money.format(ops.daily_revenue.amount) : 'Aguardando sincronização'}</b>
         <small>${Number(ops.daily_revenue?.orders || 0).toLocaleString('pt-BR')} pedidos${ops.daily_revenue?.updated_at ? ` · atualizado ${formatDateBR(ops.daily_revenue.updated_at)}` : ''}</small>
         ${ops.daily_revenue?.pending_accounts?.length ? `<small>Aguardando: ${escapeText(ops.daily_revenue.pending_accounts.join(', '))}</small>` : ''}
       </div>
-    <article class="revenue-total">
-      <span>Faturamento real mensal</span>
-      <strong>${money.format(ops.total_monthly_revenue || 0)}</strong>
-      <small title="${escapeAttr(ops.revenue_calculation_basis || "Pedidos oficiais conciliados")}">${Number(ops.total_monthly_orders || 0).toLocaleString("pt-BR")} pedidos oficiais faturáveis no mês atual</small>
 
       ${dashboardPreviousMonth({
         available: ops.previous_month_complete !== false,
@@ -1381,9 +1475,11 @@ function renderDashboard() {
           ordersChange: item.orders_change_percent,
         })}
         ${dashboardRevenueProjection(item.monthly_revenue, item.previous_month_revenue, item.previous_month_available !== false)}
+        ${Number(ops.total_monthly_revenue) > 0 ? `<div class="revenue-share" title="Participação da conta no faturamento real do mês"><span style="width:${Math.max(0, Math.min(100, Number(item.monthly_revenue || 0) / Number(ops.total_monthly_revenue) * 100)).toFixed(1)}%"></span><small>${(Number(item.monthly_revenue || 0) / Number(ops.total_monthly_revenue) * 100).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% do total</small></div>` : ""}
       </article>
     `).join("")}
   `;
+  renderDashboardRevenueChart(ops);
 
   const stockPage = paginate(stockRows, state.dashboardStockPage, 5);
   state.dashboardStockPage = stockPage.current;

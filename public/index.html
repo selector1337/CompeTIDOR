@@ -2,13 +2,23 @@
 <html lang="pt-BR">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#07090d" media="(prefers-color-scheme: dark)" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>CompeTIDOR</title>
     <link rel="icon" type="image/png" href="/competidor-menu.png" />
     <link rel="shortcut icon" type="image/png" href="/competidor-menu.png" />
+    <link rel="apple-touch-icon" href="/competidor-menu.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..800&display=swap" />
   <link rel="stylesheet" href="/styles.css?v=20261109-margins" />
+  <link rel="stylesheet" href="/liquid-glass.css?v=20261111-glass2" />
   </head>
   <body class="auth-loading">
+    <div class="lg-aurora" aria-hidden="true"><i></i><i></i><i></i></div>
     <section id="login-screen" class="login-screen" aria-label="Login CompeTIDOR">
       <div class="login-brand">
         <img class="login-logo" src="/competidor-login.png" alt="CompeTIDOR" />
@@ -31,28 +41,37 @@
     <aside class="sidebar">
       <div class="brand">
         <img class="menu-logo" src="/competidor-menu.png" alt="CompeTIDOR" />
+        <span class="brand-name" aria-hidden="true">Compe<em>TIDOR</em></span>
       </div>
       <nav aria-label="Menu principal">
-        <a class="active" href="#/dashboard" data-route="dashboard" aria-label="Dashboard" title="Dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/></svg></span><strong>Dashboard</strong></a>
-        <a href="#/analitico" data-route="analitico" aria-label="Analítico" title="Analítico"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 20V10h3v10H4Zm6 0V4h3v16h-3Zm6 0v-7h3v7h-3ZM3 22h18v-2H3v2Z"/></svg></span><strong>Analítico</strong></a>
+        <span class="nav-group" aria-hidden="true">Visão geral</span>
+        <a class="active" href="#/dashboard" data-route="dashboard" data-tab aria-label="Dashboard" title="Dashboard"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/></svg></span><strong>Dashboard</strong></a>
+        <a href="#/analitico" data-route="analitico" data-tab aria-label="Analítico" title="Analítico"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 20V10h3v10H4Zm6 0V4h3v16h-3Zm6 0v-7h3v7h-3ZM3 22h18v-2H3v2Z"/></svg></span><strong>Analítico</strong></a>
+        <a href="#/alertas" data-route="alertas" aria-label="Alertas" title="Alertas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22a2.5 2.5 0 0 0 2.4-2h-4.8A2.5 2.5 0 0 0 12 22Zm7-5-2-2V9a5 5 0 0 0-4-4.9V2h-2v2.1A5 5 0 0 0 7 9v6l-2 2v1h14v-1Z"/></svg></span><strong>Alertas</strong></a>
+        <span class="nav-group" aria-hidden="true">Vendas</span>
+        <a href="#/metas" data-route="metas" aria-label="Metas de Venda" title="Metas de Venda"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16Zm0 2.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11Zm0 2a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7Zm0 1.75a1.75 1.75 0 1 0 0 3.5 1.75 1.75 0 0 0 0-3.5Z"/></svg></span><strong>Metas de Venda</strong></a>
         <a href="#/clientes" data-route="clientes" aria-label="Clientes" title="Clientes" data-customers-admin-only><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm7.5 1a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7ZM2 21v-2.3A5.7 5.7 0 0 1 7.7 13h2.6a5.7 5.7 0 0 1 5.7 5.7V21H2Zm15.8 0v-2.3c0-1.5-.4-2.9-1.2-4.1h1a4.4 4.4 0 0 1 4.4 4.4v2h-4.2Z"/></svg></span><strong>Clientes</strong></a>
+        <a href="#/relatorios" data-route="relatorios" data-tab aria-label="Relatórios" title="Relatórios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 3h10l4 4v14H5V3Zm9 1.8V8h3.2L14 4.8ZM8 12h8v-2H8v2Zm0 4h8v-2H8v2Zm0 3h6v-2H8v2Z"/></svg></span><strong>Relatórios</strong></a>
         <a href="#/custos" data-route="custos" aria-label="Custos" title="Custos"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2v2.1c-3.4.4-5 2.3-5 4.7 0 2.9 2.5 4 5 4.7 2.2.6 3 1.1 3 2.2 0 1.2-1.1 2.1-3 2.1-2.2 0-3.8-.8-5.2-1.8l-1.5 2.3c1.6 1.2 3.8 2 6.7 2.2V22h2v-1.7c3.5-.5 5.2-2.5 5.2-5 0-3-2.4-4.1-5.2-4.9-2.1-.6-3-1.1-3-2.1 0-1 .9-1.8 2.8-1.8 1.8 0 3.2.6 4.4 1.4l1.4-2.3A10.7 10.7 0 0 0 14 4.1V2h-2Z"/></svg></span><strong>Custos</strong></a>
-        <a href="#/metas" data-route="metas" aria-label="Metas de Venda" title="Metas de Venda"><span class="nav-icon">◎</span><strong>Metas de Venda</strong></a>
-        <a href="#/compras" data-route="compras" aria-label="Compras" title="Compras"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M7 4V2h2v2h6V2h2v2h3v18H4V4h3Zm11 6H6v10h12V10Zm-9 2h6v2H9v-2Zm0 4h6v2H9v-2Z"/></svg></span><strong>Compras</strong></a>
-        <a href="#/relatorios" data-route="relatorios" aria-label="Relatórios" title="Relatórios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 3h10l4 4v14H5V3Zm9 1.8V8h3.2L14 4.8ZM8 12h8v-2H8v2Zm0 4h8v-2H8v2Zm0 3h6v-2H8v2Z"/></svg></span><strong>Relatórios</strong></a>
-        <a href="#/contas" data-route="contas" aria-label="Contas" title="Contas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8-6h5v2h-5V5Zm0 4h5v2h-5V9ZM3 21v-2a5 5 0 0 1 10 0v2H3Zm12-6h6v2h-6v-2Zm0 4h6v2h-6v-2Z"/></svg></span><strong>Contas</strong></a>
+        <span class="nav-group" aria-hidden="true">Anúncios</span>
+        <a href="#/anuncios" data-route="anuncios" data-tab aria-label="Anúncios" title="Anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16v4H4V5Zm0 6h16v8H4v-8Zm3 2v2h7v-2H7Zm0 3v1h10v-1H7Z"/></svg></span><strong>Anúncios</strong></a>
         <a href="#/catalogo" data-route="catalogo" aria-label="Catálogo" title="Catálogo"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8ZM7.5 8.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/></svg></span><strong>Catálogo</strong></a>
-        <a href="#/anuncios" data-route="anuncios" aria-label="Anúncios" title="Anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16v4H4V5Zm0 6h16v8H4v-8Zm3 2v2h7v-2H7Zm0 3v1h10v-1H7Z"/></svg></span><strong>Anúncios</strong></a>
         <a href="#/anunciar" data-route="anunciar" aria-label="Anunciar Produtos" title="Anunciar Produtos"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 3h12l4 4v14H4V3Zm11 1.8V8h3.2L15 4.8ZM8 11v2h3v3h2v-3h3v-2h-3V8h-2v3H8Zm0 7h8v-2H8v2Z"/></svg></span><strong>Anunciar Produtos</strong></a>
         <a href="#/copiar" data-route="copiar" aria-label="Copiar anúncios" title="Copiar anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 8h11v13H8V8Zm-3 8H3V3h13v2H5v11Z"/></svg></span><strong>Copiar anúncios</strong></a>
         <a href="#/kits" data-route="kits" aria-label="Anunciar Kits" title="Anunciar Kits"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Zm-7 9 7 4 7-4v6l-7 4-7-4v-6Zm7-1.3L16.9 7 12 4.3 7.1 7 12 9.7Z"/></svg></span><strong>Anunciar Kits</strong></a>
-        <a href="#/scan" data-route="scan" aria-label="Scan" title="Scan"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2Zm1 1v10l7.1 7.1 1.4-1.4-6.5-6.5V3h-2Zm-1 5a4 4 0 1 0 4 4h-2a2 2 0 1 1-2-2V8Z"/></svg></span><strong>Scan</strong></a>
+        <span class="nav-group" aria-hidden="true">Operação</span>
+        <a href="#/compras" data-route="compras" aria-label="Compras" title="Compras"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M7 4V2h2v2h6V2h2v2h3v18H4V4h3Zm11 6H6v10h12V10Zm-9 2h6v2H9v-2Zm0 4h6v2H9v-2Z"/></svg></span><strong>Compras</strong></a>
         <a href="#/devolucoes" data-route="devolucoes" aria-label="Central de Devoluções" title="Central de Devoluções"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 4h10v2H6v12h12v-5h2v7H4V4Zm12.6 1.4L19.2 8H11v2h8.2l-2.6 2.6L18 14l5-5-5-5-1.4 1.4ZM8 13h6v2H8v-2Z"/></svg></span><strong>Devoluções</strong></a>
-        <a href="#/alertas" data-route="alertas" aria-label="Alertas" title="Alertas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22a2.5 2.5 0 0 0 2.4-2h-4.8A2.5 2.5 0 0 0 12 22Zm7-5-2-2V9a5 5 0 0 0-4-4.9V2h-2v2.1A5 5 0 0 0 7 9v6l-2 2v1h14v-1Z"/></svg></span><strong>Alertas</strong></a>
+        <a href="#/scan" data-route="scan" aria-label="Scan" title="Scan"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2Zm1 1v10l7.1 7.1 1.4-1.4-6.5-6.5V3h-2Zm-1 5a4 4 0 1 0 4 4h-2a2 2 0 1 1-2-2V8Z"/></svg></span><strong>Scan</strong></a>
+        <span class="nav-group" aria-hidden="true">Administração</span>
+        <a href="#/contas" data-route="contas" aria-label="Contas" title="Contas"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8-6h5v2h-5V5Zm0 4h5v2h-5V9ZM3 21v-2a5 5 0 0 1 10 0v2H3Zm12-6h6v2h-6v-2Zm0 4h6v2h-6v-2Z"/></svg></span><strong>Contas</strong></a>
         <a href="#/usuarios" data-route="usuarios" aria-label="Usuários" title="Usuários"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M9 11a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm8.5 1a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7ZM2 21v-2.2A5.8 5.8 0 0 1 7.8 13h2.4a5.8 5.8 0 0 1 5.8 5.8V21H2Zm14.8 0v-2.2a7.7 7.7 0 0 0-1.1-4h1.8a4.5 4.5 0 0 1 4.5 4.5V21h-5.2Z"/></svg></span><strong>Usuários</strong></a>
       </nav>
-      <button id="theme-toggle" class="theme-button" type="button" aria-label="Alternar tema"><span id="theme-icon"></span></button>
+      <button id="nav-more" class="nav-more" type="button" aria-label="Mais opções do menu" aria-expanded="false"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M5 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm7 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm7 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z"/></svg></span><strong>Mais</strong></button>
+      <p id="nav-sheet-title" class="nav-sheet-title">Menu</p>
+      <button id="theme-toggle" class="theme-button" type="button" aria-label="Alternar tema"><span id="theme-icon"></span><strong class="theme-label">Tema</strong></button>
     </aside>
+    <div class="nav-sheet-backdrop" aria-hidden="true"></div>
 
     <main>
       <header class="topbar">
@@ -1520,9 +1539,10 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20261109-publication"></script>
+  <script src="/app.js?v=20261111-glass2"></script>
   <script src="/goal-pricing.js?v=20261104-pricing-save2"></script>
   <script src="/sales-goals.js?v=20261106-goals-query"></script>
   <script src="/official-stores.js?v=20260923-clear-pending"></script>
+  <script src="/liquid-shell.js?v=20261111-glass2"></script>
   </body>
 </html>
