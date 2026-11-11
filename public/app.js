@@ -5451,17 +5451,19 @@ function renderClone() {
   document.querySelector("#clone-jobs").innerHTML = batchAction + state.data.clone_jobs
     .map(
       (job) => `
-        <article class="clone-job" data-clone-job-card="${job.id}">
+        <article class="clone-job tone-${escapeAttr(cloneJobStatusTone(job.status))}" data-clone-job-card="${job.id}">
           <div>
-            <strong>${escapeText(job.source)} → ${escapeText(job.target)}</strong>
-            ${job.official_store_label ? `<p>Loja oficial: <strong>${escapeText(job.official_store_label)}</strong></p>` : ''}
+            <div class="clone-job-head">
+              <strong class="clone-job-route"><span>${escapeText(job.source)}</span><i aria-hidden="true">→</i><span>${escapeText(job.target)}</span></strong>
+              <span class="badge ${cloneJobStatusTone(job.status)}">${cloneJobStatusLabel(job.status)}</span>
+            </div>
+            ${job.official_store_label ? `<p class="clone-job-store">Loja oficial: <strong>${escapeText(job.official_store_label)}</strong></p>` : ''}
             <div class="meta-row"><span>${job.items} anúncio(s)</span><span>${escapeText(job.variant_label || "Mesmo tipo")}</span><span>${(job.item_ids || []).join(", ")}</span></div>
-            <p>${cloneJobNoteHtml(job.note)}</p>
+            <p class="clone-job-note">${cloneJobNoteHtml(job.note)}</p>
             ${job.created_details?.length ? cloneCreatedHtml(job.created_details) : ""}
             ${job.errors?.length ? cloneErrorsHtml(job.errors, job.validation_version) : ""}
-            ${["preview_ready", "review_required", "partial_error", "error", "confirmation_pending"].includes(job.status) ? `<button class="mini-button" data-execute-clone="${job.id}">${job.status === "confirmation_pending" ? "Conferir publicação" : !job.validation_version ? "Revalidar e copiar" : job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button>` : ""}
+            ${["preview_ready", "review_required", "partial_error", "error", "confirmation_pending"].includes(job.status) ? `<div class="clone-job-actions"><button class="mini-button" data-execute-clone="${job.id}">${job.status === "confirmation_pending" ? "Conferir publicação" : !job.validation_version ? "Revalidar e copiar" : job.status === "review_required" ? "Copiar com ajustes" : "Copiar agora"}</button></div>` : ""}
           </div>
-          <span class="badge ${cloneJobStatusTone(job.status)}">${cloneJobStatusLabel(job.status)}</span>
         </article>
       `
     )
