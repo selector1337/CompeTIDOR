@@ -1,4 +1,4 @@
-﻿const state = {
+const state = {
   data: null,
   meta: null,
   route: "dashboard",
@@ -852,7 +852,19 @@ function connectedAccounts() {
   );
 }
 
-const analyticsPalette = ["#00c896", "#3b82f6", "#f59e0b", "#a855f7", "#ef4444", "#14b8a6", "#ec4899", "#84cc16"];
+const analyticsPalette = ["#ffcc00", "#0a84ff", "#30d158", "#bf5af2", "#ff9f0a", "#64d2ff", "#ff375f", "#ac8e68"];
+
+function analyticsSparkline(rows, pick, tone = "current") {
+  const values = (rows || []).map(pick).map(Number).filter(Number.isFinite);
+  if (values.length < 2) return "";
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const span = max - min || 1;
+  const W = 120, H = 36;
+  const points = values.map((value, index) => [(index / (values.length - 1)) * W, H - 3 - ((value - min) / span) * (H - 8)]);
+  const line = points.map(([x, y], index) => `${index ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  return `<svg class="analytics-spark ${tone}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><path class="fill" d="${line} L${W},${H} L0,${H} Z"/><path class="stroke" d="${line}"/></svg>`;
+}
 
 function analyticsDateLabel(value) {
   const [year, month, day] = String(value || "").split("-");
@@ -943,8 +955,8 @@ function analyticsSeriesChart(current, comparison, field, currency = false) {
   }).join("");
   return `<div class="analytics-chart-scroll"><svg class="analytics-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Comparativo de ${field === "revenue" ? "faturamento" : "pedidos"}">
     <defs>
-      <linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3b82f6" stop-opacity=".42"/><stop offset="1" stop-color="#3b82f6" stop-opacity=".03"/></linearGradient>
-      <linearGradient id="${comparisonGradientId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a855f7" stop-opacity=".34"/><stop offset="1" stop-color="#a855f7" stop-opacity=".02"/></linearGradient>
+      <linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd60a" stop-opacity=".2"/><stop offset="1" stop-color="#ffd60a" stop-opacity="0"/></linearGradient>
+      <linearGradient id="${comparisonGradientId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8e8e93" stop-opacity=".12"/><stop offset="1" stop-color="#8e8e93" stop-opacity="0"/></linearGradient>
     </defs>
     ${ticks}${xTicks}
     ${areaFor(comparisonRows) ? `<path d="${areaFor(comparisonRows)}" fill="url(#${comparisonGradientId})"/>` : ""}
@@ -966,17 +978,17 @@ function analyticsDonut(entries, valueField, shareField, total, currency = false
     const title = `${row.label} · ${share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${value}`;
     const expandable = Array.isArray(row.children) && row.children.length;
     const color = analyticsPalette[index % analyticsPalette.length];
-    return `<circle class="analytics-donut-segment${expandable ? " expandable" : ""}" data-donut-tooltip data-tooltip-label="${escapeAttr(row.label)}" data-tooltip-detail="${escapeAttr(`${share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${value}`)}" data-tooltip-color="${color}" ${expandable ? `data-expand-other-brands aria-expanded="false"` : ""} cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="${color}" stroke-width="24" stroke-dasharray="${Math.min(100, share)} ${Math.max(0, 100 - share)}" stroke-dashoffset="${-offset}" transform="rotate(-90 60 60)" tabindex="0" aria-label="${escapeAttr(`${title}${expandable ? ". Clique para detalhar." : ""}`)}"></circle>`;
+    return `<circle class="analytics-donut-segment${expandable ? " expandable" : ""}" data-donut-tooltip data-tooltip-label="${escapeAttr(row.label)}" data-tooltip-detail="${escapeAttr(`${share.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${value}`)}" data-tooltip-color="${color}" ${expandable ? `data-expand-other-brands aria-expanded="false"` : ""} cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="${color}" stroke-width="14" stroke-dasharray="${Math.max(0, Math.min(100, share) - (rows.length > 1 ? 0.8 : 0))} ${Math.max(0, 100 - share + (rows.length > 1 ? 0.8 : 0))}" stroke-dashoffset="${-offset}" transform="rotate(-90 60 60)" tabindex="0" aria-label="${escapeAttr(`${title}${expandable ? ". Clique para detalhar." : ""}`)}"></circle>`;
   }).join("");
   const expandableRow = rows.find((row) => Array.isArray(row.children) && row.children.length);
   const detail = expandableRow ? `<div class="analytics-other-brands-detail" data-other-brands-detail hidden><div class="analytics-other-brands-heading"><span><strong>Detalhamento de outras marcas</strong><small>${expandableRow.children.length} marca(s) agrupada(s)</small></span><button type="button" class="ghost compact" data-expand-other-brands aria-expanded="false">Fechar</button></div><div class="analytics-other-brands-list">${expandableRow.children.map((child) => `<div><strong>${escapeText(child.label)}</strong><span>${Number(child.revenue_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%</span><b>${money.format(child.revenue || 0)}</b></div>`).join("")}</div></div>` : "";
   return `<div class="analytics-donut-block"><div class="analytics-donut-layout">
-    <div class="analytics-donut"><svg class="analytics-donut-svg" viewBox="0 0 120 120" role="img" aria-label="Gráfico de participação">${segments || `<circle cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="var(--panel-2)" stroke-width="24"/>`}</svg><div><small>Total</small><strong>${currency ? money.format(total || 0) : Number(total || 0).toLocaleString("pt-BR")}</strong></div></div>
+    <div class="analytics-donut"><svg class="analytics-donut-svg" viewBox="0 0 120 120" role="img" aria-label="Gráfico de participação">${segments || `<circle cx="60" cy="60" r="46" pathLength="100" fill="none" stroke="var(--panel-2)" stroke-width="14"/>`}</svg><div title="${escapeAttr(currency ? money.format(total || 0) : Number(total || 0).toLocaleString("pt-BR"))}"><small>Total</small><strong>${currency ? escapeText(analyticsCompactNumber(total, true)) : Number(total || 0).toLocaleString("pt-BR")}</strong></div></div>
     <div class="analytics-channel-legend">${rows.length ? rows.map((row, index) => {
       const detail = `${Number(row[shareField] || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}% · ${currency ? money.format(row[valueField] || 0) : Number(row[valueField] || 0).toLocaleString("pt-BR")}`;
       const expandable = Array.isArray(row.children) && row.children.length;
       const tag = expandable ? "button" : "div";
-      return `<${tag} ${expandable ? `type="button" data-expand-other-brands aria-expanded="false"` : ""} title="${escapeAttr(`${row.label} — ${detail}${expandable ? " — clique para detalhar" : ""}`)}"><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><span><strong>${escapeText(row.label)}${expandable ? " ›" : ""}</strong><small>${detail}</small></span></${tag}>`;
+      return `<${tag} ${expandable ? `type="button" data-expand-other-brands aria-expanded="false"` : ""} title="${escapeAttr(`${row.label} — ${detail}${expandable ? " — clique para detalhar" : ""}`)}"><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><span><strong>${escapeText(row.label)}${expandable ? " ›" : ""}</strong><small>${detail}</small><span class="analytics-legend-bar" aria-hidden="true"><i style="width:${Math.max(2, Math.min(100, Number(row[shareField] || 0))).toFixed(1)}%;background:${analyticsPalette[index % analyticsPalette.length]}"></i></span></span></${tag}>`;
     }).join("") : `<p class="muted">Sem vendas no período.</p>`}</div>
   </div><div class="analytics-donut-tooltip" data-donut-floating-tooltip hidden></div>${detail}</div>`;
 }
@@ -1027,12 +1039,12 @@ function renderAnalytics() {
     ${cacheNote}
     ${warning}${truncated}
     <div class="analytics-kpi-grid">
-      <article class="analytics-kpi featured"><span>Faturamento</span><strong>${money.format(current.revenue || 0)}</strong>${analyticsDelta(changes.revenue)}<small>Anterior: ${money.format(comparison.revenue || 0)}</small></article>
-      <article class="analytics-kpi"><span>Pedidos</span><strong>${Number(current.orders || 0).toLocaleString("pt-BR")}</strong>${analyticsDelta(changes.orders)}<small>Anterior: ${Number(comparison.orders || 0).toLocaleString("pt-BR")}</small></article>
-      <article class="analytics-kpi"><span>Unidades vendidas</span><strong>${Number(current.units || 0).toLocaleString("pt-BR")}</strong>${analyticsDelta(changes.units)}<small>Anterior: ${Number(comparison.units || 0).toLocaleString("pt-BR")}</small></article>
-      <article class="analytics-kpi"><span>Ticket médio</span><strong>${money.format(current.ticket || 0)}</strong>${analyticsDelta(changes.ticket)}<small>Anterior: ${money.format(comparison.ticket || 0)}</small></article>
-      <article class="analytics-kpi"><span>Média diária</span><strong>${money.format(current.daily_average || 0)}</strong><small>${Number(current.days || 0).toLocaleString("pt-BR")} dia(s) analisados</small></article>
-      <article class="analytics-kpi"><span>Melhor dia</span><strong>${bestDay ? money.format(bestDay.revenue || 0) : "—"}</strong><small>${bestDay ? `${analyticsDateLabel(bestDay.date)} · ${Number(bestDay.orders || 0).toLocaleString("pt-BR")} pedido(s)` : "Sem vendas no período"}</small></article>
+      <article class="analytics-kpi featured kpi-revenue"><span>Faturamento</span><strong>${money.format(current.revenue || 0)}</strong>${analyticsDelta(changes.revenue)}<small>Anterior: ${money.format(comparison.revenue || 0)}</small>${analyticsSparkline(current.daily, (row) => row.revenue)}</article>
+      <article class="analytics-kpi kpi-orders"><span>Pedidos</span><strong>${Number(current.orders || 0).toLocaleString("pt-BR")}</strong>${analyticsDelta(changes.orders)}<small>Anterior: ${Number(comparison.orders || 0).toLocaleString("pt-BR")}</small>${analyticsSparkline(current.daily, (row) => row.orders)}</article>
+      <article class="analytics-kpi kpi-units"><span>Unidades vendidas</span><strong>${Number(current.units || 0).toLocaleString("pt-BR")}</strong>${analyticsDelta(changes.units)}<small>Anterior: ${Number(comparison.units || 0).toLocaleString("pt-BR")}</small>${analyticsSparkline(current.daily, (row) => row.units)}</article>
+      <article class="analytics-kpi kpi-ticket"><span>Ticket médio</span><strong>${money.format(current.ticket || 0)}</strong>${analyticsDelta(changes.ticket)}<small>Anterior: ${money.format(comparison.ticket || 0)}</small>${analyticsSparkline(current.daily, (row) => (Number(row.orders) > 0 ? Number(row.revenue) / Number(row.orders) : NaN))}</article>
+      <article class="analytics-kpi kpi-average"><span>Média diária</span><strong>${money.format(current.daily_average || 0)}</strong><small>${Number(current.days || 0).toLocaleString("pt-BR")} dia(s) analisados</small></article>
+      <article class="analytics-kpi kpi-best"><span>Melhor dia</span><strong>${bestDay ? money.format(bestDay.revenue || 0) : "—"}</strong><small>${bestDay ? `${analyticsDateLabel(bestDay.date)} · ${Number(bestDay.orders || 0).toLocaleString("pt-BR")} pedido(s)` : "Sem vendas no período"}</small></article>
     </div>
     <div class="analytics-chart-grid">
       <article class="panel analytics-chart-card"><div class="analytics-card-heading"><div><span>Comparativo diário</span><h3>Faturamento</h3></div><div class="analytics-chart-legend"><span class="current">${escapeText(current.label || "Atual")}</span><span class="comparison">${escapeText(comparison.label || "Anterior")}</span></div></div>${analyticsSeriesChart(current, comparison, "revenue", true)}</article>
@@ -1043,7 +1055,7 @@ function renderAnalytics() {
       <article class="panel analytics-share-card"><div class="analytics-card-heading"><div><span>Participação por canal</span><h3>Pedidos</h3></div></div>${analyticsDonut(channels, "orders", "orders_share", current.orders)}</article>
       <article class="panel analytics-share-card analytics-brand-card"><div class="analytics-card-heading"><div><span>Participação por marca</span><h3>Faturamento por marca</h3></div><small class="analytics-card-hint">Passe o mouse para ver os valores · clique em “Outras marcas” para detalhar</small></div>${analyticsDonut(brands, "revenue", "revenue_share", current.revenue, true)}</article>
     </div>
-    <article class="panel analytics-table-card"><div class="analytics-card-heading"><div><span>Detalhamento</span><h3>Desempenho por conta / canal</h3></div></div><div class="analytics-table-wrap"><table class="analytics-table"><thead><tr><th>Canal</th><th>Faturamento</th><th>Participação</th><th>Variação</th><th>Pedidos</th><th>Participação</th><th>Variação</th><th>Unidades</th><th>Ticket médio</th></tr></thead><tbody>${channels.map((row, index) => `<tr><td><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><strong>${escapeText(row.label)}</strong></td><td>${money.format(row.revenue || 0)}</td><td>${Number(row.revenue_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</td><td>${analyticsDelta(row.revenue_change)}</td><td>${Number(row.orders || 0).toLocaleString("pt-BR")}</td><td>${Number(row.orders_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</td><td>${analyticsDelta(row.orders_change)}</td><td>${Number(row.units || 0).toLocaleString("pt-BR")}</td><td>${money.format(row.ticket || 0)}</td></tr>`).join("") || `<tr><td colspan="9">Sem dados no período.</td></tr>`}</tbody></table></div></article>`;
+    <article class="panel analytics-table-card"><div class="analytics-card-heading"><div><span>Detalhamento</span><h3>Desempenho por conta / canal</h3></div></div><div class="analytics-table-wrap"><table class="analytics-table"><thead><tr><th>Canal</th><th>Faturamento</th><th>Participação</th><th>Variação</th><th>Pedidos</th><th>Participação</th><th>Variação</th><th>Unidades</th><th>Ticket médio</th></tr></thead><tbody>${channels.map((row, index) => `<tr><td><span class="analytics-legend-dot" style="background:${analyticsPalette[index % analyticsPalette.length]}"></span><strong>${escapeText(row.label)}</strong></td><td>${money.format(row.revenue || 0)}</td><td><span class="analytics-share-cell"><span>${Number(row.revenue_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</span><span class="analytics-legend-bar" aria-hidden="true"><i style="width:${Math.max(2, Math.min(100, Number(row.revenue_share || 0))).toFixed(1)}%;background:${analyticsPalette[index % analyticsPalette.length]}"></i></span></span></td><td>${analyticsDelta(row.revenue_change)}</td><td>${Number(row.orders || 0).toLocaleString("pt-BR")}</td><td><span class="analytics-share-cell"><span>${Number(row.orders_share || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%</span><span class="analytics-legend-bar" aria-hidden="true"><i style="width:${Math.max(2, Math.min(100, Number(row.orders_share || 0))).toFixed(1)}%;background:${analyticsPalette[index % analyticsPalette.length]}"></i></span></span></td><td>${analyticsDelta(row.orders_change)}</td><td>${Number(row.units || 0).toLocaleString("pt-BR")}</td><td>${money.format(row.ticket || 0)}</td></tr>`).join("") || `<tr><td colspan="9">Sem dados no período.</td></tr>`}</tbody></table></div></article>`;
 }
 
 async function loadAnalytics() {
@@ -1544,6 +1556,7 @@ function renderDashboard() {
 
   const topSkuPage = paginate(ops.top_skus_today || [], state.dashboardTopSkuPage, 5);
   state.dashboardTopSkuPage = topSkuPage.current;
+  const topSkuMaxUnits = Math.max(1, ...(ops.top_skus_today || []).map((item) => Number(item.units || 0)));
   document.querySelector("#dashboard-top-skus").innerHTML = topSkuPage.items.map((item, index) => `
     <article class="sale-item top-sku-item">
       <span class="sku-rank">${topSkuPage.start + index + 1}</span>
@@ -1551,8 +1564,9 @@ function renderDashboard() {
       <div>
         <strong>${escapeText(item.product || item.sku || "SKU vendido")}</strong>
         <div class="chip-row">${copyChip((item.accounts || []).length > 1 ? "Contas" : "Conta", (item.accounts || []).join(", ") || item.account || "-")}${copyChip("SKU", item.sku || "-")}${copyChip((item.item_ids || []).length > 1 ? "Anúncios" : "MLB", (item.item_ids || []).join(", ") || item.item_id || "-")}</div>
+        <span class="sku-units-bar" aria-hidden="true"><i style="width:${Math.max(4, Math.min(100, (Number(item.units || 0) / topSkuMaxUnits) * 100)).toFixed(1)}%"></i></span>
       </div>
-      <div class="sale-total"><span>Unidades vendidas</span><strong>${Number(item.units || 0)}</strong><small>${money.format(item.revenue || 0)}</small></div>
+      <div class="sale-total"><span>Unidades vendidas</span><strong>${Number(item.units || 0)}<em> un.</em></strong><small>${money.format(item.revenue || 0)}</small></div>
     </article>
   `).join("") + paginationHtml("dashboardTopSkuPage", topSkuPage) || `<div class="notice">Nenhum SKU vendido hoje foi sincronizado.</div>`;
 
@@ -2446,6 +2460,7 @@ function renderCatalog() {
               <strong>${item.title}</strong>
               <span class="badge ${item.status}">${item.internal_competition ? labels.internal : labels[item.status]}</span>
             </div>
+            <p class="card-section-label">Seu anúncio</p>
             <div class="item-facts">
               ${fact("Loja", item.account)}
               ${fact("SKU", item.sku)}
@@ -2455,6 +2470,9 @@ function renderCatalog() {
               ${fact("Estoque", item.stock)}
               ${fact("Preço", money.format(item.price))}
               ${item.meli_status ? fact("Status ML", statusLabel(item.meli_status)) : ""}
+            </div>
+            <p class="card-section-label">Disputa do catálogo</p>
+            <div class="item-facts item-facts-competition">
               ${fact("Vencedor", catalogWinnerName(item))}
               ${fact("Preço vencedor", catalogWinnerPrice(item))}
               ${fact("Tipo vencedor", catalogWinnerType(item))}
@@ -2465,6 +2483,7 @@ function renderCatalog() {
               ${fact("Preço p/ ganhar", item.price_to_win ? money.format(item.price_to_win) : "Sem sugestão ML")}
               ${item.competition_checked_at ? fact("Verificado em", formatDateBR(item.competition_checked_at)) : ""}
             </div>
+            <p class="card-section-label">Valores por venda</p>
             <div class="commercial-strip">
               ${shippingCostFact(item)}
               ${fact("Tarifa de venda", saleFeeLabel(item))}
@@ -2489,7 +2508,7 @@ function renderCatalog() {
               </div>
             ` : ""}
           </div>
-          <div class="score">
+          <div class="score" style="--share:${Math.max(0, Math.min(100, Number(item.share) || 0))}">
             <small>Participação estimada</small>
             <strong>${Math.max(0, Math.min(100, Number(item.share) || 0))}%</strong>
             <small>Vencedor: ${catalogWinnerName(item)} · ${catalogWinnerType(item)}</small>
@@ -2730,6 +2749,7 @@ function renderAds() {
             <span class="badge ${normalizedMlStatus(item.meli_status) === "paused" ? "paused" : "winning"}">${statusLabel(item.meli_status || item.status)}</span>
           </div>
         </div>
+        <p class="card-section-label">Dados do anúncio</p>
         <div class="ad-facts ad-facts-general" aria-label="Dados gerais do anúncio">
           ${fact("Conta", item.account)}
           ${fact("Loja oficial", adsOfficialStore(item).label)}
@@ -2742,6 +2762,7 @@ function renderAds() {
           ${fact("Retirada pessoal", item.local_pick_up ? "Ativa" : "Inativa")}
           ${fact("Status do anúncio", statusLabel(item.meli_status || item.status))}
         </div>
+        <p class="card-section-label">Valores por venda</p>
         <div class="ad-facts ad-commercial-facts" aria-label="Valores do anúncio">
           ${shippingCostFact(item)}
           ${fact("Tarifa de venda", saleFeeLabel(item))}
@@ -2750,12 +2771,14 @@ function renderAds() {
           ${profitFact(item)}
         </div>
         <div class="inline-edit">
+          <p class="card-section-label">Preço e estoque</p>
           <div class="inline-edit-row ad-stock-row">
             <label>Preço <span class="money-field"><input type="number" min="0" step="0.01" value="${item.price || 0}" data-original-value="${item.price || 0}" data-price-input="${item.id}" /></span></label>
             <label>Preço de lista <span class="money-field"><input type="number" min="0" step="0.01" value="${item.list_price ?? ""}" data-original-value="${item.list_price ?? ""}" data-list-price-input="${item.id}" placeholder="Opcional" /></span><small>Enviado ao campo Preço do anúncio no Mercado Livre.</small></label>
             <label>Estoque <input type="number" min="0" step="1" value="${item.stock || 0}" data-original-value="${item.stock || 0}" data-stock-input="${item.id}" /></label>
             <label>Disponibilidade <span class="unit-field"><input type="number" min="0" max="45" step="1" value="${Number(item.manufacturing_time || 0)}" data-original-value="${Number(item.manufacturing_time || 0)}" data-manufacturing-time-input="${item.id}" /><span>dias</span></span><small>Use 0 para disponibilidade imediata.</small></label>
           </div>
+          <p class="card-section-label">Embalagem e identificação</p>
           <div class="inline-edit-row ad-package-row">
             <label>Tipo de embalagem
               <select data-package-mode-input="${item.id}" data-original-value="${escapeAttr(item.package_mode || "factory")}">
@@ -3573,6 +3596,17 @@ function reputationPeriodLabel(period) {
   return String(period || '').replace(/^(\d+) days?$/, '$1 dias') || 'Período não informado';
 }
 
+function reputationAccountInfo(account) {
+  const rows = typeof state !== 'undefined' ? (state.data?.operations?.revenue || []) : [];
+  const row = rows.find((item) => item.account === account) || {};
+  const level = String(row.reputation_level || '').toLowerCase();
+  const step = Number(level.match(/^(\d)_/)?.[1] || 0);
+  const names = {5: 'Verde', 4: 'Verde claro', 3: 'Amarelo', 2: 'Laranja', 1: 'Vermelho'};
+  const thermo = step ? `<div class="rep-thermo" data-level="${step}" role="img" aria-label="Termômetro de reputação: ${names[step]}">${[1, 2, 3, 4, 5].map((n) => `<i class="${n === step ? 'on' : ''}"></i>`).join('')}</div>` : '';
+  const badge = typeof dashboardReputation === 'function' && (row.power_seller_status || row.reputation_level) ? dashboardReputation(row) : '';
+  return {thermo, badge, levelName: names[step] || ''};
+}
+
 function renderReputationMetrics(metrics) {
   return metrics.map(metric => {
     const rows = [
@@ -3588,16 +3622,18 @@ function renderReputationMetrics(metrics) {
       const hasRate = typeof displayedRate === 'number' && Number.isFinite(displayedRate);
       const rate = hasRate ? `${displayedRate.toLocaleString('pt-BR', {maximumFractionDigits: 2})}%` : 'Não informado';
       const quantity = Number.isInteger(displayedCount) ? `${displayedCount.toLocaleString('pt-BR')} venda(s) afetada(s)` : 'Quantidade não informada';
-      return `<div class="reputation-metric ${hasRate ? '' : 'unavailable'}">
-        <span>${escapeText(label)}</span><strong>${rate}</strong>
+      return `<div class="reputation-metric rep-${key.replaceAll('_', '-')} ${hasRate ? '' : 'unavailable'}">
+        <span><i class="rep-icon" aria-hidden="true"></i>${escapeText(label)}</span><strong>${rate}</strong>
         <small>${hasRate ? escapeText(quantity) : 'Percentual não retornado pela API para esta conta.'}</small>
         ${hasRate ? `<small>${escapeText(reputationPeriodLabel(detail.period))}</small>` : ''}
-        
+
         ${detail.stale ? `<small class="error-text">Último dado disponível · ${escapeText(detail.updated_at || '')}</small>` : ''}
       </div>`;
     }).join('');
+    const info = reputationAccountInfo(metric.account);
     return `<article class="metric-item reputation-account">
-      <div class="metric-header"><strong>${escapeText(metric.account || '')}</strong><span>Consulta: ${escapeText(metric.updated_at || 'Aguardando sincronização')}</span></div>
+      <div class="metric-header"><span class="rep-avatar" aria-hidden="true">${escapeText(String(metric.account || '?').trim().charAt(0))}</span><div class="rep-id"><strong>${escapeText(metric.account || '')}</strong><span>Consulta: ${escapeText(metric.updated_at || 'Aguardando sincronização')}</span></div>${info.badge}</div>
+      ${info.thermo ? `<div class="rep-level">${info.thermo}<small>Reputação ${escapeText(info.levelName.toLowerCase())}</small></div>` : ''}
       <div class="reputation-metrics-grid">${cards}</div>
       <p class="reputation-source-note">Taxas reais de ocorrências · quando há proteção, mostramos os valores anteriores à aplicação do benefício.</p>
     </article>`;

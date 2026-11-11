@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="pt-BR">
   <head>
     <meta charset="utf-8" />
@@ -15,7 +15,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..800&display=swap" />
   <link rel="stylesheet" href="/styles.css?v=20261109-margins" />
-  <link rel="stylesheet" href="/liquid-glass.css?v=20261111-glass2" />
+  <link rel="stylesheet" href="/liquid-glass.css?v=20261111-glass3" />
   </head>
   <body class="auth-loading">
     <div class="lg-aurora" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -146,15 +146,21 @@
                 <button class="mini-button" type="button" data-export-report="dashboard_stock" data-export-format="xlsx">Excel</button>
               </div>
             </div>
-            <div class="mini-filter-bar" id="stock-period-filter">
-              <button class="active" data-stock-period="today">Hoje</button>
-              <button data-stock-period="yesterday">Ontem</button>
-              <button data-stock-period="week">Semana</button>
-              <label>De <input id="stock-custom-date" type="date" /></label>
-              <label>Até <input id="stock-custom-end-date" type="date" /></label>
-              <button type="button" id="stock-apply-period">Aplicar período</button>
+            <div class="period-picker" id="stock-period-filter">
+              <div class="period-seg" role="group" aria-label="Período rápido">
+                <button class="active" type="button" data-stock-period="today">Hoje</button>
+                <button type="button" data-stock-period="yesterday">Ontem</button>
+                <button type="button" data-stock-period="week">7 dias</button>
+              </div>
+              <div class="period-range" role="group" aria-label="Período personalizado">
+                <label><span>De</span><input id="stock-custom-date" type="date" /></label>
+                <span class="period-range-sep" aria-hidden="true"></span>
+                <label><span>Até</span><input id="stock-custom-end-date" type="date" /></label>
+                <button type="button" id="stock-apply-period" title="Aplicar período">Aplicar</button>
+              </div>
+              <label class="dashboard-account-choice"><span>Conta</span><select id="dashboard-stock-account"><option value="all">Todas as contas</option></select></label>
             </div>
-            <label class="dashboard-account-choice">Conta <select id="dashboard-stock-account"><option value="all">Todas as contas</option></select></label><div id="dashboard-stock" class="ops-list"></div>
+            <div id="dashboard-stock" class="ops-list"></div>
           </div>
           <div class="panel">
             <div class="panel-heading compact">
@@ -162,8 +168,12 @@
                 <p class="eyebrow">Atenção catálogo</p>
                 <h2>Produtos perdendo catálogo</h2>
               </div>
+              <div class="report-actions" aria-label="Exportar produtos perdendo catálogo">
+                <button class="mini-button" type="button" data-export-report="dashboard_catalog" data-export-format="pdf">PDF</button>
+                <button class="mini-button" type="button" data-export-report="dashboard_catalog" data-export-format="xlsx">Excel</button>
+              </div>
             </div>
-            <div class="report-actions"><button class="mini-button" type="button" data-export-report="dashboard_catalog" data-export-format="pdf">PDF</button><button class="mini-button" type="button" data-export-report="dashboard_catalog" data-export-format="xlsx">Excel</button></div><div id="dashboard-catalog-loss" class="ops-list"></div>
+            <div id="dashboard-catalog-loss" class="ops-list"></div>
           </div>
           <div class="panel">
             <div class="panel-heading compact">
@@ -1031,7 +1041,7 @@
               <p class="publisher-subtitle">Importe dados públicos, traduza e adapte o conteúdo, confira a ficha técnica e publique nas contas selecionadas.</p>
             </div>
             <div class="publisher-heading-actions">
-              <div class="publisher-stepper" aria-label="Etapas do cadastro"><span class="active" data-publisher-step="1">1 Importar</span><span data-publisher-step="2">2 Revisar</span><span data-publisher-step="3">3 Publicar</span></div>
+              <div class="publisher-stepper" aria-label="Etapas do cadastro"><span class="active" data-publisher-step="1"><b>1</b>Importar</span><span data-publisher-step="2"><b>2</b>Revisar</span><span data-publisher-step="3"><b>3</b>Publicar</span></div>
             </div>
           </div>
           <form id="product-import-form" class="publisher-import-form">
@@ -1050,7 +1060,7 @@
             <p>Abra o anúncio no navegador, conclua a verificação e salve a página como HTML (Ctrl+S). Selecione o arquivo abaixo e clique em “Importar e preparar” usando o mesmo link. Até 8 MB.</p>
             <label>Página salva do anúncio (opcional)<input name="page_html_file" form="product-import-form" type="file" accept=".html,.htm,text/html" /></label>
           </details>
-          <div id="product-draft-empty" class="publisher-empty"><span>＋</span><strong>Comece colando o link de um produto</strong><small>A aplicação aproveitará título, especificações e fotos e consultará categoria, atributos e catálogo no Mercado Livre.</small></div>
+          <div id="product-draft-empty" class="publisher-empty"><span>＋</span><strong>Comece colando o link de um produto</strong><small>A aplicação aproveitará título, especificações e fotos e consultará categoria, atributos e catálogo no Mercado Livre.</small><ol class="publisher-how"><li><b>1</b><span><strong>Cole o link</strong><small>Mercado Livre, Amazon, B&amp;H, Thomann ou Guitar Center</small></span></li><li><b>2</b><span><strong>Revise</strong><small>Título, categoria, ficha técnica e fotos</small></span></li><li><b>3</b><span><strong>Publique</strong><small>Nas contas e modalidades escolhidas</small></span></li></ol></div>
           <form id="product-publish-form" hidden>
             <div class="publisher-source-card">
               <img id="publisher-source-thumb" alt="Imagem principal do produto" />
@@ -1236,7 +1246,7 @@
               <p class="eyebrow">Composição de produtos</p>
               <h2>Anunciar Kits</h2>
             </div>
-            <div class="kit-step-indicator"><span class="active">1 Produtos</span><span>2 Composição</span><span>3 Publicação</span></div>
+            <div class="kit-step-indicator"><span class="active"><b>1</b>Produtos</span><span><b>2</b>Composição</span><span><b>3</b>Publicação</span></div>
           </div>
           <div class="kit-account-grid">
             <label>Conta origem <select id="kit-source-account"></select></label>
@@ -1440,19 +1450,23 @@
                 <h2>Prioridades e histórico</h2>
               </div>
             </div>
-            <div class="mini-filter-bar alert-filter-bar" id="alert-type-filter">
-              <button class="active" data-alert-type="all">Todos</button>
-              <button data-alert-type="claims">Reclamações</button>
-              <button data-alert-type="shipping">Atrasos</button>
-              <button data-alert-type="stock">Sem estoque</button>
-              <button data-alert-type="catalog">Catálogo</button>
-              <button data-alert-type="scan">Scan</button>
+            <div class="period-seg period-seg-scroll" id="alert-type-filter" role="group" aria-label="Tipo de alerta">
+              <button class="active" type="button" data-alert-type="all">Todos</button>
+              <button type="button" data-alert-type="claims">Reclamações</button>
+              <button type="button" data-alert-type="shipping">Atrasos</button>
+              <button type="button" data-alert-type="stock">Sem estoque</button>
+              <button type="button" data-alert-type="catalog">Catálogo</button>
+              <button type="button" data-alert-type="scan">Scan</button>
             </div>
-            <div class="mini-filter-bar" id="alert-period-filter">
-              <button class="active" data-alert-period="today">Hoje</button>
-              <button data-alert-period="yesterday">Ontem</button>
-              <button data-alert-period="week">Semana</button>
-              <label>Data <input id="alert-custom-date" type="date" /></label>
+            <div class="period-picker" id="alert-period-filter">
+              <div class="period-seg" role="group" aria-label="Período rápido">
+                <button class="active" type="button" data-alert-period="today">Hoje</button>
+                <button type="button" data-alert-period="yesterday">Ontem</button>
+                <button type="button" data-alert-period="week">7 dias</button>
+              </div>
+              <div class="period-range" role="group" aria-label="Dia específico">
+                <label><span>Dia</span><input id="alert-custom-date" type="date" /></label>
+              </div>
             </div>
             <div id="alerts-list" class="alerts-list"></div>
           </div>
@@ -1539,10 +1553,10 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20261111-glass2"></script>
+  <script src="/app.js?v=20261111-glass3"></script>
   <script src="/goal-pricing.js?v=20261104-pricing-save2"></script>
   <script src="/sales-goals.js?v=20261106-goals-query"></script>
   <script src="/official-stores.js?v=20260923-clear-pending"></script>
-  <script src="/liquid-shell.js?v=20261111-glass2"></script>
+  <script src="/liquid-shell.js?v=20261111-glass3"></script>
   </body>
 </html>
