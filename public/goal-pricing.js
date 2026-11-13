@@ -24,6 +24,49 @@
   async function loadDetail() {
     const result=await request('query',{sku});
     rules=[...rules.filter(r=>r.sku.toUpperCase()!==sku.toUpperCase()),...(result.rules||[])];
+    if(Array.isArray(result.presets))presets=result.presets;
+  }
+  // Modelos de programação reutilizáveis: só preenchem dias/data/horário do formulário.
+  let presets=[];
+  const dayNames=['Seg','Ter','Qua','Qui','Sex','Sáb','Dom'];
+  function presetLabel(p){
+    const days=(p.weekdays||[]).slice().sort((a,b)=>a-b);
+    const consecutive=days.length>2&&days.every((d,i)=>!i||d===days[i-1]+1);
+    const dayText=!days.length?'':days.length===7?'Todos os dias':consecutive?`${dayNames[days[0]]}–${dayNames[days.at(-1)]}`:days.map(d=>dayNames[d]).join(', ');
+    const date=p.specific_date?p.specific_date.split('-').reverse().join('/'):'';
+    const time=p.start_time?`${p.start_time}–${p.end_time}`:'Dia inteiro';
+    return [dayText,date,time].filter(Boolean).join(' · ');
+  }
+  function scheduleOf(form){
+    return {weekdays:[...form.querySelectorAll('[name=weekday]:checked')].map(i=>Number(i.value)).sort((a,b)=>a-b),specific_date:form.elements.specific_date.value,start_time:form.elements.start_time.value,end_time:form.elements.end_time.value};
+  }
+  function setupPresets(form){
+    const box=form.querySelector('.gp-presets');if(!box)return;
+    const picker=box.querySelector('[data-preset-picker]'),del=box.querySelector('[data-preset-delete]'),newBtn=box.querySelector('[data-preset-new]');
+    const panel=box.querySelector('.gp-preset-form'),nameInput=box.querySelector('[data-preset-name]'),msg=box.querySelector('.gp-preset-msg');
+    const same=(a,b)=>JSON.stringify(a.weekdays)===JSON.stringify((b.weekdays||[]).slice().sort((x,y)=>x-y))&&a.specific_date===(b.specific_date||'')&&a.start_time===(b.start_time||'')&&a.end_time===(b.end_time||'');
+    const fill=()=>{
+      const current=scheduleOf(form),match=presets.find(p=>same(current,p));
+      picker.innerHTML=`<option value="">${presets.length?'Personalizado':'Nenhum modelo salvo'}</option>${presets.map(p=>`<option value="${esc(p.id)}" ${match&&match.id===p.id?'selected':''}>${esc(p.name)} — ${esc(presetLabel(p))}</option>`).join('')}`;
+      del.hidden=!match;
+    };
+    const apply=p=>{
+      form.querySelectorAll('[name=weekday]').forEach(i=>{i.checked=(p.weekdays||[]).includes(Number(i.value));});
+      form.elements.specific_date.value=p.specific_date||'';form.elements.start_time.value=p.start_time||'';form.elements.end_time.value=p.end_time||'';
+    };
+    const send=async(body,done)=>{
+      msg.textContent='Salvando…';
+      try{const result=await request('presets',body);presets=result.presets||presets;fill();msg.textContent=done;return true;}
+      catch(err){msg.textContent=err.message||'Não foi possível salvar o modelo.';return false;}
+    };
+    picker.onchange=()=>{const p=presets.find(x=>x.id===picker.value);if(p){apply(p);msg.textContent=`Modelo “${p.name}” aplicado. Salve a regra para confirmar.`;}fill();};
+    form.querySelector('.goal-calendar').addEventListener('change',e=>{if(!e.target.closest('.gp-presets'))fill();});
+    newBtn.onclick=()=>{panel.hidden=false;nameInput.value='';nameInput.focus();msg.textContent='Os dias e horários marcados abaixo serão salvos no modelo.';};
+    box.querySelector('[data-preset-cancel]').onclick=()=>{panel.hidden=true;msg.textContent='';};
+    box.querySelector('[data-preset-confirm]').onclick=()=>{const name=nameInput.value.trim();if(!name){msg.textContent='Informe um nome para o modelo.';nameInput.focus();return;}send({action:'save',name,...scheduleOf(form)},`Modelo “${name}” salvo. Ele fica disponível em todos os SKUs.`).then(ok=>{if(ok)panel.hidden=true;});};
+    nameInput.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();box.querySelector('[data-preset-confirm]').click();}};
+    del.onclick=()=>{const p=presets.find(x=>x.id===picker.value);if(!p||!confirm(`Excluir o modelo “${p.name}”? As regras que já usam esses horários não mudam.`))return;send({action:'delete',preset_id:p.id},`Modelo “${p.name}” excluído.`);};
+    fill();
   }
   function summary(r) {
     if(!r)return '';
@@ -80,7 +123,7 @@
       <div class="gp-group"><h4>Até onde</h4>${field('floor_price','Preço mínimo',r.floor_price??0,0,'Use 0 para limitar só pela margem.','R$')}${field('floor_margin','Margem mínima',r.floor_margin??'',0,'Opcional.','%')}</div>
       </div><p class="muted gp-note">O primeiro ciclo confirma e registra o preço original de cada anúncio. Atingir a meta ou mudar de mês não restaura preços nem reinicia o intervalo. A regra continua reduzindo até os limites cadastrados, respeitando a pausa após vendas. A margem considera custo, tarifa e frete sobre a receita líquida; dados incompletos bloqueiam a redução.</p></section>
       <section class="gp-card">${section(2,'Programação','Opcional · horário de Brasília')}
-      <fieldset class="goal-calendar"><legend>Programação opcional · horário de Brasília</legend><div class="gp-weekdays">${['Seg','Ter','Qua','Qui','Sex','Sáb','Dom'].map((day,index)=>`<label><input type="checkbox" name="weekday" value="${index}" ${(r.weekdays||[]).includes(index)?'checked':''}><span>${day}</span></label>`).join('')}</div><div class="gp-times"><label>Data específica<input type="date" name="specific_date" value="${esc(r.specific_date||'')}"></label><label>Das<input type="time" name="start_time" value="${esc(r.start_time||'')}"></label><label>Até<input type="time" name="end_time" value="${esc(r.end_time||'')}"></label></div><small>Em branco: todos os dias e horários. Os filtros se combinam. Se o fim for anterior ao início, o intervalo termina no dia seguinte. Vendas e confirmações continuam sendo conferidas fora do horário.</small></fieldset></section>
+      <fieldset class="goal-calendar"><legend>Programação opcional · horário de Brasília</legend><div class="gp-presets"><label class="gp-field"><span>Modelo de programação</span><select data-preset-picker ${locked?'disabled':''}></select></label><div class="gp-preset-actions"><button type="button" data-preset-new ${locked?'disabled':''}>Salvar como modelo</button><button type="button" class="gp-danger" data-preset-delete hidden>Excluir modelo</button></div><div class="gp-preset-form" hidden><input type="text" data-preset-name maxlength="60" placeholder="Nome do modelo (ex.: Comercial · Seg–Sex 08h–18h)" aria-label="Nome do modelo"><button type="button" data-preset-confirm>Salvar modelo</button><button type="button" data-preset-cancel>Cancelar</button></div><p class="gp-preset-msg" role="status"></p></div><div class="gp-weekdays">${['Seg','Ter','Qua','Qui','Sex','Sáb','Dom'].map((day,index)=>`<label><input type="checkbox" name="weekday" value="${index}" ${(r.weekdays||[]).includes(index)?'checked':''}><span>${day}</span></label>`).join('')}</div><div class="gp-times"><label>Data específica<input type="date" name="specific_date" value="${esc(r.specific_date||'')}"></label><label>Das<input type="time" name="start_time" value="${esc(r.start_time||'')}"></label><label>Até<input type="time" name="end_time" value="${esc(r.end_time||'')}"></label></div><small>Em branco: todos os dias e horários. Os filtros se combinam. Se o fim for anterior ao início, o intervalo termina no dia seguinte. Vendas e confirmações continuam sendo conferidas fora do horário.</small></fieldset></section>
       <section class="goal-simulation gp-card">${section(3,'Rentabilidade e duração estimada','Simulação com os preços atuais dos anúncios base')}<div data-simulation></div></section>
       <p class="muted gp-note">Edite os campos e salve para atualizar a regra sem restaurar preços. Histórico e preços originais são preservados. Para outra modalidade, cadastre uma nova regra. A duração acima considera tempo contínuo sem restrições de calendário.</p>
       </div>
@@ -90,6 +133,7 @@
     const form=dialog.querySelector('form');
     const updateSimulation=()=>{if(!form.isConnected)return;const unit=dialog.querySelector('[data-unit-for="step"]');if(unit)unit.textContent=form.elements.mode.value==='percent'?'%':'R$';dialog.querySelector('[data-simulation]').innerHTML=simulation(form);};
     form.addEventListener('change',updateSimulation);
+    setupPresets(form);
     form.addEventListener('input',updateSimulation);updateSimulation();
     dialog.querySelector('[data-rule-picker]').onchange=e=>{creatingRule=e.target.value==='__new__';selectedRuleId=creatingRule?null:e.target.value;auditPage=0;draw();};
     dialog.querySelector('[data-close]').onclick=()=>dialog.close();

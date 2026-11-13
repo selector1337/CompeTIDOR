@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 FILE = 'goal_pricing.json'
+PRESETS_FILE = 'goal_pricing_presets.json'
+PRESET_LIMIT = 50
 HISTORY_LIMIT = 1000
 SCOPES = {'both': {'gold_special', 'gold_pro'}, 'classic': {'gold_special'}, 'premium': {'gold_pro'}}
 
@@ -143,9 +145,55 @@ class GoalPricing:
         rules = self.read()['rules']
         if sku:
             return {'rules': [{**r, 'rule_id':key, 'listing_scope':rule_scope(r)} for key,r in rules.items()
-                              if r.get('sku') == self.a.normalized_sku_key(sku)]}
+                              if r.get('sku') == self.a.normalized_sku_key(sku)],
+                    'presets': self.presets()}
         # The goals list only needs badges; fetch detailed logs on demand.
         return {'rules': [{**rule_summary(r),'rule_id':key} for key,r in rules.items()]}
+
+    # Reusable schedule templates ("modelos de programação"). They only copy
+    # weekdays/date/time into a rule form; saving a template never changes a rule.
+    def presets(self):
+        stored = self.a.read_json(PRESETS_FILE, {'presets': []})
+        return [p for p in stored.get('presets', []) if isinstance(p, dict) and p.get('id')]
+
+    def _require_admin(self, actor):
+        if not self.a.can_manage_users(actor) or actor.get('status') not in {'ativo','active'}:
+            raise RuntimeError('Somente Master e Administradores podem gerenciar modelos de programação.')
+
+    def save_preset(self, req, actor):
+        self._require_admin(actor)
+        name = ' '.join(str(req.get('name') or '').split())[:60]
+        if not name:
+            raise RuntimeError('Informe um nome para o modelo de programação.')
+        schedule = validate_schedule(req)
+        if not (schedule['weekdays'] or schedule['specific_date'] or schedule['start_time']):
+            raise RuntimeError('Defina ao menos um dia, uma data ou um horário para salvar o modelo.')
+        preset_id = str(req.get('preset_id') or '')
+        with self.lock:
+            presets = self.presets()
+            if any(p['id'] != preset_id and p.get('name', '').casefold() == name.casefold() for p in presets):
+                raise RuntimeError('Já existe um modelo com esse nome.')
+            entry = {'id': preset_id or uuid.uuid4().hex[:12], 'name': name, **schedule,
+                     'updated_at': self.a.now_label(), 'updated_by': actor.get('name') or actor.get('id')}
+            if preset_id and any(p['id'] == preset_id for p in presets):
+                presets = [entry if p['id'] == preset_id else p for p in presets]
+            else:
+                if len(presets) >= PRESET_LIMIT:
+                    raise RuntimeError(f'Limite de {PRESET_LIMIT} modelos atingido. Exclua um modelo antes de criar outro.')
+                presets.append(entry)
+            self.a.write_json(PRESETS_FILE, {'presets': presets})
+        return entry
+
+    def delete_preset(self, req, actor):
+        self._require_admin(actor)
+        preset_id = str(req.get('preset_id') or '')
+        with self.lock:
+            presets = self.presets()
+            remaining = [p for p in presets if p['id'] != preset_id]
+            if len(remaining) == len(presets):
+                raise RuntimeError('Modelo de programação não encontrado.')
+            self.a.write_json(PRESETS_FILE, {'presets': remaining})
+        return {'deleted': preset_id}
 
     def check_overlap(self, store, sku, key, types):
         for other_key, other in store['rules'].items():

@@ -4406,3 +4406,86 @@ html:root body .page .notice:empty { display: none; }
 #page-relatorios .reports-hub > div > small { order: 3; color: var(--muted); font-size: 0.8rem; font-weight: 500; }
 #page-relatorios .reports-hub > label { display: flex; flex-direction: column; gap: 6px; margin: 0; color: var(--muted); font-size: 0.74rem; font-weight: 600; }
 @media (max-width: 780px) { #page-relatorios .reports-hub { grid-template-columns: 1fr; padding: 16px; } }
+
+/* ---------- 26. Ajustes: simulação, dropdowns, modelos de programação e espaçamentos ---------- */
+html:root body .goal-rule-dialog .goal-simulation [data-simulation] { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+html:root body .goal-rule-dialog .goal-simulation [data-simulation]:not(:has(> .goal-simulation-card ~ .goal-simulation-card)) { grid-template-columns: minmax(0, 1fr) !important; }
+html:root body .goal-rule-dialog .goal-simulation-values { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+html:root body .goal-rule-dialog .goal-simulation-values span { min-width: 0; padding: 10px 12px; }
+html:root body .goal-rule-dialog .goal-simulation-values b { font-size: 0.92rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+html:root body .goal-rule-dialog .goal-simulation-card { padding: 18px; }
+.goal-rule-dialog .goal-sim-final b { font-size: 1.15rem; }
+
+/* Dropdowns do painel no mesmo padrão das telas */
+html:root body .goal-rule-dialog select:not([multiple]) {
+  -webkit-appearance: none;
+  appearance: none;
+  padding-right: 36px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 14px;
+  cursor: pointer;
+}
+html:root body .goal-rule-dialog select option { background: var(--panel); color: var(--ink); }
+html:root body .goal-rule-dialog input[type="text"] { width: 100%; min-height: var(--lg-control-h); box-sizing: border-box; padding: 0 12px; border: 1px solid var(--lg-stroke-inner); border-radius: 12px; background: var(--lg-fill-2); color: var(--ink); font: 600 0.86rem var(--lg-font); }
+
+/* Modelos de programação */
+.goal-rule-dialog .gp-presets {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px 12px;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--lg-stroke-inner);
+}
+.goal-rule-dialog .gp-preset-actions { display: flex; gap: 8px; }
+.goal-rule-dialog .gp-preset-form { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; }
+.goal-rule-dialog .gp-preset-form[hidden] { display: none; }
+.goal-rule-dialog .gp-preset-form > input { flex: 1 1 auto; }
+html:root body .goal-rule-dialog .gp-preset-form > [data-preset-confirm] { background: #ffcc00; color: #1c1600; font-weight: 750; }
+.goal-rule-dialog .gp-preset-msg { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 0.74rem; }
+.goal-rule-dialog .gp-preset-msg:empty { display: none; }
+
+@media (max-width: 600px) {
+  html:root body .goal-rule-dialog .goal-simulation [data-simulation] { grid-template-columns: minmax(0, 1fr) !important; }
+  .goal-rule-dialog .gp-presets { grid-template-columns: 1fr; }
+  .goal-rule-dialog .gp-preset-actions > button { flex: 1 1 0; }
+  .goal-rule-dialog .gp-preset-form { flex-wrap: wrap; }
+  .goal-rule-dialog .gp-preset-form > input { flex-basis: 100%; }
+}
+
+/* Relatórios: respiro entre o seletor e o relatório gerado */
+#page-relatorios .reports-hub { margin-bottom: 16px; }
+#page-relatorios > [data-report-section] { margin-top: 0; }
+#page-relatorios > [data-report-section] + [data-report-section] { margin-top: 16px; }
+
+/* Telegram: botões e status separados */
+#page-alertas :is(#telegram-form, .telegram-form, form) > :is(button, .notice, p[role="status"]) + :is(button, .notice, p[role="status"]) { margin-top: 10px; }
+#page-alertas #notification-status { margin-top: 12px; }
+#page-alertas #test-notifications { margin-top: 2px; }
+.goal-rule-dialog .gp-presets .gp-field { text-align: left; align-items: stretch; }
+
+/* Rótulos do estilo antigo em MAIÚSCULAS: mesma tipografia do resto do app */
+html:root body :is(
+  .fact small, .clone-pending-grid label, .copy-chip small, .dashboard-account-filter, .price-schedule-status small,
+  .customers-sync-form label, .customers-filter-grid label, .customer-purchase-table th, .cost-quick-form label, .costs-toolbar label,
+  .cost-item label, .toast strong, .scan-reference-list > strong, .scan-under-list > strong, .return-summary-card small,
+  .return-info-chip small, .return-operational-grid > section > header, .inventory-summary span, .bulk-price-bar label,
+  .bulk-price-heading small, .bulk-availability-copy strong, .equalization-table th, .purchase-opportunity-source span,
+  .purchase-opportunity-summary span, .purchase-opportunity-level, .purchase-guide b, .purchase-summary span,
+  .purchase-decision-board span, .purchase-result-grid span, .purchase-table th, .purchase-calculator-section legend,
+  .purchase-negotiation-notes > strong, .statistics-summary small, .statistics-table-head, .statistics-table-head span,
+  .stock-calculator-baseline small, .stock-calculator-result small, .profit-calculator-identity small,
+  .profit-calculator-result-grid small, .brand-report-table th, .clone-target-panel legend, .clone-variants-panel legend,
+  #sales-report-summary .sales-summary-row span, .publisher-source-card small, .analytics-filters label,
+  .analytics-kpi > span:first-child, .analytics-card-heading span, .analytics-donut small, .analytics-table th
+) { text-transform: none; letter-spacing: 0; }
+html:root body :is(.statistics-summary, #sales-report-summary, .brand-report-summary, .equalization-summary) :is(small, span):first-child { color: var(--muted); font-size: 0.76rem; font-weight: 600; }
+html:root body :is(.statistics-table-head, .brand-report-table th, .equalization-table th, .purchase-table th, .customer-purchase-table th) { color: var(--muted); font-size: 0.72rem; font-weight: 600; }
+/* Diálogos de cálculo (estoque e lucro) com a fonte do app */
+html:root body :is(.stock-calculator-dialog, .profit-calculator-dialog, dialog) { font-family: var(--lg-font); }
+html:root body dialog :is(h2, h3, strong, b) { font-weight: 700; }
+@media (min-width: 1100px) { html:root body #statistics-summary { grid-template-columns: repeat(6, minmax(0, 1fr)); } }

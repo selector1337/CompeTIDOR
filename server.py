@@ -24606,6 +24606,7 @@ class App(BaseHTTPRequestHandler):
             "/api/sales-goals/query",
             "/api/sales-goals/pricing/query",
             "/api/sales-goals/pricing/save",
+            "/api/sales-goals/pricing/presets",
             "/api/sales/reconcile",
             "/api/sales-goals/save",
             "/api/sales-goals/refresh",
@@ -24713,6 +24714,25 @@ class App(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/") and not parsed.path.startswith("/api/auth/"):
             if not self.require_auth(payload):
                 return
+
+        if parsed.path == "/api/sales-goals/pricing/presets":
+            actor = self.current_user(payload)
+            try:
+                service = goal_pricing_service()
+                action = str(request.get("action") or "list")
+                if action == "list":
+                    self.send_json({"presets": service.presets()})
+                elif action == "save":
+                    preset = service.save_preset(request, actor)
+                    self.send_json({"ok": True, "preset": preset, "presets": service.presets()})
+                elif action == "delete":
+                    service.delete_preset(request, actor)
+                    self.send_json({"ok": True, "presets": service.presets()})
+                else:
+                    self.send_json({"error": "Ação inválida."}, status=400)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
 
         if parsed.path in {"/api/sales-goals/pricing/query", "/api/sales-goals/pricing/save"}:
             actor = self.current_user(payload)
