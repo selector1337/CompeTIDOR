@@ -293,20 +293,36 @@ function renderManualActions() {
   if (!root) return;
   root.innerHTML = [...manualActions.values()].slice(-4).reverse().map((action) => {
     const progress = Number.isFinite(action.progress) ? Math.max(0, Math.min(100, action.progress)) : null;
-    const tone = action.status === "success" ? "success" : action.status === "error" ? "error" : "running";
+    const queued = action.status === "running" && action.queued;
+    const tone = action.status === "success" ? "success" : action.status === "error" ? "error" : queued ? "queued" : "running";
     const status = action.status === "success" ? "Concluído"
-      : action.status === "error" ? "Falhou" : progress === null ? "Em andamento" : `${Math.round(progress)}%`;
+      : action.status === "error" ? "Falhou" : queued ? "Na fila"
+        : progress === null ? "Em andamento" : `${Math.round(progress)}%`;
+    const counts = action.total ? `${Number(action.completed || 0).toLocaleString("pt-BR")} de ${Number(action.total).toLocaleString("pt-BR")}` : "";
+    const elapsed = action.status === "running" && action.startedAt ? formatElapsed(Date.now() - action.startedAt) : "";
+    const meta = [counts, elapsed].filter(Boolean).join(" · ");
     return `<article class="manual-action ${tone}">
       <div class="manual-action-head"><strong>${escapeText(action.label)}</strong><span>${status}</span></div>
-      <div class="manual-action-track ${progress === null ? "indeterminate" : ""}"><span style="width:${progress === null ? 35 : progress}%"></span></div>
+      <div class="manual-action-track ${progress === null || queued ? "indeterminate" : ""}"><span style="width:${progress === null || queued ? 35 : progress}%"></span></div>
       <small>${escapeText(action.message || "Processando no servidor...")}</small>
+      ${meta ? `<small class="manual-action-meta">${escapeText(meta)}</small>` : ""}
     </article>`;
   }).join("");
 }
 
+function formatElapsed(ms) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}min ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+// Keeps the elapsed time ticking while any action is still running.
+window.setInterval(() => {
+  if ([...manualActions.values()].some((action) => action.status === "running")) renderManualActions();
+}, 1000);
+
 function beginManualAction(label, message = "Enviando solicitação ao servidor...") {
   const id = `manual-${Date.now()}-${++manualActionSequence}`;
-  manualActions.set(id, { id, label, message, progress: null, status: "running" });
+  manualActions.set(id, { id, label, message, progress: null, status: "running", startedAt: Date.now() });
   renderManualActions();
   return id;
 }
@@ -477,9 +493,14 @@ async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 
     }
     if (typeof onProgress === "function") onProgress(job.message || "Processando no servidor...", job);
     const progress = Number(job.progress ?? job.percent);
+    const stalled = job.status === "running" && Number(job.seconds_since_progress) >= 20;
     updateManualAction(actionId, {
-      message: job.message || "Processando no servidor...",
+      message: (job.message || "Processando no servidor...")
+        + (stalled ? ` · última atualização há ${formatElapsed(job.seconds_since_progress * 1000)}` : ""),
       progress: Number.isFinite(progress) ? progress : null,
+      queued: job.status === "queued",
+      completed: job.completed,
+      total: job.total,
     });
     initial = {...initial, ...job};
     if (job.status === "completed") {
@@ -1447,6 +1468,26 @@ function adTitleEditState(item) {
   return { allowed: true, reason: "Alterar o título oficial no Mercado Livre." };
 }
 
+// The server keeps the latest RECENT_SALES_PER_ACCOUNT sales of each store.
+const RECENT_SALES_PER_ACCOUNT = 80;
+function saleTimestamp(sale) {
+  const time = Date.parse(sale?.date || "");
+  return Number.isFinite(time) ? time : 0;
+}
+function dashboardSalesRows(sales, account) {
+  const rows = sales
+    .filter((sale) => account === "all" || sale.account === account)
+    .slice()
+    .sort((a, b) => saleTimestamp(b) - saleTimestamp(a) || String(b.order_id || "").localeCompare(String(a.order_id || "")));
+  if (account !== "all") return rows;
+  // A busy store's history stops at its 80th sale; below that point other
+  // stores would look out of order, so the combined list ends there.
+  const perAccount = {};
+  for (const sale of rows) (perAccount[sale.account] ||= []).push(saleTimestamp(sale));
+  const cutoff = Math.max(0, ...Object.values(perAccount).filter((times) => times.length >= RECENT_SALES_PER_ACCOUNT).map((times) => Math.min(...times)));
+  return cutoff ? rows.filter((sale) => saleTimestamp(sale) >= cutoff) : rows;
+}
+
 function renderDashboard() {
   const ops = state.data.operations || {};
   const stockRows = dashboardStockRows(ops.attention_stock || []);
@@ -1529,7 +1570,7 @@ function renderDashboard() {
     </article>
   `).join("") + paginationHtml("dashboardShipmentPage", shipmentPage) || `<div class="notice">Nenhum envio pendente sincronizado.</div>`;
 
-  const salesRows = (state.data.recent_sales || []).filter((sale) => state.dashboardSalesAccount === "all" || sale.account === state.dashboardSalesAccount);
+  const salesRows = dashboardSalesRows(state.data.recent_sales || [], state.dashboardSalesAccount);
   const salesPage = paginate(salesRows, state.dashboardSalesPage, 5);
   state.dashboardSalesPage = salesPage.current;
   document.querySelector("#dashboard-sales").innerHTML = salesPage.items.map((sale) => `
@@ -1957,7 +1998,7 @@ function renderCosts() {
         <article class="cost-item" data-cost-row="${escapeAttr(row.sku)}">
           ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="${escapeAttr(row.title || row.sku)}" loading="lazy" />` : `<span class="cost-thumb-empty">${escapeText(row.sku.slice(0, 2))}</span>`}
           <div class="cost-product"><strong>${escapeText(row.sku)}</strong><span>${escapeText(row.title || "Produto sem título")}</span><small>${row.accounts.size} conta(s) · ${row.activeListings} ativo(s) de ${row.listings} anúncio(s) · estoque ${row.stock}</small></div>
-          <label>Custo unitário <span class="money-field"><input type="text" inputmode="decimal" data-cost-value="${escapeAttr(row.sku)}" value="${record.cost ?? ""}" placeholder="0,00" /></span></label>
+          <label>Custo unitário <span class="money-field"><input type="text" inputmode="decimal" data-cost-value="${escapeAttr(row.sku)}" value="${escapeAttr(formatCostInput(record.cost))}" placeholder="0,00" enterkeyhint="done" /></span></label>
           <div class="cost-actions">
             <button class="mini-button success-button" type="button" data-save-cost="${escapeAttr(row.sku)}">Salvar</button>
             <button class="mini-button danger-button" type="button" data-delete-cost="${escapeAttr(row.sku)}" ${record.cost === undefined ? "disabled" : ""}>Remover</button>
@@ -3337,6 +3378,7 @@ function renderBulkPriceProgress() {
   if (title) title.textContent = progress.status === "completed"
     ? progress.failed ? "Alteração concluída com pendências" : "Alteração concluída com sucesso"
     : progress.status === "error" ? "Alteração interrompida"
+      : progress.status === "queued" ? "Na fila · começa automaticamente"
           : progress.operation === "availability" ? "Atualizando disponibilidade"
             : progress.operation === "flex_activate" ? "Ativando Mercado Envios Flex"
         : ["flex", "flex_remove"].includes(progress.operation) ? "Removendo Mercado Envios Flex"
@@ -6939,6 +6981,28 @@ function parseBrazilianMoney(value) {
   return NaN;
 }
 
+// Accepts what people actually type in a cost field: "12,50", "R$ 12,50",
+// "1.250", "1.250,75", "1250.75" or "1,250.75".
+function parseCostInput(value) {
+  const text = String(value ?? "").replace(/R\$|\s/gi, "");
+  if (!text || !/^\d[\d.,]*$/.test(text)) return NaN;
+  const lastDot = text.lastIndexOf("."), lastComma = text.lastIndexOf(",");
+  if (lastDot >= 0 && lastComma >= 0) {
+    const decimal = lastComma > lastDot ? "," : ".";
+    const thousands = decimal === "," ? /\./g : /,/g;
+    return Number(text.replace(thousands, "").replace(decimal, "."));
+  }
+  if (lastComma >= 0) return /^\d{1,3}(,\d{3})+$/.test(text) && text.split(",").length > 2 ? Number(text.replace(/,/g, "")) : Number(text.replace(",", "."));
+  if (lastDot >= 0) return /^\d{1,3}(\.\d{3})+$/.test(text) ? Number(text.replace(/\./g, "")) : Number(text);
+  return Number(text);
+}
+
+function formatCostInput(value) {
+  const number = Number(value);
+  return value === null || value === undefined || value === "" || !Number.isFinite(number)
+    ? "" : number.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 function parseLocalizedNumber(value) {
   const text = String(value ?? "").trim();
   if (!text) return NaN;
@@ -6976,15 +7040,21 @@ async function persistSkuCost(sku, cost, remove = false) {
   else showToast(`Custo do SKU ${sku} salvo com sucesso.`);
 }
 
+document.querySelector("#costs-list")?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || !event.target.matches("[data-cost-value]")) return;
+  event.preventDefault();
+  event.target.closest("[data-cost-row]")?.querySelector("[data-save-cost]")?.click();
+});
+
 document.querySelector("#costs-list")?.addEventListener("click", async (event) => {
   const save = event.target.closest("[data-save-cost]");
   const remove = event.target.closest("[data-delete-cost]");
   if (!save && !remove) return;
   const sku = (save || remove).dataset.saveCost || (save || remove).dataset.deleteCost;
   const row = (save || remove).closest("[data-cost-row]");
-  const cost = parseLocalizedNumber(row?.querySelector("[data-cost-value]")?.value);
+  const cost = parseCostInput(row?.querySelector("[data-cost-value]")?.value);
   if (save && (!Number.isFinite(cost) || cost < 0)) {
-    showToast("Informe um custo válido.", "error");
+    showToast("Informe um custo válido, por exemplo 12,50 ou 1.250,00.", "error");
     return;
   }
   const button = save || remove;
@@ -8174,10 +8244,12 @@ document.querySelector("#product-import-form")?.addEventListener("submit", async
       method: "POST",
       body: JSON.stringify({ url: values.get("url"), ...(pageHtml ? { page_html: pageHtml } : {}) }),
     });
-    const result = await waitForAsyncOperation(queued, (message) => {
+    const result = await waitForAsyncOperation(queued, (message, job) => {
       if (requestToken !== state.productImportRequestToken) return;
       if (progressText) progressText.textContent = message || "Consultando dados e categoria.";
-      if (progressBar) progressBar.style.width = message.includes("catálogo") ? "82%" : "55%";
+      // Use the step the server reports; while queued, keep the bar at its start.
+      const percent = job?.status === "queued" ? 3 : Number(job?.percent);
+      if (progressBar && Number.isFinite(percent)) progressBar.style.width = `${Math.max(3, Math.min(100, percent))}%`;
     });
     if (requestToken !== state.productImportRequestToken) return;
     if (progressBar) progressBar.style.width = "100%";

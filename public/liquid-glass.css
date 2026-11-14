@@ -4489,3 +4489,8 @@ html:root body :is(.statistics-table-head, .brand-report-table th, .equalization
 html:root body :is(.stock-calculator-dialog, .profit-calculator-dialog, dialog) { font-family: var(--lg-font); }
 html:root body dialog :is(h2, h3, strong, b) { font-weight: 700; }
 @media (min-width: 1100px) { html:root body #statistics-summary { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+
+/* 27. Progress card: queued state and counters */
+html:root body .manual-action.queued .manual-action-head span { color: var(--muted); }
+html:root body .manual-action.queued .manual-action-track span { background: var(--muted); opacity: 0.55; }
+html:root body .manual-action .manual-action-meta { display: block; margin-top: 2px; font-variant-numeric: tabular-nums; opacity: 0.8; }

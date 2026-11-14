@@ -750,6 +750,12 @@ BACKGROUND_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=BACKGROUND_CONCURRENT_J
 PUBLICATION_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="publication-job")
 PUBLICATION_WORKER_SEMAPHORE = threading.BoundedSemaphore(2)
 HEAVY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=HEAVY_CONCURRENT_JOBS, thread_name_prefix="heavy-job")
+# Direct listing edits (price, availability, Flex, pickup, delete) get their
+# own lane: they are short and the user is waiting, so they must never queue
+# behind imports, kit loading, returns syncs or automatic price checks.
+ACTION_CONCURRENT_JOBS = max(2, MANUAL_CONCURRENT_JOBS)
+ACTION_WORKER_SEMAPHORE = threading.BoundedSemaphore(ACTION_CONCURRENT_JOBS)
+ACTION_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=ACTION_CONCURRENT_JOBS, thread_name_prefix="action-job")
 # Interactive reports must not queue behind historical imports or scheduled
 # replenishment scans. Keep concurrency bounded and exports independent of API I/O.
 ANALYTICS_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="analytics-job")
@@ -1231,6 +1237,7 @@ def write_payload(payload, replace_collections=None):
                     for collection in ("recent_sales", "daily_sku_sales"):
                         payload[collection] = [r for r in payload.get(collection, []) if r.get("account") != account_name] + [r for r in latest.get(collection, []) if r.get("account") == account_name]
                     incoming_sales[account_name] = stamp
+            payload["recent_sales"] = ordered_recent_sales(payload.get("recent_sales", []))
             payload["monthly_revenue"] = merge_monthly_revenue(payload.get("monthly_revenue") or {}, latest.get("monthly_revenue") or {})
             for field in ("official_store_rules", "official_store_batches"):
                 payload[field] = {**(payload.get(field) or {}), **(latest.get(field) or {})}
@@ -1332,6 +1339,32 @@ def parse_meli_datetime(value):
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=APP_TZ)
     return parsed.astimezone(APP_TZ)
+
+
+RECENT_SALES_PER_ACCOUNT = 80
+
+
+def recent_sale_sort_key(row):
+    # Compare real instants, not strings: offsets and formats may differ.
+    parsed = parse_meli_datetime(row.get("date"))
+    return (parsed.timestamp() if parsed else 0.0, str(row.get("order_id") or ""), str(row.get("id") or ""))
+
+
+def ordered_recent_sales(rows, per_account=RECENT_SALES_PER_ACCOUNT):
+    """Newest first, one entry per sale line, capped per account.
+
+    The cap is per account so one busy store syncing never evicts the other
+    stores' sales from the shared dashboard list."""
+    seen, counts, ordered = set(), {}, []
+    for row in sorted(rows or [], key=recent_sale_sort_key, reverse=True):
+        account = str(row.get("account") or "")
+        key = (account, str(row.get("id") or row.get("order_id") or id(row)))
+        if key in seen or counts.get(account, 0) >= per_account:
+            continue
+        seen.add(key)
+        counts[account] = counts.get(account, 0) + 1
+        ordered.append(row)
+    return ordered
 
 
 def dispatch_time_left(value, reference=None):
@@ -1570,7 +1603,7 @@ def public_payload(payload, actor=None, include_catalog=True):
         clean["catalog"] = []
         clean["item_logs"] = []
     clean.setdefault("scan_items", [])
-    clean.setdefault("recent_sales", [])
+    clean["recent_sales"] = ordered_recent_sales(clean.get("recent_sales") or [])
     for alert in clean.get("alerts", []):
         if alert.get("type") == "catalog":
             alert["message"] = normalize_catalog_alert_price(alert.get("message"))
@@ -5382,6 +5415,12 @@ def imported_meli_product(payload, item_id, source_url):
             raise RuntimeError("O link identifica um User Product, sem ID de oferta.")
         if extract_meli_user_product_id(source_url) or not extract_meli_catalog_product_id(source_url):
             item = imported_up_offer(payload, item_id, source_url)
+        elif item_id == extract_meli_catalog_product_id(source_url):
+            # A plain /p/MLB... link carries only the catalog product. Looking it
+            # up as a listing in every account just burns time before the
+            # /products lookup below, which is the right source for it.
+            update_async_operation_progress("Lendo o produto de catálogo no Mercado Livre.", 10, 100)
+            raise RuntimeError("HTTP 404: o link identifica um produto de catálogo, sem oferta específica.")
         else:
             item = try_meli_sources(payload, [f"/items/{item_id}?include_attributes=all", f"/items/{item_id}"])
     except Exception as exc:
@@ -5471,6 +5510,7 @@ def imported_meli_product(payload, item_id, source_url):
         # Items API. Treating its 403 as an unknown catalog id caused a second
         # Scan request and replaced the useful diagnosis with a generic error.
         if not user_product and not catalog_product:
+            update_async_operation_progress("A API não liberou o produto; lendo a página pública (pode levar até 1 minuto).", 15, 100)
             try:
                 return imported_meli_up_public_fallback(source_url, item_id)
             except Exception as page_exc:
@@ -5525,8 +5565,13 @@ def imported_meli_product(payload, item_id, source_url):
                 catalog_product = call_interactive_client_method(reader.product, item.get("catalog_product_id")) or {}
             except Exception:
                 catalog_product = {}
+    # A catalog product id is not a listing: it has no /items description.
+    is_catalog_id = bool(catalog_product) and str(item.get("id") or "") == extract_meli_catalog_product_id(source_url)
+    if not description and is_catalog_id:
+        short = catalog_product.get("short_description")
+        description = (short.get("content") if isinstance(short, dict) else short) or ""
     try:
-        if not description and re.fullmatch(r"MLB\d{5,}", str(item.get("id") or "")):
+        if not description and not is_catalog_id and re.fullmatch(r"MLB\d{5,}", str(item.get("id") or "")):
             detail = try_meli_sources(payload, [f"/items/{item.get('id') or item_id}/description"])
             description = detail.get("plain_text") or detail.get("text") or ""
     except Exception:
@@ -5727,7 +5772,7 @@ def catalog_candidate_rows(response):
 def import_product_operation(payload, request):
     source_url = str(request.get("url") or "").strip()
     host = product_import_host(source_url)
-    update_async_operation_progress("Lendo os dados públicos do produto.", 1, 4)
+    update_async_operation_progress("Lendo os dados do produto no link informado.", 5, 100)
     item_id = (
         extract_meli_item_id(source_url) or extract_meli_user_product_id(source_url)
     ) if "mercado" in host else ""
@@ -5762,7 +5807,7 @@ def import_product_operation(payload, request):
     reader = official_reader_client(payload)
     if not reader:
         raise RuntimeError("Conecte ao menos uma conta oficial do Mercado Livre antes de preparar anúncios.")
-    update_async_operation_progress("Prevendo categoria e ficha técnica no Mercado Livre.", 2, 4)
+    update_async_operation_progress("Produto lido. Prevendo a categoria no Mercado Livre.", 35, 100)
     suggestions = []
     try:
         suggestions = reader.domain_discovery(product.get("title"), "MLB", 3) or []
@@ -5775,11 +5820,12 @@ def import_product_operation(payload, request):
         }
         suggestions = [original, *[row for row in suggestions if row.get("category_id") != product.get("category_id")]]
     category_id = (suggestions[0].get("category_id") if suggestions else product.get("category_id")) or ""
+    update_async_operation_progress("Carregando a ficha técnica da categoria.", 45, 100)
     definitions = cached_category_attributes(reader, category_id) if category_id else []
     product["category_id"] = category_id
     product["category_suggestions"] = suggestions[:3]
     product["attributes"] = publication_attribute_rows(product, definitions)
-    update_async_operation_progress("Procurando correspondências no catálogo oficial.", 3, 4)
+    update_async_operation_progress("Procurando correspondências no catálogo oficial.", 55, 100)
     catalog_candidates = []
     search_query = product.get("gtin") or " ".join(filter(None, [product.get("brand"), product.get("model"), product.get("title")]))
     try:
@@ -5788,6 +5834,7 @@ def import_product_operation(payload, request):
         pass
     product["catalog_candidates"] = catalog_candidates
     if product.get("gtin") and catalog_candidates:
+        update_async_operation_progress("Completando dados com o produto oficial do catálogo.", 65, 100)
         try:
             official_product = call_interactive_client_method(reader.product, catalog_candidates[0].get("id")) or {}
         except Exception:
@@ -5833,9 +5880,16 @@ def import_product_operation(payload, request):
     store_identity = {
         "attributes": [{"id": "BRAND", "value_name": product.get("brand") or ""}],
     }
-    for account in payload.get("accounts") or []:
-        if not account.get("official") or account.get("status") != "connected":
-            continue
+    connected_accounts = [
+        account for account in payload.get("accounts") or []
+        if account.get("official") and account.get("status") == "connected"
+    ]
+    for index, account in enumerate(connected_accounts):
+        update_async_operation_progress(
+            f"Conferindo lojas oficiais da conta {account.get('nickname') or index + 1} "
+            f"({index + 1} de {len(connected_accounts)}).",
+            75 + int(20 * index / max(1, len(connected_accounts))), 100,
+        )
         clean_account = public_account(account)
         try:
             account_client_instance = account_client(account)
@@ -5852,7 +5906,7 @@ def import_product_operation(payload, request):
         product_accounts.append(clean_account)
     product["accounts"] = product_accounts
     product["translated"] = host.endswith(("bhphotovideo.com", "amazon.com", "thomannmusic.com", "thomann.de", "guitarcenter.com"))
-    update_async_operation_progress("Rascunho pronto para revisão.", 4, 4)
+    update_async_operation_progress("Rascunho pronto para revisão.", 100, 100)
     return {"product": product}
 
 
@@ -9340,7 +9394,7 @@ def sync_recent_sales(payload, account, client, orders=None, dashboard_only=Fals
         for item in payload.get("recent_sales", [])
         if item.get("account") != account.get("nickname")
     ]
-    payload["recent_sales"] = sorted([*rows, *existing], key=lambda item: item.get("date") or "", reverse=True)[:80]
+    payload["recent_sales"] = ordered_recent_sales([*rows, *existing])
     today = datetime.now(APP_TZ).date()
     by_sku = {}
     for sale in rows:
@@ -12620,6 +12674,23 @@ def async_operation_result(job_id):
     with ASYNC_OPERATION_JOBS_LOCK:
         job = ASYNC_OPERATION_JOBS.get(str(job_id or ""))
         snapshot = dict(job) if job else None
+        if snapshot and snapshot.get("status") == "queued":
+            lane = snapshot.get("priority")
+            created = float(snapshot.get("created_epoch") or 0)
+            same_lane = [row for row in ASYNC_OPERATION_JOBS.values() if row.get("priority") == lane and row is not job]
+            snapshot["queue_ahead"] = sum(
+                1 for row in same_lane
+                if row.get("status") == "queued" and float(row.get("created_epoch") or 0) <= created
+            )
+            snapshot["queue_running"] = sum(1 for row in same_lane if row.get("status") == "running")
+    if snapshot and snapshot.get("status") == "queued":
+        ahead, running = snapshot["queue_ahead"], snapshot["queue_running"]
+        snapshot["message"] = (
+            f"Na fila: {ahead} operação(ões) à frente e {running} em execução. Começa automaticamente."
+            if ahead else
+            f"Aguardando {running} operação(ões) em execução terminar. Começa automaticamente."
+            if running else "Iniciando…"
+        )
     if snapshot:
         now = time.time()
         snapshot['elapsed_seconds'] = max(0, int(now - snapshot.get('created_epoch', now)))
@@ -12692,7 +12763,7 @@ def start_async_operation(
             ASYNC_OPERATION_IDEMPOTENCY[idempotency_key] = job_id
 
     def worker():
-        interactive = not heavy and priority in {"interactive", "manual", "publication"}
+        interactive = not heavy and priority in {"interactive", "manual", "publication", "action"}
         previous_job_id = getattr(MELI_WORK_CONTEXT, "job_id", None)
         MELI_WORK_CONTEXT.job_id = job_id
         try:
@@ -12701,6 +12772,7 @@ def start_async_operation(
                 else PUBLICATION_WORKER_SEMAPHORE if priority == "publication"
                 else BACKGROUND_WORKER_SEMAPHORE if priority == "background"
                 else MANUAL_WORKER_SEMAPHORE if priority == "manual"
+                else ACTION_WORKER_SEMAPHORE if priority == "action"
                 else CLONE_WORKER_SEMAPHORE
             )
             with semaphore:
@@ -12758,6 +12830,7 @@ def start_async_operation(
         else PUBLICATION_JOB_EXECUTOR if priority == "publication"
         else BACKGROUND_JOB_EXECUTOR if priority == "background"
         else MANUAL_JOB_EXECUTOR if priority == "manual"
+        else ACTION_JOB_EXECUTOR if priority == "action"
         else INTERACTIVE_JOB_EXECUTOR
     )
     executor.submit(worker)
@@ -25348,8 +25421,8 @@ class App(BaseHTTPRequestHandler):
                 operation = start_async_operation(
                     "prices_refresh",
                     lambda: refresh_item_prices_operation(item_ids),
-                    "Conferência de preços oficiais adicionada à fila prioritária.",
-                    priority="manual",
+                    "Conferência de preços oficiais adicionada à fila de segundo plano.",
+                    priority="background",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25389,7 +25462,7 @@ class App(BaseHTTPRequestHandler):
                     "bulk_price",
                     lambda: bulk_price_operation(request_copy, actor),
                     "Alteração de preços adicionada à fila.",
-                    priority="manual",
+                    priority="action",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25404,7 +25477,7 @@ class App(BaseHTTPRequestHandler):
                     "bulk_availability",
                     lambda: bulk_availability_operation(request_copy, actor),
                     "Alteração de disponibilidade adicionada à fila.",
-                    priority="manual",
+                    priority="action",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25419,7 +25492,7 @@ class App(BaseHTTPRequestHandler):
                     "bulk_remove_flex",
                     lambda: bulk_remove_flex_operation(request_copy, actor),
                     "Remoção do Mercado Envios Flex adicionada à fila.",
-                    priority="manual",
+                    priority="action",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25434,7 +25507,7 @@ class App(BaseHTTPRequestHandler):
                     "bulk_activate_flex",
                     lambda: bulk_activate_flex_operation(request_copy, actor),
                     "Ativação do Mercado Envios Flex adicionada à fila.",
-                    priority="manual",
+                    priority="action",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25455,7 +25528,7 @@ class App(BaseHTTPRequestHandler):
                     kind,
                     lambda: bulk_item_action_operation(request_copy, actor, action),
                     message,
-                    priority="manual",
+                    priority="action",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25508,7 +25581,7 @@ class App(BaseHTTPRequestHandler):
                     kind,
                     lambda: work(request_copy, actor),
                     message,
-                    priority="manual",
+                    priority="action",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
