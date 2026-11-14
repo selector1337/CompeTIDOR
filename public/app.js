@@ -504,7 +504,9 @@ async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 
     });
     initial = {...initial, ...job};
     if (job.status === "completed") {
-      finishManualAction(actionId, "success", job.message || "Ação concluída com sucesso.");
+      const timing = Number.isFinite(Number(job.run_seconds))
+        ? ` Fila ${formatElapsed(Number(job.queued_seconds || 0) * 1000)} · execução ${formatElapsed(Number(job.run_seconds) * 1000)}.` : "";
+      finishManualAction(actionId, "success", (job.message || "Ação concluída com sucesso.") + timing);
       return job.result || {};
     }
     if (job.status === "error") {

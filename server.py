@@ -756,6 +756,19 @@ HEAVY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=HEAVY_CONCURRENT_JOBS, threa
 ACTION_CONCURRENT_JOBS = max(2, MANUAL_CONCURRENT_JOBS)
 ACTION_WORKER_SEMAPHORE = threading.BoundedSemaphore(ACTION_CONCURRENT_JOBS)
 ACTION_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=ACTION_CONCURRENT_JOBS, thread_name_prefix="action-job")
+# Edits of up to EXPRESS_MAX_ITEMS listings skip even the action lane, so a
+# one-listing price change never waits behind a 300-listing batch.
+EXPRESS_MAX_ITEMS = 5
+EXPRESS_CONCURRENT_JOBS = 3
+EXPRESS_WORKER_SEMAPHORE = threading.BoundedSemaphore(EXPRESS_CONCURRENT_JOBS)
+EXPRESS_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=EXPRESS_CONCURRENT_JOBS, thread_name_prefix="express-job")
+# Listings inside one batch are sent to the API this many at a time. The
+# per-request API semaphore still bounds the total load on Mercado Livre.
+BULK_ITEM_PARALLELISM = max(1, min(8, int(os.getenv("MELI_BULK_ITEM_PARALLELISM", "4"))))
+
+
+def edit_lane(item_count):
+    return "express" if int(item_count or 0) <= EXPRESS_MAX_ITEMS else "action"
 # Interactive reports must not queue behind historical imports or scheduled
 # replenishment scans. Keep concurrency bounded and exports independent of API I/O.
 ANALYTICS_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="analytics-job")
@@ -12763,7 +12776,7 @@ def start_async_operation(
             ASYNC_OPERATION_IDEMPOTENCY[idempotency_key] = job_id
 
     def worker():
-        interactive = not heavy and priority in {"interactive", "manual", "publication", "action"}
+        interactive = not heavy and priority in {"interactive", "manual", "publication", "action", "express"}
         previous_job_id = getattr(MELI_WORK_CONTEXT, "job_id", None)
         MELI_WORK_CONTEXT.job_id = job_id
         try:
@@ -12773,6 +12786,7 @@ def start_async_operation(
                 else BACKGROUND_WORKER_SEMAPHORE if priority == "background"
                 else MANUAL_WORKER_SEMAPHORE if priority == "manual"
                 else ACTION_WORKER_SEMAPHORE if priority == "action"
+                else EXPRESS_WORKER_SEMAPHORE if priority == "express"
                 else CLONE_WORKER_SEMAPHORE
             )
             with semaphore:
@@ -12783,20 +12797,29 @@ def start_async_operation(
                         return
                     if interactive:
                         ACTIVE_CLONE_OPERATIONS.add(job_id)
-                    current.update({"status": "running", "message": "Processando dados oficiais no Mercado Livre.", "updated_epoch": time.time()})
+                    started = time.time()
+                    current.update({"status": "running", "message": "Processando dados oficiais no Mercado Livre.",
+                                    "updated_epoch": started, "started_epoch": started,
+                                    "queued_seconds": round(started - float(current.get("created_epoch") or started), 1)})
                 try:
                     result = run_meli_work("background" if priority == "background" or heavy else "interactive", work)
                     with ASYNC_OPERATION_JOBS_LOCK:
                         current = ASYNC_OPERATION_JOBS.get(job_id)
                         if current:
+                            finished = time.time()
                             current.update(
                                 {
                                     "status": "completed",
                                     "message": "Processamento concluído.",
                                     "result": result,
-                                    "updated_epoch": time.time(),
+                                    "updated_epoch": finished,
+                                    "run_seconds": round(finished - float(current.get("started_epoch") or finished), 1),
                                 }
                             )
+                            if priority in {"action", "express"}:
+                                timing = (result or {}).get("timing") if isinstance(result, dict) else None
+                                print(f"[operação] {kind} ({priority}): fila {current.get('queued_seconds')}s, "
+                                      f"execução {current['run_seconds']}s{f', etapas {timing}' if timing else ''}", flush=True)
                 except Exception as exc:
                     pending_fields = getattr(exc, "pending_fields", None)
                     original_error = getattr(exc, "original_error", "")
@@ -12831,6 +12854,7 @@ def start_async_operation(
         else BACKGROUND_JOB_EXECUTOR if priority == "background"
         else MANUAL_JOB_EXECUTOR if priority == "manual"
         else ACTION_JOB_EXECUTOR if priority == "action"
+        else EXPRESS_JOB_EXECUTOR if priority == "express"
         else INTERACTIVE_JOB_EXECUTOR
     )
     executor.submit(worker)
@@ -13849,6 +13873,24 @@ def delete_item_operation(request, actor=None):
     return {"ok": True, "official": official, "item_id": item_id, "deleted": True}
 
 
+def parallel_item_calls(calls):
+    """Run (key, fn) pairs a few at a time; yield (key, value, error) as each finishes.
+
+    Only the network call runs in the helper threads. Callers apply local
+    changes and publish progress from their own thread, so the job's
+    thread-local context and the shared payload stay single-threaded."""
+    if not calls:
+        return
+    priority = getattr(MELI_WORK_CONTEXT, "priority", "interactive")
+    with ThreadPoolExecutor(max_workers=min(BULK_ITEM_PARALLELISM, len(calls)), thread_name_prefix="bulk-item") as pool:
+        futures = {pool.submit(run_meli_work, priority, fn): key for key, fn in calls}
+        for future in as_completed(futures):
+            try:
+                yield futures[future], future.result(), None
+            except Exception as exc:
+                yield futures[future], None, exc
+
+
 def bulk_price_operation(request, actor=None):
     item_ids = list(dict.fromkeys(str(value or "").strip() for value in request.get("item_ids") or [] if value))
     maximum = max(1, int(os.getenv("MELI_BULK_PRICE_MAX_ITEMS", "500")))
@@ -13860,18 +13902,28 @@ def bulk_price_operation(request, actor=None):
     value = float(request.get("value") or 0)
     if value <= 0:
         raise RuntimeError("Informe um valor maior que zero.")
+    started = time.perf_counter()
     payload = read_payload(include_catalog=True)
     catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
     accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
-    results = []
+    loaded = time.perf_counter()
+    results = {}
     total = len(item_ids)
-    update_async_operation_progress("Preparando alterações de preço.", 0, total)
-    for index, item_id in enumerate(item_ids, 1):
+    done = 0
+    update_async_operation_progress("Enviando os novos preços ao Mercado Livre.", 0, total)
+
+    def finish(item_id, row):
+        nonlocal done
+        results[item_id] = row
+        done += 1
+        update_async_operation_progress(f"Processado {done} de {total} anúncios.", done, total, row)
+
+    calls, targets, clients = [], {}, {}
+    for item_id in item_ids:
         item = catalog.get(item_id)
         account = accounts.get(str((item or {}).get("account_id") or ""))
         if not item or not account:
-            results.append({"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."})
-            update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, results[-1])
+            finish(item_id, {"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."})
             continue
         current = max(0.0, float(item.get("price") or 0))
         target = {
@@ -13882,43 +13934,60 @@ def bulk_price_operation(request, actor=None):
             "decrease_percent": lambda: current * (1 - value / 100),
         }.get(mode)
         if not target:
-            results.append({"item_id": item_id, "status": "error", "error": "Modo de alteração inválido."})
-            update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, results[-1])
+            finish(item_id, {"item_id": item_id, "status": "error", "error": "Modo de alteração inválido."})
             continue
         target_price = round(target(), 2)
         if target_price <= 0:
-            results.append({"item_id": item_id, "status": "error", "error": "O preço calculado precisa ser maior que zero."})
-            update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, results[-1])
+            finish(item_id, {"item_id": item_id, "status": "error", "error": "O preço calculado precisa ser maior que zero."})
             continue
-        try:
-            account_client(account).update_item(item_id, {"price": target_price})
-            checked_at = now_label()
-            item["price"] = target_price
-            item["price_source"] = "manual_update"
-            item["sale_price_checked_at"] = ""
-            item["sale_fee_status"] = "pending"
-            item["sale_fee_updated_at"] = ""
-            item["sale_fee_basis"] = ""
-            item["item_data_checked_at"] = checked_at
-            item["updated_at"] = checked_at
-            apply_item_net_values(item)
-            append_item_log(payload, item, actor or {}, "Alteração de preço em massa", {"price": {"from": current, "to": target_price}})
-            results.append({
-                "item_id": item_id,
-                "status": "updated",
-                "price": target_price,
-                "checked_at": checked_at,
-                "sale_fee_status": "pending",
-                "net_sale_amount": item.get("net_sale_amount"),
-            })
-        except Exception as exc:
-            results.append({"item_id": item_id, "status": "error", "error": str(exc)})
-        update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, results[-1])
+        targets[item_id] = (current, target_price)
+        # One client per account, built here: a token refresh must never run
+        # twice at once for the same account.
+        client = clients.get(str(account.get("id")))
+        if client is None:
+            try:
+                client = clients[str(account.get("id"))] = account_client(account)
+            except Exception as exc:
+                finish(item_id, {"item_id": item_id, "status": "error", "error": str(exc)})
+                continue
+        calls.append((item_id, lambda client=client, item_id=item_id, price=target_price:
+                      client.update_item(item_id, {"price": price})))
+
+    for item_id, _, error in parallel_item_calls(calls):
+        if error is not None:
+            finish(item_id, {"item_id": item_id, "status": "error", "error": str(error)})
+            continue
+        item = catalog[item_id]
+        current, target_price = targets[item_id]
+        checked_at = now_label()
+        item["price"] = target_price
+        item["price_source"] = "manual_update"
+        item["sale_price_checked_at"] = ""
+        item["sale_fee_status"] = "pending"
+        item["sale_fee_updated_at"] = ""
+        item["sale_fee_basis"] = ""
+        item["item_data_checked_at"] = checked_at
+        item["updated_at"] = checked_at
+        apply_item_net_values(item)
+        append_item_log(payload, item, actor or {}, "Alteração de preço em massa", {"price": {"from": current, "to": target_price}})
+        finish(item_id, {
+            "item_id": item_id,
+            "status": "updated",
+            "price": target_price,
+            "checked_at": checked_at,
+            "sale_fee_status": "pending",
+            "net_sale_amount": item.get("net_sale_amount"),
+        })
+    sent = time.perf_counter()
+    update_async_operation_progress("Salvando as alterações no CompeTIDOR.")
     write_payload(payload)
+    ordered = [results[item_id] for item_id in item_ids]
     return {
-        "updated": sum(row.get("status") == "updated" for row in results),
-        "failed": sum(row.get("status") == "error" for row in results),
-        "results": results,
+        "updated": sum(row.get("status") == "updated" for row in ordered),
+        "failed": sum(row.get("status") == "error" for row in ordered),
+        "results": ordered,
+        "timing": {"leitura": round(loaded - started, 1), "mercado_livre": round(sent - loaded, 1),
+                   "gravacao": round(time.perf_counter() - sent, 1)},
     }
 
 
@@ -13943,45 +14012,65 @@ def bulk_availability_operation(request, actor=None):
     payload = read_payload(include_catalog=True)
     catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
     accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
-    results = []
+    results = {}
     total = len(item_ids)
-    update_async_operation_progress("Preparando alterações de disponibilidade.", 0, total)
-    for index, item_id in enumerate(item_ids, 1):
+    done = 0
+    update_async_operation_progress("Enviando o novo prazo ao Mercado Livre.", 0, total)
+
+    def finish(item_id, row):
+        nonlocal done
+        results[item_id] = row
+        done += 1
+        update_async_operation_progress(f"Processado {done} de {total} anúncios.", done, total, row)
+
+    def send_and_confirm(client, item_id):
+        run_interactive_meli_call(client.update_item, item_id, {
+            "sale_terms": [{
+                "id": "MANUFACTURING_TIME",
+                "value_name": f"{days} dias" if days else None,
+            }],
+        })
+        verified = run_interactive_meli_call(client.item, item_id) or {}
+        if item_manufacturing_time(verified) != days:
+            raise RuntimeError("O Mercado Livre não confirmou o prazo informado.")
+
+    calls, clients = [], {}
+    for item_id in item_ids:
         item = catalog.get(item_id)
         account = accounts.get(str((item or {}).get("account_id") or ""))
         if not item or not account:
-            result = {"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."}
-        else:
-            previous = int(item.get("manufacturing_time") or 0)
+            finish(item_id, {"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."})
+            continue
+        client = clients.get(str(account.get("id")))
+        if client is None:
             try:
-                client = account_client(account)
-                run_interactive_meli_call(client.update_item, item_id, {
-                    "sale_terms": [{
-                        "id": "MANUFACTURING_TIME",
-                        "value_name": f"{days} dias" if days else None,
-                    }],
-                })
-                verified = run_interactive_meli_call(client.item, item_id) or {}
-                confirmed_days = item_manufacturing_time(verified)
-                if confirmed_days != days:
-                    raise RuntimeError("O Mercado Livre não confirmou o prazo informado.")
-                checked_at = now_label()
-                item["manufacturing_time"] = days
-                item["item_data_checked_at"] = checked_at
-                item["updated_at"] = checked_at
-                append_item_log(payload, item, actor or {}, "Alteração de disponibilidade em massa", {
-                    "manufacturing_time": {"from": previous, "to": days},
-                })
-                result = {"item_id": item_id, "status": "updated", "manufacturing_time": days, "checked_at": checked_at}
+                client = clients[str(account.get("id"))] = account_client(account)
             except Exception as exc:
-                result = {"item_id": item_id, "status": "error", "error": str(exc)}
-        results.append(result)
-        update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, result)
+                finish(item_id, {"item_id": item_id, "status": "error", "error": str(exc)})
+                continue
+        calls.append((item_id, lambda client=client, item_id=item_id: send_and_confirm(client, item_id)))
+
+    for item_id, _, error in parallel_item_calls(calls):
+        if error is not None:
+            finish(item_id, {"item_id": item_id, "status": "error", "error": str(error)})
+            continue
+        item = catalog[item_id]
+        previous = int(item.get("manufacturing_time") or 0)
+        checked_at = now_label()
+        item["manufacturing_time"] = days
+        item["item_data_checked_at"] = checked_at
+        item["updated_at"] = checked_at
+        append_item_log(payload, item, actor or {}, "Alteração de disponibilidade em massa", {
+            "manufacturing_time": {"from": previous, "to": days},
+        })
+        finish(item_id, {"item_id": item_id, "status": "updated", "manufacturing_time": days, "checked_at": checked_at})
+    update_async_operation_progress("Salvando as alterações no CompeTIDOR.")
     write_payload(payload)
+    ordered = [results[item_id] for item_id in item_ids]
     return {
-        "updated": sum(row.get("status") == "updated" for row in results),
-        "failed": sum(row.get("status") == "error" for row in results),
-        "results": results,
+        "updated": sum(row.get("status") == "updated" for row in ordered),
+        "failed": sum(row.get("status") == "error" for row in ordered),
+        "results": ordered,
     }
 
 
@@ -25462,7 +25551,7 @@ class App(BaseHTTPRequestHandler):
                     "bulk_price",
                     lambda: bulk_price_operation(request_copy, actor),
                     "Alteração de preços adicionada à fila.",
-                    priority="action",
+                    priority=edit_lane(len(request_copy.get("item_ids") or [])),
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25477,7 +25566,7 @@ class App(BaseHTTPRequestHandler):
                     "bulk_availability",
                     lambda: bulk_availability_operation(request_copy, actor),
                     "Alteração de disponibilidade adicionada à fila.",
-                    priority="action",
+                    priority=edit_lane(len(request_copy.get("item_ids") or [])),
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25492,7 +25581,7 @@ class App(BaseHTTPRequestHandler):
                     "bulk_remove_flex",
                     lambda: bulk_remove_flex_operation(request_copy, actor),
                     "Remoção do Mercado Envios Flex adicionada à fila.",
-                    priority="action",
+                    priority=edit_lane(len(request_copy.get("item_ids") or [])),
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25507,7 +25596,7 @@ class App(BaseHTTPRequestHandler):
                     "bulk_activate_flex",
                     lambda: bulk_activate_flex_operation(request_copy, actor),
                     "Ativação do Mercado Envios Flex adicionada à fila.",
-                    priority="action",
+                    priority=edit_lane(len(request_copy.get("item_ids") or [])),
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25528,7 +25617,7 @@ class App(BaseHTTPRequestHandler):
                     kind,
                     lambda: bulk_item_action_operation(request_copy, actor, action),
                     message,
-                    priority="action",
+                    priority=edit_lane(len(request_copy.get("item_ids") or [])),
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
@@ -25581,7 +25670,7 @@ class App(BaseHTTPRequestHandler):
                     kind,
                     lambda: work(request_copy, actor),
                     message,
-                    priority="action",
+                    priority="express",
                 )
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:

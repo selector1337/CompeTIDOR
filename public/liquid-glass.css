@@ -4494,3 +4494,22 @@ html:root body dialog :is(h2, h3, strong, b) { font-weight: 700; }
 html:root body .manual-action.queued .manual-action-head span { color: var(--muted); }
 html:root body .manual-action.queued .manual-action-track span { background: var(--muted); opacity: 0.55; }
 html:root body .manual-action .manual-action-meta { display: block; margin-top: 2px; font-variant-numeric: tabular-nums; opacity: 0.8; }
+/* 28. Checkbox rows: spacing lives on the label, never glued to the text */
+html:root body .page :is(.check-row, label:has(> input[type="checkbox"])) { gap: 10px; }
+html:root body .page label:has(> input[type="checkbox"]) > input[type="checkbox"] { margin: 0; }
+html:root body #page-anunciar .publisher-variants { display: grid; gap: 10px; }
+html:root body #page-anunciar .publisher-variants > label {
+  display: grid;
+  grid-template-columns: auto minmax(110px, 1fr) minmax(160px, 1.2fr);
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+}
+html:root body #page-anunciar .publisher-variants > label > span:not(.money-field) { display: grid; gap: 2px; min-width: 0; }
+html:root body #page-anunciar .publisher-variants > label > .money-field { width: 100%; }
+html:root body #page-anunciar .publisher-account-row > label:first-child { gap: 12px; padding: 12px 14px; }
+html:root body #page-anunciar .publisher-account-row > label:first-child > span { display: grid; gap: 2px; min-width: 0; }
+@media (max-width: 560px) {
+  html:root body #page-anunciar .publisher-variants > label { grid-template-columns: auto minmax(0, 1fr); }
+  html:root body #page-anunciar .publisher-variants > label > .money-field { grid-column: 1 / -1; }
+}
