@@ -470,7 +470,10 @@ async function pollReportJob(url, deadline) {
   }
 }
 
-async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 1000) {
+// A job that keeps reporting progress is followed until it ends (up to the
+// hard cap); only a job silent for ASYNC_STALL_LIMIT_MS is given up on.
+const ASYNC_STALL_LIMIT_MS = 10 * 60 * 1000;
+async function waitForAsyncOperation(initial, onProgress, timeoutMs = 60 * 60 * 1000) {
   if (!initial?.job_id) return initial;
   const actionId = initial._manualActionId || "";
   const startedAt = Date.now();
@@ -515,8 +518,11 @@ async function waitForAsyncOperation(initial, onProgress, timeoutMs = 15 * 60 * 
       Object.assign(error, job);
       throw error;
     }
+    if (job.status === "running" && Number(job.seconds_since_progress) * 1000 >= ASYNC_STALL_LIMIT_MS) {
+      throw new Error(`O servidor não informa progresso da operação ${initial.job_id} há ${formatElapsed(job.seconds_since_progress * 1000)} (última etapa: ${job.message || "sem detalhe"}). Ela pode terminar sozinha: confira o resultado antes de repetir a ação.`);
+    }
   }
-  throw new Error(`A operação ${initial.job_id} excedeu o tempo de acompanhamento desta tela. Isso não confirma seu cancelamento: confira o resultado antes de repetir a ação.`);
+  throw new Error(`A operação ${initial.job_id} excedeu o tempo de acompanhamento desta tela (${Math.round(timeoutMs / 60000)} min) e continua no servidor. Isso não confirma seu cancelamento: confira o resultado antes de repetir a ação.`);
   } catch (error) {
     finishManualAction(actionId, "error", error.message || "O acompanhamento foi interrompido.");
     throw error;
@@ -5596,14 +5602,21 @@ function renderPublisherPictures() {
   `).join("") || `<div class="notice danger-notice">Nenhuma foto foi identificada. Importe fotos do computador.</div>`;
   root.querySelectorAll(".publisher-picture img").forEach((image) => {
     image.addEventListener("error", () => {
+      // Ignore images from a previous render: they are no longer on screen
+      // and their index may point at a different photo now.
       const card = image.closest(".publisher-picture");
-      const input = card?.querySelector("input");
+      if (!card?.isConnected || !root.contains(card)) return;
+      const input = card.querySelector("input");
+      const value = input?.value || "";
+      const broken = (state.productPictureRows || []).findIndex((p) => (p.id || p.source) === value);
+      // An unloadable preview is only dropped when other photos remain;
+      // the last photo stays so the user can still decide what to do.
+      if (broken < 0 || state.productPictureRows.length <= 1) return;
       if (input?.hasAttribute("data-publisher-picture") && state.productDraft) {
-        state.productDraft.pictures = (state.productDraft.pictures || []).filter((url) => url !== input.value);
+        state.productDraft.pictures = (state.productDraft.pictures || []).filter((url) => url !== value);
       }
-      if (card) state.productPictureRows.splice(Number(card.dataset.pictureIndex), 1);
-      card?.remove();
-      root.querySelectorAll(".publisher-picture").forEach((card, index) => { card.dataset.pictureIndex=String(index);card.querySelector('span').textContent=String(index+1); });
+      state.productPictureRows.splice(broken, 1);
+      renderPublisherPictures();
     }, { once: true });
   });
   const status = document.querySelector("#publisher-picture-upload-status");
@@ -5738,6 +5751,15 @@ function collectAssistedPublication() {
     }
     return { id: input.dataset.publisherAttribute, value: input.value.trim() };
   }).filter((row) => row.value || row.value_id);
+  // The photo list in state is the source of truth (it keeps order and
+  // selection across re-renders). The checkboxes only mirror it; if the two
+  // ever disagree, fall back to what is checked on screen instead of
+  // sending an empty list.
+  let selectedPictures = (state.productPictureRows || []).filter((p) => p.selected && (p.id || p.source));
+  if (!selectedPictures.length) {
+    selectedPictures = [...form.querySelectorAll("[data-publisher-picture]:checked, [data-publisher-uploaded-picture]:checked")]
+      .map((input) => input.hasAttribute("data-publisher-uploaded-picture") ? { id: input.value } : { source: input.value });
+  }
   const variants = [];
   if (values.get("variant_classic")) variants.push({ listing_type_id: "gold_special", price: values.get("classic_price") });
   if (values.get("variant_premium")) variants.push({ listing_type_id: "gold_pro", price: values.get("premium_price") });
@@ -5762,9 +5784,9 @@ function collectAssistedPublication() {
       sku: values.get("sku"), stock: values.get("stock"), manufacturing_time: values.get("manufacturing_time"), condition: values.get("condition"),
       package_weight: values.get("package_weight"), package_height: values.get("package_height"),
       package_width: values.get("package_width"), package_length: values.get("package_length"),
-      pictures: [...form.querySelectorAll("[data-publisher-picture]:checked")].map((input) => input.value),
-      uploaded_picture_ids: [...form.querySelectorAll("[data-publisher-uploaded-picture]:checked")].map((input) => input.value),
-      ordered_pictures: (state.productPictureRows || []).filter(p=>p.selected).map(p=>p.id?{id:p.id}:{source:p.source}),
+      pictures: selectedPictures.filter((p) => !p.id).map((p) => p.source),
+      uploaded_picture_ids: selectedPictures.filter((p) => p.id).map((p) => p.id),
+      ordered_pictures: selectedPictures.map((p) => p.id ? { id: p.id } : { source: p.source }),
       attributes,
     },
   };
@@ -8112,6 +8134,7 @@ function resetAssistedPublisher() {
   state.productDraft = null;
   state.productPublicationId = "";
   state.productUploadedPictures = [];
+  state.productPictureRows = null;
   state.productImportLoading = false;
   state.productPublishing = false;
   document.querySelector("#product-import-form")?.reset();
@@ -8297,6 +8320,7 @@ document.querySelector("#publisher-picture-upload")?.addEventListener("change", 
         body: JSON.stringify({ account_id: selectedAccount, filename: file.name, data_url: dataUrl }),
       });
       const uploaded = await waitForAsyncOperation(queued);
+      if (!state.productPictureRows) renderPublisherPictures();
       state.productUploadedPictures.push({ id: uploaded.id, preview: dataUrl });
       state.productPictureRows.push({id:uploaded.id,preview:dataUrl,selected:true});
       renderPublisherPictures();
@@ -8344,7 +8368,10 @@ document.querySelector("#product-publish-form")?.addEventListener("submit", asyn
   if (!request.account_ids.length) return showToast("Selecione ao menos uma conta.", "error");
   if (!request.variants.length) return showToast("Selecione Clássico, Premium ou ambos.", "error");
   if (!request.publication_modes.length) return showToast("Selecione anúncio tradicional, anúncio de catálogo ou ambos.", "error");
-  if (!request.draft.pictures.length) return showToast("Selecione ao menos uma foto.", "error");
+  if (!request.draft.ordered_pictures.length) {
+    document.querySelector("#publisher-pictures")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    return showToast("Nenhuma foto está marcada. Marque ao menos uma foto em Fotos importadas ou envie uma do computador.", "error");
+  }
   const total = request.account_ids.length * request.variants.length * request.publication_modes.length;
   if (!window.confirm(`Publicar ${total} anúncio(s) oficialmente no Mercado Livre?`)) return;
   const button = event.currentTarget.querySelector('button[type="submit"]');

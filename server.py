@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 from html.parser import HTMLParser
 from io import BytesIO
 import base64
+import contextlib
 import copy
 import gc
 import gzip
@@ -747,8 +748,30 @@ BACKGROUND_WORKER_SEMAPHORE = threading.BoundedSemaphore(BACKGROUND_CONCURRENT_J
 INTERACTIVE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=CLONE_CONCURRENT_JOBS, thread_name_prefix="interactive-job")
 MANUAL_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=MANUAL_CONCURRENT_JOBS, thread_name_prefix="manual-job")
 BACKGROUND_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=BACKGROUND_CONCURRENT_JOBS, thread_name_prefix="background-job")
-PUBLICATION_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="publication-job")
-PUBLICATION_WORKER_SEMAPHORE = threading.BoundedSemaphore(2)
+# Copies (single and batch) run in the "publication" lane. New-product
+# publishing has its own "publish" lane, so a slow copy never holds a
+# publication from Anunciar Produtos in the queue (and vice versa).
+PUBLICATION_CONCURRENT_JOBS = 3
+PUBLICATION_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=PUBLICATION_CONCURRENT_JOBS, thread_name_prefix="publication-job")
+PUBLICATION_WORKER_SEMAPHORE = threading.BoundedSemaphore(PUBLICATION_CONCURRENT_JOBS)
+PUBLISH_CONCURRENT_JOBS = 2
+PUBLISH_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=PUBLISH_CONCURRENT_JOBS, thread_name_prefix="publish-job")
+PUBLISH_WORKER_SEMAPHORE = threading.BoundedSemaphore(PUBLISH_CONCURRENT_JOBS)
+# Short reads that prepare a copy or a publication (source data, official
+# stores, preview, validation). They used to share the generic lane with
+# long jobs such as official-store reports and price-rule confirmations.
+PREPARE_CONCURRENT_JOBS = 3
+PREPARE_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=PREPARE_CONCURRENT_JOBS, thread_name_prefix="prepare-job")
+PREPARE_WORKER_SEMAPHORE = threading.BoundedSemaphore(PREPARE_CONCURRENT_JOBS)
+LANE_BY_KIND = {
+    "clone_execute": "publication",
+    "clone_execute_batch": "publication",
+    "product_publish": "publish",
+    "clone_source": "prepare",
+    "clone_stores": "prepare",
+    "clone_preview": "prepare",
+    "product_validate": "prepare",
+}
 HEAVY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=HEAVY_CONCURRENT_JOBS, thread_name_prefix="heavy-job")
 # Direct listing edits (price, availability, Flex, pickup, delete) get their
 # own lane: they are short and the user is waiting, so they must never queue
@@ -12737,12 +12760,43 @@ def update_async_operation_progress(message="", completed=None, total=None, deta
         job.update(updates)
 
 
+@contextlib.contextmanager
+def job_step(name):
+    """Add the time spent in a step to the current job's "steps" (seconds)."""
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        job_id = getattr(MELI_WORK_CONTEXT, "job_id", "")
+        if job_id:
+            with ASYNC_OPERATION_JOBS_LOCK:
+                job = ASYNC_OPERATION_JOBS.get(job_id)
+                if job is not None:
+                    steps = job.setdefault("steps", {})
+                    steps[name] = round(steps.get(name, 0) + time.monotonic() - started, 1)
+
+
+def async_lane(priority, heavy=False):
+    """(semaphore, executor) of a lane. Globals are read at call time."""
+    if heavy:
+        return HEAVY_WORKER_SEMAPHORE, HEAVY_JOB_EXECUTOR
+    return {
+        "publication": (PUBLICATION_WORKER_SEMAPHORE, PUBLICATION_JOB_EXECUTOR),
+        "publish": (PUBLISH_WORKER_SEMAPHORE, PUBLISH_JOB_EXECUTOR),
+        "prepare": (PREPARE_WORKER_SEMAPHORE, PREPARE_JOB_EXECUTOR),
+        "background": (BACKGROUND_WORKER_SEMAPHORE, BACKGROUND_JOB_EXECUTOR),
+        "manual": (MANUAL_WORKER_SEMAPHORE, MANUAL_JOB_EXECUTOR),
+        "action": (ACTION_WORKER_SEMAPHORE, ACTION_JOB_EXECUTOR),
+        "express": (EXPRESS_WORKER_SEMAPHORE, EXPRESS_JOB_EXECUTOR),
+    }.get(priority, (CLONE_WORKER_SEMAPHORE, INTERACTIVE_JOB_EXECUTOR))
+
+
 def start_async_operation(
     kind, work, message="Processamento adicionado à fila.", heavy=False,
     priority="interactive", idempotency_key="",
 ):
-    if kind in {"clone_execute", "product_publish"} and not heavy:
-        priority = "publication"
+    if kind in LANE_BY_KIND and not heavy:
+        priority = LANE_BY_KIND[kind]
     cleanup_async_operation_jobs()
     idempotency_key = clean_attribute_value(
         idempotency_key or getattr(HTTP_REQUEST_CONTEXT, "idempotency_key", "")
@@ -12776,19 +12830,11 @@ def start_async_operation(
             ASYNC_OPERATION_IDEMPOTENCY[idempotency_key] = job_id
 
     def worker():
-        interactive = not heavy and priority in {"interactive", "manual", "publication", "action", "express"}
+        interactive = not heavy and priority != "background"
         previous_job_id = getattr(MELI_WORK_CONTEXT, "job_id", None)
         MELI_WORK_CONTEXT.job_id = job_id
         try:
-            semaphore = (
-                HEAVY_WORKER_SEMAPHORE if heavy
-                else PUBLICATION_WORKER_SEMAPHORE if priority == "publication"
-                else BACKGROUND_WORKER_SEMAPHORE if priority == "background"
-                else MANUAL_WORKER_SEMAPHORE if priority == "manual"
-                else ACTION_WORKER_SEMAPHORE if priority == "action"
-                else EXPRESS_WORKER_SEMAPHORE if priority == "express"
-                else CLONE_WORKER_SEMAPHORE
-            )
+            semaphore = async_lane(priority, heavy)[0]
             with semaphore:
                 cleanup_async_operation_jobs()
                 with ASYNC_OPERATION_JOBS_LOCK:
@@ -12816,8 +12862,8 @@ def start_async_operation(
                                     "run_seconds": round(finished - float(current.get("started_epoch") or finished), 1),
                                 }
                             )
-                            if priority in {"action", "express"}:
-                                timing = (result or {}).get("timing") if isinstance(result, dict) else None
+                            if priority != "background" and not heavy:
+                                timing = ((result or {}).get("timing") if isinstance(result, dict) else None) or current.get("steps")
                                 print(f"[operação] {kind} ({priority}): fila {current.get('queued_seconds')}s, "
                                       f"execução {current['run_seconds']}s{f', etapas {timing}' if timing else ''}", flush=True)
                 except Exception as exc:
@@ -12835,7 +12881,11 @@ def start_async_operation(
                                 error_update["pending_fields"] = pending_fields
                             if original_error:
                                 error_update["original_error"] = str(original_error)
+                            error_update["run_seconds"] = round(time.time() - float(current.get("started_epoch") or time.time()), 1)
                             current.update(error_update)
+                            if priority != "background" and not heavy:
+                                print(f"[operação] {kind} ({priority}) falhou: fila {current.get('queued_seconds')}s, "
+                                      f"execução {error_update['run_seconds']}s, etapas {current.get('steps') or {}}: {str(exc)[:160]}", flush=True)
         finally:
             if interactive:
                 with ASYNC_OPERATION_JOBS_LOCK:
@@ -12848,16 +12898,7 @@ def start_async_operation(
             else:
                 MELI_WORK_CONTEXT.job_id = previous_job_id
 
-    executor = (
-        HEAVY_JOB_EXECUTOR if heavy
-        else PUBLICATION_JOB_EXECUTOR if priority == "publication"
-        else BACKGROUND_JOB_EXECUTOR if priority == "background"
-        else MANUAL_JOB_EXECUTOR if priority == "manual"
-        else ACTION_JOB_EXECUTOR if priority == "action"
-        else EXPRESS_JOB_EXECUTOR if priority == "express"
-        else INTERACTIVE_JOB_EXECUTOR
-    )
-    executor.submit(worker)
+    async_lane(priority, heavy)[1].submit(worker)
     return {"job_id": job_id, "status": "queued", "message": message, "poll_url": f"/api/async/jobs/{job_id}"}
 
 
@@ -16716,24 +16757,23 @@ def create_official_clone(payload, job, source_item_id, edits):
         raise RuntimeError("Conta destino oficial não encontrada para clonar via Mercado Livre.")
     source_client = account_client(source_account)
     target_client = account_client(target_account)
-    update_async_operation_progress("Lendo dados e descrição do anúncio de origem.")
-    bundle = clone_source_bundle(payload, source_account.get("id"), source_item_id, include_description=True)
-    source_item = bundle["source_item"]
     source_account_id = str(source_account.get("id") or source_account.get("seller_id") or "")
     target_account_id = str(target_account.get("id") or target_account.get("seller_id") or "")
     cross_account = bool(source_account_id and target_account_id and source_account_id != target_account_id)
-    create_payload = build_clone_item_payload(source_item, edits)
-    def read_category():
-        try:
-            return cached_category_attributes(source_client, source_item.get("category_id"))
-        except Exception:
-            return []
     priority = getattr(MELI_WORK_CONTEXT, "priority", "interactive")
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="clone-prepare") as executor:
-        category_future = executor.submit(run_meli_work, priority, read_category)
+    update_async_operation_progress("Lendo o anúncio de origem e as lojas oficiais do destino.")
+    # The destination stores do not depend on the source item, so they are
+    # read while the source is still loading instead of afterwards.
+    with job_step("leitura_origem_e_lojas"), ThreadPoolExecutor(max_workers=2, thread_name_prefix="clone-prepare") as executor:
         stores_future = executor.submit(run_meli_work, priority, target_official_stores,
             target_client, target_account, payload.get("catalog") or []) if cross_account or job.get("official_store_id") else None
-        category_attributes = category_future.result()
+        bundle = clone_source_bundle(payload, source_account.get("id"), source_item_id, include_description=True)
+        source_item = bundle["source_item"]
+        create_payload = build_clone_item_payload(source_item, edits)
+        try:
+            category_attributes = cached_category_attributes(source_client, source_item.get("category_id"))
+        except Exception:
+            category_attributes = []
         destination_stores = stores_future.result() if stores_future else []
     catalog_product = bundle.get("catalog_product") or {}
     if catalog_product:
@@ -16763,34 +16803,39 @@ def create_official_clone(payload, job, source_item_id, edits):
         error = RuntimeError("Selecione a Loja Oficial da conta destino antes de copiar este anúncio.")
         error.pending_fields = [official_store_pending_field(source_item_id, destination_stores)]
         raise error
-    created = create_item_with_clone_retries(
-        target_client,
-        create_payload,
-        source_item,
-        answers,
-        source_item_id,
-        category_attributes,
-        cross_account,
-        destination_store_id,
-        destination_stores,
-        strict_store=bool(job.get("store_explicit")),
-        publication_context={"seller_id": target_account.get("seller_id"), "key": f"clone:{job['id']}:{source_item_id}" if job.get("id") else "",
-            "verify_only": any(str(row.get("item_id")) == str(source_item_id) and (
-                row.get("publication_pending") or meli_error_status(RuntimeError(row.get("error") or "")) >= 500
-            ) for row in job.get("errors", []))},
-    )
+    with job_step("envio_mercado_livre"):
+        created = create_item_with_clone_retries(
+            target_client,
+            create_payload,
+            source_item,
+            answers,
+            source_item_id,
+            category_attributes,
+            cross_account,
+            destination_store_id,
+            destination_stores,
+            strict_store=bool(job.get("store_explicit")),
+            publication_context={"seller_id": target_account.get("seller_id"), "key": f"clone:{job['id']}:{source_item_id}" if job.get("id") else "",
+                "verify_only": any(str(row.get("item_id")) == str(source_item_id) and (
+                    row.get("publication_pending") or meli_error_status(RuntimeError(row.get("error") or "")) >= 500
+                ) for row in job.get("errors", []))},
+        )
     verified_item = {}
     if created.get("id"):
+        update_async_operation_progress("Anúncio criado. Conferindo o resultado no Mercado Livre.")
         try:
-            verified_item = dict(created) if all(created.get(field) is not None for field in ("title", "price", "status")) else target_client.item_for_clone(created["id"]) if callable(getattr(target_client, "item_for_clone", None)) else target_client.item(created["id"])
+            with job_step("conferencia"):
+                verified_item = dict(created) if all(created.get(field) is not None for field in ("title", "price", "status")) else target_client.item_for_clone(created["id"]) if callable(getattr(target_client, "item_for_clone", None)) else target_client.item(created["id"])
         except Exception as exc:
             created["_verification_warning"] = f"Anúncio criado, mas ainda não apareceu na leitura imediata da API: {exc}"
     description_text = (edits.get("description") or "").strip()
     if not description_text:
         description_text = bundle.get("description") or ""
     if description_text and created.get("id"):
+        update_async_operation_progress("Anúncio criado. Enviando a descrição.")
         try:
-            call_interactive_client_method(target_client.create_item_description, created["id"], description_text)
+            with job_step("descricao"):
+                call_interactive_client_method(target_client.create_item_description, created["id"], description_text)
         except Exception as exc:
             created["_verification_warning"] = (created.get("_verification_warning", "") +
                 f" Anúncio criado; não foi possível confirmar a descrição: {exc}").strip()
@@ -17034,7 +17079,13 @@ def build_assisted_publication_payload(draft, variant):
         seen_pictures = set()
         for picture in draft["ordered_pictures"]:
             if not isinstance(picture, dict): continue
-            identity = ("id", picture.get("id")) if picture.get("id") in uploaded_picture_ids else ("url", picture.get("source"))
+            if picture.get("id") in uploaded_picture_ids:
+                identity = ("id", picture.get("id"))
+            else:
+                # Compare in the same normalized form used for "pictures", or a
+                # valid photo whose URL was rewritten would be dropped here.
+                normalized = (product_image_urls([picture.get("source")]) or [""])[0]
+                identity = ("url", normalized)
             if identity[0] == "url" and identity[1] not in pictures: continue
             if identity not in seen_pictures:
                 ordered.append({identity[0]: identity[1]})
@@ -17417,8 +17468,10 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
     for account in accounts:
         client = account_client(account)
         category_id = clean_attribute_value(draft.get("category_id"))
-        definitions = cached_category_attributes(client, category_id) if category_id else []
-        catalog_draft = catalog_safe_package_draft(client, draft) if "catalog" in publication_modes else draft
+        update_async_operation_progress(f"Lendo a ficha da categoria para a conta {account.get('nickname')}.", progress, total)
+        with job_step("categoria"):
+            definitions = cached_category_attributes(client, category_id) if category_id else []
+            catalog_draft = catalog_safe_package_draft(client, draft) if "catalog" in publication_modes else draft
         for variant, publication_mode in (
             (variant, publication_mode)
             for variant in variants
@@ -17444,9 +17497,10 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                 if publication_mode == "traditional" and linked_catalog_product_id:
                     create_payload["catalog_product_id"] = linked_catalog_product_id
                     source_item["catalog_product_id"] = linked_catalog_product_id
-                destination_stores = target_official_stores(
-                    client, account, payload.get("catalog") or [],
-                )
+                with job_step("lojas_oficiais"):
+                    destination_stores = target_official_stores(
+                        client, account, payload.get("catalog") or [],
+                    )
                 requested_store_id = clean_attribute_value(requested_stores.get(str(account.get("id"))))
                 allowed_store_ids = {
                     str(store.get("official_store_id")) for store in destination_stores
@@ -17469,26 +17523,30 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                             raise probe_exc
                         # Other validation rules remain handled by the existing
                         # creation retry pipeline, which can request user fields.
-                created = create_item_with_clone_retries(
-                    client, create_payload, source_item,
-                    category_attributes=definitions,
-                    cross_account=True,
-                    destination_store_id=destination_store_id,
-                    destination_stores=destination_stores,
-                    publication_name=draft.get("title") or "",
-                    publication_context={"seller_id": account.get("seller_id"), "key": f"publish:{request['publication_id']}:{variant.get('listing_type_id')}:{publication_mode}" if request.get("publication_id") else ""},
-                )
+                with job_step("envio_mercado_livre"):
+                    created = create_item_with_clone_retries(
+                        client, create_payload, source_item,
+                        category_attributes=definitions,
+                        cross_account=True,
+                        destination_store_id=destination_store_id,
+                        destination_stores=destination_stores,
+                        publication_name=draft.get("title") or "",
+                        publication_context={"seller_id": account.get("seller_id"), "key": f"publish:{request['publication_id']}:{variant.get('listing_type_id')}:{publication_mode}" if request.get("publication_id") else ""},
+                    )
                 if package_adjustments:
                     created.setdefault("_clone_adjustments", []).extend(package_adjustments)
                 item_id = created.get("id")
                 description_warning = ""
                 if description and item_id and publication_mode != "catalog":
+                    update_async_operation_progress(f"{label} · {mode_label} criado ({item_id}). Enviando a descrição.", progress - 1, total)
                     try:
-                        client.create_item_description(item_id, description)
+                        with job_step("descricao"):
+                            client.create_item_description(item_id, description)
                     except Exception:
                         description_warning = "Anúncio criado, mas a descrição não foi salva. Revise a descrição no anúncio existente."
                 try:
-                    verified = dict(created) if all(created.get(field) is not None for field in ("title", "price", "status")) else client.item_for_clone(item_id) if item_id else {}
+                    with job_step("conferencia"):
+                        verified = dict(created) if all(created.get(field) is not None for field in ("title", "price", "status")) else client.item_for_clone(item_id) if item_id else {}
                 except Exception:
                     verified = {}
                 official = {**source_item, **created, **verified}
@@ -17501,7 +17559,8 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                     existing.update(normalized)
                 else:
                     payload.setdefault("catalog", []).append(normalized)
-                write_payload(payload)
+                with job_step("gravacao"):
+                    write_payload(payload)
                 append_item_log(payload, normalized, actor or {}, "Cadastro assistido por link", {
                     "source_url": {"from": draft.get("source_url") or "", "to": item_id or ""},
                     "listing_type_id": {"from": "", "to": variant.get("listing_type_id")},
@@ -17569,7 +17628,9 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
 
 def publish_assisted_product_request(request, actor):
     with ASSISTED_PUBLICATION_LOCK:
-        return publish_assisted_product_operation(read_payload(), request, actor)
+        with job_step("leitura_local"):
+            payload = read_payload()
+        return publish_assisted_product_operation(payload, request, actor)
 
 
 def statistics_date_window(date_from, date_to):
@@ -23405,7 +23466,8 @@ def execute_clone_job(payload, job, incoming_answers=None):
             }
         )
         catalog.append(new_item)
-        write_payload(payload)
+        with job_step("gravacao"):
+            write_payload(payload)
         catalog = payload["catalog"]
         copied.append(new_item)
         created_details.append(
@@ -23925,19 +23987,22 @@ def prepare_clone_preview(request):
 
 
 def execute_clone_request(request):
-    payload = read_payload()
+    with job_step("leitura_local"):
+        payload = read_payload()
     jobs = payload.get("clone_jobs") if isinstance(payload.get("clone_jobs"), list) else []
     job = next((item for item in jobs if item.get("id") == request.get("job_id")), None)
     if not job:
         raise RuntimeError("Preview não encontrado.")
     copied = execute_clone_job(payload, job, request.get("field_answers") or {})
     job["updated_at_ns"] = time.time_ns()
-    write_payload(payload)
+    with job_step("gravacao"):
+        write_payload(payload)
     return {"ok": True, "job": job, "copied": copied}
 
 
 def execute_clone_batch_request(request):
-    payload = read_payload()
+    with job_step("leitura_local"):
+        payload = read_payload()
     jobs = payload.get("clone_jobs") if isinstance(payload.get("clone_jobs"), list) else []
     requested_ids = request.get("job_ids") or []
     batch_id = str(request.get("batch_id") or "")
@@ -23950,12 +24015,18 @@ def execute_clone_batch_request(request):
     if not selected:
         raise RuntimeError("Nenhum preview do lote foi encontrado.")
     copied = []
-    for job in selected:
+    for index, job in enumerate(selected):
         if job.get("status") == "copied":
             continue
+        update_async_operation_progress(
+            f"Copiando combinação {index + 1} de {len(selected)} ({job.get('target')} · {job.get('variant_label') or 'mesmo tipo'}).",
+            index, len(selected),
+        )
         copied.extend(execute_clone_job(payload, job, (request.get("field_answers") or {}).get(job.get("id"), {})))
         job["updated_at_ns"] = time.time_ns()
-    write_payload(payload)
+    update_async_operation_progress("Gravando as cópias criadas.", len(selected), len(selected))
+    with job_step("gravacao"):
+        write_payload(payload)
     return {"ok": True, "jobs": selected, "copied": copied}
 
 
