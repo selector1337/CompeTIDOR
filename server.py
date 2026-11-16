@@ -8,6 +8,9 @@ from io import BytesIO
 import base64
 import contextlib
 import copy
+import faulthandler
+import signal
+import traceback
 import gc
 import gzip
 import json
@@ -668,7 +671,72 @@ PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
 PURCHASE_OPPORTUNITIES_CACHE_VERSION = 9
 CUSTOMERS_DATA_FILE = "customers.json"
 SYNC_LOCK = threading.Lock()
-DATA_LOCK = threading.RLock()
+
+
+class TracedRLock:
+    """RLock that logs who holds it when someone waits too long.
+
+    Every save in the app goes through DATA_LOCK. If it is ever held for
+    minutes again (deadlock, network call inside the lock), the service log
+    shows the holder's stack instead of the app silently stopping."""
+
+    def __init__(self, name, warn_after=30.0):
+        self._lock = threading.RLock()
+        self._name = name
+        self._warn_after = warn_after
+        self._owner = None
+        self._depth = 0
+
+    def acquire(self, blocking=True, timeout=-1):
+        if self._lock.acquire(blocking=False):
+            return self._got()
+        if not blocking:
+            return False
+        deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+        waited = 0.0
+        while True:
+            step = self._warn_after if deadline is None else max(0.0, min(self._warn_after, deadline - time.monotonic()))
+            if self._lock.acquire(timeout=step):
+                return self._got()
+            waited += step
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            self._report(waited)
+
+    def _got(self):
+        if self._depth == 0:
+            self._owner = threading.get_ident()
+        self._depth += 1
+        return True
+
+    def release(self):
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+        self._lock.release()
+
+    def _report(self, waited):
+        try:
+            owner = self._owner
+            names = {thread.ident: thread.name for thread in threading.enumerate()}
+            frame = sys._current_frames().get(owner)
+            stack = "".join(traceback.format_stack(frame)[-15:]) if frame is not None else "(sem pilha)\n"
+            waiting = threading.current_thread().name
+            print(f"[trava] {waiting} espera {self._name} há {int(waited)}s; em uso por "
+                  f"{names.get(owner, owner)}:\n{stack}", flush=True)
+        except Exception:
+            pass
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+DATA_LOCK = TracedRLock("DATA_LOCK")
 ACCOUNT_REFRESH_LOCK = threading.RLock()
 ACCOUNT_REFRESHED_TOKENS = {}
 ACCOUNT_TOKEN_FIELDS = ("access_token", "refresh_token", "expires_in", "token_created_at", "token_created_at_ns")
@@ -7627,7 +7695,7 @@ def save_sku_costs(request, actor=None):
     entries = request.get("costs") if isinstance(request.get("costs"), list) else [request]
     saved = []
     deleted = []
-    with SKU_COMMERCIAL_DATA_LOCK:
+    with DATA_LOCK, SKU_COMMERCIAL_DATA_LOCK:  # same lock order as everywhere
         costs = read_json(SKU_COSTS_FILE, {})
         costs = costs if isinstance(costs, dict) else {}
         for entry in entries:
@@ -7685,7 +7753,8 @@ def save_sku_costs(request, actor=None):
 
 def update_sku_last_sales(rows):
     changed = False
-    with SKU_COMMERCIAL_DATA_LOCK:
+    # Lock order is always DATA_LOCK -> SKU lock (write_json takes DATA_LOCK).
+    with DATA_LOCK, SKU_COMMERCIAL_DATA_LOCK:
         stored = read_json(SKU_LAST_SALES_FILE, {})
         stored = stored if isinstance(stored, dict) else {}
         for row in rows or []:
@@ -11942,15 +12011,19 @@ def reconcile_month_sales(request):
             record = cache_sales_goal_orders(payload, account, period, orders)
             cache_official_orders_for_analytics(payload, account, start.date(),
                 min(end - timedelta(days=1), datetime.now(APP_TZ)).date(), orders)
-            with DATA_LOCK:
-                fresh = read_payload(include_catalog=False)
-                fresh["accounts"] = merge_critical_records("accounts", [account], fresh.get("accounts", []))
-                upsert_monthly_revenue(fresh, account, record["amount"], record["orders_count"], period, "Pedidos conferidos com a API oficial", orders=orders)
-                if period == current_month_period():
-                    sync_recent_sales(fresh, account, client, orders=orders, dashboard_only=True)
-                    snapshot = fresh.setdefault("operations_snapshot", {})
-                    snapshot["top_skus_today"] = build_operations(fresh)["top_skus_today"]
-                write_payload(fresh)
+            # No DATA_LOCK here. sync_recent_sales takes the SKU and customer
+            # locks and calls the API for customers; holding DATA_LOCK around
+            # it deadlocked against the automatic sync (SKU lock -> DATA_LOCK)
+            # and froze every save in the app. write_payload merges with the
+            # latest file under its own lock, as the automatic sync does.
+            fresh = read_payload(include_catalog=False)
+            fresh["accounts"] = merge_critical_records("accounts", [account], fresh.get("accounts", []))
+            upsert_monthly_revenue(fresh, account, record["amount"], record["orders_count"], period, "Pedidos conferidos com a API oficial", orders=orders)
+            if period == current_month_period():
+                sync_recent_sales(fresh, account, client, orders=orders, dashboard_only=True)
+                snapshot = fresh.setdefault("operations_snapshot", {})
+                snapshot["top_skus_today"] = build_operations(fresh)["top_skus_today"]
+            write_payload(fresh)
             results.append({"account": account.get("nickname"), "orders": record["orders_count"], "amount": record["amount"], "status": "ok",
                             "previous_orders": old.get("orders_count"), "previous_amount": old.get("amount")})
         except Exception as exc:
@@ -12776,6 +12849,69 @@ def job_step(name):
                     steps[name] = round(steps.get(name, 0) + time.monotonic() - started, 1)
 
 
+ASYNC_STALL_SECONDS = max(15, int(os.getenv("COMPETIDOR_JOB_STALL_SECONDS", "45")))
+_STALL_WATCHDOG_STARTED = False
+_STALL_WATCHDOG_LOCK = threading.Lock()
+
+
+def stalled_job_report(job, now=None):
+    """Text with the current stack of a job's worker (and its helper threads)."""
+    now = now or time.time()
+    frames = sys._current_frames()
+    names = {thread.ident: thread.name for thread in threading.enumerate()}
+    lines = [
+        f"[operação travada] {job.get('kind')} ({job.get('priority')}) {job.get('id')}: "
+        f"sem progresso há {int(now - float(job.get('updated_epoch') or now))}s; "
+        f"última etapa: {job.get('message')!r}; {job.get('completed', 0)} de {job.get('total', '?')}; "
+        f"etapas {job.get('steps') or {}}"
+    ]
+    tids = [job.get("thread_id")]
+    # Helper threads doing the network calls of batches and copies.
+    tids += [tid for tid, name in names.items() if str(name).startswith(("bulk-item", "clone-", "publish-"))]
+    for tid in dict.fromkeys(t for t in tids if t):
+        frame = frames.get(tid)
+        if frame is None:
+            continue
+        stack = "".join(traceback.format_stack(frame)[-12:])
+        lines.append(f"  -- thread {names.get(tid, tid)}:\n{stack}")
+    return "\n".join(lines)
+
+
+def stalled_job_watchdog():
+    while True:
+        time.sleep(10)
+        try:
+            now = time.time()
+            with ASYNC_OPERATION_JOBS_LOCK:
+                stalled = [
+                    dict(job) for job in ASYNC_OPERATION_JOBS.values()
+                    if job.get("status") == "running"
+                    and job.get("priority") not in {"background", "heavy"}
+                    and now - float(job.get("updated_epoch") or now) >= ASYNC_STALL_SECONDS
+                    and job.get("stall_reported_epoch") != job.get("updated_epoch")
+                ]
+                for row in stalled:
+                    ASYNC_OPERATION_JOBS[row["id"]]["stall_reported_epoch"] = row.get("updated_epoch")
+            for row in stalled:
+                print(stalled_job_report(row, now), flush=True)
+        except Exception as exc:  # The watchdog must never stop the server.
+            print(f"[operação travada] falha ao inspecionar: {exc}", flush=True)
+
+
+def ensure_stall_watchdog():
+    global _STALL_WATCHDOG_STARTED
+    with _STALL_WATCHDOG_LOCK:
+        if _STALL_WATCHDOG_STARTED:
+            return
+        _STALL_WATCHDOG_STARTED = True
+    threading.Thread(target=stalled_job_watchdog, name="job-watchdog", daemon=True).start()
+    # `kill -USR1 <pid>` prints every thread's stack to the service log.
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except (AttributeError, ValueError, RuntimeError):
+        pass  # Not available on Windows or outside the main thread.
+
+
 def async_lane(priority, heavy=False):
     """(semaphore, executor) of a lane. Globals are read at call time."""
     if heavy:
@@ -12797,6 +12933,7 @@ def start_async_operation(
 ):
     if kind in LANE_BY_KIND and not heavy:
         priority = LANE_BY_KIND[kind]
+    ensure_stall_watchdog()
     cleanup_async_operation_jobs()
     idempotency_key = clean_attribute_value(
         idempotency_key or getattr(HTTP_REQUEST_CONTEXT, "idempotency_key", "")
@@ -12845,8 +12982,10 @@ def start_async_operation(
                         ACTIVE_CLONE_OPERATIONS.add(job_id)
                     started = time.time()
                     current.update({"status": "running", "message": "Processando dados oficiais no Mercado Livre.",
-                                    "updated_epoch": started, "started_epoch": started,
+                                    "updated_epoch": started, "started_epoch": started, "thread_id": threading.get_ident(),
                                     "queued_seconds": round(started - float(current.get("created_epoch") or started), 1)})
+                if priority != "background" and not heavy:
+                    print(f"[operação] {kind} ({priority}) {job_id} iniciou após {current.get('queued_seconds')}s na fila.", flush=True)
                 try:
                     result = run_meli_work("background" if priority == "background" or heavy else "interactive", work)
                     with ASYNC_OPERATION_JOBS_LOCK:
@@ -13944,14 +14083,16 @@ def bulk_price_operation(request, actor=None):
     if value <= 0:
         raise RuntimeError("Informe um valor maior que zero.")
     started = time.perf_counter()
-    payload = read_payload(include_catalog=True)
+    update_async_operation_progress("Lendo os anúncios selecionados.", 0, len(item_ids))
+    with job_step("leitura"):
+        payload = read_payload(include_catalog=True)
     catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
     accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
     loaded = time.perf_counter()
     results = {}
     total = len(item_ids)
     done = 0
-    update_async_operation_progress("Enviando os novos preços ao Mercado Livre.", 0, total)
+    update_async_operation_progress("Preparando o acesso às contas.", 0, total)
 
     def finish(item_id, row):
         nonlocal done
@@ -13987,15 +14128,21 @@ def bulk_price_operation(request, actor=None):
         client = clients.get(str(account.get("id")))
         if client is None:
             try:
-                client = clients[str(account.get("id"))] = account_client(account)
+                update_async_operation_progress(f"Preparando o acesso à conta {account.get('nickname')}.")
+                with job_step("acesso_contas"):
+                    client = clients[str(account.get("id"))] = account_client(account)
             except Exception as exc:
                 finish(item_id, {"item_id": item_id, "status": "error", "error": str(exc)})
                 continue
         calls.append((item_id, lambda client=client, item_id=item_id, price=target_price:
                       client.update_item(item_id, {"price": price})))
 
+    if calls:
+        update_async_operation_progress(f"Enviando os novos preços ao Mercado Livre ({len(calls)} anúncios).", done, total)
+    send_started = time.perf_counter()
     for item_id, _, error in parallel_item_calls(calls):
         if error is not None:
+            print(f"[operação] bulk_price: {item_id} não alterado: {str(error)[:200]}", flush=True)
             finish(item_id, {"item_id": item_id, "status": "error", "error": str(error)})
             continue
         item = catalog[item_id]
@@ -14027,8 +14174,8 @@ def bulk_price_operation(request, actor=None):
         "updated": sum(row.get("status") == "updated" for row in ordered),
         "failed": sum(row.get("status") == "error" for row in ordered),
         "results": ordered,
-        "timing": {"leitura": round(loaded - started, 1), "mercado_livre": round(sent - loaded, 1),
-                   "gravacao": round(time.perf_counter() - sent, 1)},
+        "timing": {"leitura": round(loaded - started, 1), "acesso_contas": round(send_started - loaded, 1),
+                   "mercado_livre": round(sent - send_started, 1), "gravacao": round(time.perf_counter() - sent, 1)},
     }
 
 
@@ -26259,6 +26406,7 @@ if __name__ == "__main__":
         print(f"Callback HTTPS local em https://127.0.0.1:{https_port()}/api/oauth/callback")
     else:
         print("HTTPS local desativado; TLS deve terminar no proxy reverso.")
+    ensure_stall_watchdog()
     http_server.serve_forever()
 
 
