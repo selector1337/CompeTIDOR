@@ -788,6 +788,7 @@ CLONE_SOURCE_CACHE_LOCK = threading.RLock()
 CLONE_SOURCE_CACHE = {}
 JSON_CACHE_LOCK = threading.RLock()
 JSON_CACHE = {}
+POLL_USERS_CACHE = {}
 STATIC_FILE_CACHE_LOCK = threading.RLock()
 STATIC_FILE_CACHE = {}
 RESPONSE_CACHE_LOCK = threading.RLock()
@@ -991,22 +992,24 @@ def read_json(name, fallback):
     with JSON_CACHE_LOCK:
         cached = JSON_CACHE.get(cache_key)
         if cached and cached.get("signature") == signature:
-            cached_value = cached["value"]
+            cached_text = cached["text"]
         else:
-            cached_value = None
-    if cached_value is not None:
-        return copy.deepcopy(cached_value)
+            cached_text = None
+    if cached_text is not None:
+        # Parsing the cached text (C code) is about twice as fast as
+        # copy.deepcopy of the parsed objects and keeps far less in memory.
+        return json.loads(cached_text)
     # Files are published with os.replace(), so readers can safely consume the
     # previous complete snapshot while a large catalog is being serialized.
     for attempt in range(3):
         try:
             read_signature = file_signature(path)
-            value = json.loads(path.read_text(encoding="utf-8"))
-            cached_value = copy.deepcopy(value)
+            text = path.read_text(encoding="utf-8")
+            value = json.loads(text)
             with JSON_CACHE_LOCK:
                 JSON_CACHE[cache_key] = {
                     "signature": read_signature,
-                    "value": cached_value,
+                    "text": text,
                     "loaded_at": time.monotonic(),
                 }
                 if len(JSON_CACHE) > 32:
@@ -1020,36 +1023,37 @@ def read_json(name, fallback):
             time.sleep(0.02 * (attempt + 1))
 
 
+_JSON_ENCODE = json.JSONEncoder(ensure_ascii=False, separators=(",", ":")).encode
+
+
+def write_json_stream(payload, stream):
+    """Compact JSON through the C encoder, one list element at a time.
+
+    json.dump() always uses the pure-Python encoder and was the slowest part
+    of every save (3-7x slower), all of it while holding DATA_LOCK. Encoding
+    element by element keeps memory low for the large catalog list."""
+    if isinstance(payload, list):
+        stream.write("[")
+        for index, row in enumerate(payload):
+            if index:
+                stream.write(",")
+            stream.write(_JSON_ENCODE(row))
+        stream.write("]")
+    else:
+        stream.write(_JSON_ENCODE(payload))
+
+
 def write_json(name, payload):
     with DATA_LOCK:
         path = DATA / name
         temporary = DATA / f".{name}.{uuid.uuid4().hex}.tmp"
-        compact = name in {
-            CATALOG_DATA_FILE, RETURNS_DATA_FILE, ANALYTICS_DAILY_CACHE_FILE,
-            PURCHASE_OPPORTUNITIES_CACHE_FILE, CUSTOMERS_DATA_FILE,
-        }
         with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(
-                payload,
-                stream,
-                indent=None if compact else 2,
-                separators=(",", ":") if compact else None,
-                ensure_ascii=False,
-            )
+            write_json_stream(payload, stream)
         os.replace(temporary, path)
-        cached_copy = None if compact else copy.deepcopy(payload)
+        # The next reader parses the new file outside the lock; no deep copy
+        # of the payload is made here while every other save is waiting.
         with JSON_CACHE_LOCK:
-            cache_key = str(path.resolve())
-            if compact:
-                # O catálogo é grande. Manter o payload do escritor e uma cópia
-                # integral no cache dobra o pico de RAM durante sincronizações.
-                JSON_CACHE.pop(cache_key, None)
-            else:
-                JSON_CACHE[cache_key] = {
-                    "signature": file_signature(path),
-                    "value": cached_copy,
-                    "loaded_at": time.monotonic(),
-                }
+            JSON_CACHE.pop(str(path.resolve()), None)
         invalidate_response_cache(name)
 
 
@@ -1102,12 +1106,14 @@ def read_poll_authorization():
     """Read current users without copying batch histories on every progress poll."""
     path = DATA / APP_DATA_FILE
     signature = file_signature(path)
+    cache_key = str(path.resolve())
     with JSON_CACHE_LOCK:
-        cached = JSON_CACHE.get(str(path.resolve()))
-        value = cached.get("value") if cached and cached.get("signature") == signature else None
-        users = value.get("users", []) if isinstance(value, dict) else None
+        cached = POLL_USERS_CACHE.get(cache_key)
+        users = cached["users"] if cached and cached.get("signature") == signature else None
     if users is None:
         users = read_json(APP_DATA_FILE, {}).get("users", [])
+        with JSON_CACHE_LOCK:
+            POLL_USERS_CACHE[cache_key] = {"signature": signature, "users": copy.deepcopy(users)}
     return {"users": copy.deepcopy(users)}
 
 
@@ -1324,6 +1330,7 @@ def write_payload(payload, replace_collections=None):
         path = DATA / APP_DATA_FILE
         latest = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         latest.pop("catalog", None)
+        saved_catalog = None
         payload["assisted_catalog_opt_ins"] = {
             **(latest.get("assisted_catalog_opt_ins") or {}),
             **(payload.get("assisted_catalog_opt_ins") or {}),
@@ -1363,9 +1370,10 @@ def write_payload(payload, replace_collections=None):
                 latest.get("price_schedules", []),
             )
             if payload.get("_catalog_loaded", True):
+                saved_catalog = read_json(CATALOG_DATA_FILE, [])
                 payload["catalog"] = merge_catalog_records(
                     payload.get("catalog", []),
-                    read_json(CATALOG_DATA_FILE, []),
+                    saved_catalog,
                 )
         deletions = {}
         for record in [*(latest.get("deleted_items") or []), *(payload.get("deleted_items") or [])]:
@@ -1377,7 +1385,9 @@ def write_payload(payload, replace_collections=None):
         payload["_revision"] = latest_revision + 1
         catalog_loaded = bool(payload.get("_catalog_loaded", True))
         if catalog_loaded:
-            saved_items = {row.get("id"): row for row in read_json(CATALOG_DATA_FILE, [])}
+            if saved_catalog is None:
+                saved_catalog = read_json(CATALOG_DATA_FILE, [])
+            saved_items = {row.get("id"): row for row in saved_catalog}
             for row in payload.get("catalog", []):
                 track_catalog_loss(row, saved_items.get(row.get("id")))
             write_json(CATALOG_DATA_FILE, payload.get("catalog", []))
@@ -3196,6 +3206,14 @@ def account_client(account):
                 })
                 ACCOUNT_REFRESHED_TOKENS[key] = {k: account[k] for k in ACCOUNT_TOKEN_FIELDS if k in account}
                 applied = True
+    if applied:
+        # Most of the time the newer token came from the in-memory cache and
+        # is already on disk: check that without the lock, so a price change
+        # does not queue behind every background save just to find nothing to do.
+        on_disk = next((a for a in read_payload(include_catalog=False).get("accounts", [])
+                        if same_oauth_account(a, account)), None)
+        if on_disk is None or account_token_revision(on_disk) >= account_token_revision(account):
+            applied = False
     if applied:
         # Persist before returning a client, even if the subsequent operation fails.
         with DATA_LOCK:
