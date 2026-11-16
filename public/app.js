@@ -5466,6 +5466,8 @@ async function applyBulkSpreadsheet(button) {
   }
 }
 
+var CLONE_BATCH_STATUSES = ["preview_ready", "review_required", "partial_error", "error"];
+
 function renderClone() {
   const source = document.querySelector('select[name="source"]');
   const currentSource = source.value;
@@ -5496,8 +5498,12 @@ function renderClone() {
   if (copyPageSize && Number(copyPageSize.value) !== state.copyPageSize) copyPageSize.value = String(state.copyPageSize);
   renderCopyItems();
 
-  const latestBatch = state.data.clone_jobs.find((job) => job.batch_id && ["preview_ready", "partial_error", "error"].includes(job.status))?.batch_id;
-  const batchAction = latestBatch ? `<div class="clone-batch-toolbar"><button class="mini-button success-button" type="button" data-execute-clone-batch="${latestBatch}">Copiar todas as combinações prontas</button></div>` : "";
+  const latestBatch = state.data.clone_jobs.find((job) => job.batch_id && CLONE_BATCH_STATUSES.includes(job.status))?.batch_id;
+  const batchJobs = latestBatch ? state.data.clone_jobs.filter((job) => job.batch_id === latestBatch && CLONE_BATCH_STATUSES.includes(job.status)) : [];
+  const needsAdjustments = batchJobs.some((job) => job.status === "review_required" || job.errors?.some((row) => row.pending_fields?.length));
+  const batchAction = batchJobs.length > 1 || needsAdjustments
+    ? `<div class="clone-batch-toolbar">${needsAdjustments ? `<small>Preencha os campos uma vez: o mesmo campo do mesmo anúncio é repetido nas outras combinações.</small>` : ""}<button class="mini-button success-button" type="button" data-execute-clone-batch="${latestBatch}">${needsAdjustments ? `Copiar todas com os ajustes (${batchJobs.length})` : `Copiar todas as combinações prontas (${batchJobs.length})`}</button></div>`
+    : "";
   document.querySelector("#clone-jobs").innerHTML = batchAction + state.data.clone_jobs
     .map(
       (job) => `
@@ -5885,7 +5891,9 @@ function cloneJobStatusTone(status) {
 }
 
 function clonePendingInputHtml(row, field) {
-  const common = `data-clone-answer-item="${escapeAttr(row.item_id)}" data-clone-answer-field="${escapeAttr(field.id)}"`;
+  const rejected = field.rejected_value ? ` data-clone-rejected="${escapeAttr(field.default_value || "")}"` : "";
+  const alternative = field.alternative_to ? ` data-clone-alternative-to="${escapeAttr(field.alternative_to)}"` : "";
+  const common = `data-clone-answer-item="${escapeAttr(row.item_id)}" data-clone-answer-field="${escapeAttr(field.id)}"${rejected}${alternative}`;
   const defaultValue = field.default_value || "";
   if (field.options?.length) {
     return `
@@ -6002,6 +6010,7 @@ function cloneErrorsHtml(errors, validationVersion = 0) {
         <div class="clone-error-block">
           <strong>${escapeText(row.item_id)}</strong>
           <p>${escapeText(row.error)}</p>
+          ${row.ml_reason ? `<p class="clone-ml-reason"><small>Motivo informado pelo Mercado Livre: ${escapeText(row.ml_reason)}</small></p>` : ""}
           ${row.pending_fields?.length ? `
             <div class="clone-pending-grid">
               ${row.pending_fields.map((field) => `
@@ -8053,6 +8062,7 @@ async function fillCloneFieldsFromItem(itemId) {
   const item = state.data.catalog.find((row) => row.id === itemId);
   if (!item) return;
   const form = document.querySelector("#clone-form");
+  state.cloneTouchedFields = new Set();
   form.elements.title_override.value = (item.title || "").slice(0, 60);
   updateCloneTitleCounter();
   form.elements.price_override.value = item.price || "";
@@ -8099,13 +8109,17 @@ async function fillCloneFieldsFromItem(itemId) {
 }
 
 function applyCloneSourceToForm(result, item, form) {
-  form.elements.title_override.value = (result.title || item.title || "").slice(0, 60);
-  form.elements.price_override.value = result.price ?? item.price ?? "";
-  form.elements.stock_override.value = result.stock ?? item.stock ?? "";
-  form.elements.listing_type_override.value = result.listing_type_id || item.listing_type_id || "";
-  form.elements.sku_suffix.value = result.sku || (item.sku !== "-" ? item.sku : "") || "";
-  form.elements.gtin_override.value = result.gtin || item.gtin || "";
-  form.elements.description_override.value = result.description || state.itemDescriptions[item.id]?.value || "";
+  // The official data can arrive after the user already typed a new title,
+  // price, etc. Never overwrite a field the user edited for this listing.
+  const touched = state.cloneTouchedFields || new Set();
+  const set = (name, value) => { if (!touched.has(name) && form.elements[name]) form.elements[name].value = value; };
+  set("title_override", (result.title || item.title || "").slice(0, 60));
+  set("price_override", result.price ?? item.price ?? "");
+  set("stock_override", result.stock ?? item.stock ?? "");
+  set("listing_type_override", result.listing_type_id || item.listing_type_id || "");
+  set("sku_suffix", result.sku || (item.sku !== "-" ? item.sku : "") || "");
+  set("gtin_override", result.gtin || item.gtin || "");
+  set("description_override", result.description || state.itemDescriptions[item.id]?.value || "");
   const gtinHint = document.querySelector("#clone-gtin-hint");
   if (gtinHint) {
     gtinHint.textContent = result.variation_count > 1
@@ -8126,6 +8140,9 @@ function updateCloneTitleCounter() {
 }
 
 document.querySelector('[name="title_override"]')?.addEventListener("input", updateCloneTitleCounter);
+document.querySelector("#clone-form")?.addEventListener("input", (event) => {
+  if (event.target?.name) (state.cloneTouchedFields ||= new Set()).add(event.target.name);
+});
 
 document.querySelector('#product-publish-form [name="title"]')?.addEventListener("input", updatePublisherTitleCounter);
 
@@ -8491,17 +8508,79 @@ document.querySelector("#clone-form").addEventListener("submit", async (event) =
   }
 });
 
+// Answers typed in one combination's card, in the format the server expects:
+// {item_id: {field_id: value}}. Returns a problem text instead when the form
+// would resend a code Mercado Livre already refused.
+function collectCloneAnswers(card) {
+  const answers = {};
+  let problem = "";
+  const inputs = [...(card?.querySelectorAll("[data-clone-answer-item][data-clone-answer-field]") || [])];
+  inputs.forEach((input) => {
+    if (!input.value.trim()) return;
+    const itemId = input.dataset.cloneAnswerItem;
+    const unitControl = input.closest("label")?.querySelector("[data-clone-answer-unit]");
+    const unit = unitControl?.dataset.cloneAnswerUnit || unitControl?.value || "";
+    const rawValue = input.value.trim();
+    const value = unit && !/[a-zA-Z]/.test(rawValue) ? `${rawValue} ${unit}` : rawValue;
+    answers[itemId] ||= {};
+    answers[itemId][input.dataset.cloneAnswerField] = value;
+  });
+  inputs.filter((input) => input.dataset.cloneRejected !== undefined).forEach((input) => {
+    const itemId = input.dataset.cloneAnswerItem;
+    const field = input.dataset.cloneAnswerField;
+    const alternativeChosen = inputs.some((other) => other.dataset.cloneAlternativeTo === field
+      && other.dataset.cloneAnswerItem === itemId && other.value.trim());
+    if (!alternativeChosen && input.value.trim() && input.value.trim() === input.dataset.cloneRejected.trim()) {
+      problem = `${itemId}: o Mercado Livre já recusou o código ${input.value.trim()}. Informe outro código ou escolha o motivo de não ter código.`;
+      input.classList.add("input-error");
+    }
+  });
+  return { answers, problem };
+}
+
+// Filling a field in one combination fills the same field of the same
+// listing in the other combinations, unless that one was already changed.
+document.querySelector("#clone-jobs")?.addEventListener("input", (event) => {
+  const source = event.target.closest("[data-clone-answer-item][data-clone-answer-field]");
+  if (!source) return;
+  source.classList.remove("input-error");
+  source.dataset.cloneEdited = "1";
+  const selector = `[data-clone-answer-item="${CSS.escape(source.dataset.cloneAnswerItem)}"][data-clone-answer-field="${CSS.escape(source.dataset.cloneAnswerField)}"]`;
+  document.querySelectorAll(`#clone-jobs ${selector}`).forEach((other) => {
+    if (other === source || other.dataset.cloneEdited) return;
+    other.value = source.value;
+    other.classList.remove("input-error");
+  });
+});
+document.querySelector("#clone-jobs")?.addEventListener("change", (event) => {
+  if (event.target.matches?.("select[data-clone-answer-field]")) {
+    event.target.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+});
+
 document.querySelector("#clone-jobs").addEventListener("click", async (event) => {
   const batchButton = event.target.closest("[data-execute-clone-batch]");
   if (batchButton) {
     const batchId = batchButton.dataset.executeCloneBatch;
-    const jobs = state.data.clone_jobs.filter((job) => job.batch_id === batchId && ["preview_ready", "partial_error", "error"].includes(job.status));
+    const jobs = state.data.clone_jobs.filter((job) => job.batch_id === batchId && CLONE_BATCH_STATUSES.includes(job.status));
+    // Every combination is copied with the adjustments filled in its card.
+    const fieldAnswers = {};
+    for (const job of jobs) {
+      const card = document.querySelector(`[data-clone-job-card="${CSS.escape(job.id)}"]`);
+      const { answers, problem } = collectCloneAnswers(card);
+      if (problem) {
+        card?.scrollIntoView({ behavior: "smooth", block: "center" });
+        showToast(problem, "error");
+        return;
+      }
+      if (Object.keys(answers).length) fieldAnswers[job.id] = answers;
+    }
     batchButton.disabled = true;
     batchButton.textContent = "Copiando lote...";
     try {
       const queued = await api("/api/clone/execute-batch", {
         method: "POST",
-        body: JSON.stringify({ batch_id: batchId, job_ids: jobs.map((job) => job.id) }),
+        body: JSON.stringify({ batch_id: batchId, job_ids: jobs.map((job) => job.id), field_answers: fieldAnswers }),
       });
       const result = await waitForAsyncOperation(queued, (message) => {
         batchButton.textContent = message.includes("fila") ? "Cópia na fila..." : "Copiando lote...";
@@ -8515,24 +8594,18 @@ document.querySelector("#clone-jobs").addEventListener("click", async (event) =>
     } catch (error) {
       showToast(error.message || "Não foi possível executar o lote.", "error");
       batchButton.disabled = false;
-      batchButton.textContent = "Copiar todas as combinações prontas";
+      batchButton.textContent = "Copiar todas com os ajustes";
     }
     return;
   }
   const button = event.target.closest("[data-execute-clone]");
   if (!button) return;
   const card = button.closest("[data-clone-job-card]");
-  const fieldAnswers = {};
-  card?.querySelectorAll("[data-clone-answer-item][data-clone-answer-field]").forEach((input) => {
-    if (!input.value.trim()) return;
-    const itemId = input.dataset.cloneAnswerItem;
-    const unitControl = input.closest("label")?.querySelector("[data-clone-answer-unit]");
-    const unit = unitControl?.dataset.cloneAnswerUnit || unitControl?.value || "";
-    const rawValue = input.value.trim();
-    const value = unit && !/[a-zA-Z]/.test(rawValue) ? `${rawValue} ${unit}` : rawValue;
-    fieldAnswers[itemId] ||= {};
-    fieldAnswers[itemId][input.dataset.cloneAnswerField] = value;
-  });
+  const { answers: fieldAnswers, problem } = collectCloneAnswers(card);
+  if (problem) {
+    showToast(problem, "error");
+    return;
+  }
   button.disabled = true;
   button.textContent = "Copiando...";
   try {

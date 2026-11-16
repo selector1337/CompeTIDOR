@@ -16291,7 +16291,11 @@ def fill_missing_clone_fields(create_payload, source_item, fields):
 
 
 def clone_payload_from_answers(create_payload, answers):
-    answers = answers or {}
+    answers = dict(answers or {})
+    # GTIN and "no GTIN reason" are mutually exclusive. A chosen reason wins,
+    # whatever order the form sent them in.
+    if clean_attribute_value(answers.get("attribute:EMPTY_GTIN_REASON")):
+        answers.pop("attribute:GTIN", None)
     for key, value in answers.items():
         if not clean_attribute_value(value):
             continue
@@ -16559,11 +16563,16 @@ def clone_retry_adjustments_from_error(
                     pending["rejected_value"] = True
                     pending_fields.append(pending)
                     attrs_to_remove = [attr for attr in attrs_to_remove if attr not in GTIN_IDENTIFIER_ATTRS]
-                if not source_identifiers:
-                    empty_reason = pending_clone_attribute("EMPTY_GTIN_REASON", source_item, category_attributes or [], item_id)
-                    if empty_reason:
-                        empty_reason["message"] = "Use este campo somente quando o produto realmente não possuir código universal."
-                        pending_fields.append(empty_reason)
+                # Offer the documented alternative even when the source has a
+                # code: resending the same rejected code would only fail again.
+                empty_reason = pending_clone_attribute("EMPTY_GTIN_REASON", source_item, category_attributes or [], item_id)
+                if empty_reason:
+                    empty_reason["message"] = (
+                        "Alternativa ao código: escolha um motivo somente se o produto realmente não tiver código "
+                        "universal aceito. Com um motivo escolhido, o GTIN não é enviado."
+                    )
+                    empty_reason["alternative_to"] = "attribute:GTIN"
+                    pending_fields.append(empty_reason)
         if code == "item.attribute.invalid":
             attr_ids = attribute_ids_from_error_text(message)
             attr_ids.extend(attribute_id_from_human_name(name) for name in human_attribute_names_from_error_text(message))
@@ -16922,6 +16931,12 @@ def create_item_with_clone_retries(
         error = RuntimeError(message)
         error.pending_fields = deduped_fields
         error.original_error = str(last_error)
+        # Mercado Livre's own words, shown on the card next to the fields.
+        error.ml_reason = "; ".join(dict.fromkeys(
+            clean_attribute_value(cause.get("message"))
+            for cause in meli_error_causes(last_error)
+            if str(cause.get("type") or "error") != "warning" and clean_attribute_value(cause.get("message"))
+        ))[:400]
         raise error
     raise last_error
 
@@ -16959,6 +16974,16 @@ def create_official_clone(payload, job, source_item_id, edits):
     hydrate_clone_package_attributes(create_payload, source_item)
     hydrate_required_clone_attributes(create_payload, source_item, category_attributes, catalog_product)
     create_payload = apply_target_account_clone_rules(create_payload, source_item, source_account, target_account)
+    # A title typed in Copiar must win over the source's family_name. Sellers
+    # on the User Products model get their title from family_name, so the new
+    # title is sent in the field the destination account actually uses.
+    requested_title = clean_attribute_value(edits.get("title"))[:60]
+    title_changed = bool(requested_title) and requested_title != clean_attribute_value(source_item.get("title"))[:60]
+    publication_model = publication_name = ""
+    if title_changed:
+        publication_model = target_publication_model(target_client, target_account, source_item)
+        publication_name = requested_title
+        apply_publication_name(create_payload, requested_title, publication_model)
     answers = (job.get("field_answers") or {}).get(source_item_id) or {}
     update_async_operation_progress("Conferindo a loja oficial e preparando a cópia.")
     allowed_store_ids = {
@@ -16992,6 +17017,8 @@ def create_official_clone(payload, job, source_item_id, edits):
             cross_account,
             destination_store_id,
             destination_stores,
+            publication_model=publication_model,
+            publication_name=publication_name,
             strict_store=bool(job.get("store_explicit")),
             publication_context={"seller_id": target_account.get("seller_id"), "key": f"clone:{job['id']}:{source_item_id}" if job.get("id") else "",
                 "verify_only": any(str(row.get("item_id")) == str(source_item_id) and (
@@ -17006,6 +17033,17 @@ def create_official_clone(payload, job, source_item_id, edits):
                 verified_item = dict(created) if all(created.get(field) is not None for field in ("title", "price", "status")) else target_client.item_for_clone(created["id"]) if callable(getattr(target_client, "item_for_clone", None)) else target_client.item(created["id"])
         except Exception as exc:
             created["_verification_warning"] = f"Anúncio criado, mas ainda não apareceu na leitura imediata da API: {exc}"
+        official_title = clean_attribute_value((verified_item or created).get("title"))
+        if title_changed and official_title and official_title != requested_title:
+            try:
+                with job_step("titulo"):
+                    call_interactive_client_method(target_client.update_item, created["id"], {"title": requested_title})
+                verified_item = {**verified_item, "title": requested_title}
+                created["title"] = requested_title
+            except Exception as exc:
+                created["_verification_warning"] = (created.get("_verification_warning", "") +
+                    f" O Mercado Livre gerou o título \"{official_title}\" a partir da ficha do produto e não aceitou "
+                    f"trocá-lo por \"{requested_title}\": {friendly_clone_error(exc)}").strip()
     description_text = (edits.get("description") or "").strip()
     if not description_text:
         description_text = bundle.get("description") or ""
@@ -23664,6 +23702,7 @@ def execute_clone_job(payload, job, incoming_answers=None, outcomes=None):
                         "error": str(exc),
                         "pending_fields": pending_fields,
                         "original_error": getattr(exc, "original_error", ""),
+                        "ml_reason": getattr(exc, "ml_reason", ""),
                     }
                 )
             else:

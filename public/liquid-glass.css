@@ -4513,3 +4513,8 @@ html:root body #page-anunciar .publisher-account-row > label:first-child > span 
   html:root body #page-anunciar .publisher-variants > label { grid-template-columns: auto minmax(0, 1fr); }
   html:root body #page-anunciar .publisher-variants > label > .money-field { grid-column: 1 / -1; }
 }
+/* 29. Copiar: lote com ajustes e campo recusado */
+html:root body #page-copiar .clone-batch-toolbar { align-items: center; gap: 14px; flex-wrap: wrap; }
+html:root body #page-copiar .clone-batch-toolbar small { color: var(--muted, #9aa0aa); flex: 1 1 260px; text-align: right; }
+html:root body #page-copiar .clone-ml-reason small { color: var(--muted, #9aa0aa); }
+html:root body #page-copiar :is(input, select).input-error { border-color: #ef4444 !important; box-shadow: 0 0 0 3px rgba(239, 68, 68, .2) !important; }
