@@ -857,6 +857,9 @@ EXPRESS_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=EXPRESS_CONCURRENT_JOBS, t
 # Listings inside one batch are sent to the API this many at a time. The
 # per-request API semaphore still bounds the total load on Mercado Livre.
 BULK_ITEM_PARALLELISM = max(1, min(8, int(os.getenv("MELI_BULK_ITEM_PARALLELISM", "4"))))
+# Copy combinations / publication accounts sent at the same time. Each one
+# makes several calls, so this stays lower than the bulk-edit parallelism.
+CLONE_BATCH_PARALLELISM = max(1, min(4, int(os.getenv("MELI_CLONE_BATCH_PARALLELISM", "3"))))
 
 
 def edit_lane(item_count):
@@ -14071,7 +14074,7 @@ def delete_item_operation(request, actor=None):
     return {"ok": True, "official": official, "item_id": item_id, "deleted": True}
 
 
-def parallel_item_calls(calls):
+def parallel_item_calls(calls, workers=None):
     """Run (key, fn) pairs a few at a time; yield (key, value, error) as each finishes.
 
     Only the network call runs in the helper threads. Callers apply local
@@ -14080,8 +14083,18 @@ def parallel_item_calls(calls):
     if not calls:
         return
     priority = getattr(MELI_WORK_CONTEXT, "priority", "interactive")
-    with ThreadPoolExecutor(max_workers=min(BULK_ITEM_PARALLELISM, len(calls)), thread_name_prefix="bulk-item") as pool:
-        futures = {pool.submit(run_meli_work, priority, fn): key for key, fn in calls}
+    job_id = getattr(MELI_WORK_CONTEXT, "job_id", "")
+
+    def in_job(fn):
+        # Helper threads report steps and progress to the same job.
+        MELI_WORK_CONTEXT.job_id = job_id
+        try:
+            return run_meli_work(priority, fn)
+        finally:
+            MELI_WORK_CONTEXT.job_id = ""
+
+    with ThreadPoolExecutor(max_workers=min(workers or BULK_ITEM_PARALLELISM, len(calls)), thread_name_prefix="bulk-item") as pool:
+        futures = {pool.submit(in_job, fn): key for key, fn in calls}
         for future in as_completed(futures):
             try:
                 yield futures[future], future.result(), None
@@ -17629,11 +17642,24 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
     description = str(draft.get("description") or "").strip()[:50000]
     results = []
     total = len(accounts) * len(variants) * len(publication_modes)
-    progress = 0
-    for account in accounts:
+    progress_lock = threading.Lock()
+    finished = 0
+    catalog_snapshot = list(payload.get("catalog") or [])  # read-only in the account threads
+
+    def report(message, row=None):
+        nonlocal finished
+        with progress_lock:
+            if row is not None:
+                finished += 1
+            update_async_operation_progress(message, finished, total, row)
+
+    def publish_account(account):
+        """Mercado Livre part for one account. Returns [(result_row, normalized_item)]
+        and never touches the shared payload, so accounts run side by side."""
+        rows = []
         client = account_client(account)
         category_id = clean_attribute_value(draft.get("category_id"))
-        update_async_operation_progress(f"Lendo a ficha da categoria para a conta {account.get('nickname')}.", progress, total)
+        report(f"Lendo a ficha da categoria para a conta {account.get('nickname')}.")
         with job_step("categoria"):
             definitions = cached_category_attributes(client, category_id) if category_id else []
             catalog_draft = catalog_safe_package_draft(client, draft) if "catalog" in publication_modes else draft
@@ -17642,13 +17668,10 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
             for variant in variants
             for publication_mode in publication_modes
         ):
-            progress += 1
             destination_stores = []
             label = "Premium" if variant.get("listing_type_id") == "gold_pro" else "Clássico"
             mode_label = "Catálogo" if publication_mode == "catalog" else "Tradicional"
-            update_async_operation_progress(
-                f"Publicando {label} · {mode_label} na conta {account.get('nickname')}.", progress - 1, total
-            )
+            report(f"Publicando {label} · {mode_label} na conta {account.get('nickname')}.")
             created = {}
             item_id = ""
             try:
@@ -17664,7 +17687,7 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                     source_item["catalog_product_id"] = linked_catalog_product_id
                 with job_step("lojas_oficiais"):
                     destination_stores = target_official_stores(
-                        client, account, payload.get("catalog") or [],
+                        client, account, catalog_snapshot,
                     )
                 requested_store_id = clean_attribute_value(requested_stores.get(str(account.get("id"))))
                 allowed_store_ids = {
@@ -17703,7 +17726,7 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                 item_id = created.get("id")
                 description_warning = ""
                 if description and item_id and publication_mode != "catalog":
-                    update_async_operation_progress(f"{label} · {mode_label} criado ({item_id}). Enviando a descrição.", progress - 1, total)
+                    report(f"{label} · {mode_label} criado ({item_id}). Enviando a descrição.")
                     try:
                         with job_step("descricao"):
                             client.create_item_description(item_id, description)
@@ -17719,35 +17742,26 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                 normalized["assisted_publication_id"] = str(request.get("publication_id") or "")[:100]
                 normalized["assisted_publication_mode"] = publication_mode
                 normalized["description_override"] = description
-                existing = next((row for row in payload.get("catalog", []) if row.get("id") == item_id), None)
-                if existing is not None:
-                    existing.update(normalized)
-                else:
-                    payload.setdefault("catalog", []).append(normalized)
-                with job_step("gravacao"):
-                    write_payload(payload)
-                append_item_log(payload, normalized, actor or {}, "Cadastro assistido por link", {
-                    "source_url": {"from": draft.get("source_url") or "", "to": item_id or ""},
-                    "listing_type_id": {"from": "", "to": variant.get("listing_type_id")},
-                })
-                results.append({
+                normalized["_assisted_listing_type_id"] = variant.get("listing_type_id")
+                row = {
                     "status": "created", "account": account.get("nickname"), "account_id": account.get("id"),
                     "listing_type_id": variant.get("listing_type_id"), "item_id": item_id,
                     "publication_mode": publication_mode,
                     "title": official.get("title") or draft.get("title"),
                     "permalink": official.get("permalink") or created.get("permalink") or "",
                     "warning": description_warning,
-                })
+                }
+                rows.append((row, normalized))
             except Exception as exc:
                 if item_id:
-                    results.append({
+                    rows.append(({
                         "status": "created", "account": account.get("nickname"), "account_id": account.get("id"),
                         "listing_type_id": variant.get("listing_type_id"), "item_id": item_id,
                         "publication_mode": publication_mode, "title": draft.get("title"),
                         "permalink": created.get("permalink") or "",
                         "warning": "Anúncio criado e confirmado. Falha ao finalizar o registro local: " + str(exc) + ". Não publique novamente.",
-                    })
-                    update_async_operation_progress(f"Processado {progress} de {total} anúncio(s).", progress, total, results[-1])
+                    }, None))
+                    report(f"Processado {finished + 1} de {total} anúncio(s).", rows[-1][0])
                     continue
                 pending_fields = list(getattr(exc, "pending_fields", []) or [])
                 if official_store_error_kind(exc) == "required" and not pending_fields:
@@ -17765,10 +17779,36 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
                 }
                 if pending_fields:
                     error_result["pending_fields"] = pending_fields
-                results.append(error_result)
-            update_async_operation_progress(
-                f"Processado {progress} de {total} anúncio(s).", progress, total, results[-1]
-            )
+                rows.append((error_result, None))
+            report(f"Processado {finished + 1} de {total} anúncio(s).", rows[-1][0])
+        return rows
+
+    # Accounts are different sellers: publish them side by side (bounded),
+    # then update the local catalog here, in the original order, and save once.
+    by_account = {}
+    calls = [(str(account.get("id")), lambda account=account: publish_account(account)) for account in accounts]
+    for account_id, rows, error in parallel_item_calls(calls, workers=CLONE_BATCH_PARALLELISM):
+        if error is not None:
+            account = next(a for a in accounts if str(a.get("id")) == account_id)
+            rows = [({"status": "error", "account": account.get("nickname"), "account_id": account.get("id"),
+                      "listing_type_id": variant.get("listing_type_id"), "error": friendly_clone_error(error),
+                      "publication_mode": mode}, None) for variant in variants for mode in publication_modes]
+        by_account[account_id] = rows
+    for account in accounts:
+        for row, normalized in by_account.get(str(account.get("id")), []):
+            results.append(row)
+            if normalized is None:
+                continue
+            listing_type_id = normalized.pop("_assisted_listing_type_id", "")
+            existing = next((item for item in payload.get("catalog", []) if item.get("id") == normalized.get("id")), None)
+            if existing is not None:
+                existing.update(normalized)
+            else:
+                payload.setdefault("catalog", []).append(normalized)
+            append_item_log(payload, normalized, actor or {}, "Cadastro assistido por link", {
+                "source_url": {"from": draft.get("source_url") or "", "to": normalized.get("id") or ""},
+                "listing_type_id": {"from": "", "to": listing_type_id},
+            })
     created_count = sum(row.get("status") == "created" for row in results)
     has_pending_fields = any(row.get("pending_fields") for row in results)
     pending_count = sum(row.get("status") == "pending" for row in results)
@@ -17777,7 +17817,9 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
         raise RuntimeError(f"Nenhum anúncio foi criado. {detail}")
     if created_count:
         try:
-            write_payload(payload)
+            update_async_operation_progress("Gravando os anúncios criados.", total, total)
+            with job_step("gravacao"):
+                write_payload(payload)
         except Exception as exc:
             for row in results:
                 if row.get("status") == "created":
@@ -23559,7 +23601,7 @@ def apply_spreadsheet_job(token, actor):
     }
 
 
-def execute_clone_job(payload, job, incoming_answers=None):
+def record_clone_answers(job, incoming_answers):
     incoming_answers = incoming_answers or {}
     if isinstance(incoming_answers, dict) and incoming_answers:
         saved_answers = job.setdefault("field_answers", {})
@@ -23568,6 +23610,30 @@ def execute_clone_job(payload, job, incoming_answers=None):
                 saved_answers.setdefault(item_id, {}).update(
                     {key: value for key, value in answers.items() if value not in (None, "")}
                 )
+
+
+def clone_job_outcomes(payload, job):
+    """Mercado Livre part of a copy: {item_id: (created, source, verified) or exception}.
+
+    Only reads the payload, so several combinations can run at the same time;
+    the local catalog is changed afterwards, in one thread."""
+    catalog_ids = {item.get("id") for item in payload.get("catalog") or [] if item.get("id")}
+    confirmed = {row.get("source_item_id") for row in job.get("created_details") or []}
+    outcomes = {}
+    for item_id in job.get("item_ids", []):
+        if item_id in confirmed or item_id not in catalog_ids:
+            continue
+        try:
+            outcomes[item_id] = create_official_clone(payload, job, item_id, job.get("edits") or {})
+        except Exception as exc:
+            outcomes[item_id] = exc
+    return outcomes
+
+
+def execute_clone_job(payload, job, incoming_answers=None, outcomes=None):
+    record_clone_answers(job, incoming_answers)
+    if outcomes is None:
+        outcomes = clone_job_outcomes(payload, job)
     catalog = payload.setdefault("catalog", [])
     existing_ids = {item.get("id") for item in catalog if item.get("id")}
     copied = []
@@ -23583,7 +23649,12 @@ def execute_clone_job(payload, job, incoming_answers=None):
             errors.append({"item_id": item_id, "error": "O anúncio de origem não foi encontrado na base sincronizada."})
             continue
         try:
-            created, official_source, verified_item = create_official_clone(payload, job, item_id, edits)
+            outcome = outcomes.get(item_id)
+            if outcome is None:
+                raise RuntimeError("A cópia deste anúncio não foi processada; tente novamente.")
+            if isinstance(outcome, Exception):
+                raise outcome
+            created, official_source, verified_item = outcome
         except Exception as exc:
             pending_fields = getattr(exc, "pending_fields", [])
             if pending_fields:
@@ -23630,10 +23701,9 @@ def execute_clone_job(payload, job, incoming_answers=None):
                 "action": f"Anúncio criado oficialmente no Mercado Livre a partir de {source_item.get('id')}. Novo código: {new_id}.",
             }
         )
+        # Saved once by the caller at the end. A repeat cannot duplicate the
+        # listing: the creation is already recorded by the publication guard.
         catalog.append(new_item)
-        with job_step("gravacao"):
-            write_payload(payload)
-        catalog = payload["catalog"]
         copied.append(new_item)
         created_details.append(
             {
@@ -23670,19 +23740,27 @@ def kit_components_from_request(payload, request, include_description=True):
         raise RuntimeError("Selecione ao menos um anúncio para montar o kit.")
     components = []
     source_client = account_client(source_account)
+
+    def load_component(item_id):
+        bundle = clone_source_bundle(payload, source_account.get("id"), item_id, include_description=include_description)
+        source_item = complete_clone_source_pictures(source_client, item_id, bundle.get("source_item") or {})
+        return bundle, source_item
+
+    # Each component is an independent listing: read them side by side.
+    wanted = list(dict.fromkeys(
+        str((row or {}).get("item_id") or "").strip() for row in rows if str((row or {}).get("item_id") or "").strip()
+    ))
+    loaded = {}
+    for item_id, value, error in parallel_item_calls([(item_id, lambda item_id=item_id: load_component(item_id)) for item_id in wanted]):
+        if error is not None:
+            raise error
+        loaded[item_id] = value
     for index, row in enumerate(rows):
         item_id = str((row or {}).get("item_id") or "").strip()
         quantity = max(1, int((row or {}).get("quantity") or 1))
         if not item_id:
             continue
-        bundle = clone_source_bundle(
-            payload,
-            source_account.get("id"),
-            item_id,
-            include_description=include_description,
-        )
-        source_item = bundle.get("source_item") or {}
-        source_item = complete_clone_source_pictures(source_client, item_id, source_item)
+        bundle, source_item = loaded[item_id]
         sku = clean_attribute_value(item_sku(source_item))
         if not sku or sku == "-" or sku.upper() == item_id.upper():
             raise RuntimeError(
@@ -23895,7 +23973,19 @@ def create_kit_listing(request, actor=None):
         raise RuntimeError("Selecione uma conta destino oficial.")
     first = components[0]["source_item"]
     target_client = account_client(target_account)
-    publication_model = target_publication_model(target_client, target_account, first)
+    source_client = account_client(source_account)
+    cross_account = str(source_account.get("id")) != str(target_account.get("id"))
+    # Three independent reads, done side by side instead of one after another.
+    prefetched = {}
+    for key, value, error in parallel_item_calls([
+        ("model", lambda: target_publication_model(target_client, target_account, first)),
+        ("category", lambda: cached_category_attributes(source_client, first.get("category_id"))),
+        ("stores", lambda: target_official_stores(target_client, target_account, payload.get("catalog") or []) if cross_account else []),
+    ]):
+        if error is not None:
+            raise error
+        prefetched[key] = value
+    publication_model = prefetched["model"]
     fields = request.get("fields") or {}
     edits = {
         "title": str(fields.get("title") or "")[:60],
@@ -23938,8 +24028,7 @@ def create_kit_listing(request, actor=None):
         api_value = seller_package_api_value(field, raw_value)
         expected_package[field] = api_value
         add_or_update_clone_attribute(create_payload, attr_id, api_value)
-    source_client = account_client(source_account)
-    category_attributes = cached_category_attributes(source_client, first.get("category_id"))
+    category_attributes = prefetched["category"]
     hydrate_required_clone_attributes(create_payload, first, category_attributes, {})
     hydrate_clone_package_attributes(create_payload, first)
     create_payload = apply_target_account_clone_rules(
@@ -23948,12 +24037,7 @@ def create_kit_listing(request, actor=None):
         source_account,
         target_account,
     )
-    cross_account = str(source_account.get("id")) != str(target_account.get("id"))
-    destination_stores = target_official_stores(
-        account_client(target_account),
-        target_account,
-        payload.get("catalog") or [],
-    ) if cross_account else []
+    destination_stores = prefetched["stores"]
     requested_store_id = clean_attribute_value(fields.get("official_store_id"))
     allowed_store_ids = {
         str(store.get("official_store_id") or "")
@@ -24180,16 +24264,24 @@ def execute_clone_batch_request(request):
     if not selected:
         raise RuntimeError("Nenhum preview do lote foi encontrado.")
     copied = []
-    for index, job in enumerate(selected):
-        if job.get("status") == "copied":
-            continue
-        update_async_operation_progress(
-            f"Copiando combinação {index + 1} de {len(selected)} ({job.get('target')} · {job.get('variant_label') or 'mesmo tipo'}).",
-            index, len(selected),
-        )
-        copied.extend(execute_clone_job(payload, job, (request.get("field_answers") or {}).get(job.get("id"), {})))
+    pending = [job for job in selected if job.get("status") != "copied"]
+    for job in pending:
+        record_clone_answers(job, (request.get("field_answers") or {}).get(job.get("id"), {}))
+    total = len(pending)
+    update_async_operation_progress(f"Copiando {total} combinação(ões), até {CLONE_BATCH_PARALLELISM} ao mesmo tempo.", 0, total)
+    # Combinations are independent listings: send them to Mercado Livre a few
+    # at a time, then update the local catalog in this thread and save once.
+    outcomes, done = {}, 0
+    calls = [(job.get("id"), lambda job=job: clone_job_outcomes(payload, job)) for job in pending]
+    for job_id, value, error in parallel_item_calls(calls, workers=CLONE_BATCH_PARALLELISM):
+        done += 1
+        outcomes[job_id] = value if error is None else {item_id: error for item_id in next(
+            (job.get("item_ids") or [] for job in pending if job.get("id") == job_id), [])}
+        update_async_operation_progress(f"Copiadas {done} de {total} combinações.", done, total)
+    for job in pending:
+        copied.extend(execute_clone_job(payload, job, outcomes=outcomes.get(job.get("id")) or {}))
         job["updated_at_ns"] = time.time_ns()
-    update_async_operation_progress("Gravando as cópias criadas.", len(selected), len(selected))
+    update_async_operation_progress("Gravando as cópias criadas.", total, total)
     with job_step("gravacao"):
         write_payload(payload)
     return {"ok": True, "jobs": selected, "copied": copied}
