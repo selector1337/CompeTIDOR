@@ -3564,13 +3564,109 @@ def catalog_package_reference(client, catalog_product_id):
     return {"values": values, "source": source, "complete": all(field in values for field in fields)}
 
 
+PACKAGE_PROBE_LIMITS = {"package_height": 300, "package_width": 300, "package_length": 300, "package_weight": 100_000}
+
+
+def catalog_package_minimum_by_validation(client, create_payload, max_probes=40):
+    """Exact smallest whole package Mercado Livre accepts for a catalog product.
+
+    /items/validate (creates nothing) answers "<field> too small for the
+    product dimensions" when a measure is below the ones Mercado Livre has for
+    the product, naming only the fields that are low. Each field is searched
+    on its own (grow, then binary search) in the same probes, so the result is
+    the exact minimum in cm/g instead of an inflated upper bound."""
+    method = getattr(client, "validate_item", None)
+    if not callable(method):
+        return {}
+    payload = json.loads(json.dumps(create_payload or {}, ensure_ascii=False))
+    fields = list(PACKAGE_PROBE_LIMITS)
+    low = {field: 0 for field in fields}      # known too small
+    high = {field: None for field in fields}  # known accepted
+    guess = {field: 1 for field in fields}
+    probes = 0
+
+    def too_small(values):
+        nonlocal probes
+        probes += 1
+        set_package_payload_numbers(payload, values)
+        try:
+            run_interactive_meli_call(method, payload)
+            return set()
+        except Exception as exc:
+            return set(catalog_too_small_package_fields(exc))
+
+    while probes < max_probes:
+        pending = [f for f in fields if high[f] is None or high[f] - low[f] > 1]
+        if not pending:
+            # Confirm the final package as a whole. If Mercado Livre now names
+            # a field it had not mentioned, keep searching only that field.
+            final = {field: high[field] for field in fields}
+            still_low = too_small(final)
+            if not still_low:
+                break
+            for field in still_low:
+                low[field], high[field] = final[field], None
+                guess[field] = min(PACKAGE_PROBE_LIMITS[field], final[field] * 2)
+            continue
+        values = {}
+        for field in fields:
+            if high[field] is None:
+                values[field] = guess[field]
+            elif high[field] - low[field] > 1:
+                values[field] = (low[field] + high[field]) // 2
+            else:
+                values[field] = high[field]
+        rejected = too_small(values)
+        for field in pending:
+            if field in rejected:
+                low[field] = values[field]
+                if high[field] is None:
+                    if values[field] >= PACKAGE_PROBE_LIMITS[field]:
+                        return {}  # no accepted size within reasonable limits
+                    guess[field] = min(PACKAGE_PROBE_LIMITS[field], values[field] * 2)
+            else:
+                high[field] = values[field]
+    if any(high[field] is None for field in fields):
+        return {}
+    # A product without its own measures accepts 1 cm / 1 g: nothing to show.
+    if all(high[field] <= 1 for field in fields):
+        return {}
+    return {field: high[field] for field in fields}
+
+
 def catalog_package_reference_operation(payload, request):
     account_ids = [str(value) for value in request.get("account_ids") or [] if value]
     accounts = [a for a in payload.get("accounts") or [] if a.get("official") and a.get("access_token")]
     account = next((a for a in accounts if str(a.get("id")) in account_ids), None) or (accounts[0] if accounts else None)
     if not account:
         raise RuntimeError("Conecte uma conta oficial para consultar as medidas do Mercado Livre.")
-    return catalog_package_reference(account_client(account), request.get("catalog_product_id"))
+    client = account_client(account)
+    update_async_operation_progress("Procurando as medidas na ficha e nas ofertas do produto.")
+    reference = catalog_package_reference(client, request.get("catalog_product_id"))
+    draft = request.get("draft") if isinstance(request.get("draft"), dict) else {}
+    if reference["complete"] or not draft.get("category_id"):
+        return reference
+    # The sheet and the offers did not have them: ask the official validator,
+    # which compares the package with the measures Mercado Livre calculated.
+    update_async_operation_progress("Conferindo as medidas com a validação oficial do Mercado Livre (sem criar anúncio).")
+    try:
+        # Only a check: SKU, stock and measures get placeholders when still empty.
+        mode_draft = {**draft, "catalog_listing": True, "catalog_product_id": request.get("catalog_product_id"),
+                      "sku": draft.get("sku") or "CONSULTA-MEDIDAS", "stock": draft.get("stock") or 1,
+                      "package_weight": "1", "package_height": "1", "package_width": "1", "package_length": "1"}
+        variant = {"listing_type_id": "gold_special", "price": draft.get("price") or 100}
+        create_payload, source_item = build_assisted_publication_payload(mode_draft, variant)
+        requested_stores = request.get("official_store_ids") if isinstance(request.get("official_store_ids"), dict) else {}
+        stores = target_official_stores(client, account, payload.get("catalog") or [])
+        store_id = clean_attribute_value(requested_stores.get(str(account.get("id")))) or target_official_store_id(client, account, source_item, stores)
+        prepare_cross_account_official_store_payload(create_payload, store_id)
+        with job_step("validacao_medidas"):
+            values = catalog_package_minimum_by_validation(client, create_payload)
+    except Exception:
+        values = {}
+    if values:
+        return {"values": values, "source": "validação oficial do Mercado Livre (medidas calculadas por ele)", "complete": True}
+    return reference
 
 
 def catalog_safe_package_draft(client, draft):
@@ -9550,6 +9646,9 @@ def sync_recent_sales(payload, account, client, orders=None, dashboard_only=Fals
                 "channel": order.get("context", {}).get("channel") or order.get("tags", ["Mercado Livre"])[0],
                 "status": order.get("status") or "-",
                 "date": order.get("date_created") or order.get("last_updated") or now_label(),
+                # Payment approval: the date and time Mercado Livre's sales
+                # screen shows. Only for display; totals keep date_created.
+                "approved_at": order.get("date_closed") or "",
             }
             rows.append(sale)
     if not dashboard_only:
@@ -19562,6 +19661,7 @@ def query_sales_report(payload, request, *, target_skus=None, paid_only=False):
                         "account": account.get("nickname") or str(account.get("seller_id") or ""),
                         "order_id": order_id,
                         "pack_id": order.get("pack_id") or "",
+                        "approved_at": order.get("date_closed") or "",
                         "item_id": item_id,
                         "sku": sku,
                         "brand": item_brand,

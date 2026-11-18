@@ -14,6 +14,10 @@ Roda com o mesmo usuário e a mesma configuração do serviço:
     -p WorkingDirectory=/opt/competidor -p EnvironmentFile=/etc/competidor.env \
     -p EnvironmentFile=-/etc/competidor-dedicated.env \
     /opt/competidor/.venv/bin/python deploy/diagnostico_pedidos.py todas 2026-11 2000016101789289
+
+Para comparar com a lista de outro integrador, exporte os pedidos do mês dele
+(CSV, planilha salva como CSV ou texto copiado), envie o arquivo para /tmp e
+acrescente:  --lista /tmp/pedidos_integrador.csv
 """
 import collections
 import sys
@@ -82,13 +86,65 @@ def explain(client, identity, months_orders):
         print(f"  Pedido {order.get('id')}: conta como venda? {server.official_order_is_revenue(order)}")
 
 
+def numbers_from_file(path):
+    """Order/cart numbers in any export (CSV, TXT, copied table).
+
+    Mercado Livre order and cart numbers start with 2000 and have 16 digits;
+    other columns (payment, shipment, CEP) are ignored."""
+    import re
+    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    return list(dict.fromkeys(re.findall(r"(?<!\d)2000\d{12}(?!\d)", text)))
+
+
+def compare_list(path, accounts, all_orders, start, end):
+    numbers = numbers_from_file(path)
+    known = {}
+    for client, order in all_orders:
+        for key in (str(order.get("id")), str(order.get("pack_id") or "")):
+            if key:
+                known.setdefault(key, []).append((client, order))
+    print(f"\n=== Lista do outro integrador: {len(numbers)} números encontrados em {path} ===")
+    counted = 0
+    for number in numbers:
+        matches = known.get(number) or []
+        if matches and any(server.official_order_is_revenue(order) for _, order in matches):
+            counted += 1
+            continue
+        if matches:
+            for _, order in matches:
+                print(f"- {number}: está na busca, mas o app não conta como venda (status {order.get('status')}). {describe(order)}")
+            continue
+        order, owner = None, None
+        for account in accounts:
+            try:
+                order = server.MercadoLivreClient(account["access_token"]).order(number)
+                owner = account
+                break
+            except Exception:
+                continue
+        if not order:
+            print(f"- {number}: não é pedido de nenhuma conta conectada (pode ser carrinho de outro mês ou de conta não conectada).")
+            continue
+        created = server.parse_meli_datetime(order.get("date_created"))
+        reason = ("criado fora do mês no fuso do app" if created and not (start <= created < end)
+                  else "não voltou na busca de pedidos do Mercado Livre")
+        print(f"- {number} ({owner.get('nickname')}): {reason}. {describe(order)}")
+    print(f"Contados pelo CompeTIDOR: {counted} de {len(numbers)}. Os demais estão explicados acima.")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 2
     wanted = sys.argv[1].strip().lower()
     period, start, end = server.sales_goal_month(sys.argv[2] if len(sys.argv) > 2 else None)
-    numbers = [value.strip().lstrip("#") for value in sys.argv[3:] if value.strip()]
+    extra = sys.argv[3:]
+    list_file = ""
+    if "--lista" in extra:
+        index = extra.index("--lista")
+        list_file = extra[index + 1] if index + 1 < len(extra) else ""
+        extra = extra[:index] + extra[index + 2:]
+    numbers = [value.strip().lstrip("#") for value in extra if value.strip()]
     payload = server.read_payload(include_catalog=False)
     accounts = [a for a in payload.get("accounts") or [] if a.get("official") and a.get("access_token")]
     if wanted != "todas":
@@ -121,6 +177,8 @@ def main():
         client = all_orders[0][0] if all_orders else server.MercadoLivreClient(accounts[0]["access_token"])
         owner = next((c for c, o in all_orders if identity in {str(o.get("id")), str(o.get("pack_id"))}), client)
         explain(owner, identity, [o for _, o in all_orders])
+    if list_file:
+        compare_list(list_file, accounts, all_orders, start, end)
     return 0
 
 

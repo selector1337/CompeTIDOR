@@ -1497,8 +1497,14 @@ function adTitleEditState(item) {
 
 // The server keeps the latest RECENT_SALES_PER_ACCOUNT sales of each store.
 const RECENT_SALES_PER_ACCOUNT = 80;
+// The date Mercado Livre's sales screen shows: payment approval when known,
+// otherwise order creation. Totals and analytics are not affected.
+function saleDisplayDate(sale) {
+  return sale?.approved_at || sale?.date || "";
+}
+
 function saleTimestamp(sale) {
-  const time = Date.parse(sale?.date || "");
+  const time = Date.parse(saleDisplayDate(sale));
   return Number.isFinite(time) ? time : 0;
 }
 function dashboardSalesRows(sales, account) {
@@ -1611,7 +1617,8 @@ function renderDashboard() {
           ${copyChip("SKU", sale.sku || "-")}
           ${copyChip("Qtd.", sale.quantity || 1)}
           ${copyChip("Canal", sale.channel || "Mercado Livre")}
-          ${copyChip("Data", formatDateBR(sale.date || "-"))}
+          ${sale.pack_id && String(sale.pack_id) !== String(sale.order_id) ? copyChip("Carrinho", sale.pack_id) : ""}
+          ${copyChip("Data", formatDateBR(saleDisplayDate(sale) || "-"))}
         </div>
       </div>
       <div class="sale-total">
@@ -4878,7 +4885,7 @@ function renderSalesReport() {
         return `
         <article class="sales-report-row">
           ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
-          <div class="sales-report-product"><div class="sales-report-product-title"><strong>${escapeText(row.product)}</strong>${row.flex ? `<span class="sales-flex-badge">FLEX</span>` : ""}</div><small>${escapeText(row.account)} · SKU ${escapeText(row.sku)} · ${escapeText(orderLabel(row))}</small><small>${formatDateBR(row.date)}</small></div>
+          <div class="sales-report-product"><div class="sales-report-product-title"><strong>${escapeText(row.product)}</strong>${row.flex ? `<span class="sales-flex-badge">FLEX</span>` : ""}</div><small>${escapeText(row.account)} · SKU ${escapeText(row.sku)} · ${escapeText(orderLabel(row))}</small><small>${formatDateBR(saleDisplayDate(row))}</small></div>
           <span><small>Qtd.</small><strong>${Number(row.quantity || 0)}</strong></span>
           <span><small>Venda</small><strong>${money.format(row.gross_amount || 0)}</strong></span>
           <span><small>Tarifa de venda</small><strong>${row.percentage_fee_amount == null ? "Não disponível" : money.format(row.percentage_fee_amount)}</strong></span>
@@ -5758,6 +5765,9 @@ function applyAssistedProduct(product) {
 document.querySelector("#publisher-accounts")?.addEventListener("change", updatePublisherStoreRequirements);
 document.querySelector('#product-publish-form [name="catalog_product_id"]')?.addEventListener("change", updatePublisherPublicationModes);
 document.querySelector('#product-publish-form [name="catalog_product_id"]')?.addEventListener("change", loadPublisherCatalogPackage);
+document.addEventListener("click", (event) => {
+  if (event.target.closest("[data-publisher-package-retry]")) loadPublisherCatalogPackage();
+});
 
 const PACKAGE_FIELDS = [["package_height", "cm"], ["package_width", "cm"], ["package_length", "cm"], ["package_weight", "g"]];
 
@@ -5781,17 +5791,27 @@ async function loadPublisherCatalogPackage() {
   box.className = "publisher-ml-package span-2";
   box.innerHTML = `<small>Consultando as medidas que o Mercado Livre tem para ${escapeText(catalogProductId)}…</small>`;
   try {
-    const accountIds = [...form.querySelectorAll("[data-publisher-account]:checked")].map((input) => input.value);
+    const publication = collectAssistedPublication();
     const queued = await api("/api/products/catalog-package", {
       method: "POST", manualProgress: false,
-      body: JSON.stringify({ catalog_product_id: catalogProductId, account_ids: accountIds }),
+      body: JSON.stringify({
+        catalog_product_id: catalogProductId,
+        account_ids: publication.account_ids,
+        official_store_ids: publication.official_store_ids,
+        // Used only for an official validation (nothing is created) when the
+        // product sheet and other offers do not carry the measures.
+        draft: { ...publication.draft, price: publication.variants[0]?.price || "" },
+      }),
     });
-    const result = await waitForAsyncOperation(queued);
+    const result = await waitForAsyncOperation(queued, (message) => {
+      if (token === state.publisherPackageToken && message) box.innerHTML = `<small>${escapeText(message)}</small>`;
+    });
     if (token !== state.publisherPackageToken) return;
     const values = result.values || {};
     if (!Object.keys(values).length) {
       box.className = "publisher-ml-package span-2 muted";
-      box.innerHTML = `<small>O Mercado Livre não informou pela API medidas para este produto de catálogo. Informe as medidas reais da embalagem.</small>`;
+      box.innerHTML = `<small>O Mercado Livre não tem medidas próprias para este produto (nem na ficha, nem nas ofertas, nem na validação oficial). Informe as medidas reais da embalagem.</small>
+        <button type="button" class="ghost mini-button" data-publisher-package-retry>Consultar novamente</button>`;
       return;
     }
     const raised = [];
@@ -5809,7 +5829,8 @@ async function loadPublisherCatalogPackage() {
   } catch (error) {
     if (token !== state.publisherPackageToken) return;
     box.className = "publisher-ml-package span-2 muted";
-    box.innerHTML = `<small>Não foi possível consultar as medidas do Mercado Livre agora: ${escapeText(error.message || "erro")}.</small>`;
+    box.innerHTML = `<small>Não foi possível consultar as medidas do Mercado Livre agora: ${escapeText(error.message || "erro")}.</small>
+      <button type="button" class="ghost mini-button" data-publisher-package-retry>Consultar novamente</button>`;
   }
 }
 
