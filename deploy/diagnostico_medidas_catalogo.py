@@ -10,8 +10,10 @@ regravado; se estiver vencido, rode de novo depois que o serviço renovar.
 Uso no servidor (troque MLB12345678 pelo código do produto de Catálogo, o que
 aparece no link /p/MLB...; a conta é opcional):
 
-  sudo -u www-data bash -c 'set -a; . /etc/competidor.env; cd /opt/competidor; \
-    .venv/bin/python deploy/diagnostico_medidas_catalogo.py MLB12345678 "NOME DA CONTA"'
+  sudo systemd-run --quiet --pty --wait --collect -p User=www-data \
+    -p WorkingDirectory=/opt/competidor -p EnvironmentFile=/etc/competidor.env \
+    -p EnvironmentFile=-/etc/competidor-dedicated.env \
+    /opt/competidor/.venv/bin/python deploy/diagnostico_medidas_catalogo.py MLB12345678 "NOME DA CONTA"
 """
 import json
 import sys
