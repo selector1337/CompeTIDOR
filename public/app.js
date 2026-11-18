@@ -201,6 +201,7 @@ const pageTitles = {
   anunciar: ["Cadastro inteligente", "Anunciar Produtos"],
   copiar: ["Multiplicar anúncios", "Copiar anúncios específicos"],
   kits: ["Composição de produtos", "Anunciar Kits"],
+  codigos: ["Controle interno", "Códigos EAN"],
   concorrentes: ["Monitoramento", "Concorrentes"],
   scan: ["Scan", "Acompanhar preços"],
   devolucoes: ["Pós-venda oficial", "Central de Devoluções"],
@@ -853,6 +854,7 @@ function renderRoute() {
     anunciar: renderAssistedPublisher,
     copiar: renderClone,
     kits: renderKits,
+    codigos: renderInternalCodes,
     concorrentes: renderCompetitors,
     scan: renderScan,
     devolucoes: renderReturns,
@@ -864,6 +866,139 @@ function renderRoute() {
   };
   (routeRenderers[state.route] || renderDashboard)();
 }
+
+// ---- Internal EAN-13 codes (GS1 040-049, restricted circulation) ----
+
+async function loadInternalCodes(force = false) {
+  if (state.internalCodes?.loading || (state.internalCodes?.loaded && !force)) return;
+  state.internalCodes = { ...(state.internalCodes || {}), loading: true };
+  try {
+    const result = await api("/api/internal-codes", { manualProgress: false });
+    state.internalCodes = { loaded: true, codes: result.codes || [], total: result.total || 0 };
+  } catch (error) {
+    state.internalCodes = { loaded: true, codes: [], total: 0, error: error.message };
+  }
+  renderInternalCodes();
+}
+
+function internalCodesCsv(rows) {
+  const lines = [["codigo", "gerado_em", "gerado_por", "observacao", "conferido_no_mercado_livre"],
+    ...rows.map((row) => [row.code, row.created_at, row.created_by, row.note, row.meli_checked ? "sim" : "nao"])];
+  return lines.map((line) => line.map((cell) => `"${String(cell ?? "").replace(/"/g, '""')}"`).join(";")).join("\n");
+}
+
+function downloadInternalCodes(rows, name) {
+  const blob = new Blob(["﻿" + internalCodesCsv(rows)], { type: "text/csv;charset=utf-8" });
+  const link = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: name });
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+function renderInternalCodes() {
+  const history = document.querySelector("#codes-history");
+  if (!history) return;
+  if (!state.internalCodes?.loaded) {
+    history.innerHTML = `<div class="notice">Carregando códigos já gerados…</div>`;
+    loadInternalCodes();
+    return;
+  }
+  const { codes = [], total = 0, error = "" } = state.internalCodes;
+  document.querySelector("#codes-total").textContent = `${total.toLocaleString("pt-BR")} código(s)`;
+  history.innerHTML = error
+    ? `<div class="notice danger-notice">${escapeText(error)}</div>`
+    : codes.length
+      ? `<table class="codes-table"><thead><tr><th>Código</th><th>Gerado em</th><th>Por</th><th>Observação</th><th>Mercado Livre</th></tr></thead><tbody>${codes.slice(0, 200).map((row) => `
+          <tr><td>${copyChip("EAN", row.code)}</td><td>${escapeText(row.created_at || "")}</td><td>${escapeText(row.created_by || "-")}</td>
+          <td>${escapeText(row.note || "")}</td><td>${row.meli_checked ? "Conferido" : "Não conferido"}</td></tr>`).join("")}</tbody></table>
+          ${codes.length > 200 ? `<small>Mostrando os 200 mais recentes. Use "Baixar todos (CSV)" para a lista completa.</small>` : ""}`
+      : `<div class="notice">Nenhum código gerado ainda.</div>`;
+}
+
+document.querySelector("#codes-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
+  const button = form.querySelector('button[type="submit"]');
+  const status = document.querySelector("#codes-status");
+  const resultBox = document.querySelector("#codes-result");
+  const body = {
+    prefix: form.elements.prefix.value.trim(),
+    quantity: Number(form.elements.quantity.value || 1),
+    note: form.elements.note.value.trim(),
+    meli_check: form.elements.meli_check.checked,
+  };
+  button.disabled = true;
+  status.textContent = "Gerando…";
+  try {
+    const queued = await api("/api/internal-codes/generate", { method: "POST", body: JSON.stringify(body) });
+    const result = await waitForAsyncOperation(queued, (message) => { status.textContent = message || "Gerando…"; });
+    const codes = result.codes || [];
+    state.lastInternalCodes = codes;
+    resultBox.hidden = false;
+    resultBox.innerHTML = `
+      <div class="codes-result-head"><strong>${codes.length} código(s) novo(s)${body.meli_check ? ", conferidos no Mercado Livre" : ""}</strong>
+        <span><button class="ghost mini-button" type="button" data-codes-copy>Copiar todos</button>
+        <button class="ghost mini-button" type="button" data-codes-export="last">Baixar CSV</button></span></div>
+      <div class="codes-list">${codes.map((row) => copyChip("EAN", row.code)).join("")}</div>
+      ${result.skipped?.length ? `<small>${result.skipped.length} número(s) pulado(s) por já estarem em uso: ${escapeText(result.skipped.slice(0, 5).map((row) => `${row.code} (${row.reason})`).join("; "))}${result.skipped.length > 5 ? "…" : ""}</small>` : ""}
+      <small>Ainda livres neste prefixo: ${Number(result.remaining || 0).toLocaleString("pt-BR")}.</small>`;
+    status.textContent = "";
+    showToast(`${codes.length} código(s) gerado(s).`);
+    loadInternalCodes(true);
+  } catch (error) {
+    status.textContent = "";
+    showToast(error.message || "Não foi possível gerar os códigos.", "error");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector("#codes-check-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const box = document.querySelector("#codes-check-result");
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
+  box.hidden = false;
+  box.className = "codes-check-result";
+  box.innerHTML = "<small>Conferindo…</small>";
+  try {
+    const queued = await api("/api/internal-codes/check", { method: "POST", body: JSON.stringify({ code: form.elements.code.value, meli_check: true }) });
+    const r = await waitForAsyncOperation(queued);
+    const lines = [];
+    lines.push(r.valid ? `Dígito verificador correto (${escapeText(r.type)}).` : escapeText(r.message || "Código inválido."));
+    if (r.valid) {
+      lines.push(`Faixa: ${escapeText(r.range || "-")}.`);
+      lines.push(r.generated_here ? `Gerado aqui em ${escapeText(r.generated.created_at || "")}${r.generated.note ? ` (${escapeText(r.generated.note)})` : ""}.` : "Não foi gerado por este app.");
+      lines.push(r.listings?.length ? `Usado como GTIN nos seus anúncios: ${escapeText(r.listings.join(", "))}.` : "Não é usado como GTIN nos seus anúncios.");
+      lines.push(r.meli_error ? `Não foi possível consultar o Mercado Livre: ${escapeText(r.meli_error)}.`
+        : r.meli_found ? "Existe no catálogo do Mercado Livre." : "Não existe no catálogo do Mercado Livre.");
+    }
+    box.className = `codes-check-result ${r.valid ? "success" : "danger"}`;
+    box.innerHTML = lines.map((line) => `<p>${line}</p>`).join("");
+  } catch (error) {
+    box.className = "codes-check-result danger";
+    box.innerHTML = `<p>${escapeText(error.message || "Não foi possível conferir o código.")}</p>`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.addEventListener("click", (event) => {
+  const exportButton = event.target.closest("[data-codes-export]");
+  if (exportButton) {
+    const rows = exportButton.dataset.codesExport === "last" ? (state.lastInternalCodes || []) : (state.internalCodes?.codes || []);
+    if (!rows.length) return showToast("Nenhum código para baixar.", "error");
+    downloadInternalCodes(rows, `codigos-ean-${new Date().toISOString().slice(0, 10)}.csv`);
+    return;
+  }
+  if (event.target.closest("[data-codes-copy]")) {
+    const text = (state.lastInternalCodes || []).map((row) => row.code).join("\n");
+    navigator.clipboard?.writeText(text).then(() => showToast("Códigos copiados.")).catch(() => showToast("Não foi possível copiar.", "error"));
+  }
+});
 
 function renderReportsHub() {
   const selector = document.querySelector("#reports-section-select");

@@ -16,7 +16,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..800&display=swap" />
   <link rel="stylesheet" href="/styles.css?v=20261109-margins" />
-  <link rel="stylesheet" href="/liquid-glass.css?v=20261118-glass17" />
+  <link rel="stylesheet" href="/liquid-glass.css?v=20261118-glass18" />
   </head>
   <body class="auth-loading">
     <div class="lg-aurora" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -60,6 +60,7 @@
         <a href="#/anunciar" data-route="anunciar" aria-label="Anunciar Produtos" title="Anunciar Produtos"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 3h12l4 4v14H4V3Zm11 1.8V8h3.2L15 4.8ZM8 11v2h3v3h2v-3h3v-2h-3V8h-2v3H8Zm0 7h8v-2H8v2Z"/></svg></span><strong>Anunciar Produtos</strong></a>
         <a href="#/copiar" data-route="copiar" aria-label="Copiar anúncios" title="Copiar anúncios"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M8 8h11v13H8V8Zm-3 8H3V3h13v2H5v11Z"/></svg></span><strong>Copiar anúncios</strong></a>
         <a href="#/kits" data-route="kits" aria-label="Anunciar Kits" title="Anunciar Kits"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Zm-7 9 7 4 7-4v6l-7 4-7-4v-6Zm7-1.3L16.9 7 12 4.3 7.1 7 12 9.7Z"/></svg></span><strong>Anunciar Kits</strong></a>
+        <a href="#/codigos" data-route="codigos" aria-label="Códigos EAN internos" title="Códigos EAN internos"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M3 4h2v16H3V4Zm3 0h1v16H6V4Zm2 0h2v16H8V4Zm3 0h1v16h-1V4Zm2 0h3v16h-3V4Zm4 0h1v16h-1V4Zm2 0h2v16h-2V4Z"/></svg></span><strong>Códigos EAN</strong></a>
         <span class="nav-group" aria-hidden="true">Operação</span>
         <a href="#/compras" data-route="compras" aria-label="Compras" title="Compras"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M7 4V2h2v2h6V2h2v2h3v18H4V4h3Zm11 6H6v10h12V10Zm-9 2h6v2H9v-2Zm0 4h6v2H9v-2Z"/></svg></span><strong>Compras</strong></a>
         <a href="#/devolucoes" data-route="devolucoes" aria-label="Central de Devoluções" title="Central de Devoluções"><span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M4 4h10v2H6v12h12v-5h2v7H4V4Zm12.6 1.4L19.2 8H11v2h8.2l-2.6 2.6L18 14l5-5-5-5-1.4 1.4ZM8 13h6v2H8v-2Z"/></svg></span><strong>Devoluções</strong></a>
@@ -1242,6 +1243,37 @@
         </div>
       </section>
 
+      <section class="page" id="page-codigos">
+        <div class="panel codes-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Controle interno</p>
+              <h2>Gerador de códigos EAN-13</h2>
+            </div>
+          </div>
+          <div class="notice codes-notice">
+            <strong>Códigos para uso interno (etiquetas, estoque, conferência)</strong>
+            <p>Os códigos começam entre 040 e 049, faixa que a GS1 reserva para uso interno de cada empresa e nunca atribui a fabricantes. Por isso não se confundem com o código de nenhum produto real. Cada código é gerado uma única vez, nunca repete um GTIN dos seus anúncios e, com a opção marcada, é conferido no catálogo do Mercado Livre.</p>
+            <p><b>Não use como GTIN de anúncio no Mercado Livre:</b> ele só aceita códigos oficiais da GS1. Para produtos sem código oficial, use o motivo de GTIN vazio.</p>
+          </div>
+          <form id="codes-form" class="codes-form">
+            <label>Prefixo <input name="prefix" inputmode="numeric" pattern="04[0-9]{1,7}" maxlength="9" value="04003" required /><small>De 040 a 049, com até 9 dígitos.</small></label>
+            <label>Quantidade <input name="quantity" type="number" min="1" max="500" step="1" value="1" required /><small>1 para um código, até 500 por lote.</small></label>
+            <label class="span-2">Observação <input name="note" maxlength="120" placeholder="Ex.: etiquetas do depósito, lote de novembro" /></label>
+            <label class="check-row span-2"><input name="meli_check" type="checkbox" checked /><span>Conferir cada código no catálogo do Mercado Livre antes de entregar</span></label>
+            <div class="codes-actions span-2"><button class="primary" type="submit">Gerar códigos</button><small id="codes-status"></small></div>
+          </form>
+          <div id="codes-result" class="codes-result" hidden></div>
+          <form id="codes-check-form" class="codes-check">
+            <label>Verificar um código <input name="code" inputmode="numeric" maxlength="14" placeholder="Digite um EAN, UPC ou GTIN" required /></label>
+            <button class="ghost" type="submit">Verificar</button>
+          </form>
+          <div id="codes-check-result" class="codes-check-result" hidden></div>
+          <div class="codes-history-head"><strong>Códigos já gerados</strong><span><small id="codes-total"></small><button class="ghost mini-button" type="button" data-codes-export="all">Baixar todos (CSV)</button></span></div>
+          <div id="codes-history" class="codes-history"></div>
+        </div>
+      </section>
+
       <section class="page" id="page-kits">
         <div class="panel kit-builder">
           <div class="panel-heading compact">
@@ -1556,7 +1588,7 @@
 
     <div id="manual-action-center" class="manual-action-center" aria-live="polite"></div>
     <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/app.js?v=20261118-glass17"></script>
+  <script src="/app.js?v=20261118-glass18"></script>
   <script src="/goal-pricing.js?v=20261113-glass8"></script>
   <script src="/sales-goals.js?v=20261113-glass8"></script>
   <script src="/official-stores.js?v=20260923-clear-pending"></script>

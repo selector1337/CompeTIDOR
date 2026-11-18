@@ -2766,6 +2766,10 @@ class MercadoLivreClient:
         }
         return self.get(f"/products/search?{urlencode(params)}", **interactive_request_options())
 
+    def product_by_identifier(self, code, site_id="MLB"):
+        params = {"status": "active", "site_id": site_id or "MLB", "product_identifier": str(code or "").strip()}
+        return self.get(f"/products/search?{urlencode(params)}", **interactive_request_options())
+
     def category(self, category_id):
         return self.get(f"/categories/{category_id}", **interactive_request_options())
 
@@ -3562,6 +3566,68 @@ def catalog_package_reference(client, catalog_product_id):
         source = "ficha do produto no Mercado Livre" if from_product else "anúncios deste produto" if from_offers else ""
     values = {field: int(max(1, math.ceil(value))) for field, value in values.items()}
     return {"values": values, "source": source, "complete": all(field in values for field in fields)}
+
+
+def internal_codes_meli_checker(payload):
+    """code -> True when Mercado Livre's product catalog already has it."""
+    import internal_codes
+    accounts = [a for a in payload.get("accounts") or [] if a.get("official") and a.get("access_token")]
+    if not accounts:
+        raise RuntimeError("Conecte uma conta oficial para consultar o catálogo do Mercado Livre.")
+    client = account_client(accounts[0])
+
+    def known(code):
+        for candidate in {internal_codes.clean_code(code), internal_codes.as_gtin13(code)}:
+            try:
+                response = client.product_by_identifier(candidate) or {}
+            except Exception as exc:
+                # 400/404: Mercado Livre does not know this identifier. Other
+                # failures (network, 5xx) stop the check instead of guessing.
+                if meli_error_status(exc) in {400, 404}:
+                    continue
+                raise
+            if response.get("results"):
+                return True
+        return False
+
+    def found(codes):
+        hits = set()
+        for code, is_known, error in parallel_item_calls([(code, lambda code=code: known(code)) for code in codes]):
+            if error is not None:
+                raise error
+            if is_known:
+                hits.add(code)
+        return hits
+    return found
+
+
+def internal_codes_generate_operation(request, actor=None):
+    import internal_codes
+    if (actor or {}).get("role") == "viewer":
+        raise RuntimeError("Usuários com acesso somente para leitura não podem gerar códigos.")
+    checker = internal_codes_meli_checker(read_payload(include_catalog=False)) if request.get("meli_check", True) else None
+    try:
+        return internal_codes.generate(
+            sys.modules[__name__], request.get("quantity") or 1, request.get("prefix") or internal_codes.DEFAULT_PREFIX,
+            request.get("note") or "", actor, checker,
+            progress=lambda done, total: update_async_operation_progress(f"Gerado {done} de {total} código(s).", done, total),
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def internal_codes_check_operation(request):
+    import internal_codes
+    checker = internal_codes_meli_checker(read_payload(include_catalog=False)) if request.get("meli_check", True) else None
+    return internal_codes.check(sys.modules[__name__], request.get("code"), checker)
+
+
+def internal_codes_list():
+    import internal_codes
+    registry = read_json(internal_codes.REGISTRY_FILE, internal_codes.empty_registry())
+    codes = list(reversed(registry.get("codes") or []))
+    return {"codes": codes[:5000], "total": len(codes), "default_prefix": internal_codes.DEFAULT_PREFIX,
+            "last_serial": registry.get("last_serial") or {}, "max_batch": internal_codes.MAX_BATCH}
 
 
 PACKAGE_PROBE_LIMITS = {"package_height": 300, "package_width": 300, "package_length": 300, "package_weight": 100_000}
@@ -25090,6 +25156,12 @@ class App(BaseHTTPRequestHandler):
         if parsed.path == "/api/accounts":
             self.send_json([public_account(account) for account in payload["accounts"]])
             return
+        if parsed.path == "/api/internal-codes":
+            try:
+                self.send_json(internal_codes_list())
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, status=400)
+            return
         if parsed.path == "/api/returns":
             try:
                 self.send_json(query_returns(parse_qs(parsed.query)))
@@ -25314,6 +25386,8 @@ class App(BaseHTTPRequestHandler):
             "/api/products/import",
             "/api/products/category",
             "/api/products/catalog-package",
+            "/api/internal-codes/generate",
+            "/api/internal-codes/check",
             "/api/products/validate",
             "/api/products/picture",
             "/api/kits/preview",
@@ -25723,6 +25797,20 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path in {"/api/internal-codes/generate", "/api/internal-codes/check"}:
+            request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+            actor = self.current_user(payload)
+            generate = parsed.path.endswith("/generate")
+            operation = start_async_operation(
+                "internal_codes_generate" if generate else "internal_codes_check",
+                (lambda: internal_codes_generate_operation(request_copy, actor)) if generate
+                else (lambda: internal_codes_check_operation(request_copy)),
+                "Gerando e conferindo os códigos." if generate else "Conferindo o código.",
+                priority="manual",
+            )
+            self.send_json({"ok": True, **operation}, status=202)
             return
 
         if parsed.path == "/api/products/catalog-package":
