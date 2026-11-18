@@ -9535,6 +9535,9 @@ def sync_recent_sales(payload, account, client, orders=None, dashboard_only=Fals
             sale = {
                 "id": f"{order.get('id')}-{item.get('id') or len(rows)}",
                 "order_id": order.get("id"),
+                # Mercado Livre's sales screen shows the cart (pack) number for
+                # carts; keep it so the same number can be found here.
+                "pack_id": order.get("pack_id") or "",
                 "account": account.get("nickname"),
                 "product": item.get("title") or "Produto sem título",
                 "item_id": item.get("id") or "",
@@ -11730,6 +11733,7 @@ def sync_pending_shipments_from_orders(payload, account, orders):
             {
                 "account": account.get("nickname"),
                 "order_id": order.get("id") or "-",
+                "pack_id": order.get("pack_id") or "",
                 "buyer": first_present(order, ["buyer.nickname", "buyer.first_name"], "Comprador Mercado Livre"),
                 "deadline": deadline,
                 "time_left": dispatch_time_left(deadline),
@@ -19557,6 +19561,7 @@ def query_sales_report(payload, request, *, target_skus=None, paid_only=False):
                         "date": sold_at.isoformat() if sold_at else str(order.get("date_created") or ""),
                         "account": account.get("nickname") or str(account.get("seller_id") or ""),
                         "order_id": order_id,
+                        "pack_id": order.get("pack_id") or "",
                         "item_id": item_id,
                         "sku": sku,
                         "brand": item_brand,

@@ -310,6 +310,14 @@ function renderManualActions() {
   }).join("");
 }
 
+// "Pedido X · Carrinho Y". Mercado Livre's sales screen shows the cart
+// (pack) number for carts, so both are shown to find the same sale here.
+function orderLabel(row) {
+  const order = String(row?.order_id || "-");
+  const pack = String(row?.pack_id || "");
+  return pack && pack !== order ? `Pedido ${order} · Carrinho ${pack}` : `Pedido ${order}`;
+}
+
 // Real pixel size of an image file, read by the browser (same check used
 // when editing photos in Anúncios).
 function imageDimensions(dataUrl, name = "imagem") {
@@ -1583,7 +1591,7 @@ function renderDashboard() {
   document.querySelector("#dashboard-shipments").innerHTML = shipmentPage.items.map((item) => `
     <article class="ops-item">
       <strong>${item.account}</strong>
-      <p>Pedido ${item.order_id} · ${item.buyer}</p>
+      <p>${escapeText(orderLabel(item))} · ${item.buyer}</p>
       <div class="chip-row">${copyChip("Conta", item.account)}${copyChip("Envio", item.shipment_id || "-")}${copyChip("Limite", formatDateBR(item.deadline))}${copyChip("Falta", timeLeftBR(item.deadline, item.time_left))}</div>
       ${item.sync_status ? `<small>${escapeText(item.sync_status)}</small>` : ""}
     </article>
@@ -1609,7 +1617,7 @@ function renderDashboard() {
       <div class="sale-total">
         <span>Valor vendido</span>
         <strong>${money.format(sale.total || 0)}</strong>
-        <small>Pedido ${sale.order_id || "-"}</small>
+        <small>${escapeText(orderLabel(sale))}</small>
       </div>
     </article>
   `).join("") + paginationHtml("dashboardSalesPage", salesPage) || `<div class="notice">Nenhuma venda recente sincronizada. Sincronize uma conta oficial com permissão de vendas/pedidos para preencher este bloco.</div>`;
@@ -4870,7 +4878,7 @@ function renderSalesReport() {
         return `
         <article class="sales-report-row">
           ${row.thumbnail ? `<img src="${escapeAttr(row.thumbnail)}" alt="" loading="lazy" />` : `<span class="statistics-thumb-empty"></span>`}
-          <div class="sales-report-product"><div class="sales-report-product-title"><strong>${escapeText(row.product)}</strong>${row.flex ? `<span class="sales-flex-badge">FLEX</span>` : ""}</div><small>${escapeText(row.account)} · SKU ${escapeText(row.sku)} · Pedido ${escapeText(row.order_id)}</small><small>${formatDateBR(row.date)}</small></div>
+          <div class="sales-report-product"><div class="sales-report-product-title"><strong>${escapeText(row.product)}</strong>${row.flex ? `<span class="sales-flex-badge">FLEX</span>` : ""}</div><small>${escapeText(row.account)} · SKU ${escapeText(row.sku)} · ${escapeText(orderLabel(row))}</small><small>${formatDateBR(row.date)}</small></div>
           <span><small>Qtd.</small><strong>${Number(row.quantity || 0)}</strong></span>
           <span><small>Venda</small><strong>${money.format(row.gross_amount || 0)}</strong></span>
           <span><small>Tarifa de venda</small><strong>${row.percentage_fee_amount == null ? "Não disponível" : money.format(row.percentage_fee_amount)}</strong></span>
