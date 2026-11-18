@@ -4518,3 +4518,7 @@ html:root body #page-copiar .clone-batch-toolbar { align-items: center; gap: 14p
 html:root body #page-copiar .clone-batch-toolbar small { color: var(--muted, #9aa0aa); flex: 1 1 260px; text-align: right; }
 html:root body #page-copiar .clone-ml-reason small { color: var(--muted, #9aa0aa); }
 html:root body #page-copiar :is(input, select).input-error { border-color: #ef4444 !important; box-shadow: 0 0 0 3px rgba(239, 68, 68, .2) !important; }
+/* 30. Anunciar: medidas informadas pelo Mercado Livre */
+html:root body #page-anunciar .publisher-ml-package { display: grid; gap: 4px; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line, rgba(255,255,255,.12)); }
+html:root body #page-anunciar .publisher-ml-package.success { border-color: rgba(34, 197, 94, .45); background: rgba(34, 197, 94, .08); }
+html:root body #page-anunciar .publisher-ml-package small { color: var(--muted, #9aa0aa); }

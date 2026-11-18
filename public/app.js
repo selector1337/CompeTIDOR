@@ -310,6 +310,17 @@ function renderManualActions() {
   }).join("");
 }
 
+// Real pixel size of an image file, read by the browser (same check used
+// when editing photos in Anúncios).
+function imageDimensions(dataUrl, name = "imagem") {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+    image.onerror = () => reject(new Error(`${name}: imagem inválida.`));
+    image.src = dataUrl;
+  });
+}
+
 function formatElapsed(ms) {
   const seconds = Math.max(0, Math.round(ms / 1000));
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}min ${String(seconds % 60).padStart(2, "0")}s`;
@@ -5733,10 +5744,66 @@ function applyAssistedProduct(product) {
   document.querySelector("#publisher-validation").hidden = true;
   updatePublisherTitleCounter();
   renderAssistedPublisher();
+  loadPublisherCatalogPackage();
 }
 
 document.querySelector("#publisher-accounts")?.addEventListener("change", updatePublisherStoreRequirements);
 document.querySelector('#product-publish-form [name="catalog_product_id"]')?.addEventListener("change", updatePublisherPublicationModes);
+document.querySelector('#product-publish-form [name="catalog_product_id"]')?.addEventListener("change", loadPublisherCatalogPackage);
+
+const PACKAGE_FIELDS = [["package_height", "cm"], ["package_width", "cm"], ["package_length", "cm"], ["package_weight", "g"]];
+
+function packageText(values) {
+  const size = ["package_height", "package_width", "package_length"].map((field) => values[field] ?? "?").join(" x ");
+  const weight = values.package_weight ? `${(values.package_weight / 1000).toLocaleString("pt-BR", { maximumFractionDigits: 3 })} kg` : "peso ?";
+  return `${size} cm (altura x largura x comprimento) e ${weight}`;
+}
+
+// Measures Mercado Livre already has for the selected catalog product. When
+// found, they fill the empty or smaller package fields (the catalog rejects
+// smaller ones) and stay visible so the user knows where they came from.
+async function loadPublisherCatalogPackage() {
+  const form = document.querySelector("#product-publish-form");
+  const box = document.querySelector("#publisher-ml-package");
+  const catalogProductId = form?.elements.catalog_product_id?.value || "";
+  if (!box) return;
+  const token = (state.publisherPackageToken = (state.publisherPackageToken || 0) + 1);
+  if (!catalogProductId) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.className = "publisher-ml-package span-2";
+  box.innerHTML = `<small>Consultando as medidas que o Mercado Livre tem para ${escapeText(catalogProductId)}…</small>`;
+  try {
+    const accountIds = [...form.querySelectorAll("[data-publisher-account]:checked")].map((input) => input.value);
+    const queued = await api("/api/products/catalog-package", {
+      method: "POST", manualProgress: false,
+      body: JSON.stringify({ catalog_product_id: catalogProductId, account_ids: accountIds }),
+    });
+    const result = await waitForAsyncOperation(queued);
+    if (token !== state.publisherPackageToken) return;
+    const values = result.values || {};
+    if (!Object.keys(values).length) {
+      box.className = "publisher-ml-package span-2 muted";
+      box.innerHTML = `<small>O Mercado Livre não informou pela API medidas para este produto de catálogo. Informe as medidas reais da embalagem.</small>`;
+      return;
+    }
+    const raised = [];
+    PACKAGE_FIELDS.forEach(([field]) => {
+      const input = form.elements[field];
+      const value = Number(values[field]);
+      if (!input || !Number.isFinite(value) || value <= 0) return;
+      const current = Number(input.value || 0);
+      if (!current || current < value) { input.value = String(value); raised.push(field); }
+    });
+    box.className = "publisher-ml-package span-2 success";
+    box.innerHTML = `<strong>Medidas do Mercado Livre para este produto: ${escapeText(packageText(values))}</strong>
+      <small>Fonte: ${escapeText(result.source || "Mercado Livre")}.${result.complete ? "" : " Algumas medidas não foram informadas; complete as que faltam."}
+      ${raised.length ? " Os campos abaixo foram preenchidos com elas." : " As medidas informadas já são iguais ou maiores."}</small>`;
+  } catch (error) {
+    if (token !== state.publisherPackageToken) return;
+    box.className = "publisher-ml-package span-2 muted";
+    box.innerHTML = `<small>Não foi possível consultar as medidas do Mercado Livre agora: ${escapeText(error.message || "erro")}.</small>`;
+  }
+}
 
 function updatePublisherTitleCounter() {
   const input = document.querySelector('#product-publish-form [name="title"]');
@@ -8332,9 +8399,11 @@ document.querySelector("#publisher-picture-upload")?.addEventListener("change", 
         reader.onerror = reject;
         reader.readAsDataURL(file);
       });
+      const { width, height } = await imageDimensions(dataUrl, file.name);
+      if (width < 500 || height < 500) throw new Error(`a imagem tem ${width} x ${height} px; o mínimo é 500 x 500 px.`);
       const queued = await api("/api/products/picture", {
         method: "POST",
-        body: JSON.stringify({ account_id: selectedAccount, filename: file.name, data_url: dataUrl }),
+        body: JSON.stringify({ account_id: selectedAccount, filename: file.name, data_url: dataUrl, width, height }),
       });
       const uploaded = await waitForAsyncOperation(queued);
       if (!state.productPictureRows) renderPublisherPictures();
@@ -9062,12 +9131,16 @@ document.querySelector("#kit-picture-upload")?.addEventListener("change", async 
         reader.onerror = reject;
         reader.readAsDataURL(file);
       });
+      const { width, height } = await imageDimensions(dataUrl, file.name);
+      if (width < 500 || height < 500) throw new Error(`a imagem tem ${width} x ${height} px; o mínimo é 500 x 500 px.`);
       const queued = await api("/api/kits/picture", {
         method: "POST",
         body: JSON.stringify({
           account_id: state.kitTarget,
           filename: file.name,
           data_url: dataUrl,
+          width,
+          height,
         }),
       });
       const uploaded = await waitForAsyncOperation(queued);

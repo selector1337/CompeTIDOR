@@ -840,6 +840,7 @@ LANE_BY_KIND = {
     "clone_stores": "prepare",
     "clone_preview": "prepare",
     "product_validate": "prepare",
+    "catalog_package": "prepare",
 }
 HEAVY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=HEAVY_CONCURRENT_JOBS, thread_name_prefix="heavy-job")
 # Direct listing edits (price, availability, Flex, pickup, delete) get their
@@ -3534,6 +3535,42 @@ def catalog_offer_package_minimums(client, catalog_product_id, product=None):
             row["package_weight"],
         ),
     )
+
+
+def catalog_package_reference(client, catalog_product_id):
+    """Measures Mercado Livre already has for a catalog product, to show before publishing.
+
+    Accepted offers of the same product carry the package Mercado Livre uses
+    for shipping (SELLER_PACKAGE_* or shipping.dimensions); a complete one is
+    preferred because its four values were validated together. The product
+    sheet fills in what the offers do not have. Weight in grams, sizes in cm."""
+    catalog_product_id = clean_attribute_value(catalog_product_id)
+    if not catalog_product_id:
+        return {"values": {}, "source": "", "complete": False}
+    try:
+        product = call_interactive_client_method(client.product, catalog_product_id) or {}
+    except Exception:
+        product = {}
+    from_offers = catalog_offer_package_minimums(client, catalog_product_id, product)
+    from_product = catalog_product_package_minimums(product)
+    fields = ("package_height", "package_width", "package_length", "package_weight")
+    if all(field in from_offers for field in fields):
+        values, source = from_offers, "anúncios deste produto já aceitos pelo Mercado Livre"
+    else:
+        values = {field: max(from_offers.get(field, 0), from_product.get(field, 0)) for field in fields}
+        values = {field: value for field, value in values.items() if value}
+        source = "ficha do produto no Mercado Livre" if from_product else "anúncios deste produto" if from_offers else ""
+    values = {field: int(max(1, math.ceil(value))) for field, value in values.items()}
+    return {"values": values, "source": source, "complete": all(field in values for field in fields)}
+
+
+def catalog_package_reference_operation(payload, request):
+    account_ids = [str(value) for value in request.get("account_ids") or [] if value]
+    accounts = [a for a in payload.get("accounts") or [] if a.get("official") and a.get("access_token")]
+    account = next((a for a in accounts if str(a.get("id")) in account_ids), None) or (accounts[0] if accounts else None)
+    if not account:
+        raise RuntimeError("Conecte uma conta oficial para consultar as medidas do Mercado Livre.")
+    return catalog_package_reference(account_client(account), request.get("catalog_product_id"))
 
 
 def catalog_safe_package_draft(client, draft):
@@ -17033,8 +17070,21 @@ def create_official_clone(payload, job, source_item_id, edits):
                 verified_item = dict(created) if all(created.get(field) is not None for field in ("title", "price", "status")) else target_client.item_for_clone(created["id"]) if callable(getattr(target_client, "item_for_clone", None)) else target_client.item(created["id"])
         except Exception as exc:
             created["_verification_warning"] = f"Anúncio criado, mas ainda não apareceu na leitura imediata da API: {exc}"
-        official_title = clean_attribute_value((verified_item or created).get("title"))
-        if title_changed and official_title and official_title != requested_title:
+        official = verified_item or created
+        official_title = clean_attribute_value(official.get("title"))
+        if clean_attribute_value(official.get("family_name")):
+            # The item was created on the User Products model: remember it so
+            # the next copies already send the title as family_name.
+            target_account["publication_model"] = "user_product"
+        if title_changed and official_title and clean_attribute_value(official.get("family_name")):
+            # On this model Mercado Livre builds the title from family_name:
+            # it normalizes capitalization and appends attributes such as the
+            # color, and it does not allow changing the title afterwards.
+            if not normalized_attribute_label(official_title).startswith(normalized_attribute_label(requested_title)):
+                created["_verification_warning"] = (created.get("_verification_warning", "") +
+                    f" Neste modelo de anúncio o Mercado Livre monta o título a partir do nome do produto e gerou "
+                    f"\"{official_title}\". Ele não permite alterar o título depois de criado.").strip()
+        elif title_changed and official_title and official_title != requested_title:
             try:
                 with job_step("titulo"):
                     call_interactive_client_method(target_client.update_item, created["id"], {"title": requested_title})
@@ -17700,7 +17750,12 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
         report(f"Lendo a ficha da categoria para a conta {account.get('nickname')}.")
         with job_step("categoria"):
             definitions = cached_category_attributes(client, category_id) if category_id else []
-            catalog_draft = catalog_safe_package_draft(client, draft) if "catalog" in publication_modes else draft
+            # A traditional listing created to be linked to a catalog product is
+            # checked against that product's measures when it is linked, so it
+            # needs the same minimum package as a catalog listing.
+            catalog_draft = catalog_safe_package_draft(
+                client, {**draft, "catalog_product_id": linked_catalog_product_id or draft.get("catalog_product_id")},
+            ) if "catalog" in publication_modes or linked_catalog_product_id else draft
         for variant, publication_mode in (
             (variant, publication_mode)
             for variant in variants
@@ -17714,7 +17769,7 @@ def publish_assisted_product_operation(payload, request, actor=None, *, linked_c
             item_id = ""
             try:
                 mode_draft = {
-                    **(catalog_draft if publication_mode == "catalog" else draft),
+                    **(catalog_draft if publication_mode == "catalog" or linked_catalog_product_id else draft),
                     "catalog_listing": publication_mode == "catalog",
                 }
                 if publication_mode == "traditional":
@@ -23989,6 +24044,13 @@ def upload_kit_picture(request):
     content = base64.b64decode(match.group(2), validate=True)
     if len(content) > 10 * 1024 * 1024:
         raise RuntimeError("A imagem excede o limite de 10 MB.")
+    # Same rule as editing photos in Anúncios: check the file's real size,
+    # measured by the browser. Mercado Livre's "max_size" describes its own
+    # processed copy (borders may be trimmed) and rejected valid photos.
+    width = int(request.get("width") or 0)
+    height = int(request.get("height") or 0)
+    if width and height and (width < 500 or height < 500):
+        raise RuntimeError(f"A imagem tem {width} x {height} px; o mínimo é 500 x 500 px.")
     result = run_interactive_meli_call(
         account_client(account).upload_item_picture,
         content,
@@ -23996,9 +24058,6 @@ def upload_kit_picture(request):
         match.group(1).lower(),
     )
     size = str(result.get("max_size") or "")
-    size_match = re.match(r"(\d+)x(\d+)", size)
-    if size_match and min(int(size_match.group(1)), int(size_match.group(2))) < 500:
-        raise RuntimeError("A imagem precisa ter no mínimo 500 x 500 px.")
     if not result.get("id"):
         raise RuntimeError("O Mercado Livre não confirmou o upload da imagem.")
     return {"ok": True, "id": result["id"], "max_size": size}
@@ -25149,6 +25208,7 @@ class App(BaseHTTPRequestHandler):
             "/api/clone/execute-batch",
             "/api/products/import",
             "/api/products/category",
+            "/api/products/catalog-package",
             "/api/products/validate",
             "/api/products/picture",
             "/api/kits/preview",
@@ -25558,6 +25618,16 @@ class App(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, **operation}, status=202)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/products/catalog-package":
+            request_copy = json.loads(json.dumps(request, ensure_ascii=False))
+            operation = start_async_operation(
+                "catalog_package",
+                lambda: catalog_package_reference_operation(read_payload(include_catalog=False), request_copy),
+                "Consultando as medidas do produto no Mercado Livre.",
+            )
+            self.send_json({"ok": True, **operation}, status=202)
             return
 
         if parsed.path == "/api/products/category":
