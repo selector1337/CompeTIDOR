@@ -7600,7 +7600,9 @@ document.querySelector("#ads-bulk-price")?.addEventListener("click", async (even
       state.bulkPriceProgress = {
         status: "completed",
         operation: state.bulkPriceProgress.operation,
-        message: result.failed ? "Alguns anúncios precisam de nova tentativa." : deleting ? "Anúncios excluídos definitivamente." : "Retirada pessoal atualizada.",
+        message: result.failed ? "Alguns anúncios precisam de nova tentativa." : deleting ? "Anúncios excluídos definitivamente."
+          : result.confirmed === result.updated ? "Retirada pessoal atualizada e confirmada pelo Mercado Livre."
+          : `Retirada pessoal enviada: ${result.confirmed || 0} de ${result.updated || 0} já confirmados; o Mercado Livre ainda está aplicando os demais.`,
         completed: (result.results || []).length,
         total: (result.results || []).length,
         percent: 100,
@@ -7973,7 +7975,7 @@ document.querySelector("#ads-list").addEventListener("click", async (event) => {
         activate ? "Ativando..." : "Desativando...",
       );
       mergeCatalogItem(result?.item);
-      showToast(`Retirada pessoal ${activate ? "ativada" : "desativada"} com sucesso.`, "success");
+      showToast(result?.message || `Retirada pessoal ${activate ? "ativada" : "desativada"}.`, "success");
       renderAds();
     } catch (error) {
       showToast(error.message || "Não foi possível alterar a retirada pessoal.", "error");

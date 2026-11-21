@@ -916,6 +916,7 @@ ALLOWED_MELI_PATHS = (
     re.compile(r"^/items/[^/]+/price_to_win(\?|$)"),
     re.compile(r"^/items/[^/]+/sale_price(\?|$)"),
     re.compile(r"^/items/[^/]+/catalog_listing_eligibility(\?|$)"),
+    re.compile(r"^/flex/sites/[A-Z]{3}/items/[A-Z]{3}[0-9]+/v2$"),
     re.compile(r"^/item/[A-Z]{3}[0-9]+/performance(\?|$)"),
     re.compile(r"^/user-product/[^/]+/performance(\?|$)"),
     re.compile(r"^/categories/[^/]+/attributes(\?|$)"),
@@ -2598,6 +2599,32 @@ class MercadoLivreClient:
             retries=retries,
             timeout=timeout,
         )
+
+    def delete(self, path, timeout=None):
+        validate_meli_path(path)
+        return request_json(
+            f"{MELI_API_URL}{path}",
+            method="DELETE",
+            headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"},
+            retries=1,
+            timeout=timeout,
+        )
+
+    # Official Mercado Envios Flex endpoints (opt-in/opt-out per item).
+    def flex_status(self, item_id, site_id="MLB"):
+        return self.get(f"/flex/sites/{site_id}/items/{item_id}/v2", **interactive_request_options())
+
+    def flex_activate(self, item_id, site_id="MLB"):
+        path = f"/flex/sites/{site_id}/items/{item_id}/v2"
+        validate_meli_path(path)
+        return request_json(
+            f"{MELI_API_URL}{path}", method="POST",
+            headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"},
+            retries=1, timeout=interactive_request_options()["timeout"],
+        )
+
+    def flex_deactivate(self, item_id, site_id="MLB"):
+        return self.delete(f"/flex/sites/{site_id}/items/{item_id}/v2", timeout=interactive_request_options()["timeout"])
 
     def me(self):
         return self.get("/users/me")
@@ -14146,6 +14173,75 @@ def win_catalog_operation(request, actor=None):
     return {"ok": True, "official": official, "item": item}
 
 
+CONFIRMATION_WAITS = (0.6, 1.2, 2.0, 3.0)  # seconds between read-backs (~7 s total)
+
+
+def flex_has(client, item_id):
+    return bool((call_interactive_client_method(client.flex_status, item_id) or {}).get("has_flex"))
+
+
+def apply_flex_change(client, item_id, activate):
+    """Turn Flex on/off with the official endpoints and confirm it.
+
+    Returns "confirmed" or "already". Raises with a clear message when Mercado
+    Livre refuses or does not confirm, so the app never reports a change that
+    did not happen (the old PUT of shipping.logistic_type could be accepted and
+    silently ignored)."""
+    if flex_has(client, item_id) == activate:
+        return "already"
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            run_interactive_meli_call(client.flex_activate if activate else client.flex_deactivate, item_id)
+            break
+        except Exception as exc:
+            status = meli_error_status(exc)
+            text = meli_error_text(exc).lower()
+            if activate and status == 400 and "already" in text:
+                break
+            if status == 409 and attempts < 3:  # concurrent change on the same item
+                time.sleep(1.0 * attempts)
+                continue
+            if status == 403:
+                raise RuntimeError("O Mercado Livre não oferece Flex para este anúncio (modalidade de envio, categoria ou zona de cobertura).") from exc
+            if status == 404:
+                raise RuntimeError("O Mercado Livre não encontrou o Flex para este anúncio ou conta (Flex desativado na conta?).") from exc
+            raise
+    for wait in CONFIRMATION_WAITS:
+        time.sleep(wait)
+        try:
+            if flex_has(client, item_id) == activate:
+                return "confirmed"
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"O Mercado Livre recebeu o pedido para {'ativar' if activate else 'desativar'} o Flex, mas não confirmou a mudança. "
+        "Confira o anúncio em alguns minutos antes de repetir."
+    )
+
+
+def apply_local_pickup_change(client, item_id, target):
+    """Send local pickup and read it back. Returns "confirmed" or "sent"."""
+    run_interactive_meli_call(client.update_item, item_id, {"shipping": {"local_pick_up": bool(target)}})
+    for wait in CONFIRMATION_WAITS:
+        time.sleep(wait)
+        try:
+            official = call_interactive_client_method(client.item_for_clone, item_id) or {}
+            if bool((official.get("shipping") or {}).get("local_pick_up")) == bool(target):
+                return "confirmed"
+        except Exception:
+            continue
+    return "sent"
+
+
+def flex_local_logistic_type(item, activate):
+    if activate:
+        return "self_service"
+    previous = str(item.get("shipping_logistic_type") or "")
+    return previous if previous and previous != "self_service" else "drop_off"
+
+
 def flex_item_operation(request, actor=None, activate=False):
     payload = read_payload()
     item_id = str(request.get("item_id") or "")
@@ -14163,12 +14259,12 @@ def flex_item_operation(request, actor=None, activate=False):
     action = "ativar" if activate else "remover"
     if not account or not account.get("official"):
         raise RuntimeError(f"Conta oficial não encontrada para {action} o Mercado Envios Flex.")
-    logistic_type = "self_service" if activate else "drop_off"
-    update = {"shipping": {"mode": item.get("shipping_mode") or "me2", "logistic_type": logistic_type}}
-    official = run_interactive_meli_call(account_client(account).update_item, item_id, update)
+    outcome = apply_flex_change(account_client(account), item_id, activate)
+    logistic_type = flex_local_logistic_type(item, activate)
     old_logistic_type = item.get("shipping_logistic_type") or ""
-    item["shipping_mode"] = update["shipping"]["mode"]
+    official = {"has_flex": activate, "result": outcome}
     item["shipping_logistic_type"] = logistic_type
+    item["flex_active"] = bool(activate)
     item["item_data_checked_at"] = now_label()
     item["updated_at"] = now_label()
     append_item_log(
@@ -14198,11 +14294,8 @@ def local_pickup_item_operation(request, actor=None, activate=False):
     if not account:
         raise RuntimeError("Conta oficial não encontrada para alterar a retirada pessoal.")
     target = bool(activate)
-    official = run_interactive_meli_call(
-        account_client(account).update_item,
-        item_id,
-        {"shipping": {"local_pick_up": target}},
-    )
+    outcome = apply_local_pickup_change(account_client(account), item_id, target)
+    official = {"local_pick_up": target, "result": outcome}
     previous = bool(item.get("local_pick_up"))
     item["local_pick_up"] = target
     item["item_data_checked_at"] = now_label()
@@ -14213,7 +14306,14 @@ def local_pickup_item_operation(request, actor=None, activate=False):
         {"local_pick_up": {"from": previous, "to": target}},
     )
     write_payload(payload)
-    return {"ok": True, "official": official, "item": item}
+    return {"ok": True, "official": official, "item": item, "confirmed": outcome == "confirmed",
+            "message": PICKUP_RESULT_MESSAGES[outcome]}
+
+
+PICKUP_RESULT_MESSAGES = {
+    "confirmed": "O Mercado Livre confirmou a alteração da retirada pessoal.",
+    "sent": "Alteração enviada e aceita pelo Mercado Livre; ele ainda está aplicando e o anúncio pode levar alguns minutos para mostrar.",
+}
 
 
 def delete_item_operation(request, actor=None):
@@ -14509,47 +14609,58 @@ def bulk_flex_operation(request, actor=None, activate=False):
     payload = read_payload(include_catalog=True)
     catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
     accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
-    results = []
+    results = {}
     total = len(item_ids)
+    done = 0
     action_label = "ativação" if activate else "remoção"
-    target_logistic_type = "self_service" if activate else "drop_off"
     update_async_operation_progress(f"Preparando {action_label} do Mercado Envios Flex.", 0, total)
-    for index, item_id in enumerate(item_ids, 1):
+
+    def finish(item_id, result):
+        nonlocal done
+        results[item_id] = result
+        done += 1
+        update_async_operation_progress(f"Processado {done} de {total} anúncios.", done, total, result)
+
+    # The real state is always asked to Mercado Livre (the local flag can be
+    # stale), and each change is confirmed by reading it back.
+    calls, clients = [], {}
+    for item_id in item_ids:
         item = catalog.get(item_id)
         account = accounts.get(str((item or {}).get("account_id") or ""))
         if not item or not account:
-            result = {"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."}
-        elif (item.get("shipping_logistic_type") == "self_service") == activate:
-            result = {
-                "item_id": item_id,
-                "status": "ignored",
-                "message": f"ME Flex já estava {'ativo' if activate else 'inativo'}.",
-            }
-        else:
+            finish(item_id, {"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."})
+            continue
+        key = str(account.get("id"))
+        if key not in clients:
             try:
-                update = {
-                    "shipping": {
-                        "mode": item.get("shipping_mode") or "me2",
-                        "logistic_type": target_logistic_type,
-                    }
-                }
-                run_interactive_meli_call(account_client(account).update_item, item_id, update)
-                old_logistic_type = item.get("shipping_logistic_type") or ""
-                item["shipping_logistic_type"] = target_logistic_type
-                item["item_data_checked_at"] = now_label()
-                item["updated_at"] = now_label()
-                append_item_log(
-                    payload,
-                    item,
-                    actor or {},
-                    f"{'Ativação' if activate else 'Remoção'} do Mercado Envios Flex em massa",
-                    {"shipping_logistic_type": {"from": old_logistic_type, "to": target_logistic_type}},
-                )
-                result = {"item_id": item_id, "status": "updated", "shipping_logistic_type": target_logistic_type}
+                clients[key] = account_client(account)
             except Exception as exc:
-                result = {"item_id": item_id, "status": "error", "error": str(exc)}
-        results.append(result)
-        update_async_operation_progress(f"Processado {index} de {total} anúncios.", index, total, result)
+                finish(item_id, {"item_id": item_id, "status": "error", "error": str(exc)})
+                continue
+        calls.append((item_id, lambda client=clients[key], item_id=item_id: apply_flex_change(client, item_id, activate)))
+    for item_id, outcome, error in parallel_item_calls(calls):
+        if error is not None:
+            finish(item_id, {"item_id": item_id, "status": "error", "error": friendly_clone_error(error) if meli_error_status(error) else str(error)})
+            continue
+        item = catalog[item_id]
+        old_logistic_type = item.get("shipping_logistic_type") or ""
+        new_logistic_type = flex_local_logistic_type(item, activate)
+        item["shipping_logistic_type"] = new_logistic_type
+        item["flex_active"] = bool(activate)
+        item["item_data_checked_at"] = now_label()
+        item["updated_at"] = now_label()
+        if outcome == "already":
+            finish(item_id, {"item_id": item_id, "status": "ignored",
+                             "message": f"ME Flex já estava {'ativo' if activate else 'inativo'} no Mercado Livre."})
+            continue
+        append_item_log(
+            payload, item, actor or {},
+            f"{'Ativação' if activate else 'Remoção'} do Mercado Envios Flex em massa",
+            {"shipping_logistic_type": {"from": old_logistic_type, "to": new_logistic_type}},
+        )
+        finish(item_id, {"item_id": item_id, "status": "updated", "shipping_logistic_type": new_logistic_type,
+                         "message": "Confirmado pelo Mercado Livre."})
+    results = [results[item_id] for item_id in item_ids]
     write_payload(payload)
     return {
         "updated": sum(row.get("status") == "updated" for row in results),
@@ -14582,6 +14693,8 @@ def bulk_item_action_operation(request, actor=None, action=""):
         "delete": "Excluindo anúncios",
     }
     update_async_operation_progress(labels.get(action, "Processando anúncios"), 0, total)
+    if action in {"pickup_activate", "pickup_remove"}:
+        return bulk_local_pickup_operation(item_ids, actor, action == "pickup_activate")
     for index, item_id in enumerate(item_ids, 1):
         try:
             current_payload = read_payload(include_catalog=True)
@@ -14602,6 +14715,56 @@ def bulk_item_action_operation(request, actor=None, action=""):
         "updated": sum(row.get("status") == "updated" for row in results),
         "failed": sum(row.get("status") == "error" for row in results),
         "results": results,
+    }
+
+
+def bulk_local_pickup_operation(item_ids, actor, activate):
+    """Local pickup for many listings: 4 at a time, read back, one save."""
+    payload = read_payload(include_catalog=True)
+    catalog = {str(item.get("id")): item for item in payload.get("catalog") or [] if item.get("id")}
+    accounts = {str(account.get("id")): account for account in payload.get("accounts") or [] if account.get("official")}
+    total, done, results = len(item_ids), 0, {}
+
+    def finish(item_id, result):
+        nonlocal done
+        results[item_id] = result
+        done += 1
+        update_async_operation_progress(f"Processado {done} de {total} anúncios.", done, total, result)
+
+    calls, clients = [], {}
+    for item_id in item_ids:
+        item = catalog.get(item_id)
+        account = accounts.get(str((item or {}).get("account_id") or ""))
+        if not item or not account:
+            finish(item_id, {"item_id": item_id, "status": "error", "error": "Anúncio ou conta oficial não encontrado."})
+            continue
+        key = str(account.get("id"))
+        if key not in clients:
+            try:
+                clients[key] = account_client(account)
+            except Exception as exc:
+                finish(item_id, {"item_id": item_id, "status": "error", "error": str(exc)})
+                continue
+        calls.append((item_id, lambda client=clients[key], item_id=item_id: apply_local_pickup_change(client, item_id, activate)))
+    for item_id, outcome, error in parallel_item_calls(calls):
+        if error is not None:
+            finish(item_id, {"item_id": item_id, "status": "error", "error": str(error)})
+            continue
+        item = catalog[item_id]
+        previous = bool(item.get("local_pick_up"))
+        item.update(local_pick_up=bool(activate), item_data_checked_at=now_label(), updated_at=now_label())
+        append_item_log(payload, item, actor or {},
+                        "Ativação da retirada pessoal" if activate else "Desativação da retirada pessoal",
+                        {"local_pick_up": {"from": previous, "to": bool(activate)}})
+        finish(item_id, {"item_id": item_id, "status": "updated", "confirmed": outcome == "confirmed",
+                         "message": PICKUP_RESULT_MESSAGES[outcome]})
+    write_payload(payload)
+    ordered = [results[item_id] for item_id in item_ids]
+    return {
+        "updated": sum(row.get("status") == "updated" for row in ordered),
+        "confirmed": sum(bool(row.get("confirmed")) for row in ordered),
+        "failed": sum(row.get("status") == "error" for row in ordered),
+        "results": ordered,
     }
 
 
