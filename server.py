@@ -861,6 +861,9 @@ BULK_ITEM_PARALLELISM = max(1, min(8, int(os.getenv("MELI_BULK_ITEM_PARALLELISM"
 # Copy combinations / publication accounts sent at the same time. Each one
 # makes several calls, so this stays lower than the bulk-edit parallelism.
 CLONE_BATCH_PARALLELISM = max(1, min(4, int(os.getenv("MELI_CLONE_BATCH_PARALLELISM", "3"))))
+# Orders whose shipping/fees are looked up at the same time in reports. Kept
+# below the interactive request limit so screens stay responsive meanwhile.
+REPORT_ORDER_PARALLELISM = max(1, min(8, int(os.getenv("MELI_REPORT_ORDER_PARALLELISM", "4"))))
 
 
 def edit_lane(item_count):
@@ -19730,13 +19733,39 @@ def query_sales_report(payload, request, *, target_skus=None, paid_only=False):
                 ))) in target_skus
                 for line in order.get("order_items") or []
             )]
+        # Brand/SKU filters and cancelled orders are applied BEFORE the per-order
+        # API lookups (Flex, shipping, reimbursements): they used to run for
+        # every order of the period and were discarded only at the end.
+        orders = [order for order in orders if str(order.get("status") or "").lower() not in ignored_statuses]
+        if brand_filter or sku_filter:
+            def order_matches(order):
+                for line in order.get("order_items") or []:
+                    line_item = (
+                        catalog_by_account_item.get((str(account.get("id") or ""), str((line.get("item") or {}).get("id") or "")))
+                        or catalog_by_name_item.get((str(account.get("nickname") or ""), str((line.get("item") or {}).get("id") or "")))
+                        or {}
+                    )
+                    if sku_filter and normalized_sku_key(order_item_sku(line, line_item) or "-") != sku_filter:
+                        continue
+                    if brand_filter and brand_filter not in normalized_attribute_label(line_item.get("brand") or ""):
+                        continue
+                    return True
+                return False
+            orders = [order for order in orders if order_matches(order)]
+        statistics_progress(f"{account.get('nickname')}: {len(orders)} pedido(s) no período; identificando envios Flex.")
         flex_by_order = {}
         billing_period_by_order = {}
+        flex_lookups = parallel_item_calls([
+            (str(order.get("id") or ""), lambda order=order: order_is_flex(
+                client, order, catalog_by_account_item, shipment_mode_cache, shipment_lookup_state))
+            for order in orders
+        ], workers=REPORT_ORDER_PARALLELISM)
+        for done, (order_key, value, error) in enumerate(flex_lookups, 1):
+            flex_by_order[order_key] = None if error is not None else value
+            if done % 50 == 0:
+                statistics_progress(f"{account.get('nickname')}: identificando envios Flex ({done} de {len(orders)} pedidos).")
         for order in orders:
             order_id = str(order.get("id") or "")
-            flex_by_order[order_id] = order_is_flex(
-                client, order, catalog_by_account_item, shipment_mode_cache, shipment_lookup_state
-            )
             sold_at = parse_meli_datetime(order.get("date_created") or order.get("last_updated"))
             if sold_at and order_id:
                 sale_month = sold_at.date().replace(day=1)
@@ -19751,9 +19780,8 @@ def query_sales_report(payload, request, *, target_skus=None, paid_only=False):
             billing_period_by_order,
         )
         warnings.extend(f"{account.get('nickname')}: {warning}" for warning in billing_warnings)
-        for order in orders:
-            if str(order.get("status") or "").lower() in ignored_statuses:
-                continue
+        def order_rows(order):
+            built = []
             order_id = str(order.get("id") or "")
             sold_at = parse_meli_datetime(order.get("date_created") or order.get("last_updated"))
             is_flex = flex_by_order.get(order_id)
@@ -19884,7 +19912,7 @@ def query_sales_report(payload, request, *, target_skus=None, paid_only=False):
                     if net is not None and cost_total is not None else None
                 )
                 margin = round((profit / net) * 100, 2) if profit is not None and net and net > 0 else None
-                rows.append(
+                built.append(
                     {
                         "date": sold_at.isoformat() if sold_at else str(order.get("date_created") or ""),
                         "account": account.get("nickname") or str(account.get("seller_id") or ""),
@@ -19917,6 +19945,25 @@ def query_sales_report(payload, request, *, target_skus=None, paid_only=False):
                         "flex": sale_is_flex,
                     }
                 )
+            return built
+
+        # Shipping, fees and reimbursements of each order: a few orders at a
+        # time (bounded by the API request limits), kept in the original order.
+        built_by_order = {}
+        total_orders = len(orders)
+        for done, (order_key, value, error) in enumerate(parallel_item_calls(
+            [(index, lambda order=order: order_rows(order)) for index, order in enumerate(orders)],
+            workers=REPORT_ORDER_PARALLELISM,
+        ), 1):
+            if error is not None:
+                warnings.append(f"{account.get('nickname')}: pedido {orders[order_key].get('id')}: {error}")
+                value = []
+            built_by_order[order_key] = value
+            if done % 25 == 0 or done == total_orders:
+                statistics_progress(f"{account.get('nickname')}: conferindo envio e taxas ({done} de {total_orders} pedidos).",
+                                    done, total_orders)
+        for index in range(total_orders):
+            rows.extend(built_by_order.get(index) or [])
     if not rows and warnings:
         raise RuntimeError(" ".join(warnings))
     rows.sort(key=lambda row: str(row.get("date") or ""), reverse=True)
@@ -21356,7 +21403,8 @@ def query_purchase_intelligence(payload, request):
     for sku, stock in stock_by_sku.items():
         grouped[sku]["current_stock"] = stock
 
-    sales = query_sales_report(payload, request)
+    # Only orders of the SKUs being analysed need the shipping/fee lookups.
+    sales = query_sales_report(payload, request, target_skus=set(grouped))
     for sale in sales.get("rows") or []:
         sku = normalized_sku_key(sale.get("sku"))
         row = grouped.get(sku)
@@ -22258,6 +22306,25 @@ def cleanup_statistics_jobs(now=None):
             STATISTICS_JOBS.pop(job_id, None)
 
 
+STATISTICS_CONTEXT = threading.local()
+
+
+def statistics_progress(message, done=None, total=None):
+    """Progress of the report running in this thread (shown on screen)."""
+    job_id = getattr(STATISTICS_CONTEXT, "job_id", "")
+    if not job_id:
+        return
+    with STATISTICS_JOBS_LOCK:
+        job = STATISTICS_JOBS.get(job_id)
+        if not job:
+            return
+        updates = {"message": message, "updated_epoch": time.time()}
+        if done is not None and total:
+            # 20-95 %: the remaining 5 % are the final summary.
+            updates["progress"] = round(20 + 75 * min(1.0, done / total))
+        job.update(updates)
+
+
 def start_statistics_job(request):
     cleanup_statistics_jobs()
     safe_request = {
@@ -22309,7 +22376,8 @@ def start_statistics_job(request):
                     if safe_request.get("kind") == "purchase_opportunities"
                     else "Consultando vendas oficiais no Mercado Livre."
                 )
-                current.update({"status": "processing", "progress": 20, "message": message})
+                current.update({"status": "processing", "progress": 20, "message": message, "updated_epoch": time.time()})
+        STATISTICS_CONTEXT.job_id = job_id
         try:
             source_payload = read_payload()
             if safe_request.get("kind") == "sales":
@@ -22351,6 +22419,8 @@ def start_statistics_job(request):
                             "finished_at": now_label(),
                         }
                     )
+        finally:
+            STATISTICS_CONTEXT.job_id = ""
 
     executor = (
         ANALYTICS_JOB_EXECUTOR if safe_request.get("kind") == "analytics"

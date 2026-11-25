@@ -477,18 +477,32 @@ async function followPendingPublication(result, repeat, onProgress, isPending) {
   return result;
 }
 
+// Reports are followed while the server keeps reporting progress (up to 1 h);
+// only a report silent for REPORT_STALL_LIMIT_MS is given up on.
 async function pollReportJob(url, deadline) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new Error("O acompanhamento do relatório excedeu 15 minutos. A consulta pode continuar no servidor; tente consultar novamente para acompanhar o mesmo processamento.");
+    if (remaining <= 0) throw new Error("O relatório passou de 1 hora e continua no servidor. Tente consultar novamente daqui a pouco para acompanhar o mesmo processamento.");
     try {
-      return await api(url, { manualProgress: false, retryPrompt: false, timeoutMs: Math.min(20000, remaining) });
+      const job = await api(url, { manualProgress: false, retryPrompt: false, timeoutMs: Math.min(20000, remaining) });
+      // Silence is measured here, from the last change this screen saw.
+      const signature = `${job?.status}|${job?.progress}|${job?.message}|${job?.updated_epoch || ""}`;
+      const seen = REPORT_LAST_CHANGE.get(url);
+      if (!seen || seen.signature !== signature) REPORT_LAST_CHANGE.set(url, { signature, at: Date.now() });
+      const silentFor = Date.now() - REPORT_LAST_CHANGE.get(url).at;
+      if (job?.status !== "processing" && job?.status !== "queued") REPORT_LAST_CHANGE.delete(url);
+      if (job?.status === "processing" && silentFor > REPORT_STALL_LIMIT_MS) {
+        throw Object.assign(new Error(`O servidor não informa progresso do relatório há ${Math.round(silentFor / 60000)} minutos (última etapa: ${job.message || "sem detalhe"}).`), { status: 400 });
+      }
+      return job;
     } catch (error) {
       if ([400, 401, 403, 404].includes(error.status) || attempt === 2) throw error;
       await new Promise(resolve => window.setTimeout(resolve, 1000 * (attempt + 1)));
     }
   }
 }
+const REPORT_STALL_LIMIT_MS = 10 * 60 * 1000;
+const REPORT_LAST_CHANGE = new Map();
 
 // A job that keeps reporting progress is followed until it ends (up to the
 // hard cap); only a job silent for ASYNC_STALL_LIMIT_MS is given up on.
@@ -1265,7 +1279,7 @@ async function loadAnalytics() {
     };
     let job = await api("/api/analytics/query", { method: "POST", manualProgress: false, body: JSON.stringify(body) });
     state.analyticsJobId = job.id || "";
-    const reportDeadline = Date.now() + 15 * 60 * 1000;
+    const reportDeadline = Date.now() + 60 * 60 * 1000; // 1 h; stalls are caught by pollReportJob
     while (["queued", "processing"].includes(job.status)) {
       if (requestToken !== state.analyticsRequestToken) return;
       state.analyticsProgress = job.message || "Consultando as vendas oficiais...";
@@ -2403,7 +2417,7 @@ async function loadPurchaseOpportunities() {
       body: JSON.stringify(purchaseOpportunityRequest()),
     });
     state.purchaseOpportunityJobId = job.id || "";
-    const reportDeadline = Date.now() + 15 * 60 * 1000;
+    const reportDeadline = Date.now() + 60 * 60 * 1000; // 1 h; stalls are caught by pollReportJob
     while (["queued", "processing"].includes(job.status)) {
       state.purchaseOpportunityProgress = job.message || "Enriquecendo ranking, preços e concorrência...";
       updateManualAction(actionId, { message: state.purchaseOpportunityProgress, progress: Number(job.progress || 0) });
@@ -2522,7 +2536,7 @@ async function loadPurchaseAnalysis() {
   try {
     let job = await api("/api/purchases/query", { method: "POST", manualProgress: false, body: JSON.stringify(purchaseRequestFromForm()) });
     state.purchaseJobId = job.id || "";
-    const reportDeadline = Date.now() + 15 * 60 * 1000;
+    const reportDeadline = Date.now() + 60 * 60 * 1000; // 1 h; stalls are caught by pollReportJob
     while (["queued", "processing"].includes(job.status)) {
       state.purchaseProgress = job.message || "Calculando demanda, curvas e reposição...";
       updateManualAction(actionId, { message: state.purchaseProgress, progress: Number(job.progress || 0) });
@@ -4918,7 +4932,7 @@ async function loadStatistics() {
       }),
     });
     state.statisticsJobId = job.id || "";
-    const reportDeadline = Date.now() + 15 * 60 * 1000;
+    const reportDeadline = Date.now() + 60 * 60 * 1000; // 1 h; stalls are caught by pollReportJob
     while (["queued", "processing"].includes(job.status)) {
       if (requestToken !== state.statisticsRequestToken) return;
       state.statisticsProgress = job.message || "Consulta em andamento no servidor...";
@@ -5059,7 +5073,7 @@ async function loadSalesReport() {
       }),
     });
     state.salesReportJobId = job.id || "";
-    const reportDeadline = Date.now() + 15 * 60 * 1000;
+    const reportDeadline = Date.now() + 60 * 60 * 1000; // 1 h; stalls are caught by pollReportJob
     while (["queued", "processing"].includes(job.status)) {
       state.salesReportProgress = job.message || "Consultando vendas oficiais...";
       updateManualAction(actionId, { message: state.salesReportProgress, progress: Number(job.progress || 0) });
@@ -5253,7 +5267,7 @@ async function loadBrandSalesReport() {
       }),
     });
     state.brandSalesReportJobId = job.id || "";
-    const reportDeadline = Date.now() + 15 * 60 * 1000;
+    const reportDeadline = Date.now() + 60 * 60 * 1000; // 1 h; stalls are caught by pollReportJob
     while (["queued", "processing"].includes(job.status)) {
       state.brandSalesReportProgress = job.message || "Analisando vendas e estoque da marca...";
       updateManualAction(actionId, { message: state.brandSalesReportProgress, progress: Number(job.progress || 0) });
@@ -5392,7 +5406,7 @@ async function downloadReport(button) {
       }),
     });
     let reportJob = started;
-    const reportDeadline = Date.now() + 15 * 60 * 1000;
+    const reportDeadline = Date.now() + 60 * 60 * 1000; // 1 h; stalls are caught by pollReportJob
     while (["queued", "processing"].includes(reportJob.status)) {
       button.textContent = reportJob.row_count
         ? `Gerando ${Number(reportJob.row_count).toLocaleString("pt-BR")} linhas...`
