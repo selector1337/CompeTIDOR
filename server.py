@@ -666,6 +666,8 @@ REPLENISHMENT_SALES_DAYS = 60
 SYNC_PROGRESS_FILE = "sync_progress.json"
 RETURNS_DATA_FILE = "returns.json"
 ANALYTICS_DAILY_CACHE_FILE = "analytics_daily_cache.json"
+ANALYTICS_FLEX_SHIPMENTS_FILE = "analytics_flex_shipments.json"
+CATEGORY_PATHS_FILE = "category_paths.json"
 ANALYTICS_CACHE_VERSION = 3
 PURCHASE_OPPORTUNITIES_CACHE_FILE = "purchase_opportunities_cache.json"
 PURCHASE_OPPORTUNITIES_CACHE_VERSION = 9
@@ -765,6 +767,8 @@ CATALOG_OFFERS_CACHE = {}
 STATISTICS_CACHE_LOCK = threading.RLock()
 STATISTICS_CACHE = {}
 ANALYTICS_DAILY_CACHE_LOCK = threading.RLock()
+ANALYTICS_FLEX_SHIPMENTS_LOCK = threading.RLock()
+CATEGORY_PATHS_LOCK = threading.RLock()
 PURCHASE_OPPORTUNITIES_CACHE_LOCK = threading.RLock()
 CUSTOMERS_DATA_LOCK = threading.RLock()
 CUSTOMERS_SYNC_LOCK = threading.RLock()
@@ -21762,6 +21766,7 @@ def empty_analytics_snapshot(start, end):
         "daily_average": 0.0,
         "best_day": None,
         "brands": {},
+        "categories": {},
         "daily": [
             {
                 "index": index + 1,
@@ -21771,6 +21776,10 @@ def empty_analytics_snapshot(start, end):
                 "orders": 0,
                 "units": 0,
                 "brands": {},
+                "categories": {},
+                # [shipment_id, amount, flex_hint] per order; used for the Flex
+                # neighbourhood ranking and never sent to the browser.
+                "shipments": [],
             }
             for index in range(days)
         ],
@@ -21779,20 +21788,38 @@ def empty_analytics_snapshot(start, end):
 
 def analytics_order_brand_allocations(order, amount, brand_by_item=None):
     brand_by_item = brand_by_item or {}
-    lines = []
-    for line in (order or {}).get("order_items") or []:
-        item = line.get("item") if isinstance(line.get("item"), dict) else {}
-        item_id = str(item.get("id") or "")
-        brand = customer_text_value(
-            brand_by_item.get(item_id)
+
+    def brand_of(item):
+        return customer_text_value(
+            brand_by_item.get(str(item.get("id") or ""))
             or source_attribute_value(item, ["BRAND"])
             or "Sem marca"
         )
+    return analytics_order_line_allocations(order, amount, brand_of, "Sem marca")
+
+
+def analytics_order_category_allocations(order, amount, category_by_item=None):
+    category_by_item = category_by_item or {}
+
+    def category_of(item):
+        return str(item.get("category_id") or category_by_item.get(str(item.get("id") or "")) or "").strip().upper()
+    allocations = analytics_order_line_allocations(order, amount, category_of, "")
+    for row in allocations:
+        row["category"] = row.pop("brand")
+    return allocations
+
+
+def analytics_order_line_allocations(order, amount, key_of_item, empty_key):
+    """Split the order revenue across its lines (by gross value) grouped by key_of_item."""
+    lines = []
+    for line in (order or {}).get("order_items") or []:
+        item = line.get("item") if isinstance(line.get("item"), dict) else {}
+        brand = key_of_item(item) or empty_key
         quantity = max(1, int(line.get("quantity") or 1))
         gross = max(0.0, float(line.get("unit_price") or line.get("full_unit_price") or 0)) * quantity
-        lines.append({"brand": brand or "Sem marca", "quantity": quantity, "gross": gross})
+        lines.append({"brand": brand, "quantity": quantity, "gross": gross})
     if not lines:
-        return [{"brand": "Sem marca", "revenue": round(float(amount or 0), 2), "orders": 1, "units": 0}]
+        return [{"brand": empty_key, "revenue": round(float(amount or 0), 2), "orders": 1, "units": 0}]
     total_gross = sum(row["gross"] for row in lines)
     allocations = {}
     remaining = round(float(amount or 0), 2)
@@ -21819,7 +21846,7 @@ def merge_analytics_brand_bucket(target, source):
             bucket[field] += values.get(field) or 0
 
 
-def add_orders_to_analytics_snapshot(snapshot, orders, brand_by_item=None):
+def add_orders_to_analytics_snapshot(snapshot, orders, brand_by_item=None, category_by_item=None):
     daily_by_date = {row["date"]: row for row in snapshot["daily"]}
     seen = set()
     for order in orders or []:
@@ -21850,6 +21877,13 @@ def add_orders_to_analytics_snapshot(snapshot, orders, brand_by_item=None):
             values = {field: allocation[field] for field in ("revenue", "orders", "units")}
             merge_analytics_brand_bucket(snapshot["brands"], {brand: values})
             merge_analytics_brand_bucket(day["brands"], {brand: values})
+        for allocation in analytics_order_category_allocations(order, amount, category_by_item):
+            values = {field: allocation[field] for field in ("revenue", "orders", "units")}
+            merge_analytics_brand_bucket(snapshot.setdefault("categories", {}), {allocation["category"]: values})
+            merge_analytics_brand_bucket(day.setdefault("categories", {}), {allocation["category"]: values})
+        shipment_id = shipment_id_from_order(order)
+        if shipment_id not in (None, "", 0, "0"):
+            day.setdefault("shipments", []).append([str(shipment_id), round(amount, 2), flex_hint_from_payload(order)])
     return finalize_analytics_snapshot(snapshot)
 
 
@@ -21859,10 +21893,12 @@ def finalize_analytics_snapshot(snapshot):
     snapshot["daily_average"] = round(snapshot["revenue"] / snapshot["days"], 2) if snapshot["days"] else 0.0
     for day in snapshot["daily"]:
         day["revenue"] = round(day["revenue"], 2)
-        for values in (day.get("brands") or {}).values():
+        for bucket in ("brands", "categories"):
+            for values in (day.get(bucket) or {}).values():
+                values["revenue"] = round(float(values.get("revenue") or 0), 2)
+    for bucket in ("brands", "categories"):
+        for values in (snapshot.get(bucket) or {}).values():
             values["revenue"] = round(float(values.get("revenue") or 0), 2)
-    for values in (snapshot.get("brands") or {}).values():
-        values["revenue"] = round(float(values.get("revenue") or 0), 2)
     snapshot["best_day"] = max(snapshot["daily"], key=lambda row: (row["revenue"], row["orders"])) if snapshot["orders"] else None
     return snapshot
 
@@ -21877,12 +21913,19 @@ def merge_analytics_snapshot(target, source):
             target_day[field] += source_day.get(field) or 0
             target[field] += source_day.get(field) or 0
         merge_analytics_brand_bucket(target_day.setdefault("brands", {}), source_day.get("brands") or {})
+        merge_analytics_brand_bucket(target_day.setdefault("categories", {}), source_day.get("categories") or {})
+        target_day.setdefault("shipments", []).extend(source_day.get("shipments") or [])
     merge_analytics_brand_bucket(target.setdefault("brands", {}), source.get("brands") or {})
+    merge_analytics_brand_bucket(target.setdefault("categories", {}), source.get("categories") or {})
     return finalize_analytics_snapshot(target)
 
 
 def analytics_cache_fresh(entry, day, today, now_epoch):
     if not isinstance(entry, dict) or int(entry.get("version") or 0) != ANALYTICS_CACHE_VERSION:
+        return False
+    if not analytics_cache_day_detailed(entry):
+        # Days saved before categories / Flex neighbourhoods existed are
+        # recalculated once (inside the 12-month API window).
         return False
     updated_at = float(entry.get("updated_at") or 0)
     if day >= today:
@@ -21897,6 +21940,10 @@ def analytics_cache_fresh(entry, day, today, now_epoch):
     # closed month never becomes a permanently stale second source of truth.
     ttl = max(3600, int(os.getenv("MELI_ANALYTICS_CLOSED_DAY_CACHE_SECONDS", "86400")))
     return now_epoch - updated_at < ttl
+
+
+def analytics_cache_day_detailed(entry):
+    return isinstance(entry, dict) and "categories" in entry and "shipments" in entry
 
 
 def analytics_contiguous_windows(days):
@@ -21925,7 +21972,17 @@ def analytics_cache_day(day, updated_at, daily):
         "orders": int(daily.get("orders") or 0),
         "units": int(daily.get("units") or 0),
         "brands": daily.get("brands") or {},
+        "categories": daily.get("categories") or {},
+        "shipments": daily.get("shipments") or [],
         "updated_at": float(updated_at),
+    }
+
+
+def analytics_category_by_item(payload):
+    return {
+        str(item.get("id") or ""): str(item.get("category_id") or "").strip().upper()
+        for item in (payload or {}).get("catalog") or []
+        if item.get("id") and item.get("category_id")
     }
 
 
@@ -21938,7 +21995,7 @@ def cache_official_orders_for_analytics(payload, account, start, end, orders, no
         if item.get("id")
     }
     snapshot = add_orders_to_analytics_snapshot(
-        empty_analytics_snapshot(start, end), orders, brand_by_item,
+        empty_analytics_snapshot(start, end), orders, brand_by_item, analytics_category_by_item(payload),
     )
     entries = {
         daily["date"]: analytics_cache_day(date.fromisoformat(daily["date"]), now_epoch, daily)
@@ -21960,7 +22017,8 @@ def cache_official_orders_for_analytics(payload, account, start, end, orders, no
 
 
 def fetch_analytics_account_snapshot(
-    client, seller_id, account_id, start, end, today=None, now_epoch=None, brand_by_item=None
+    client, seller_id, account_id, start, end, today=None, now_epoch=None, brand_by_item=None,
+    category_by_item=None,
 ):
     """Return daily analytics while only refreshing missing or volatile days."""
     today = today or datetime.now(APP_TZ).date()
@@ -21997,7 +22055,7 @@ def fetch_analytics_account_snapshot(
         api_windows += 1
         truncated = truncated or window_truncated
         window_snapshot = add_orders_to_analytics_snapshot(
-            empty_analytics_snapshot(window_start, window_end), orders, brand_by_item
+            empty_analytics_snapshot(window_start, window_end), orders, brand_by_item, category_by_item
         )
         fetched_snapshots.append(window_snapshot)
         if not window_truncated:
@@ -22025,17 +22083,23 @@ def fetch_analytics_account_snapshot(
     result = empty_analytics_snapshot(start, end)
     refresh_keys = {day.isoformat() for day in refresh_days}
     result_days = {row["date"]: row for row in result["daily"]}
+    undetailed_days = 0
     for day in requested_days:
         key = day.isoformat()
         if key in refresh_keys:
             continue
         entry = cached_days.get(key) or {}
+        if not analytics_cache_day_detailed(entry):
+            undetailed_days += 1
         target = result_days[key]
         for field in ("revenue", "orders", "units"):
             target[field] = entry.get(field) or 0
             result[field] += entry.get(field) or 0
         merge_analytics_brand_bucket(target["brands"], entry.get("brands") or {})
         merge_analytics_brand_bucket(result["brands"], entry.get("brands") or {})
+        merge_analytics_brand_bucket(target["categories"], entry.get("categories") or {})
+        merge_analytics_brand_bucket(result["categories"], entry.get("categories") or {})
+        target["shipments"].extend(entry.get("shipments") or [])
     for snapshot in fetched_snapshots:
         merge_analytics_snapshot(result, snapshot)
     finalize_analytics_snapshot(result)
@@ -22044,6 +22108,7 @@ def fetch_analytics_account_snapshot(
         "cached_days": len(requested_days) - len(refresh_days),
         "refreshed_days": len(refresh_days),
         "api_windows": api_windows,
+        "undetailed_days": undetailed_days,
     }
 
 
@@ -22086,6 +22151,193 @@ def analytics_brand_rows(brands, total_revenue, maximum=8):
     return rows
 
 
+def category_paths(client, category_ids):
+    """Category trees (path_from_root) by id, cached on disk: names rarely change."""
+    wanted = sorted({str(value or "").strip().upper() for value in category_ids if re.fullmatch(r"[A-Z]{3}\d+", str(value or "").strip().upper())})
+    ttl = max(86400, int(os.getenv("MELI_CATEGORY_PATH_CACHE_SECONDS", str(30 * 86400))))
+    now = time.time()
+    with CATEGORY_PATHS_LOCK:
+        cache = dict(read_json(CATEGORY_PATHS_FILE, {}) or {})
+    missing = [cid for cid in wanted if not (cache.get(cid) and now - float(cache[cid].get("updated_at") or 0) < ttl)]
+    fetched = {}
+    if missing and client is not None:
+        for category_id, data, error in parallel_item_calls(
+            [(cid, (lambda cid=cid: client.category(cid))) for cid in missing], workers=REPORT_ORDER_PARALLELISM
+        ):
+            if error or not isinstance(data, dict):
+                continue
+            path = [
+                {"id": str(node.get("id") or ""), "name": customer_text_value(node.get("name"))}
+                for node in data.get("path_from_root") or [] if isinstance(node, dict)
+            ] or [{"id": category_id, "name": customer_text_value(data.get("name")) or category_id}]
+            fetched[category_id] = {"path": path, "updated_at": now}
+    if fetched:
+        with CATEGORY_PATHS_LOCK:
+            latest = dict(read_json(CATEGORY_PATHS_FILE, {}) or {})
+            latest.update(fetched)
+            write_json(CATEGORY_PATHS_FILE, latest)
+        cache.update(fetched)
+    return {cid: (cache.get(cid) or {}).get("path") or [] for cid in wanted}
+
+
+def analytics_category_rows(categories, comparison_categories, total_revenue, paths):
+    """Main categories (first level of the tree) with their subcategories (leaf)."""
+    groups = {}
+    for category_id, values in (categories or {}).items():
+        path = paths.get(category_id) or []
+        if path:
+            top_id, top_name = path[0]["id"], path[0]["name"] or path[0]["id"]
+            leaf_name = path[-1]["name"] or category_id
+            full_path = " > ".join(node["name"] for node in path if node.get("name"))
+        elif category_id:
+            top_id, top_name, leaf_name, full_path = category_id, category_id, category_id, category_id
+        else:
+            top_id, top_name, leaf_name, full_path = "", "Sem categoria", "Sem categoria", ""
+        group = groups.setdefault(top_id, {"id": top_id, "label": top_name, "revenue": 0.0, "orders": 0,
+                                           "units": 0, "comparison_revenue": 0.0, "comparison_orders": 0,
+                                           "children": []})
+        previous = (comparison_categories or {}).get(category_id) or {}
+        child = {
+            "id": category_id, "label": leaf_name, "path": full_path,
+            "revenue": round(float(values.get("revenue") or 0), 2),
+            "orders": int(values.get("orders") or 0), "units": int(values.get("units") or 0),
+            "comparison_revenue": round(float(previous.get("revenue") or 0), 2),
+            "comparison_orders": int(previous.get("orders") or 0),
+        }
+        group["children"].append(child)
+        for field in ("revenue", "orders", "units", "comparison_revenue", "comparison_orders"):
+            group[field] += child[field]
+    # Comparison-only subcategories still count for the variation of the main category.
+    for category_id, previous in (comparison_categories or {}).items():
+        if category_id in (categories or {}):
+            continue
+        path = paths.get(category_id) or []
+        top_id = path[0]["id"] if path else category_id
+        if top_id in groups:
+            groups[top_id]["comparison_revenue"] += float(previous.get("revenue") or 0)
+            groups[top_id]["comparison_orders"] += int(previous.get("orders") or 0)
+
+    def finish(row):
+        row["revenue"] = round(row["revenue"], 2)
+        row["ticket"] = round(row["revenue"] / row["orders"], 2) if row["orders"] else 0.0
+        row["revenue_share"] = round(row["revenue"] / total_revenue * 100, 2) if total_revenue else 0.0
+        row["revenue_change"] = analytics_change(row["revenue"], row["comparison_revenue"])
+        row["orders_change"] = analytics_change(row["orders"], row["comparison_orders"])
+        return row
+    rows = [finish(group) for group in groups.values() if group["revenue"] > 0]
+    for row in rows:
+        row["children"] = sorted((finish(child) for child in row["children"] if child["revenue"] > 0),
+                                 key=lambda child: (-child["orders"], -child["revenue"], child["label"]))
+    rows.sort(key=lambda row: (-row["revenue"], row["label"]))
+    return rows
+
+
+def analytics_shipment_flex_record(shipment):
+    """Minimal persistent record: Flex or not and, for Flex, where it was delivered."""
+    hint = flex_hint_from_payload(shipment)
+    if hint is None:
+        return None
+    record = {"flex": bool(hint)}
+    if hint:
+        address = customer_address(customer_delivery_source(shipment))
+        record.update({
+            "neighborhood": address.get("neighborhood") or "",
+            "city": address.get("city") or "",
+            "state": address.get("state_code") or address.get("state") or "",
+        })
+    return record
+
+
+def analytics_flex_neighborhoods(entries, maximum_rows=50):
+    """Rank delivery neighbourhoods of Flex orders.
+
+    entries: (client, shipment_id, amount, flex_hint). One shipment lookup per
+    order not yet known; results are kept forever (a delivered shipment does
+    not change), so later periods reuse them."""
+    with ANALYTICS_FLEX_SHIPMENTS_LOCK:
+        cache = dict(read_json(ANALYTICS_FLEX_SHIPMENTS_FILE, {}) or {})
+    with SHIPMENT_MODE_CACHE_LOCK:
+        known_modes = {key: value.get("flex") for key, value in SHIPMENT_MODE_CACHE.items()}
+    pending = {}
+    for client, shipment_id, _amount, hint in entries:
+        if shipment_id in cache or shipment_id in pending:
+            continue
+        if hint is False or known_modes.get(shipment_id) is False:
+            continue  # known not to be Flex: no lookup needed
+        pending[shipment_id] = client
+    fetched = {}
+    failed = 0
+    total = len(pending)
+    if total:
+        statistics_progress(f"Flex: identificando bairros de entrega (0 de {total} envios)", 0, total)
+
+    def save(rows):
+        if not rows:
+            return
+        with ANALYTICS_FLEX_SHIPMENTS_LOCK:
+            latest = dict(read_json(ANALYTICS_FLEX_SHIPMENTS_FILE, {}) or {})
+            latest.update(rows)
+            write_json(ANALYTICS_FLEX_SHIPMENTS_FILE, latest)
+    unsaved = {}
+    try:
+        done = 0
+        for shipment_id, shipment, error in parallel_item_calls(
+            [(sid, (lambda sid=sid, client=client: client.shipment(sid))) for sid, client in pending.items()],
+            workers=REPORT_ORDER_PARALLELISM,
+        ):
+            done += 1
+            record = None if error else analytics_shipment_flex_record(shipment)
+            if record is None:
+                failed += 1
+            else:
+                fetched[shipment_id] = unsaved[shipment_id] = record
+            if len(unsaved) >= 200:
+                save(unsaved)
+                unsaved = {}
+            if done % 25 == 0 or done == total:
+                statistics_progress(f"Flex: identificando bairros de entrega ({done} de {total} envios)", done, total)
+    finally:
+        save(unsaved)
+    cache.update(fetched)
+
+    groups = {}
+    flex_orders = 0
+    flex_revenue = 0.0
+    seen = set()
+    for _client, shipment_id, amount, _hint in entries:
+        record = cache.get(shipment_id) or {}
+        if not record.get("flex") or shipment_id in seen:
+            continue
+        seen.add(shipment_id)
+        flex_orders += 1
+        flex_revenue += float(amount or 0)
+        neighborhood = customer_text_value(record.get("neighborhood")) or "Bairro não informado"
+        city = customer_text_value(record.get("city"))
+        key = (unicodedata.normalize("NFKD", neighborhood).encode("ascii", "ignore").decode().lower().strip(),
+               unicodedata.normalize("NFKD", city).encode("ascii", "ignore").decode().lower().strip())
+        group = groups.setdefault(key, {"neighborhood": neighborhood, "city": city,
+                                        "state": record.get("state") or "", "orders": 0, "revenue": 0.0})
+        group["orders"] += 1
+        group["revenue"] += float(amount or 0)
+    rows = []
+    for group in groups.values():
+        group["revenue"] = round(group["revenue"], 2)
+        group["ticket"] = round(group["revenue"] / group["orders"], 2) if group["orders"] else 0.0
+        group["orders_share"] = round(group["orders"] / flex_orders * 100, 2) if flex_orders else 0.0
+        group["revenue_share"] = round(group["revenue"] / flex_revenue * 100, 2) if flex_revenue else 0.0
+        rows.append(group)
+    rows.sort(key=lambda row: (-row["orders"], -row["revenue"], row["neighborhood"]))
+    return {
+        "rows": rows[:max(1, int(maximum_rows))],
+        "neighborhoods": len(rows),
+        "orders": flex_orders,
+        "revenue": round(flex_revenue, 2),
+        "ticket": round(flex_revenue / flex_orders, 2) if flex_orders else 0.0,
+        "unresolved": failed,
+        "looked_up": total,
+    }
+
+
 def query_analytics_report(payload, request):
     current_start, current_end, previous_start, previous_end = analytics_date_ranges(request)
     account_filter = str((request or {}).get("account") or "all")
@@ -22115,6 +22367,10 @@ def query_analytics_report(payload, request):
         for item in payload.get("catalog") or []
         if item.get("id")
     }
+    category_by_item = analytics_category_by_item(payload)
+    flex_entries = []
+    category_client = None
+    undetailed_days = 0
     for account in accounts:
         account_id = str(account.get("id") or account.get("seller_id") or account.get("nickname") or "")
         channel = {
@@ -22133,9 +22389,10 @@ def query_analytics_report(payload, request):
             (comparison, previous_start, previous_end, "comparison_"),
         ):
             try:
+                statistics_progress(f"{channel['label']}: consultando vendas ({analytics_period_label(start, end)})")
                 account_snapshot, account_truncated, account_cache = fetch_analytics_account_snapshot(
                     client, account.get("seller_id"), account_id, start, end,
-                    brand_by_item=brand_by_item,
+                    brand_by_item=brand_by_item, category_by_item=category_by_item,
                 )
                 truncated = truncated or account_truncated
                 account_ok = True
@@ -22152,6 +22409,11 @@ def query_analytics_report(payload, request):
             channel[f"{prefix}orders"] = account_snapshot["orders"]
             if not prefix:
                 channel["units"] = account_snapshot["units"]
+                category_client = category_client or client
+                undetailed_days = max(undetailed_days, int(account_cache.get("undetailed_days") or 0))
+                for daily in account_snapshot.get("daily") or []:
+                    for shipment_id, amount, hint in daily.get("shipments") or []:
+                        flex_entries.append((client, str(shipment_id), amount, hint))
         if account_ok:
             successful_accounts += 1
         channels[account_id] = channel
@@ -22171,6 +22433,30 @@ def query_analytics_report(payload, request):
         })
     channel_rows.sort(key=lambda row: (-float(row.get("revenue") or 0), row.get("label") or ""))
 
+    statistics_progress("Organizando categorias e subcategorias.")
+    try:
+        paths = category_paths(category_client, [*current.get("categories", {}), *comparison.get("categories", {})])
+    except Exception as exc:
+        paths = {}
+        warnings.append(f"Nomes das categorias: {policy_error_message(exc, 'a leitura das categorias')}")
+    category_rows = analytics_category_rows(current.get("categories"), comparison.get("categories"),
+                                            current.get("revenue"), paths)
+    try:
+        flex_neighborhoods = analytics_flex_neighborhoods(flex_entries)
+    except Exception as exc:
+        flex_neighborhoods = {"rows": [], "neighborhoods": 0, "orders": 0, "revenue": 0.0, "ticket": 0.0,
+                              "unresolved": 0, "looked_up": 0, "error": policy_error_message(exc, "a leitura dos envios Flex")}
+    if undetailed_days:
+        warnings.append(
+            f"{undetailed_days} dia(s) do período estão fora dos 12 meses que a API de pedidos devolve; "
+            "o faturamento deles está correto, mas categorias e bairros Flex não incluem esses dias."
+        )
+    for snapshot in (current, comparison):
+        snapshot.pop("categories", None)
+        for daily in snapshot.get("daily") or []:
+            daily.pop("shipments", None)
+            daily.pop("categories", None)
+
     return {
         "ok": True,
         "kind": "analytics",
@@ -22186,6 +22472,8 @@ def query_analytics_report(payload, request):
         },
         "channels": channel_rows,
         "brands": analytics_brand_rows(current.get("brands"), current.get("revenue")),
+        "categories": category_rows,
+        "flex_neighborhoods": flex_neighborhoods,
         "warnings": warnings,
         "truncated": truncated,
         "cache": cache_summary,

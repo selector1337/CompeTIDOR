@@ -4544,3 +4544,20 @@ html:root body #page-codigos .codes-check label { display: grid; gap: 6px; flex:
 html:root body #page-codigos .codes-table { width: 100%; border-collapse: collapse; }
 html:root body #page-codigos .codes-table th, html:root body #page-codigos .codes-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line, rgba(255,255,255,.08)); font-size: 13px; }
 @media (max-width: 640px) { html:root body #page-codigos .codes-form { grid-template-columns: 1fr; } html:root body #page-codigos .codes-check { flex-direction: column; align-items: stretch; } }
+/* 32. Analítico: categorias e bairros Flex */
+html:root body .analytics-categories-card, html:root body .analytics-flex-card { margin-top: 18px; }
+html:root body .analytics-category-list { display: grid; gap: 4px; overflow-x: auto; }
+html:root body .analytics-category-row { display: grid; grid-template-columns: minmax(220px, 2.2fr) repeat(6, minmax(90px, 1fr)); gap: 10px; align-items: center; padding: 10px 12px; font-size: 13px; min-width: 820px; }
+html:root body .analytics-category-row > span:first-child { display: grid; gap: 2px; }
+html:root body .analytics-category-row small { color: var(--muted, #9aa0aa); font-size: 11px; }
+html:root body .analytics-category-head { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted, #9aa0aa); border-bottom: 1px solid var(--line, rgba(255,255,255,.1)); }
+html:root body details.analytics-category { border-radius: 12px; border: 1px solid var(--line, rgba(255,255,255,.08)); }
+html:root body details.analytics-category > summary { cursor: pointer; list-style: none; border-radius: 12px; }
+html:root body details.analytics-category > summary::-webkit-details-marker { display: none; }
+html:root body details.analytics-category > summary > span:first-child strong::before { content: "▸ "; color: var(--muted, #9aa0aa); }
+html:root body details.analytics-category[open] > summary > span:first-child strong::before { content: "▾ "; }
+html:root body details.analytics-category > summary:hover { background: rgba(127, 127, 127, .08); }
+html:root body .analytics-subcategory { border-top: 1px dashed var(--line, rgba(255,255,255,.08)); }
+html:root body .analytics-subcategory > span:first-child { padding-left: 18px; }
+html:root body .analytics-flex-card .analytics-legend-bar i { background: #22c55e; }
+html:root body .analytics-empty-line { margin: 0; padding: 12px; color: var(--muted, #9aa0aa); }
